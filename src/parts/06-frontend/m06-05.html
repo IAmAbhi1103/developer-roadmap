@@ -1,0 +1,612 @@
+<article class="topic" id="m6-project-structure">
+  <h3>Mini project: Employee Manager UI — contract, folders and app shell</h3>
+  <p class="tldr">The project is a React app with JWT login, protected routes and a paginated
+  list/create/edit/delete screen for one resource (employees) against your Spring Boot API; this article
+  fixes the API contract, the folder structure and the wiring files, and the
+  <a href="#m6-project-crud">next article</a> builds the pages.</p>
+
+  <h4>What you build and why this project</h4>
+  <p>Almost every business application is "log in, see a table, add a row, change it, delete it". If you can
+  build this one resource cleanly, you can build most screens of a real project. The project uses everything
+  from Modules 5 and 6: routing, forms, Context, TanStack Query, Axios with interceptors, CORS, JWT, error
+  handling and environment variables. It is also the frontend of <strong>Project 3</strong> in the
+  roadmap (see <a href="#m6-practice">Practice</a>).</p>
+
+  <h4>The API contract</h4>
+  <p>Agree on the contract <em>before</em> writing screens. This table is what the React app expects from
+  your Spring Boot application (the controller code is in <a href="04-spring-boot.html#m2">Spring Boot ·
+  Module 2</a>; authentication is in <a href="04-spring-boot.html#m4">Module 4</a>).</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Endpoint</th><th>Body / params</th><th>Success</th><th>Errors the UI handles</th></tr></thead>
+    <tbody>
+      <tr><td><code>POST /api/auth/login</code></td><td>email, password</td><td>200 + accessToken, user</td><td>401 wrong credentials</td></tr>
+      <tr><td><code>GET /api/employees</code></td><td><code>page</code>, <code>size</code>, <code>q</code></td><td>200 + PageResponse</td><td>401, 5xx</td></tr>
+      <tr><td><code>GET /api/employees/{id}</code></td><td>-</td><td>200 + Employee</td><td>404</td></tr>
+      <tr><td><code>POST /api/employees</code></td><td>name, email, department, salary</td><td>201 + Employee</td><td>400 field errors, 409 duplicate email</td></tr>
+      <tr><td><code>PUT /api/employees/{id}</code></td><td>same as create</td><td>200 + Employee</td><td>400, 404, 409</td></tr>
+      <tr><td><code>DELETE /api/employees/{id}</code></td><td>-</td><td>204</td><td>403 (not ADMIN), 404</td></tr>
+    </tbody>
+  </table></div>
+
+<pre data-title="Backend DTOs the frontend mirrors"><code class="language-java">public record EmployeeRequest(
+        @NotBlank String name,
+        @NotBlank @Email String email,
+        @NotBlank String department,
+        @NotNull @Positive BigDecimal salary) {}
+
+public record EmployeeDto(Long id, String name, String email, String department,
+                          BigDecimal salary) {}
+
+// Controller outline (bodies omitted)
+@RestController
+@RequestMapping("/api/employees")
+class EmployeeController {
+    @GetMapping
+    PageResponse&lt;EmployeeDto&gt; list(String q, Pageable pageable) { /* ... */ }
+
+    @GetMapping("/{id}")
+    EmployeeDto get(@PathVariable Long id) { /* 404 if missing */ }
+
+    @PostMapping
+    ResponseEntity&lt;EmployeeDto&gt; create(@Valid @RequestBody EmployeeRequest r) { /* 201 */ }
+
+    @PutMapping("/{id}")
+    EmployeeDto update(@PathVariable Long id, @Valid @RequestBody EmployeeRequest r) { /* ... */ }
+
+    @DeleteMapping("/{id}")
+    @PreAuthorize("hasRole('ADMIN')")
+    ResponseEntity&lt;Void&gt; delete(@PathVariable Long id) { /* 204 */ }
+}</code></pre>
+
+  <p>The validation error body (<code>errors</code> map) and the <code>PageResponse</code> record are the ones
+  from <a href="#m6-backend-validation-errors">validation errors</a> and
+  <a href="#m6-pagination-optimistic">pagination</a>. CORS is set up as in
+  <a href="#m6-cors-spring">CORS in Spring Boot</a>: allow the Vite origin
+  <code>http://localhost:5173</code> with the headers <code>Authorization</code> and
+  <code>Content-Type</code>.</p>
+
+  <h4>Create the project</h4>
+<pre data-title="Terminal" class="out"><code class="language-shell">$ npm create vite@latest employee-ui -- --template react
+$ cd employee-ui
+$ npm install
+$ npm install react-router axios @tanstack/react-query react-hot-toast
+$ npm run dev</code></pre>
+  <p>Then create <code>.env.development</code> with <code>VITE_API_URL=http://localhost:8080/api</code> (see
+  <a href="#m6-env-vars-build">environment variables</a>). If your tutorial or company uses
+  <code>react-router-dom</code>, the code is the same; only the import path differs.</p>
+
+  <h4>Folder structure</h4>
+  <figure class="fig">
+<pre class="diagram">
+employee-ui/
+├── .env.development          VITE_API_URL=http://localhost:8080/api
+├── .env.production           VITE_API_URL=https://api.acme.in/api
+├── index.html
+└── src/
+    ├── main.jsx              providers + root render
+    ├── App.jsx               all routes
+    ├── lib/
+    │   ├── axios.js          Axios instance + interceptors     (built earlier)
+    │   ├── tokenStore.js     get/set/clear the access token    (built earlier)
+    │   ├── errors.js         classifyError, getFieldErrors     (built earlier)
+    │   ├── config.js         required env variables
+    │   └── employeeApi.js    the only place that knows URLs
+    ├── context/
+    │   └── AuthContext.jsx   user, login, logout              (built earlier)
+    ├── hooks/
+    │   └── employeeHooks.js  TanStack Query hooks
+    ├── components/
+    │   ├── Layout.jsx        nav bar + Outlet
+    │   ├── RequireAuth.jsx   route guard                      (built earlier)
+    │   ├── HasRole.jsx       hide UI by role                  (built earlier)
+    │   ├── QueryState.jsx    loading / error / empty          (built earlier)
+    │   ├── TextField.jsx     label + input + error            (built earlier)
+    │   ├── EmployeeForm.jsx  create and edit form             (built earlier)
+    │   └── Pagination.jsx                                     (built earlier)
+    └── pages/
+        ├── LoginPage.jsx                                      (built earlier)
+        ├── EmployeeListPage.jsx
+        ├── EmployeeCreatePage.jsx
+        ├── EmployeeEditPage.jsx
+        ├── ForbiddenPage.jsx
+        └── NotFoundPage.jsx
+</pre>
+    <figcaption>Folders by role: <code>lib</code> for plumbing, <code>hooks</code> for server data,
+    <code>components</code> for reusable UI, <code>pages</code> for routes</figcaption>
+  </figure>
+
+  <p>Files marked "built earlier" were written in the previous articles; this article does not repeat
+  them. The rule behind the layout: a <strong>page</strong> is one route; a <strong>component</strong> is
+  reused by several pages; a <strong>hook</strong> wraps server data; <strong>lib</strong> has no React in
+  it (except Context). For bigger projects, group by feature instead
+  (<code>features/employees/…</code>); the idea is the same.</p>
+
+  <h4>The only file that knows the URLs: employeeApi.js</h4>
+  <p>Components never call <code>api.get('/employees')</code> directly. A small module owns every URL and
+  returns plain data, so a changed endpoint is a one-file edit and tests can mock one module.</p>
+
+<pre data-title="src/lib/employeeApi.js"><code class="language-javascript">import { api } from './axios.js';
+
+export const employeeApi = {
+  async list({ page = 0, size = 10, q = '' }, signal) {
+    const { data } = await api.get('/employees', {
+      params: { page, size, q: q || undefined },         // undefined params are not sent
+      signal,
+    });
+    return data;                                          // PageResponse
+  },
+
+  async get(id, signal) {
+    const { data } = await api.get(`/employees/${id}`, { signal });
+    return data;
+  },
+
+  async create(body) {
+    const { data } = await api.post('/employees', body);
+    return data;
+  },
+
+  async update(id, body) {
+    const { data } = await api.put(`/employees/${id}`, body);
+    return data;
+  },
+
+  async remove(id) {
+    await api.delete(`/employees/${id}`);                 // 204: no body to return
+  },
+};</code></pre>
+
+  <p>The <code>useEmployees</code> hook from the pagination article now calls
+  <code>employeeApi.list({ page, q, size }, signal)</code> inside its <code>queryFn</code> instead of
+  <code>api.get</code>. Keep it in the same file as the hooks below.</p>
+
+  <h4>The query hooks</h4>
+<pre data-title="src/hooks/employeeHooks.js"><code class="language-javascript">import {
+  keepPreviousData, useMutation, useQuery, useQueryClient,
+} from '@tanstack/react-query';
+import { employeeApi } from '../lib/employeeApi.js';
+
+// Query keys in one place: a typo in a key is a classic cache bug
+export const keys = {
+  list: (params) =&gt; ['employees', params],
+  all: ['employees'],
+  one: (id) =&gt; ['employee', String(id)],
+};
+
+export function useEmployees({ page, q, size = 10 }) {
+  return useQuery({
+    queryKey: keys.list({ page, q, size }),
+    queryFn: ({ signal }) =&gt; employeeApi.list({ page, q, size }, signal),
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useEmployee(id) {
+  return useQuery({
+    queryKey: keys.one(id),
+    queryFn: ({ signal }) =&gt; employeeApi.get(id, signal),
+  });
+}
+
+export function useCreateEmployee() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: employeeApi.create,
+    onSuccess: () =&gt; queryClient.invalidateQueries({ queryKey: keys.all }),
+  });
+}
+
+export function useUpdateEmployee() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, body }) =&gt; employeeApi.update(id, body),
+    onSuccess: (saved, { id }) =&gt; {
+      queryClient.setQueryData(keys.one(id), saved);             // detail page is fresh at once
+      queryClient.invalidateQueries({ queryKey: keys.all });     // lists refetch
+    },
+  });
+}
+
+export function useDeleteEmployee() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: employeeApi.remove,
+    onSuccess: () =&gt; queryClient.invalidateQueries({ queryKey: keys.all }),
+  });
+}</code></pre>
+
+  <p>Why <code>invalidateQueries</code>: after a write, the cached lists are out of date. Invalidating the
+  <code>['employees']</code> prefix marks every cached page of the list stale and refetches the ones on
+  screen. The single-employee key is <code>['employee', id]</code> (singular), so it is not matched by that
+  prefix; the update hook sets it directly.</p>
+
+  <h4>main.jsx: providers in the right order</h4>
+<pre data-title="src/main.jsx"><code class="language-jsx">import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { BrowserRouter } from 'react-router';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { Toaster } from 'react-hot-toast';
+import App from './App.jsx';
+import { AuthProvider } from './context/AuthContext.jsx';
+import { queryClient } from './lib/queryClient.js';
+import './index.css';
+
+createRoot(document.getElementById('root')).render(
+  &lt;StrictMode&gt;
+    &lt;QueryClientProvider client={queryClient}&gt;
+      &lt;BrowserRouter&gt;
+        &lt;AuthProvider&gt;
+          &lt;App /&gt;
+          &lt;Toaster position="top-right" /&gt;
+        &lt;/AuthProvider&gt;
+      &lt;/BrowserRouter&gt;
+    &lt;/QueryClientProvider&gt;
+  &lt;/StrictMode&gt;,
+);</code></pre>
+
+  <p><code>src/lib/queryClient.js</code> is the <code>QueryClient</code> with the retry rule and the global
+  <code>QueryCache</code> error toast from the <a href="#m6-loading-error-states">error-states article</a>,
+  moved into its own file and exported. The order matters: <code>AuthProvider</code> may call the API,
+  so it sits inside the places that provide what it needs; <code>RequireAuth</code> uses router hooks, so
+  <code>BrowserRouter</code> must be above <code>App</code>.</p>
+
+  <h4>App.jsx and Layout.jsx</h4>
+<pre data-title="src/App.jsx"><code class="language-jsx">import { Navigate, Route, Routes } from 'react-router';
+import RequireAuth from './components/RequireAuth.jsx';
+import Layout from './components/Layout.jsx';
+import LoginPage from './pages/LoginPage.jsx';
+import EmployeeListPage from './pages/EmployeeListPage.jsx';
+import EmployeeCreatePage from './pages/EmployeeCreatePage.jsx';
+import EmployeeEditPage from './pages/EmployeeEditPage.jsx';
+import ForbiddenPage from './pages/ForbiddenPage.jsx';
+import NotFoundPage from './pages/NotFoundPage.jsx';
+
+export default function App() {
+  return (
+    &lt;Routes&gt;
+      &lt;Route path="/login" element={&lt;LoginPage /&gt;} /&gt;
+      &lt;Route path="/forbidden" element={&lt;ForbiddenPage /&gt;} /&gt;
+
+      &lt;Route element={&lt;RequireAuth /&gt;}&gt;
+        &lt;Route element={&lt;Layout /&gt;}&gt;
+          &lt;Route index element={&lt;Navigate to="/employees" replace /&gt;} /&gt;
+          &lt;Route path="employees" element={&lt;EmployeeListPage /&gt;} /&gt;
+          &lt;Route element={&lt;RequireAuth roles={['ADMIN', 'HR']} /&gt;}&gt;
+            &lt;Route path="employees/new" element={&lt;EmployeeCreatePage /&gt;} /&gt;
+            &lt;Route path="employees/:id/edit" element={&lt;EmployeeEditPage /&gt;} /&gt;
+          &lt;/Route&gt;
+        &lt;/Route&gt;
+      &lt;/Route&gt;
+
+      &lt;Route path="*" element={&lt;NotFoundPage /&gt;} /&gt;
+    &lt;/Routes&gt;
+  );
+}</code></pre>
+
+<pre data-title="src/components/Layout.jsx"><code class="language-jsx">import { NavLink, Outlet } from 'react-router';
+import { useAuth } from '../context/AuthContext.jsx';
+
+export default function Layout() {
+  const { user, logout } = useAuth();
+  return (
+    &lt;div className="app"&gt;
+      &lt;header className="topbar"&gt;
+        &lt;strong&gt;Employee Manager&lt;/strong&gt;
+        &lt;nav&gt;
+          &lt;NavLink to="/employees"&gt;Employees&lt;/NavLink&gt;
+        &lt;/nav&gt;
+        &lt;span className="spacer" /&gt;
+        &lt;span&gt;{user.name} ({user.roles.join(', ')})&lt;/span&gt;
+        &lt;button onClick={logout}&gt;Log out&lt;/button&gt;
+      &lt;/header&gt;
+      &lt;main&gt;
+        &lt;Outlet /&gt;
+      &lt;/main&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions used in this project</p>
+    <ul>
+      <li>One module owns the API URLs; pages never build URLs.</li>
+      <li>Server data lives in TanStack Query, not in <code>useState</code> or Context. Context holds only
+      the logged-in user.</li>
+      <li>Every list page has the four states: loading, error, empty, data.</li>
+      <li>URL is state: page and search text are in the query string; the edit page's id is in the
+      path.</li>
+      <li>Roles are shown as the backend sends them (<code>ADMIN</code>); routes and buttons use the same
+      strings.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes when wiring the app</p>
+    <ul>
+      <li>Two nested <code>BrowserRouter</code> components, or <code>AuthProvider</code> above the router
+      when it needs router hooks.</li>
+      <li>Placing <code>/employees/new</code> after <code>/employees/:id</code> logic that would treat
+      <code>new</code> as an id. React Router ranks static segments higher, but the habit of checking the
+      order is still useful.</li>
+      <li>Fetching in components with <code>useEffect</code> and also in hooks, so the same data loads
+      twice.</li>
+      <li>Forgetting that <code>useParams()</code> returns strings: <code>id</code> is
+      <code>"7"</code>, not <code>7</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-project-crud">
+  <h3>Mini project: list, create, edit and delete pages — and debugging it</h3>
+  <p class="tldr">The list page combines search, pagination, role-based buttons and delete; the create
+  and edit pages reuse one form that shows server validation errors; a short debugging table maps
+  common symptoms to causes, and a checklist tells you when the project is done.</p>
+
+  <h4>The list page</h4>
+  <p>This page uses almost everything: URL state for page and search, the query hook, the
+  <code>QueryState</code> wrapper, the pagination control, a role-aware delete button and a mutation with
+  a toast.</p>
+
+<pre data-title="src/pages/EmployeeListPage.jsx"><code class="language-jsx">import { useState } from 'react';
+import { Link } from 'react-router';
+import toast from 'react-hot-toast';
+import { useEmployeeParams } from '../hooks/useEmployeeParams.js';
+import { useDeleteEmployee, useEmployees } from '../hooks/employeeHooks.js';
+import { QueryState } from '../components/QueryState.jsx';
+import { Pagination } from '../components/Pagination.jsx';
+import { SkeletonRows } from '../components/SkeletonRows.jsx';
+import { HasRole } from '../components/HasRole.jsx';
+import { describeError } from '../lib/errors.js';
+
+export default function EmployeeListPage() {
+  const { page, q, update } = useEmployeeParams();
+  const query = useEmployees({ page, q });
+  const remove = useDeleteEmployee();
+  const [search, setSearch] = useState(q);
+
+  function handleSearch(e) {
+    e.preventDefault();
+    update({ q: search.trim(), page: 0 });               // a new search starts at page 0
+  }
+
+  function handleDelete(employee) {
+    if (!window.confirm(`Delete ${employee.name}?`)) return;
+    remove.mutate(employee.id, {
+      onSuccess: () =&gt; {
+        toast.success(`${employee.name} deleted`);
+        const onlyRowOnPage = query.data.content.length === 1;
+        if (onlyRowOnPage &amp;&amp; page &gt; 0) update({ page: page - 1 });
+      },
+      onError: (err) =&gt; toast.error(describeError(err)),
+    });
+  }
+
+  const rows = query.data?.content ?? [];
+
+  return (
+    &lt;section&gt;
+      &lt;div className="toolbar"&gt;
+        &lt;h1&gt;Employees&lt;/h1&gt;
+        &lt;form onSubmit={handleSearch} role="search"&gt;
+          &lt;input value={search} onChange={(e) =&gt; setSearch(e.target.value)}
+                 placeholder="Search name or email" aria-label="Search employees" /&gt;
+          &lt;button&gt;Search&lt;/button&gt;
+        &lt;/form&gt;
+        &lt;HasRole roles={['ADMIN', 'HR']}&gt;
+          &lt;Link to="/employees/new" className="button"&gt;Add employee&lt;/Link&gt;
+        &lt;/HasRole&gt;
+      &lt;/div&gt;
+
+      &lt;QueryState query={query} isEmpty={rows.length === 0}
+                  skeleton={&lt;SkeletonRows /&gt;}
+                  emptyMessage={q ? `No employees match "${q}".` : 'No employees yet.'}&gt;
+        &lt;table className={query.isPlaceholderData ? 'dim' : undefined}&gt;
+          &lt;thead&gt;
+            &lt;tr&gt;
+              &lt;th&gt;Name&lt;/th&gt;&lt;th&gt;Email&lt;/th&gt;&lt;th&gt;Department&lt;/th&gt;
+              &lt;th&gt;Salary&lt;/th&gt;&lt;th&gt;&lt;/th&gt;
+            &lt;/tr&gt;
+          &lt;/thead&gt;
+          &lt;tbody&gt;
+            {rows.map((e) =&gt; (
+              &lt;tr key={e.id}&gt;
+                &lt;td&gt;{e.name}&lt;/td&gt;
+                &lt;td&gt;{e.email}&lt;/td&gt;
+                &lt;td&gt;{e.department}&lt;/td&gt;
+                &lt;td&gt;₹{Number(e.salary).toLocaleString('en-IN')}&lt;/td&gt;
+                &lt;td&gt;
+                  &lt;HasRole roles={['ADMIN', 'HR']}&gt;
+                    &lt;Link to={`/employees/${e.id}/edit`}&gt;Edit&lt;/Link&gt;
+                  &lt;/HasRole&gt;
+                  &lt;HasRole roles={['ADMIN']}&gt;
+                    &lt;button onClick={() =&gt; handleDelete(e)}
+                            disabled={remove.isPending &amp;&amp; remove.variables === e.id}&gt;
+                      Delete
+                    &lt;/button&gt;
+                  &lt;/HasRole&gt;
+                &lt;/td&gt;
+              &lt;/tr&gt;
+            ))}
+          &lt;/tbody&gt;
+        &lt;/table&gt;
+        &lt;Pagination page={query.data?.page ?? 0} totalPages={query.data?.totalPages ?? 0}
+                    disabled={query.isPlaceholderData}
+                    onChange={(p) =&gt; update({ page: p })} /&gt;
+      &lt;/QueryState&gt;
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+  <p>Two small files complete it: <code>useEmployeeParams</code> is the URL-state hook from the
+  pagination article saved as <code>src/hooks/useEmployeeParams.js</code>, and <code>SkeletonRows</code>
+  is the skeleton component from the error-states article. A salary shown with
+  <code>toLocaleString('en-IN')</code> gives Indian digit grouping (for example 1,25,000).</p>
+
+  <h4>Create and edit pages share one form</h4>
+  <p><code>EmployeeForm</code> takes <code>initial</code> values and an async <code>onSubmit</code>. It
+  already handles client rules, server field errors and the disabled button. The two pages only decide
+  what to call.</p>
+
+<pre data-title="src/pages/EmployeeCreatePage.jsx"><code class="language-jsx">import { useNavigate } from 'react-router';
+import toast from 'react-hot-toast';
+import { EmployeeForm } from '../components/EmployeeForm.jsx';
+import { useCreateEmployee } from '../hooks/employeeHooks.js';
+
+export default function EmployeeCreatePage() {
+  const navigate = useNavigate();
+  const create = useCreateEmployee();
+
+  async function handleSubmit(values) {
+    await create.mutateAsync(values);          // throws on 400/409: the form shows the errors
+    toast.success('Employee created');
+    navigate('/employees');
+  }
+
+  return (
+    &lt;section&gt;
+      &lt;h1&gt;Add employee&lt;/h1&gt;
+      &lt;EmployeeForm onSubmit={handleSubmit} submitLabel="Create" /&gt;
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+<pre data-title="src/pages/EmployeeEditPage.jsx"><code class="language-jsx">import { Link, useNavigate, useParams } from 'react-router';
+import toast from 'react-hot-toast';
+import { EmployeeForm } from '../components/EmployeeForm.jsx';
+import { QueryState } from '../components/QueryState.jsx';
+import { useEmployee, useUpdateEmployee } from '../hooks/employeeHooks.js';
+
+export default function EmployeeEditPage() {
+  const { id } = useParams();                   // a string such as "7"
+  const navigate = useNavigate();
+  const query = useEmployee(id);
+  const update = useUpdateEmployee();
+
+  async function handleSubmit(values) {
+    await update.mutateAsync({ id, body: values });
+    toast.success('Employee updated');
+    navigate('/employees');
+  }
+
+  const employee = query.data;
+
+  return (
+    &lt;section&gt;
+      &lt;h1&gt;Edit employee&lt;/h1&gt;
+      &lt;QueryState query={query}&gt;
+        {employee &amp;&amp; (
+          &lt;EmployeeForm
+            key={employee.id}                   // new employee loaded = fresh form state
+            initial={{
+              name: employee.name,
+              email: employee.email,
+              department: employee.department,
+              salary: String(employee.salary),
+            }}
+            onSubmit={handleSubmit}
+            submitLabel="Save changes"
+          /&gt;
+        )}
+      &lt;/QueryState&gt;
+      &lt;Link to="/employees"&gt;Back to the list&lt;/Link&gt;
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+  <p>The form copies <code>initial</code> into its own state once, when it first renders. That is why the
+  edit page renders the form <em>only after</em> the data has loaded (inside <code>QueryState</code>), and
+  why it passes a <code>key</code>: with the key, loading a different employee mounts a fresh form. If you
+  rendered the form first with empty values and passed the data later, the inputs would stay empty,
+  which is a very common bug.</p>
+
+  <h4>Try the whole flow</h4>
+  <ol class="steps">
+    <li>Start PostgreSQL and the Spring Boot API (port 8080), then <code>npm run dev</code> (port 5173).</li>
+    <li>Open <code>/employees</code> while logged out. You must land on <code>/login</code>.</li>
+    <li>Log in with a wrong password: a clear message, no redirect loop. Log in correctly: you return to
+    <code>/employees</code>.</li>
+    <li>Add an employee with an empty name and a bad email: client messages appear without a request. Fix
+    them and submit an email that already exists: the server's 409 message appears under the email field.</li>
+    <li>Create a valid employee, see the toast and the new row. Edit it. Delete it as ADMIN; log in as a
+    normal user and check that the Delete button is hidden <em>and</em> that
+    <code>DELETE</code> from curl gives 403.</li>
+    <li>Stop the Spring Boot app and reload: you see the "cannot reach the server" message with a retry
+    button, not a white page.</li>
+    <li>Wait for the token to expire (or shorten it to one minute in <code>application.yml</code>) and click
+    around: the interceptor refreshes, or sends you to the login page.</li>
+    <li>Run <code>npm run build</code> and <code>npm run preview</code>; repeat steps 2 to 5 against the
+    built app.</li>
+  </ol>
+
+  <h4>Debugging with the Network tab</h4>
+  <p>Open DevTools (<kbd>F12</kbd>) and the <strong>Network</strong> tab, filter by <em>Fetch/XHR</em>.
+  Click a request and read four things: the <strong>status code</strong>, the <strong>request
+  headers</strong> (is there <code>Authorization: Bearer …</code>?), the <strong>request payload</strong>
+  (are the field names right?) and the <strong>response body</strong> (what did Spring say?). The Console
+  tab shows CORS errors in red.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Symptom</th><th>Likely cause</th><th>Where to look / fix</th></tr></thead>
+    <tbody>
+      <tr><td>Console: "blocked by CORS policy"</td><td>Origin not allowed, or the preflight (OPTIONS) was rejected by Spring Security</td><td>Network tab: failed OPTIONS request. Fix the CORS bean; see <a href="#m6-cors-spring">CORS</a></td></tr>
+      <tr><td>Every API call is 401</td><td>Token missing or malformed header; token expired; backend filter order</td><td>Request headers: <code>Authorization: Bearer &lt;token&gt;</code> with a space</td></tr>
+      <tr><td>Request goes to <code>/employees</code> on port 5173 (404)</td><td><code>baseURL</code> empty because the env variable is missing or misspelled</td><td>Restart <code>npm run dev</code>; the name must start with <code>VITE_</code></td></tr>
+      <tr><td>Field errors never show</td><td>Form field names differ from DTO names, or the response has no <code>errors</code></td><td>Compare the response JSON keys with the input <code>name</code>s</td></tr>
+      <tr><td>400 with "JSON parse error"</td><td>Sending a string where the DTO expects a number, or bad JSON</td><td>Request payload: convert <code>salary</code> with <code>Number()</code></td></tr>
+      <tr><td>List is empty but the database has rows</td><td>Reading <code>data</code> instead of <code>data.content</code>, or page out of range</td><td>Response body shape; <code>page</code> param</td></tr>
+      <tr><td>Page works, refresh logs me out</td><td>Token only in memory and no refresh/restore step</td><td><a href="#m6-jwt-flow">JWT flow</a>: restore on load</td></tr>
+      <tr><td>Create works but list does not update</td><td>No <code>invalidateQueries</code>, or a different query key</td><td>Compare keys in the hooks file; TanStack Query devtools</td></tr>
+      <tr><td>Edit form shows empty inputs</td><td>Form rendered before data loaded, no <code>key</code></td><td>Render the form inside <code>QueryState</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-tip">
+    <p class="co-t">Reproduce an API problem outside React</p>
+    <p>If something fails, copy the request from the Network tab (right-click, Copy as cURL) and run it in a
+    terminal or Postman. If curl works but the browser fails, the problem is browser-specific: CORS,
+    cookies or headers. If curl fails too, the bug is in the backend. This one habit saves hours.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases to test</p>
+    <ul>
+      <li>Open <code>/employees/9999/edit</code> (a missing id): the page shows the 404 message and a link
+      back; it does not crash.</li>
+      <li>Double-click Create quickly: the button disables and only one employee is created.</li>
+      <li>Delete the last row on the last page: the list moves to the previous page.</li>
+      <li>Change the search while on page 3: the page resets to 0.</li>
+      <li>Salary of <code>0</code>, negative, or letters: client and server both reject.</li>
+      <li>A normal user opens <code>/employees/new</code> by typing the URL: redirected to
+      <code>/forbidden</code> by the route, and a direct API call is also rejected.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">How a real team would extend this</p>
+    <ul>
+      <li>Replace hand-written forms with React Hook Form and Zod schemas; keep the server-error mapping.</li>
+      <li>Add TypeScript (<a href="#m7-typescript-basics">Module 7</a>) so a renamed DTO field breaks
+      the build, not the user.</li>
+      <li>Add tests for the form and the list with Vitest and MSW
+      (<a href="#m7-testing">testing</a>).</li>
+      <li>Deploy: the UI on Vercel or in an Nginx container, the API in Docker
+      (<a href="#m6-deploy">deployment</a>), a pipeline on every push
+      (<a href="07-devops.html#m4">DevOps · Module 4</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Walk me through the React app you built against your Spring Boot API"</p>
+    <ul>
+      <li>Architecture: Vite SPA, Axios instance with interceptors, JWT in memory plus refresh cookie
+      (or localStorage in a simple version), React Router with a guard, TanStack Query for server
+      state.</li>
+      <li>Features: login, protected routes, CRUD, pagination in the URL, role-based UI, backend
+      validation errors on fields, loading/error/empty states, toasts.</li>
+      <li>Hard parts you solved: CORS and preflight, 401 refresh with a single shared promise, cache
+      invalidation after writes, the SPA fallback on deploy.</li>
+      <li>Honest limits: client roles are cosmetic; the backend enforces security.</li>
+    </ul>
+  </div>
+</article>

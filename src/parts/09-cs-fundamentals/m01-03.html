@@ -1,0 +1,428 @@
+<article class="topic" id="m1-sync-critical-section">
+  <h3>Race conditions and the critical-section problem</h3>
+  <p class="tldr">When two threads or processes update shared data without coordination, the result depends on timing (a race condition); the critical-section problem asks for a protocol that gives mutual exclusion, progress and bounded waiting, implemented with help from atomic hardware instructions.</p>
+
+  <h4>The race condition</h4>
+  <p>A <strong>race condition</strong> exists when the result of a computation depends on the order in which concurrent threads run. The classic example is <code>counter++</code>. It looks like one step, but the CPU does three: <em>load</em> the value into a register, <em>add</em> one, <em>store</em> it back. If two threads interleave those steps, one update is lost.</p>
+  <figure class="fig">
+<pre class="diagram">
+ counter = 5 at the start. Both threads run counter++ once. Expected: 7.
+
+ Time   Thread A              Thread B              counter in memory
+  1     load  r1 = 5                                       5
+  2                           load  r2 = 5                 5
+  3     add   r1 = 6                                       5
+  4     store counter = 6                                  6
+  5                           add   r2 = 6                 6
+  6                           store counter = 6            6   (lost update!)
+</pre>
+    <figcaption>Interleaved load-add-store: two increments produce 6 instead of 7</figcaption>
+  </figure>
+  <p>The Java version of this bug, with a program that prints less than 2,000,000, and the fixes (<code>synchronized</code>, <code>AtomicInteger</code>) are in <a href="02-core-java.html#m6">Core Java · Module 6</a>. This article gives the OS theory behind those fixes.</p>
+
+  <h4>The critical-section problem</h4>
+  <p>The part of the code that accesses shared data is the <strong>critical section</strong>. A correct design wraps it like this:</p>
+  <pre data-title="Structure of a process"><code class="language-plaintext">do {
+    entry section        // ask permission to enter
+        critical section // use the shared data
+    exit section         // announce that we are done
+    remainder section    // everything else
+} while (true);</code></pre>
+  <p>A solution must satisfy three requirements:</p>
+  <ol class="steps">
+    <li><strong>Mutual exclusion:</strong> if one process is in its critical section, no other can be.</li>
+    <li><strong>Progress:</strong> if no process is in its critical section and some want to enter, only the processes that are <em>not</em> in their remainder sections take part in deciding who goes next, and the decision cannot be postponed forever. (Nobody outside the contest may block it.)</li>
+    <li><strong>Bounded waiting:</strong> once a process has asked to enter, there is a limit on how many times others may enter before it does. This prevents starvation.</li>
+  </ol>
+  <p>On top of these, a solution must not assume anything about the CPU speed or the number of CPUs.</p>
+
+  <h4>Software solution: Peterson's algorithm</h4>
+  <p><strong>Peterson's solution</strong> works for exactly two processes, 0 and 1, using two shared variables: <code>flag[2]</code> (who wants to enter) and <code>turn</code> (whose turn it is if both want to). Process <em>i</em> treats the other process as <em>j</em>:</p>
+  <pre data-title="Peterson's algorithm for process i"><code class="language-plaintext">// shared: boolean flag[2] = {false, false};  int turn;
+flag[i] = true;                     // I want to enter
+turn = j;                           // but you go first, if you also want to
+while (flag[j] &amp;&amp; turn == j) {
+    /* busy wait */
+}
+    /* critical section */
+flag[i] = false;                    // I am done</code></pre>
+  <p>If both set their flags at the same moment, whichever writes <code>turn</code> last loses and waits, so the other enters. Mutual exclusion, progress and bounded waiting all hold. The catch: modern CPUs and compilers <strong>reorder</strong> memory operations, so on real hardware it fails without memory barriers. That is why you learn it for the idea, not for production use.</p>
+
+  <h4>Hardware support: atomic instructions</h4>
+  <p>Real systems rely on instructions that execute <strong>atomically</strong> (as one indivisible step, even with other cores running):</p>
+  <ul>
+    <li><strong>Disabling interrupts</strong> works on a single CPU (nobody can preempt you) but not on multicore machines, and user programs must not be allowed to do it. The kernel uses it for very short sections.</li>
+    <li><strong>Test-and-set:</strong> reads a flag, sets it to true, and returns the old value, all atomically.</li>
+    <li><strong>Compare-and-swap (CAS):</strong> sets a variable to a new value only if it currently equals the expected value, and reports whether it did.</li>
+  </ul>
+  <pre data-title="Lock with test-and-set (spinlock)"><code class="language-plaintext">// test_and_set(x) atomically does: old = x; x = true; return old;
+boolean lock = false;               // shared
+
+// entry:
+while (test_and_set(&amp;lock)) {
+    /* spin: the lock was already true */
+}
+    /* critical section */
+// exit:
+lock = false;</code></pre>
+  <pre data-title="Compare-and-swap, as the CPU defines it"><code class="language-plaintext">// executed atomically
+int compare_and_swap(int *value, int expected, int new_value) {
+    int old = *value;
+    if (old == expected) *value = new_value;
+    return old;                     // caller checks: old == expected ?
+}</code></pre>
+  <p>CAS is the building block of lock-free code. Java's <code>AtomicInteger</code> and the other atomic classes are built on it; the retry loop is explained in <a href="02-core-java.html#m6">Core Java · Module 6</a>.</p>
+  <p>The simple test-and-set lock gives mutual exclusion and progress but <em>not</em> bounded waiting: an unlucky process can lose the race every time. Textbook versions add a waiting array to fix that.</p>
+
+  <h4>Spinlocks: busy waiting</h4>
+  <p>A lock where a process loops until it is free is a <strong>spinlock</strong> (the waiting is called <em>busy waiting</em>). It wastes CPU cycles while spinning, but it avoids the cost of a context switch. That makes it a good choice only when the critical section is <em>very short</em> and there are several cores, as inside the kernel. On a single core a spinning process just burns its time slice while the lock holder cannot run. For longer waits, use a lock that puts the waiter to sleep (a mutex or semaphore, next article).</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: all three requirements must hold</p>
+    <p>A lock that gives mutual exclusion but can deadlock or starve a process is not a solution. When asked "what are the requirements of the critical-section problem", name all three: mutual exclusion, progress, bounded waiting.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A race needs <em>sharing and mutation</em>. Read-only shared data and thread-private data need no lock.</li>
+      <li>Visibility problems are separate from atomicity: without synchronization, a thread may not see another thread's write for a long time (the Java memory model topic in Module 6).</li>
+      <li>Peterson's algorithm is correct on an idealised machine but incorrect on real CPUs that reorder instructions.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "a single statement is atomic"</p>
+    <p>One line of high-level code (<code>count++</code>, <code>balance += x</code>, <code>if (!map.containsKey(k)) map.put(k, v)</code>) is usually several machine steps. Never assume atomicity without a guarantee from the language, the library or a lock.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a race condition? What is the critical-section problem?"</p>
+    <ul>
+      <li>Race: outcome depends on interleaving of unsynchronised access to shared data; give the <code>count++</code> load-add-store example.</li>
+      <li>Critical section: code touching shared data; needs mutual exclusion, progress and bounded waiting.</li>
+      <li>Solutions: Peterson (software, two processes), atomic hardware instructions (test-and-set, CAS), then locks, semaphores and monitors built on them.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-mutex-semaphore">
+  <h3>Mutex, semaphore and monitor</h3>
+  <p class="tldr">A mutex is a lock owned by one thread for mutual exclusion; a semaphore is a counter used for signalling and for limiting access to a pool of identical resources; a monitor bundles a lock with condition variables, and Java's synchronized and wait/notify are exactly that.</p>
+
+  <h4>Semaphores</h4>
+  <p>A <strong>semaphore</strong> (invented by Dijkstra) is an integer variable that can be changed only through two atomic operations:</p>
+  <ul>
+    <li><code>wait(S)</code> (also called <code>P</code>, <code>down</code> or <code>acquire</code>): decrement <code>S</code>; if the result is negative, block the caller.</li>
+    <li><code>signal(S)</code> (also <code>V</code>, <code>up</code>, <code>release</code>): increment <code>S</code>; if there are blocked processes, wake one up.</li>
+  </ul>
+  <pre data-title="Semaphore with a waiting queue (no busy waiting)"><code class="language-plaintext">typedef struct { int value; list of processes waiting; } semaphore;
+
+wait(S) {
+    S.value--;
+    if (S.value &lt; 0) {
+        add this process to S.waiting;
+        block();                        // process goes to the waiting state
+    }
+}
+
+signal(S) {
+    S.value++;
+    if (S.value &lt;= 0) {
+        remove a process P from S.waiting;
+        wakeup(P);                      // P goes to the ready state
+    }
+}</code></pre>
+  <p>When the value is negative, its magnitude is the number of waiting processes. The kernel must make <code>wait</code> and <code>signal</code> atomic themselves, typically with a short spinlock inside.</p>
+  <p>Two kinds:</p>
+  <ul>
+    <li><strong>Binary semaphore:</strong> value is 0 or 1. Used for mutual exclusion (initial value 1) or for signalling between two threads (initial value 0).</li>
+    <li><strong>Counting semaphore:</strong> value 0 to N. Initialised to the number of available units of a resource, for example 10 free database connections. Each user does <code>wait</code> before using one and <code>signal</code> after.</li>
+  </ul>
+  <p>Another use is <strong>ordering</strong>: to make B run after A, start a semaphore at 0; B does <code>wait(s)</code> and A does <code>signal(s)</code> when it is done.</p>
+  <pre data-title="PoolLimit.java"><code class="language-java">import java.util.concurrent.Semaphore;
+
+public class PoolLimit {
+    // at most 3 threads may call the payment gateway at the same time
+    private static final Semaphore permits = new Semaphore(3);
+
+    static void callGateway(int id) throws InterruptedException {
+        permits.acquire();                       // wait(S)
+        try {
+            System.out.println("request " + id + " is calling the gateway");
+            Thread.sleep(100);                   // pretend work
+        } finally {
+            permits.release();                   // signal(S)
+        }
+    }
+
+    public static void main(String[] args) {
+        for (int i = 1; i &lt;= 6; i++) {
+            int id = i;
+            new Thread(() -&gt; {
+                try { callGateway(id); } catch (InterruptedException e) { }
+            }).start();
+        }
+    }
+}</code></pre>
+  <p>Only three requests are inside <code>callGateway</code> at any moment; the other three wait for a permit. This is also how a connection pool limits its users.</p>
+
+  <h4>Mutex</h4>
+  <p>A <strong>mutex</strong> (mutual exclusion lock) has two states, locked and unlocked, and an <strong>owner</strong>: only the thread that locked it may unlock it. It protects a critical section: <code>lock()</code>, work, <code>unlock()</code>. In Java the equivalents are <code>synchronized</code> and <code>ReentrantLock</code>.</p>
+
+  <h4>Mutex vs binary semaphore vs counting semaphore</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Mutex</th><th>Binary semaphore</th><th>Counting semaphore</th></tr></thead>
+    <tbody>
+      <tr><td>Purpose</td><td>Mutual exclusion (locking)</td><td>Mutual exclusion or signalling</td><td>Limit access to N identical resources; signal counts of events</td></tr>
+      <tr><td>Value range</td><td>Locked / unlocked</td><td>0 or 1</td><td>0 to N (any non-negative number)</td></tr>
+      <tr><td>Ownership</td><td>Yes: only the locker may unlock</td><td>No: any thread may signal</td><td>No</td></tr>
+      <tr><td>Who releases</td><td>Same thread that acquired</td><td>Often a different thread (signalling)</td><td>Often a different thread</td></tr>
+      <tr><td>Priority inheritance</td><td>Often supported (the owner is known)</td><td>Not possible in general (no owner)</td><td>Not possible</td></tr>
+      <tr><td>Mental model</td><td>A key to a room; you return it yourself</td><td>A flag or a doorbell</td><td>N parking slots</td></tr>
+    </tbody>
+  </table></div>
+  <p>A binary semaphore can be <em>used</em> as a lock, but it is not the same thing, because it has no owner. If a buggy thread calls <code>signal</code> without having called <code>wait</code>, a semaphore silently allows two threads into the critical section, while a mutex would reject the unlock. Use a mutex to protect data, a semaphore to coordinate events and counts. That sentence is the best short answer to "mutex vs semaphore".</p>
+
+  <h4>Monitors</h4>
+  <p>Semaphores are powerful but easy to misuse: swap two <code>wait</code> calls and you deadlock, forget a <code>signal</code> and everyone hangs. A <strong>monitor</strong> is a higher-level language construct that makes the common case safe. It is a module with:</p>
+  <ul>
+    <li>private shared data,</li>
+    <li>procedures (methods) that access the data, only one thread allowed inside the monitor at a time (<strong>mutual exclusion is automatic</strong>),</li>
+    <li><strong>condition variables</strong> with <code>wait()</code> (give up the monitor and sleep until the condition is signalled) and <code>signal()</code> (wake one waiting thread).</li>
+  </ul>
+  <p>Java's <code>synchronized</code> is a monitor. Every object has one hidden monitor lock; <code>synchronized</code> methods and blocks enter it, and <code>wait()</code>, <code>notify()</code>, <code>notifyAll()</code> are the condition operations. One difference: a Java object has a single wait set, while a general monitor can have several condition variables (<code>ReentrantLock</code> with <code>Condition</code> provides several). Full details and code are in <a href="02-core-java.html#m6">Core Java · Module 6</a>.</p>
+  <figure class="fig">
+<pre class="diagram">
+              Monitor
+  entry     ┌───────────────────────────────┐
+  queue     │  shared data                  │
+  ──► ──►   │  method A()  method B()       │   only one thread is
+  waiting   │      (one thread inside)      │   inside at a time
+  to enter  │                               │
+            │  condition queue: x.wait()    │ ◄── threads that gave up the
+            └───────────────────────────────┘     monitor and sleep until signalled
+</pre>
+    <figcaption>A monitor: one thread inside, an entry queue outside, condition queues for waiting</figcaption>
+  </figure>
+
+  <h4>Semaphore vs monitor in one view</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Semaphore</th><th>Monitor</th></tr></thead>
+    <tbody>
+      <tr><td>Level</td><td>Low-level primitive (library or OS)</td><td>High-level language construct</td></tr>
+      <tr><td>Mutual exclusion</td><td>You must add <code>wait</code>/<code>signal</code> yourself</td><td>Built in: one thread inside</td></tr>
+      <tr><td>Memory of signals</td><td>Yes: the count remembers a <code>signal</code> done earlier</td><td>No: a condition <code>signal</code> with nobody waiting is lost</td></tr>
+      <tr><td>Error risk</td><td>High (order of waits, forgotten signal)</td><td>Lower</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: always release what you acquire, on every path</p>
+    <p>Pair every <code>wait</code>/<code>lock</code>/<code>acquire</code> with exactly one <code>signal</code>/<code>unlock</code>/<code>release</code>, in <code>finally</code> in Java. A missed release means every other thread blocks forever.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Priority inversion arises with locks: a high-priority thread waits for a lock held by a low-priority one (see <a href="#m1-sched-priority-rr">priority scheduling</a>). Mutexes with priority inheritance fix it.</li>
+      <li>A <strong>recursive (reentrant) mutex</strong> lets the owner lock again without deadlocking itself. Java's intrinsic locks and <code>ReentrantLock</code> are reentrant; a plain POSIX mutex is not by default.</li>
+      <li>Java's <code>Semaphore</code> is <em>not</em> reentrant and has no owner: calling <code>acquire()</code> twice in one thread uses two permits.</li>
+      <li>A mutex unlocked by a non-owner is an error; a semaphore does not care who signals.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using a semaphore as a lock and forgetting the "binary" part</p>
+    <p>A counting semaphore initialised to 2 for a "mutex" lets two threads into the critical section. Initialise to 1 only for mutual exclusion, and prefer a real lock object.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Mutex vs semaphore" (very frequent)</p>
+    <ul>
+      <li>Mutex: ownership, locking mechanism, one thread at a time, released by the owner. Semaphore: signalling mechanism with a counter, no ownership.</li>
+      <li>Binary semaphore (0/1) vs counting semaphore (0..N, N identical resources).</li>
+      <li>Give examples: mutex around a bank balance update; counting semaphore for a pool of 10 connections; semaphore starting at 0 to make thread B wait for thread A.</li>
+      <li>Monitor: lock plus condition variables built into the language; Java <code>synchronized</code> with <code>wait/notify</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-classic-problems">
+  <h3>Classic synchronization problems</h3>
+  <p class="tldr">Producer–consumer (bounded buffer), readers–writers and dining philosophers are three standard tests of any synchronization tool; each shows a typical hazard (lost items, writer starvation, deadlock) and its standard fix.</p>
+
+  <h4>1. Producer–consumer (bounded buffer)</h4>
+  <p>A <strong>producer</strong> creates items and puts them into a fixed-size buffer; a <strong>consumer</strong> takes them out. Three rules: the producer must wait if the buffer is full, the consumer must wait if it is empty, and only one of them may change the buffer at a time. Think of Swiggy orders (produced by customers) waiting in a queue for the kitchen (consumer).</p>
+  <p>Three semaphores solve it: <code>empty</code> counts free slots (starts at N), <code>full</code> counts filled slots (starts at 0), and <code>mutex</code> protects the buffer (starts at 1).</p>
+  <pre data-title="Bounded buffer with semaphores"><code class="language-plaintext">semaphore mutex = 1, empty = N, full = 0;
+
+producer() {                       consumer() {
+    while (true) {                     while (true) {
+        item = produce();                  wait(full);     // any item?
+        wait(empty);   // free slot?       wait(mutex);
+        wait(mutex);                       item = remove();
+        insert(item);                      signal(mutex);
+        signal(mutex);                     signal(empty);  // one more free slot
+        signal(full);  // one more item     consume(item);
+    }                                  }
+}                                  }</code></pre>
+  <p>Order matters: wait on <code>empty</code>/<code>full</code> <em>before</em> <code>mutex</code>. If the producer took <code>mutex</code> first and then found the buffer full, it would sleep while holding the lock, the consumer could never get in to remove an item, and both would be stuck forever: a deadlock.</p>
+  <pre data-title="BoundedBuffer.java"><code class="language-java">import java.util.ArrayDeque;
+import java.util.Queue;
+import java.util.concurrent.Semaphore;
+
+public class BoundedBuffer {
+    private final Queue&lt;Integer&gt; items = new ArrayDeque&lt;&gt;();
+    private final Semaphore empty;                       // free slots
+    private final Semaphore full = new Semaphore(0);     // filled slots
+    private final Semaphore mutex = new Semaphore(1);    // protects the queue
+
+    BoundedBuffer(int capacity) { this.empty = new Semaphore(capacity); }
+
+    void put(int item) throws InterruptedException {
+        empty.acquire();
+        mutex.acquire();
+        try { items.add(item); } finally { mutex.release(); }
+        full.release();
+    }
+
+    int take() throws InterruptedException {
+        full.acquire();
+        mutex.acquire();
+        int item;
+        try { item = items.remove(); } finally { mutex.release(); }
+        empty.release();
+        return item;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        BoundedBuffer buf = new BoundedBuffer(2);
+        Thread producer = new Thread(() -&gt; {
+            try { for (int i = 1; i &lt;= 5; i++) buf.put(i); }
+            catch (InterruptedException e) { }
+        });
+        producer.start();
+        for (int i = 0; i &lt; 5; i++) {
+            System.out.println("Consumed " + buf.take());
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Consumed 1
+Consumed 2
+Consumed 3
+Consumed 4
+Consumed 5</code></pre>
+  <p>In real Java code you would use <code>BlockingQueue</code> instead; it contains exactly this logic (see <a href="02-core-java.html#m6">Core Java · Module 6</a>).</p>
+
+  <h4>2. Readers–writers</h4>
+  <p>Many threads share a data set (a product catalogue). <strong>Readers</strong> only read, so many can read together. <strong>Writers</strong> modify, so a writer needs exclusive access (no readers, no other writer). The "first readers–writers" solution gives readers priority:</p>
+  <pre data-title="First readers-writers solution"><code class="language-plaintext">semaphore rw_mutex = 1;   // exclusive access to the data
+semaphore mutex = 1;      // protects read_count
+int read_count = 0;
+
+writer() {                         reader() {
+    wait(rw_mutex);                    wait(mutex);
+    write();                           read_count++;
+    signal(rw_mutex);                  if (read_count == 1) wait(rw_mutex);
+}                                      signal(mutex);
+                                       read();
+                                       wait(mutex);
+                                       read_count--;
+                                       if (read_count == 0) signal(rw_mutex);
+                                       signal(mutex);
+                                   }</code></pre>
+  <p>The first reader locks writers out and the last reader lets them back in. The weakness: while readers keep arriving, <strong>writers starve</strong>. The "second" variant gives writers priority and may starve readers instead. In Java use <code>ReentrantReadWriteLock</code> or a concurrent collection (see <a href="02-core-java.html#m6">Core Java · Module 6</a>), and databases offer the same idea as shared and exclusive locks (<a href="#m3">DBMS theory</a>).</p>
+
+  <h4>3. Dining philosophers</h4>
+  <p>Five philosophers sit round a table with a bowl of rice and one chopstick between each pair (5 chopsticks). A philosopher alternates between thinking and eating, and needs <strong>both</strong> neighbouring chopsticks to eat. The problem is a model for a process needing several resources at once.</p>
+  <figure class="fig">
+<pre class="diagram">
+          P0
+      c0 /  \ c4
+       P1    P4        Philosopher Pi uses chopsticks ci and c(i+1) mod 5.
+      c1 \  / c3       P0 needs c0 and c1, P1 needs c1 and c2, ..., P4 needs c4 and c0.
+         P2--P3
+           c2
+</pre>
+    <figcaption>Five philosophers (P0 to P4) and five chopsticks (c0 to c4) in a circle</figcaption>
+  </figure>
+  <p>The naive solution picks the left chopstick, then the right:</p>
+  <pre data-title="Naive solution - can deadlock"><code class="language-plaintext">semaphore chopstick[5] = {1, 1, 1, 1, 1};
+
+philosopher(i) {
+    while (true) {
+        think();
+        wait(chopstick[i]);               // pick left
+        wait(chopstick[(i + 1) % 5]);     // pick right
+        eat();
+        signal(chopstick[i]);
+        signal(chopstick[(i + 1) % 5]);
+    }
+}</code></pre>
+  <p>If all five pick up their left chopstick at the same time, each holds one and waits for the next one forever: a circular wait, which is a <a href="#m1-deadlock-basics">deadlock</a>. Fixes:</p>
+  <ul>
+    <li><strong>Allow at most 4 philosophers at the table</strong> (a counting semaphore of 4): at least one can always get both chopsticks.</li>
+    <li><strong>Pick up both or neither</strong> (check both under a lock or monitor). No hold-and-wait.</li>
+    <li><strong>Asymmetric order:</strong> odd-numbered philosophers pick left first, even-numbered pick right first.</li>
+    <li><strong>Resource ordering:</strong> number the chopsticks and always pick the lower number first. This breaks the circular wait.</li>
+  </ul>
+  <pre data-title="Philosopher.java (resource ordering)"><code class="language-java">import java.util.concurrent.locks.ReentrantLock;
+
+public class Philosopher implements Runnable {
+    private final int id;
+    private final ReentrantLock[] chopsticks;
+
+    Philosopher(int id, ReentrantLock[] chopsticks) {
+        this.id = id;
+        this.chopsticks = chopsticks;
+    }
+
+    @Override
+    public void run() {
+        int n = chopsticks.length;
+        int first = Math.min(id, (id + 1) % n);    // always lower number first
+        int second = Math.max(id, (id + 1) % n);
+        for (int meal = 0; meal &lt; 3; meal++) {
+            chopsticks[first].lock();
+            try {
+                chopsticks[second].lock();
+                try {
+                    System.out.println("Philosopher " + id + " eats meal " + meal);
+                } finally {
+                    chopsticks[second].unlock();
+                }
+            } finally {
+                chopsticks[first].unlock();
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        ReentrantLock[] sticks = new ReentrantLock[5];
+        for (int i = 0; i &lt; 5; i++) sticks[i] = new ReentrantLock();
+        for (int i = 0; i &lt; 5; i++) new Thread(new Philosopher(i, sticks)).start();
+    }
+}</code></pre>
+  <p>Philosopher 4 needs chopsticks 4 and 0, and picks 0 first, so the cycle of "everyone holds the left one" cannot form. The output order differs on every run, but all 15 meals complete.</p>
+  <p>Deadlock-freedom alone is not enough: a scheme can still <strong>starve</strong> a philosopher whose neighbours keep eating in turn. Fairness needs extra care.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: acquire multiple locks in one global order</p>
+    <p>Whenever code needs several locks or resources, acquire them in the same order everywhere. This is the practical lesson of dining philosophers and the most useful deadlock-avoidance habit in real code.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>With a buffer of size 1, producer and consumer simply alternate.</li>
+      <li>Readers–writers: a reader cannot upgrade to a writer while other readers are active without risking deadlock, if two readers both try to upgrade.</li>
+      <li>Semaphore <code>signal</code> counts are remembered, but monitor/condition signals are not. Mixing them up produces "lost wake-up" bugs.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>Producer–consumer is everywhere: a thread pool's task queue, a Kafka consumer, log appenders, and the HTTP server accept queue. Readers–writers appears as database shared/exclusive locks and read-write locks on caches. Dining philosophers is the model for the "transfer money from account A to B" deadlock: lock the accounts in order of account id.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Solve producer–consumer / dining philosophers"</p>
+    <ul>
+      <li>Producer–consumer: semaphores <code>empty</code> (N), <code>full</code> (0), <code>mutex</code> (1); wait on the counting semaphore before the mutex. In Java, say <code>BlockingQueue</code>.</li>
+      <li>Readers–writers: reader count guarded by a mutex; first reader blocks writers; mention writer starvation.</li>
+      <li>Philosophers: show the circular-wait deadlock, then give two fixes (limit to 4 / ordered pick-up).</li>
+    </ul>
+  </div>
+</article>

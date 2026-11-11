@@ -1,0 +1,616 @@
+<div class="mintro">
+  <p>Object-oriented programming (OOP) is the way almost all Java code is organised. You model a problem as <strong>objects</strong> — things that hold data together with the code that works on that data — and you describe each kind of object with a <strong>class</strong>. Spring beans, JPA entities, DTOs, exceptions, collections: everything you touch in a Java project is a class.</p>
+  <p>This module starts with the basics (classes, objects, constructors, <code>this</code>, <code>static</code>), moves through the four pillars — encapsulation, inheritance, polymorphism and abstraction — and then covers the tools professionals use every day: <code>final</code>, the <code>Object</code> methods (<code>equals</code>, <code>hashCode</code>, <code>toString</code>), composition, nested classes, packages, enums and records. It ends with one worked example that ties everything together.</p>
+  <p>It is the base for much of what follows: Collections (<a href="#m4">Module 4</a>) depend on <code>equals</code> and <code>hashCode</code>, modern Java (<a href="#m5">Module 5</a>) builds on interfaces, records and sealed types, memory (<a href="#m7">Module 7</a>) explains where objects live, and design principles and patterns (<a href="08-system-design.html#m1">System Design · Module 1</a>) assume you know all of this well.</p>
+  <ul>
+    <li>Explain the four pillars with Java code and a real example for each, the way interviewers expect.</li>
+    <li>Write classes with correct constructors, validation, encapsulation and immutability.</li>
+    <li>Predict the output of initialization-order, overloading and overriding puzzles.</li>
+    <li>Choose between an abstract class and an interface, and between inheritance and composition.</li>
+    <li>Implement <code>equals()</code>, <code>hashCode()</code> and <code>toString()</code> correctly.</li>
+    <li>Use enums, records, nested classes and packages the way professional codebases do.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m2-why-oop">
+  <h3>Why OOP: classes, objects, state, behaviour and identity</h3>
+  <p class="tldr">OOP keeps data and the code that changes it together inside objects, so each object can protect its own rules; a class is the blueprint and an object is one thing built from it.</p>
+
+  <p>Before OOP became mainstream, most programs were written in a <strong>procedural</strong> style: data lives in variables, arrays or simple records, and separate functions read and change that data. This works for small programs. It becomes painful as the program grows, because nothing stops any function from changing any data, and the business rules ("a balance can never go below zero") get copied into many places.</p>
+
+  <h4>The problem with procedural code</h4>
+  <p>Here is a tiny bank written in a procedural style. The data (holders and balances) sits in arrays, and a function changes it.</p>
+  <pre data-title="BankProcedural.java"><code class="language-java">public class BankProcedural {
+    static String[] holders = {"Ravi", "Asha"};
+    static long[] balances = {5_000, 12_000};
+
+    static void withdraw(int index, long amount) {
+        balances[index] -= amount;            // no rule is checked here...
+    }
+
+    public static void main(String[] args) {
+        withdraw(0, 8_000);
+        balances[1] = -999;                   // ...and any code can do this
+        System.out.println(holders[0] + ": " + balances[0]);
+        System.out.println(holders[1] + ": " + balances[1]);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Ravi: -3000
+Asha: -999</code></pre>
+  <p>Three problems show up at once:</p>
+  <ul>
+    <li><strong>No protection.</strong> Any line of code can write <code>balances[1] = -999</code>. The rule "no negative balance" is not enforced anywhere.</li>
+    <li><strong>Scattered rules.</strong> If ten functions change balances, each one must remember to check the rule. One forgets, and you have a production bug.</li>
+    <li><strong>Hard to extend.</strong> Add a "current account with overdraft" and every function grows another <code>if (type == CURRENT)</code> branch.</li>
+  </ul>
+
+  <h4>The OOP answer: keep data and behaviour together</h4>
+  <p>In OOP you create an <code>Account</code> class. The balance is <code>private</code>, so only the class's own methods can change it, and each method checks the rules once, in one place.</p>
+  <pre data-title="Account.java"><code class="language-java">public class Account {
+    private final String holder;
+    private long balance;                       // hidden: only Account can touch it
+
+    public Account(String holder, long openingBalance) {
+        if (openingBalance &lt; 0) {
+            throw new IllegalArgumentException("Opening balance cannot be negative");
+        }
+        this.holder = holder;
+        this.balance = openingBalance;
+    }
+
+    public void withdraw(long amount) {
+        if (amount &lt;= 0) {
+            throw new IllegalArgumentException("Amount must be positive");
+        }
+        if (amount &gt; balance) {
+            throw new IllegalStateException("Insufficient balance for " + holder);
+        }
+        balance -= amount;
+    }
+
+    public long getBalance() {
+        return balance;
+    }
+}</code></pre>
+  <pre data-title="Main.java"><code class="language-java">public class Main {
+    public static void main(String[] args) {
+        Account ravi = new Account("Ravi", 5_000);
+        try {
+            ravi.withdraw(8_000);
+        } catch (IllegalStateException e) {
+            System.out.println(e.getMessage());
+        }
+        ravi.withdraw(1_500);
+        System.out.println("Ravi: " + ravi.getBalance());
+        // ravi.balance = -999;   // compile error: balance has private access in Account
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Insufficient balance for Ravi
+Ravi: 3500</code></pre>
+  <p>The rule now lives in exactly one method, and the compiler itself blocks <code>ravi.balance = -999</code>. When you need a new account type, you add a new class instead of editing every function — that is what <a href="#m2-inheritance">inheritance</a> and <a href="#m2-polymorphism">polymorphism</a> give you.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Procedural</th><th>Object-oriented</th></tr></thead>
+    <tbody>
+      <tr><td>Unit of code</td><td>Functions</td><td>Classes (data + methods together)</td></tr>
+      <tr><td>Data access</td><td>Usually open to every function</td><td>Hidden behind methods (encapsulation)</td></tr>
+      <tr><td>Business rules</td><td>Repeated wherever the data changes</td><td>Written once, inside the class that owns the data</td></tr>
+      <tr><td>Adding a new variant</td><td>Edit every function (<code>if</code>/<code>switch</code> on a type code)</td><td>Add a new class (a subclass or a new implementation)</td></tr>
+      <tr><td>Good fit</td><td>Small scripts, simple data pipelines</td><td>Large applications with many entities and rules</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Class vs object</h4>
+  <p>A <strong>class</strong> is a blueprint. It says what data every object of that kind holds and what those objects can do. An <strong>object</strong> (also called an <strong>instance</strong>) is one concrete thing built from the blueprint at run time with <code>new</code>. One class, many objects — like one house plan and many houses built from it, each with its own paint colour and its own residents.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  C["class Account (blueprint)"] -->|new| O1["ravi: holder Ravi, balance 3500"]
+  C -->|new| O2["asha: holder Asha, balance 12000"]
+  C -->|new| O3["meera: holder Meera, balance 0"]
+</pre>
+  <figcaption>One class, many objects — each object has its own copy of the fields</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Class</th><th>Object</th></tr></thead>
+    <tbody>
+      <tr><td>What it is</td><td>A type, a blueprint</td><td>A value built from the blueprint</td></tr>
+      <tr><td>When it exists</td><td>Written at compile time; loaded once by the JVM</td><td>Created at run time, as many times as you like</td></tr>
+      <tr><td>Memory</td><td>Class metadata, loaded once</td><td>Each object gets its own memory on the heap</td></tr>
+      <tr><td>Example</td><td><code>class Account { … }</code></td><td><code>new Account("Ravi", 5_000)</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>State, behaviour and identity</h4>
+  <p>Every object has three things. Interviewers like this definition because it separates "what an object knows", "what it does" and "which one it is".</p>
+  <dl class="terms">
+    <dt>State</dt><dd>The data the object holds right now — the current values of its fields. Ravi's account: holder "Ravi", balance 3,500.</dd>
+    <dt>Behaviour</dt><dd>What the object can do — its methods, such as <code>withdraw()</code> and <code>getBalance()</code>. Behaviour usually reads or changes state.</dd>
+    <dt>Identity</dt><dd>What makes this object itself and not another one. Two accounts can have the same holder and the same balance and still be two different objects. In Java, <code>==</code> on two references compares identity.</dd>
+  </dl>
+  <p>Keep identity and equality apart in your head: <code>==</code> asks "is this the very same object?", while <code>equals()</code> asks "do these two objects represent the same value?". You decide what "same value" means by overriding <code>equals()</code> — see <a href="#m2-equals-hashcode">equals() and hashCode()</a>.</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class Account {
+    -String holder
+    -long balance
+    +Account(String holder, long openingBalance)
+    +withdraw(long amount) void
+    +getBalance() long
+  }
+</pre>
+  <figcaption>The Account class in UML notation: minus = private, plus = public</figcaption>
+  </figure>
+
+  <h4>The four pillars in one line each</h4>
+  <ul>
+    <li><strong>Encapsulation</strong> — hide the data and expose safe methods that keep it valid.</li>
+    <li><strong>Inheritance</strong> — build a new class from an existing one when the new one "is a" kind of the old one.</li>
+    <li><strong>Polymorphism</strong> — one method call, different behaviour depending on the actual object.</li>
+    <li><strong>Abstraction</strong> — show what an object does and hide how it does it.</li>
+  </ul>
+  <p>Each pillar has its own articles below, and the <a href="#m2-four-pillars">four pillars summary</a> pulls them together at the end of the module.</p>
+
+  <div class="co co-real">
+    <p class="co-t">In a real Spring Boot project</p>
+    <p>You write entity classes (<code>Order</code>, <code>Customer</code>), DTO records (<code>OrderResponse</code>), service classes (<code>OrderService</code>) and controllers. Spring creates the service and controller objects for you (they are "beans"); you create entities and DTOs yourself with <code>new</code>, or JPA and Jackson create them for you from database rows and JSON.</p>
+  </div>
+  <div class="co co-note">
+    <p class="co-t">Java is not "pure" OOP — and that is fine</p>
+    <p>Primitives such as <code>int</code> and <code>double</code> are not objects, and <code>static</code> methods belong to no object. Modern Java also mixes in a functional style (lambdas and streams, <a href="#m5">Module 5</a>) and a data-oriented style (records, sealed types and pattern matching). Good Java uses the right tool for each job.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: one giant "manager" class</p>
+    <p>A <code>BankManager</code> class with fifty methods that all work on raw arrays and maps is procedural code wearing a class costume (often called a <strong>god class</strong>). Model the domain nouns instead — <code>Account</code>, <code>Transaction</code>, <code>Customer</code> — and let each class own its data and its rules.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is OOP and why do we use it?"</p>
+    <ul>
+      <li>OOP models software as objects that combine state (fields) and behaviour (methods); a class is the blueprint, an object is an instance.</li>
+      <li>Benefits: encapsulation protects invariants, inheritance and composition give reuse, polymorphism lets you add new types without changing callers, abstraction hides complexity.</li>
+      <li>Give a 20-second example: an <code>Account</code> with a private balance and a <code>withdraw()</code> that checks the rule.</li>
+      <li>Bonus point: mention the trade-off — deep inheritance trees are a design smell; prefer composition (see <a href="#m2-composition-over-inheritance">favor composition</a>).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-classes-objects">
+  <h3>Classes and objects in code: fields, methods and new</h3>
+  <p class="tldr">A class declares fields (state), constructors (setup) and methods (behaviour); <code>new</code> creates an object on the heap, runs its constructor and gives you a reference to it.</p>
+
+  <h4>Anatomy of a class</h4>
+  <p>Here is a realistic class from an e-commerce app. Notice the three main parts: fields, a constructor and methods. The price is stored in whole paise as a <code>long</code>, because <code>double</code> cannot represent money exactly.</p>
+  <pre data-title="Product.java"><code class="language-java">public class Product {
+    // 1. Fields: the state every Product object carries
+    private final String sku;
+    private String name;
+    private long pricePaise;          // money as whole paise, never double
+    private int stock;
+
+    // 2. Constructor: builds a valid object
+    public Product(String sku, String name, long pricePaise, int stock) {
+        this.sku = sku;
+        this.name = name;
+        this.pricePaise = pricePaise;
+        this.stock = stock;
+    }
+
+    // 3. Methods: the behaviour
+    public boolean isInStock() {
+        return stock &gt; 0;
+    }
+
+    public void sell(int quantity) {
+        if (quantity &gt; stock) {
+            throw new IllegalStateException("Only " + stock + " left for " + sku);
+        }
+        stock -= quantity;
+    }
+
+    public String getName() { return name; }
+    public int getStock()   { return stock; }
+
+    public static void main(String[] args) {
+        Product mouse = new Product("SKU-101", "Wireless Mouse", 49_900, 3);
+        Product keyboard = new Product("SKU-102", "Keyboard", 1_29_900, 0);
+
+        mouse.sell(2);
+        System.out.println(mouse.getName() + " stock: " + mouse.getStock());
+        System.out.println(keyboard.getName() + " in stock? " + keyboard.isInStock());
+        try {
+            mouse.sell(5);
+        } catch (IllegalStateException e) {
+            System.out.println("Error: " + e.getMessage());
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Wireless Mouse stock: 1
+Keyboard in stock? false
+Error: Only 1 left for SKU-101</code></pre>
+  <p>Two objects, <code>mouse</code> and <code>keyboard</code>, came from one class. Each has its own <code>stock</code>: selling a mouse did not touch the keyboard. Underscores in numbers such as <code>1_29_900</code> are only for readability; the compiler ignores them.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Member</th><th>Purpose</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Instance field</td><td>State stored separately in each object</td><td><code>private int stock;</code></td></tr>
+      <tr><td>Static field</td><td>State shared by the whole class (one copy)</td><td><code>private static int created;</code></td></tr>
+      <tr><td>Constructor</td><td>Sets up a new object in a valid state</td><td><code>public Product(…)</code></td></tr>
+      <tr><td>Instance method</td><td>Behaviour that works on one object</td><td><code>sell(int quantity)</code></td></tr>
+      <tr><td>Static method</td><td>Behaviour that needs no object</td><td><code>Product.of(…)</code></td></tr>
+      <tr><td>Initializer block</td><td>Setup code that runs during construction (rare)</td><td><code>{ … }</code>, <code>static { … }</code></td></tr>
+      <tr><td>Nested type</td><td>A class, interface, enum or record declared inside</td><td><code>static class Builder</code></td></tr>
+    </tbody>
+  </table></div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions for classes and members</p>
+    <ul>
+      <li>Class names are nouns in PascalCase: <code>OrderService</code>, <code>UpiPayment</code>. Method names are verbs in camelCase: <code>placeOrder()</code>, <code>isInStock()</code>. Constants are UPPER_SNAKE_CASE: <code>MAX_RETRIES</code>.</li>
+      <li>A file holds at most one <code>public</code> top-level class, and the file must be named after it (<code>Product.java</code>). Otherwise javac reports <code>class Product is public, should be declared in a file named Product.java</code>.</li>
+      <li>Common member order: constants, static fields, instance fields, constructors, public methods, private helpers. Teams enforce it with formatters and Checkstyle.</li>
+      <li>Fields are <code>private</code> by default in professional code; you open access only on purpose (see <a href="#m2-encapsulation">encapsulation</a>).</li>
+    </ul>
+  </div>
+
+  <h4>Creating an object with new</h4>
+  <p>The line <code>Product mouse = new Product("SKU-101", "Wireless Mouse", 49_900, 3);</code> does three things. <code>Product mouse</code> declares a <strong>reference variable</strong> of type <code>Product</code>. <code>new Product(…)</code> creates the object. The <code>=</code> stores a reference to the new object in the variable. Since Java 10 you can also write <code>var mouse = new Product(…);</code> — the variable's type is still <code>Product</code>; <code>var</code> only saves typing.</p>
+
+  <h4>What new does, step by step</h4>
+  <ol class="steps">
+    <li><strong>Load and initialize the class</strong> if this is its first use. Static fields and static blocks run once, here (see <a href="#m2-init-order">initialization order</a>).</li>
+    <li><strong>Allocate memory on the heap</strong> — enough for an object header plus every instance field, including the fields inherited from parent classes.</li>
+    <li><strong>Set every field to its default value</strong>: <code>0</code>, <code>false</code>, <code>'\u0000'</code> or <code>null</code>.</li>
+    <li><strong>Run the constructor chain</strong>: the parent constructor first (all the way up to <code>Object</code>), then this class's field initializers and instance blocks, then the constructor body.</li>
+    <li><strong>Return the reference.</strong> The assignment stores it in your variable.</li>
+  </ol>
+  <figure class="fig">
+<pre class="diagram">
+  Stack (frame of main)              Heap
+ ┌──────────────────┐        ┌─────────────────────────────┐
+ │ a ───────────────┼───┬───▶│ Account                     │
+ │                  │   │    │   holder  = "Ravi"          │
+ │ b ───────────────┼───┘    │   balance = 5500            │
+ │                  │        └─────────────────────────────┘
+ │ c ───────────────┼───────▶┌─────────────────────────────┐
+ │                  │        │ Account                     │
+ └──────────────────┘        │   holder  = "Ravi"          │
+                             │   balance = 5500            │
+                             └─────────────────────────────┘
+</pre>
+  <figcaption>a and b point to the same object; c points to a different object with equal state</figcaption>
+  </figure>
+  <p>The variable does not contain the object. It contains a <strong>reference</strong> — think of it as the object's address inside the JVM. Local variables live in the method's <strong>stack frame</strong> and disappear when the method returns. Objects live on the <strong>heap</strong> and stay there as long as something can still reach them. <a href="#m7">Module 7</a> covers the heap, the stack and garbage collection in depth.</p>
+  <div class="co co-note">
+    <p class="co-t">The JIT may skip the heap — your mental model stays the same</p>
+    <p>The JIT compiler uses <strong>escape analysis</strong>: if an object never leaves a method, the JVM may avoid allocating it on the heap at all. This is an optimisation you cannot see in your program's behaviour, so "objects live on the heap, references point to them" remains the right way to reason about code.</p>
+  </div>
+
+  <h4>Default values</h4>
+  <p>Fields always start with a default value before any constructor code runs. Local variables do not.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Default for a field</th><th>Local variable</th></tr></thead>
+    <tbody>
+      <tr><td><code>byte</code>, <code>short</code>, <code>int</code>, <code>long</code></td><td><code>0</code></td><td>No default — must be assigned</td></tr>
+      <tr><td><code>float</code>, <code>double</code></td><td><code>0.0</code></td><td>No default</td></tr>
+      <tr><td><code>char</code></td><td><code>'\u0000'</code> (the NUL character)</td><td>No default</td></tr>
+      <tr><td><code>boolean</code></td><td><code>false</code></td><td>No default</td></tr>
+      <tr><td>Any reference type (<code>String</code>, <code>List</code>, arrays…)</td><td><code>null</code></td><td>No default</td></tr>
+    </tbody>
+  </table></div>
+  <div class="co co-rule">
+    <p class="co-t">Rule: a local variable must be assigned before it is read</p>
+    <p>Reading an unassigned local variable is a compile error: <code>variable total might not have been initialized</code>. The compiler checks every path through the method (this is called <strong>definite assignment</strong>). Fields never cause this error because they always have a default — which is exactly why a forgotten field assignment becomes a silent <code>null</code> or <code>0</code> bug instead.</p>
+  </div>
+
+  <h4>References are values: assignment and method calls</h4>
+  <p>Assigning one reference variable to another copies the reference, not the object. Passing an object to a method also copies the reference. The method can change the shared object, but it cannot make your variable point somewhere else.</p>
+  <pre data-title="Refs.java"><code class="language-java">public class Refs {
+    static class Account {
+        String holder;
+        long balance;
+        Account(String holder, long balance) { this.holder = holder; this.balance = balance; }
+    }
+
+    static void credit(Account acc, long amount) {
+        acc.balance += amount;          // changes the shared object
+    }
+
+    static void replace(Account acc) {
+        acc = new Account("Someone else", 0);   // changes only the local copy of the reference
+    }
+
+    public static void main(String[] args) {
+        Account a = new Account("Ravi", 1000);
+        Account b = a;                  // copies the reference, not the object
+        b.balance = 5000;
+        System.out.println(a.balance);  // 5000
+        System.out.println(a == b);     // true: same object
+
+        credit(a, 500);
+        System.out.println(a.balance);  // 5500
+        replace(a);
+        System.out.println(a.holder);   // Ravi
+
+        Account c = new Account("Ravi", 5500);
+        System.out.println(a == c);     // false: different objects, same state
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">5000
+true
+5500
+Ravi
+false</code></pre>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Is Java pass-by-value or pass-by-reference?"</p>
+    <p>Always pass-by-value. For primitives the value is the number itself; for objects the value is the reference. That is why <code>credit()</code> can change the account (both copies of the reference point to the same object) but <code>replace()</code> cannot change what <code>a</code> points to. A strong answer shows exactly this pair of methods.</p>
+  </div>
+
+  <h4>null and NullPointerException</h4>
+  <p>A reference can be <code>null</code>, meaning it points to no object. Calling a method or reading a field through <code>null</code> throws <code>NullPointerException</code> (NPE). Since Java 14 the JVM prints <strong>helpful NPE messages</strong> (on by default since Java 15) that name exactly what was null:</p>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Exception in thread "main" java.lang.NullPointerException: Cannot invoke "String.length()" because "c.name" is null
+	at Npe.main(Npe.java:8)</code></pre>
+  <p>Variable names such as <code>c.name</code> appear when the class was compiled with debug information (Maven and Gradle do this by default); otherwise you see placeholders like <code>&lt;local1&gt;</code>.</p>
+  <div class="co co-conv">
+    <p class="co-t">Conventions that prevent most NPEs</p>
+    <ul>
+      <li>Validate constructor arguments early: <code>this.name = Objects.requireNonNull(name, "name");</code> fails fast with a clear message.</li>
+      <li>Return an empty list instead of <code>null</code> from methods that return collections.</li>
+      <li>Use <code>Optional</code> as the return type when "no value" is a normal outcome (<a href="#m5">Module 5</a>).</li>
+    </ul>
+  </div>
+
+  <h4>When does an object die?</h4>
+  <p>Java has no destructors and no manual <code>free()</code>. When no live reference can reach an object any more, it becomes <strong>eligible for garbage collection</strong>, and the garbage collector reclaims the memory at a time of its choosing. Setting a local variable to <code>null</code> "to help the GC" is almost never needed; the reference disappears when the method returns. The cases that really matter — objects kept alive by a <code>static</code> collection or a cache — are covered in <a href="#m7">Module 7</a>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using == to compare objects by value</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: compares identity</p><pre><code class="language-java">Account x = new Account("Ravi", 5500);
+Account y = new Account("Ravi", 5500);
+if (x == y) {               // false: two different objects
+    System.out.println("Same account");
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: compare by value with equals()</p><pre><code class="language-java">// after Account overrides equals() and hashCode()
+if (x.equals(y)) {          // true when the fields match
+    System.out.println("Same account");
+}</code></pre></div>
+    </div>
+    <p>Without an overridden <code>equals()</code>, the version inherited from <code>Object</code> also compares identity, so you must override it first (see <a href="#m2-equals-hashcode">equals() and hashCode()</a>).</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-constructors">
+  <h3>Constructors in depth: default, overloaded, chained and copy</h3>
+  <p class="tldr">A constructor puts a new object into a valid state; Java adds a no-arg default constructor only when you write none, and constructors reuse each other with <code>this(…)</code> and <code>super(…)</code>.</p>
+
+  <p>A <strong>constructor</strong> is a special block of code that runs exactly once for each new object, as part of <code>new</code>. Its job is to make the object valid from its very first moment: required fields set, rules checked. If an object can exist in a half-built state, bugs follow.</p>
+  <p>A constructor has the same name as the class and no return type — not even <code>void</code>. It can be overloaded, it can have any access modifier, and it can throw exceptions. It is not a method and it is not inherited.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Constructor</th><th>Method</th></tr></thead>
+    <tbody>
+      <tr><td>Name</td><td>Exactly the class name</td><td>Any name (a camelCase verb)</td></tr>
+      <tr><td>Return type</td><td>None, not even <code>void</code></td><td>Required (<code>void</code> if nothing)</td></tr>
+      <tr><td>How it runs</td><td>Automatically, through <code>new</code>, <code>this(…)</code> or <code>super(…)</code></td><td>Called explicitly, any number of times</td></tr>
+      <tr><td>Inherited?</td><td>No</td><td>Yes, if accessible</td></tr>
+      <tr><td>Can be <code>static</code>, <code>final</code>, <code>abstract</code>?</td><td>No — compile error</td><td>Yes</td></tr>
+      <tr><td>Provided automatically?</td><td>Yes, a default one, if you declare none</td><td>No</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The default constructor</h4>
+  <p>If a class declares no constructor at all, the compiler adds a <strong>default constructor</strong>: it takes no arguments, has the same access as the class (a <code>public</code> class gets a <code>public</code> one; a package-private class gets a package-private one), and its body simply calls <code>super()</code>.</p>
+  <p>The moment you write any constructor yourself, the compiler stops adding the default one. Code that used <code>new Customer()</code> then breaks:</p>
+  <pre data-title="E2.java"><code class="language-java">class Customer {
+    private String name;
+    Customer(String name) { this.name = name; }
+}
+
+public class E2 {
+    public static void main(String[] args) {
+        Customer c = new Customer();   // compile error
+    }
+}</code></pre>
+  <pre class="out" data-title="javac output"><code class="language-plaintext">E2.java:7: error: constructor Customer in class Customer cannot be applied to given types;
+        Customer c = new Customer();
+                     ^
+  required: String
+  found:    no arguments
+  reason: actual and formal argument lists differ in length</code></pre>
+  <div class="co co-real">
+    <p class="co-t">Frameworks that need a no-arg constructor</p>
+    <p>JPA requires every entity class to have a <code>public</code> or <code>protected</code> no-arg constructor, because Hibernate creates entity objects by reflection and then fills the fields. If you add <code>Order(String id)</code> to an entity, also add <code>protected Order() { }</code>. Jackson, which turns JSON into objects in Spring Boot, needs either a no-arg constructor or a constructor it can bind to — such as a record's canonical constructor or one marked <code>@JsonCreator</code>.</p>
+  </div>
+
+  <h4>Overloading and chaining with this(…)</h4>
+  <p>A class can have several constructors with different parameter lists — <strong>constructor overloading</strong>. To avoid copying the validation into each one, let the short constructors delegate to the most complete one using <code>this(…)</code>. This is <strong>constructor chaining</strong>.</p>
+  <pre data-title="Ct2.java"><code class="language-java">public class Ct2 {
+    static class Order {
+        private final String id;
+        private final int quantity;
+        private final String note;
+
+        Order(String id) {
+            this(id, 1);                          // delegate
+        }
+
+        Order(String id, int quantity) {
+            this(id, quantity, "");               // delegate
+        }
+
+        Order(String id, int quantity, String note) {   // the "main" constructor
+            if (id == null || id.isBlank()) {
+                throw new IllegalArgumentException("id is required");
+            }
+            if (quantity &lt;= 0) {
+                throw new IllegalArgumentException("quantity must be &gt; 0");
+            }
+            this.id = id;
+            this.quantity = quantity;
+            this.note = note;
+            System.out.println("Created " + this);
+        }
+
+        @Override public String toString() {
+            return "Order[id=" + id + ", quantity=" + quantity + ", note='" + note + "']";
+        }
+    }
+
+    public static void main(String[] args) {
+        new Order("SW-1001");
+        new Order("SW-1002", 3);
+        new Order("SW-1003", 2, "Less spicy");
+        try {
+            new Order("SW-1004", 0);
+        } catch (IllegalArgumentException e) {
+            System.out.println("Rejected: " + e.getMessage());
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Created Order[id=SW-1001, quantity=1, note='']
+Created Order[id=SW-1002, quantity=3, note='']
+Created Order[id=SW-1003, quantity=2, note='Less spicy']
+Rejected: quantity must be &gt; 0</code></pre>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A["new Order(id)"] --> B["Order(id) calls this(id, 1)"]
+  B --> C["Order(id, qty) calls this(id, qty, empty note)"]
+  C --> D["Order(id, qty, note) calls super() implicitly"]
+  D --> E["Object() runs"]
+  E --> F["Main constructor body: validate and assign"]
+  F --> G["Control returns down the chain to the caller"]
+</pre>
+  <figcaption>Constructor chaining: the most complete constructor does the real work</figcaption>
+  </figure>
+
+  <h4>Calling the parent with super(…)</h4>
+  <p>Every constructor starts by running a constructor of its parent class. You either write <code>super(…)</code> yourself, or — if you write neither <code>this(…)</code> nor <code>super(…)</code> — the compiler inserts <code>super()</code> with no arguments. If the parent has no no-arg constructor, that hidden call fails:</p>
+  <pre data-title="E3.java"><code class="language-java">class Vehicle {
+    Vehicle(String regNo) { }
+}
+
+class Car extends Vehicle {
+    Car() { }        // compiler inserts super() here, but Vehicle() does not exist
+}</code></pre>
+  <pre class="out" data-title="javac output"><code class="language-plaintext">E3.java:5: error: constructor Vehicle in class Vehicle cannot be applied to given types;
+    Car() { }
+          ^
+  required: String
+  found:    no arguments
+  reason: actual and formal argument lists differ in length</code></pre>
+  <p>The fix is <code>Car(String regNo) { super(regNo); }</code>. More on parent constructors in <a href="#m2-inheritance">inheritance</a>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for this(…) and super(…)</p>
+    <ul>
+      <li>Up to Java 24, <code>this(…)</code> or <code>super(…)</code> must be the very first statement of the constructor. Java 17 says <code>call to super must be first statement in constructor</code>.</li>
+      <li>A constructor can call only one of them — never both.</li>
+      <li>Constructors must not call each other in a loop: javac reports <code>recursive constructor invocation</code>.</li>
+      <li>The arguments you pass to <code>this(…)</code>/<code>super(…)</code> cannot use the object being built. <code>super(makeId())</code> fails if <code>makeId()</code> is an instance method (<code>cannot reference makeId() before supertype constructor has been called</code>); a <code>static</code> helper is fine.</li>
+    </ul>
+  </div>
+  <div class="co co-version">
+    <p class="co-t">Java 25: flexible constructor bodies</p>
+    <p>Java 25 finalised <strong>flexible constructor bodies</strong> (JEP 513). Statements may now appear before <code>super(…)</code> or <code>this(…)</code> — for example to validate arguments before the expensive parent constructor runs — as long as they do not use the object under construction (no reading fields, no instance method calls). They may assign fields that have no initializer.</p>
+    <pre data-title="E8.java (Java 25)"><code class="language-java">class SavingsAccount extends Account {
+    private final double rate;
+
+    SavingsAccount(String accountNo, double rate) {
+        if (rate &lt; 0 || rate &gt; 0.15) {           // validate BEFORE calling super
+            throw new IllegalArgumentException("Bad rate: " + rate);
+        }
+        this.rate = rate;                        // allowed: field has no initializer
+        super(accountNo);
+    }
+}</code></pre>
+    <p>On Java 17 or 21 this is a compile error. Most projects still target 17 or 21, so write the classic form (call <code>super</code> first, or validate inside a <code>static</code> helper used as an argument) unless your project is on 25.</p>
+  </div>
+
+  <h4>Copy constructors</h4>
+  <p>A <strong>copy constructor</strong> takes another object of the same class and builds a new, independent object with the same state. Copy immutable fields (like <code>String</code>) by reference; copy mutable fields (like a <code>List</code>) into a new object, or the two objects will share and change the same list.</p>
+  <pre data-title="CopyCtor.java"><code class="language-java">import java.util.*;
+
+public class CopyCtor {
+    static class Policy {
+        private final String holder;
+        private final List&lt;String&gt; nominees;
+
+        Policy(String holder, List&lt;String&gt; nominees) {
+            this.holder = holder;
+            this.nominees = new ArrayList&lt;&gt;(nominees);
+        }
+
+        // Copy constructor: a new, independent object with the same state
+        Policy(Policy other) {
+            this.holder = other.holder;                       // String is immutable: share it
+            this.nominees = new ArrayList&lt;&gt;(other.nominees);  // List is mutable: copy it
+        }
+
+        void addNominee(String name) { nominees.add(name); }
+        List&lt;String&gt; nominees() { return List.copyOf(nominees); }
+    }
+
+    public static void main(String[] args) {
+        Policy original = new Policy("Meera", List.of("Arjun"));
+        Policy copy = new Policy(original);
+        copy.addNominee("Kavya");
+        System.out.println("original: " + original.nominees());
+        System.out.println("copy:     " + copy.nominees());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">original: [Arjun]
+copy:     [Arjun, Kavya]</code></pre>
+  <p>Notice that <code>Policy(Policy other)</code> reads <code>other.nominees</code> even though the field is <code>private</code>. Access in Java is per class, not per object, so code inside <code>Policy</code> may read the private fields of any <code>Policy</code>. The JDK uses copy constructors everywhere: <code>new ArrayList&lt;&gt;(otherList)</code>, <code>new HashMap&lt;&gt;(otherMap)</code>. They are preferred over <code>clone()</code> — see <a href="#m2-clone-copy">copying objects</a>.</p>
+
+  <h4>Private constructors and static factory methods</h4>
+  <p>A <code>private</code> constructor stops other classes from calling <code>new</code>. You use it for:</p>
+  <ul>
+    <li><strong>Utility classes</strong> that only have static methods (<code>Math</code>, <code>Collections</code>) — see <a href="#m2-static">static</a>.</li>
+    <li><strong>Singletons</strong>, where exactly one instance must exist (<a href="08-system-design.html#m2">System Design · Module 2</a>).</li>
+    <li><strong>Static factory methods</strong> — static methods that create objects for the caller: <code>List.of(…)</code>, <code>LocalDate.of(2026, 10, 18)</code>, <code>Integer.valueOf(42)</code>.</li>
+  </ul>
+  <p>Factories have advantages over constructors: they have names (<code>Money.ofRupees(250)</code> reads better than <code>new Money(25000)</code>), they can return a cached object instead of a new one (<code>Integer.valueOf</code> caches −128 to 127 by default), and they can return a subtype. Their downside is that they are less visible than constructors in the class's API.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and surprises</p>
+    <ul>
+      <li><strong>A "constructor" with a return type is a method.</strong> <code>void FakeCtor() { status = "ACTIVE"; }</code> compiles as an ordinary method named like the class. <code>new FakeCtor()</code> uses the default constructor, the "constructor" never runs, and <code>status</code> stays <code>null</code>. javac does not even warn you.</li>
+      <li><strong>Modifiers:</strong> <code>final</code>, <code>static</code>, <code>abstract</code> and <code>synchronized</code> are not allowed on a constructor (<code>modifier final not allowed here</code>).</li>
+      <li><strong>Abstract classes have constructors too.</strong> You cannot call them with <code>new</code>, but subclasses call them through <code>super(…)</code>.</li>
+      <li><strong>A constructor that throws</strong> means <code>new</code> completes abruptly and no reference is assigned — the caller never gets the half-built object.</li>
+      <li><strong>Enums and records</strong> follow special rules: enum constructors are always private, and records get a canonical constructor instead of a no-arg one (see <a href="#m2-enums">enums</a> and <a href="#m2-records">records</a>).</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: the parameter shadows the field</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: assigns the parameter to itself</p><pre><code class="language-java">class Customer {
+    private String name;
+    Customer(String name) {
+        name = name;        // field stays null
+    }
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: this.name is the field</p><pre><code class="language-java">class Customer {
+    private final String name;
+    Customer(String name) {
+        this.name = name;   // field = parameter
+    }
+}</code></pre></div>
+    </div>
+    <p>Making the field <code>final</code> turns this bug into a compile error, because a final field that is never assigned is reported (<code>variable name might not have been initialized</code>).</p>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: too many constructor parameters? Use a builder</p>
+    <p>A constructor with seven parameters (several of them optional) is hard to call correctly — <code>new Pizza("L", true, false, true, null, 2, "thin")</code>. This is the <strong>telescoping constructor</strong> problem. The usual fix is the Builder pattern (a static nested <code>Builder</code> class, see <a href="#m2-nested-classes">nested classes</a>), or a record plus a few static factories.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: constructor questions</p>
+    <ul>
+      <li><b>Can a constructor be private?</b> Yes — singletons, utility classes, static factories.</li>
+      <li><b>Can it be final, static or abstract?</b> No. Constructors are not inherited, so <code>final</code> and <code>abstract</code> mean nothing; <code>static</code> makes no sense because a constructor works on a new instance.</li>
+      <li><b>Can you override a constructor?</b> No (not inherited), but you can overload it.</li>
+      <li><b>What is constructor chaining?</b> One constructor calling another with <code>this(…)</code> (same class) or <code>super(…)</code> (parent class), first statement, so setup logic is written once.</li>
+      <li><b>Does a constructor return anything?</b> It has no return type; the <code>new</code> expression produces the reference.</li>
+    </ul>
+  </div>
+</article>

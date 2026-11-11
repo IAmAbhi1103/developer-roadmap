@@ -1,0 +1,545 @@
+<article class="topic" id="m2-records">
+  <h3>Records: compact immutable data classes</h3>
+  <p class="tldr">A record declares an immutable data carrier in one line: the compiler generates the private final fields, the constructor, the accessors, and <code>equals</code>, <code>hashCode</code> and <code>toString</code>; use it for DTOs, value objects and return types, not for JPA entities or mutable state.</p>
+
+  <p>A normal data class needs about 30 lines: fields, a constructor, getters, <code>equals</code>, <code>hashCode</code>, <code>toString</code>. Most of it is boilerplate. A <strong>record</strong> (a standard feature since Java 16) says it in one line, and the intent is clear: "this class is just its data".</p>
+  <pre data-title="RecordBasics.java"><code class="language-java">record Point(int x, int y) { }                      // that's the whole class
+
+public class RecordBasics {
+    public static void main(String[] args) {
+        Point p = new Point(3, 4);
+        System.out.println(p.x() + ", " + p.y());   // accessor is x(), not getX()
+        System.out.println(p);                      // generated toString
+        System.out.println(p.equals(new Point(3, 4)));          // generated equals: by value
+        System.out.println(p.hashCode() == new Point(3, 4).hashCode());
+        // p.x = 5;       // error: cannot assign a value to final variable x
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">3, 4
+Point[x=3, y=4]
+true
+true</code></pre>
+
+  <h4>What the compiler generates</h4>
+  <ul>
+    <li>A <code>private final</code> field for each component (the names in the header).</li>
+    <li>A <strong>canonical constructor</strong> with all components in order: <code>new Point(3, 4)</code>.</li>
+    <li>One public accessor per component, named like the component: <code>x()</code>, <code>y()</code>. There is no <code>getX()</code> and no setters.</li>
+    <li><code>equals()</code> (all components equal), <code>hashCode()</code> (derived from all components) and <code>toString()</code> in the form <code>Point[x=3, y=4]</code>.</li>
+    <li>The record is implicitly <code>final</code> and extends <code>java.lang.Record</code>, so it cannot extend another class. It can implement interfaces.</li>
+  </ul>
+
+  <h4>Compact constructor: validation and normalisation</h4>
+  <p>To check or adjust values, write a <strong>compact canonical constructor</strong>: the record name with no parameter list. It runs first with the parameters in scope. Assign nothing to the fields yourself; the compiler does it at the end, with whatever the parameters now hold.</p>
+  <pre data-title="Money.java"><code class="language-java">import java.util.*;
+
+record Money(long paise, String currency) implements Comparable&lt;Money&gt; {
+
+    static final Money ZERO_INR = new Money(0, "INR");   // static fields are allowed
+
+    Money {                                              // compact constructor
+        Objects.requireNonNull(currency, "currency");
+        if (paise &lt; 0) throw new IllegalArgumentException("paise must be >= 0: " + paise);
+        currency = currency.toUpperCase();               // normalise the parameter
+    }
+
+    static Money inr(double rupees) {                    // static factory with a clear name
+        return new Money(Math.round(rupees * 100), "INR");
+    }
+
+    Money plus(Money other) {                            // custom method
+        if (!currency.equals(other.currency)) throw new IllegalArgumentException("currency mismatch");
+        return new Money(paise + other.paise, currency);
+    }
+
+    @Override public int compareTo(Money o) { return Long.compare(paise, o.paise); }
+
+    @Override public String toString() {                 // you may override generated methods
+        return String.format("%s %.2f", currency, paise / 100.0);
+    }
+
+    public static void main(String[] args) {
+        System.out.println(inr(499.5).plus(new Money(250, "inr")));
+        try {
+            new Money(-1, "INR");
+        } catch (IllegalArgumentException e) {
+            System.out.println(e.getMessage());
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">INR 502.00
+paise must be >= 0: -1</code></pre>
+  <p>Besides the compact form, you can write the full canonical constructor yourself (then you assign the fields with <code>this.x = x</code>), or add extra constructors, which must start with <code>this(…)</code> and so end up in the canonical one. A record may also declare an accessor of its own, for example to return a copy.</p>
+
+  <h4>Immutability is shallow</h4>
+  <p>The fields of a record are final, but if a component is a mutable object, the object can still change. Copy mutable inputs in the compact constructor and return unmodifiable views.</p>
+  <pre data-title="Team.java"><code class="language-java">import java.util.*;
+
+record Team(String name, List&lt;String&gt; members) {
+    Team {
+        members = List.copyOf(members);          // defensive copy; unmodifiable
+    }
+
+    public static void main(String[] args) {
+        List&lt;String&gt; list = new ArrayList&lt;&gt;(List.of("Asha", "Ravi"));
+        Team t = new Team("Core", list);
+        list.add("Meera");                       // does not affect the record
+        System.out.println(t);
+        try {
+            t.members().add("X");                // UnsupportedOperationException
+        } catch (UnsupportedOperationException e) {
+            System.out.println("members are read-only");
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Team[name=Core, members=[Asha, Ravi]]
+members are read-only</code></pre>
+  <p>Without that line, the caller still holds the list and can change the team's state from outside. This is the same defensive-copy rule as in <a href="#m2-immutability">immutability</a>. For hash-based collections a record with a mutable component also breaks the "mutable keys" rule from <a href="#m2-equals-hashcode">equals and hashCode</a>.</p>
+
+  <h4>Other things records can do</h4>
+  <ul>
+    <li><strong>Nested and local records.</strong> A record declared inside a method is handy for grouping temporary data in a stream pipeline: <code>record Pair(String name, int score) {}</code>.</li>
+    <li><strong>Generics.</strong> <code>record Pair&lt;A, B&gt;(A first, B second) {}</code>.</li>
+    <li><strong>Interfaces.</strong> <code>record Circle(double r) implements Shape</code> (see <a href="#m2-sealed-classes">sealed classes</a>).</li>
+    <li><strong>Record patterns (Java 21).</strong> <code>if (o instanceof Point(int x, int y)) { … }</code> takes a record apart in a test or <code>switch</code> (<a href="#m5">Module 5</a>).</li>
+    <li><strong>Static members</strong> are allowed; <strong>instance fields</strong> other than the components are not.</li>
+  </ul>
+
+  <h4>Records vs Lombok vs a normal class</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Question</th><th>Record</th><th>Lombok <code>@Value</code></th><th>Normal class</th></tr></thead>
+    <tbody>
+      <tr><td>Boilerplate</td><td>None, built in</td><td>None, via annotation processor</td><td>All written or IDE-generated</td></tr>
+      <tr><td>Extra dependency</td><td>No</td><td>Yes (Lombok)</td><td>No</td></tr>
+      <tr><td>Getter style</td><td><code>x()</code></td><td><code>getX()</code></td><td>Your choice</td></tr>
+      <tr><td>Mutable fields / setters</td><td>No</td><td>No (<code>@Data</code> has them)</td><td>Yes</td></tr>
+      <tr><td>Can extend a class</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Works as a JPA entity</td><td>No</td><td>No (needs a no-arg constructor)</td><td>Yes</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>A record cannot extend a class, cannot be <code>abstract</code>, and cannot declare instance fields beyond its components.</li>
+      <li>In a compact constructor you cannot write <code>this.x = x</code>; assign to the parameter.</li>
+      <li>An explicit canonical constructor cannot be less accessible than the record itself.</li>
+      <li>An overridden accessor must be public and return the component's type.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When not to use a record</p>
+    <ul>
+      <li><strong>JPA/Hibernate entities.</strong> They need a no-argument constructor, non-final classes (for lazy proxies), mutable fields and an identity that outlives its data. Use a normal class for the entity and a record for the DTO or projection that you return from the API.</li>
+      <li><strong>Mutable state or builder-style construction</strong> with many optional parameters (a record with 12 components is hard to read; use a class with a builder).</li>
+      <li><strong>Inheritance hierarchies.</strong> Records are final. Model a family with a sealed interface and several records instead.</li>
+      <li><strong>Hiding data.</strong> A record is a transparent carrier; its components are its public API. If you need to hide the representation (<a href="#m2-encapsulation">encapsulation</a>), use a normal class.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real Spring Boot projects</p>
+    <p>Records are now the standard way to write request and response DTOs: <code>record CreateOrderRequest(@NotBlank String customerId, @Min(1) int quantity) {}</code> works with Jackson (JSON) and Bean Validation, and with Spring Data projections and <code>@ConfigurationProperties</code>. Also use them for map keys, for returning several values from a method, and for events and messages.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: record questions</p>
+    <ul>
+      <li><b>What is a record, and what does the compiler generate?</b> A final, immutable data class: fields, canonical constructor, accessors, <code>equals</code>, <code>hashCode</code>, <code>toString</code>.</li>
+      <li><b>Are records fully immutable?</b> Only shallowly; copy mutable components.</li>
+      <li><b>Can a record have a setter, extend a class or implement an interface?</b> No / no / yes.</li>
+      <li><b>Why not use a record as a JPA entity?</b> No no-arg constructor, final class and fields, no proxies.</li>
+      <li><b>Record vs Lombok?</b> Language feature with no dependency, but no setters or inheritance.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-sealed-classes">
+  <h3>Sealed classes and interfaces (a teaser)</h3>
+  <p class="tldr">A sealed class or interface lists exactly which classes may extend or implement it, so the compiler knows every possible subtype and can check that a <code>switch</code> over them is complete.</p>
+
+  <p>Normally anyone can extend your public class or implement your public interface. Sometimes you want a closed family: a payment is either UPI, a card or cash on delivery, and nothing else. Enums are closed families of <em>constants</em>; <strong>sealed types</strong> (final since Java 17) are closed families of <em>types</em>, each of which may carry different data.</p>
+  <pre data-title="SealedDemo.java"><code class="language-java">sealed interface Payment permits Upi, Card, Cod { }      // the allowed implementations
+
+record Upi(String vpa) implements Payment { }
+record Card(String last4, boolean credit) implements Payment { }
+record Cod() implements Payment { }
+
+public class SealedDemo {
+    static String describe(Payment p) {
+        return switch (p) {                                // exhaustive: no default needed
+            case Upi u  -&gt; "UPI to " + u.vpa();
+            case Card c -&gt; (c.credit() ? "Credit" : "Debit") + " card ending " + c.last4();
+            case Cod c  -&gt; "Cash on delivery";
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(describe(new Upi("asha@bank")));
+        System.out.println(describe(new Card("4242", true)));
+        System.out.println(describe(new Cod()));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">UPI to asha@bank
+Credit card ending 4242
+Cash on delivery</code></pre>
+  <p>If you later add a fourth permitted type, <code>describe</code> stops compiling until you handle it. That is the big gain: the compiler tells you every place a new case matters. It replaces long <code>instanceof</code> chains and the visitor pattern. Pattern-matching <code>switch</code> belongs to <a href="#m5">Module 5</a>; this article only shows why sealing makes it safe.</p>
+
+  <h4>The rules</h4>
+  <ul>
+    <li>Declare with <code>sealed</code> and a <code>permits</code> list. If the permitted classes are in the same file, <code>permits</code> may be omitted.</li>
+    <li>Each permitted subclass must say what happens next: <code>final</code> (no more subclasses), <code>sealed</code> (it restricts its own children) or <code>non-sealed</code> (it opens the hierarchy again).</li>
+    <li>Permitted subclasses must be in the same module, or in the same package when you do not use modules.</li>
+    <li>Records and enums are implicitly final, so they fit perfectly as permitted types.</li>
+  </ul>
+  <pre data-title="Shapes.java"><code class="language-java">sealed abstract class Shape permits Circle, Polygon { }
+final class Circle extends Shape { }
+sealed class Polygon extends Shape permits Triangle, Square { }
+final class Triangle extends Polygon { }
+non-sealed class Square extends Polygon { }      // anyone may extend Square</code></pre>
+
+  <div class="co co-conv">
+    <p class="co-t">When to use sealed types</p>
+    <ul>
+      <li>For domain models with a small, known set of variants: results (<code>Success</code>/<code>Failure</code>), payment types, commands, expression trees.</li>
+      <li>When you want exhaustive <code>switch</code> without a <code>default</code>.</li>
+      <li>Not for plugin points where third parties must extend your type. Use a normal interface there.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: one-liner</p>
+    <p>"A sealed type restricts its direct subtypes with <code>permits</code>; each must be <code>final</code>, <code>sealed</code> or <code>non-sealed</code>. It gives closed hierarchies and compiler-checked exhaustive switches." Compare it with <code>final</code> (no subclasses at all) and with enums (closed, but constants of one type).</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-four-pillars">
+  <h3>The four pillars together: a worked bank example, and SOLID</h3>
+  <p class="tldr">Encapsulation protects data, abstraction hides complexity behind a contract, inheritance shares code in an is-a family, and polymorphism lets one call behave differently per object; a small bank model shows all four working together.</p>
+
+  <h4>The four pillars at a glance</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pillar</th><th>Idea</th><th>How Java supports it</th><th>Interview one-liner</th></tr></thead>
+    <tbody>
+      <tr><td><a href="#m2-encapsulation">Encapsulation</a></td><td>Keep data private and change it only through methods that keep it valid</td><td><code>private</code> fields, public methods, immutability</td><td>"Bundling data with the code that guards it, and hiding it."</td></tr>
+      <tr><td><a href="#m2-abstraction">Abstraction</a></td><td>Expose what an object does, hide how</td><td>Interfaces, abstract classes, small public APIs</td><td>"Showing the essentials, hiding the details."</td></tr>
+      <tr><td><a href="#m2-inheritance">Inheritance</a></td><td>A new class reuses and specialises an existing one</td><td><code>extends</code>, <code>super</code>, <code>protected</code></td><td>"Acquiring the properties and behaviour of a parent: an is-a relationship."</td></tr>
+      <tr><td><a href="#m2-polymorphism">Polymorphism</a></td><td>One reference type, many behaviours</td><td>Overriding and dynamic dispatch (run time); overloading (compile time)</td><td>"Same call, different behaviour depending on the real object."</td></tr>
+    </tbody>
+  </table></div>
+  <p>Real-world picture: a <em>UPI app</em>. Your account details are not readable by other apps (encapsulation). You tap "Pay" without knowing banks' internal APIs (abstraction). Savings and current accounts share account rules but differ in details (inheritance). Paying through any bank behaves correctly for that bank (polymorphism).</p>
+
+  <h4>The model</h4>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class Account {
+    &lt;&lt;abstract&gt;&gt;
+    -String number
+    -long balance
+    +deposit(long)
+    +withdraw(long)
+    #minimumBalance() long
+    +monthEnd()
+  }
+  class SavingsAccount
+  class CurrentAccount
+  class Transaction {
+    &lt;&lt;record&gt;&gt;
+  }
+  class InterestPolicy {
+    &lt;&lt;interface&gt;&gt;
+    +interestFor(long) long
+  }
+  Account &lt;|-- SavingsAccount
+  Account &lt;|-- CurrentAccount
+  Account "1" *-- "*" Transaction : history
+  SavingsAccount --> InterestPolicy : uses
+</pre>
+    <figcaption>Bank model: inheritance for accounts, composition for history and interest</figcaption>
+  </figure>
+
+  <h4>The code</h4>
+  <pre data-title="BankDemo.java"><code class="language-java">import java.util.*;
+
+interface InterestPolicy {                                // abstraction: a contract
+    long interestFor(long balanceInPaise);
+}
+
+record Transaction(String type, long amountInPaise, long balanceAfter) { }  // immutable data
+
+abstract class Account {
+    private final String number;                          // encapsulation: private state
+    private long balance;
+    private final List&lt;Transaction&gt; history = new ArrayList&lt;&gt;();
+
+    protected Account(String number) { this.number = number; }
+
+    public final void deposit(long amount) {              // fixed rules: subclasses can't break them
+        if (amount &lt;= 0) throw new IllegalArgumentException("Amount must be positive");
+        post("DEPOSIT", amount);
+    }
+
+    public final void withdraw(long amount) {
+        if (amount &lt;= 0) throw new IllegalArgumentException("Amount must be positive");
+        if (balance - amount &lt; minimumBalance()) {
+            throw new IllegalStateException("Insufficient funds in " + number);
+        }
+        post("WITHDRAW", -amount);
+    }
+
+    protected abstract long minimumBalance();             // varies per account type
+    public void monthEnd() { }                            // hook: default does nothing
+
+    protected final void post(String type, long signedAmount) {
+        balance += signedAmount;
+        history.add(new Transaction(type, Math.abs(signedAmount), balance));
+    }
+
+    public long balance() { return balance; }
+    public List&lt;Transaction&gt; history() { return List.copyOf(history); }   // defensive copy
+
+    @Override public String toString() {
+        return String.format("%s %s balance=Rs %.2f",
+                getClass().getSimpleName(), number, balance / 100.0);
+    }
+}
+
+class SavingsAccount extends Account {                    // inheritance: is-a Account
+    private final InterestPolicy policy;                  // composition: has-a policy
+
+    SavingsAccount(String number, InterestPolicy policy) {
+        super(number);
+        this.policy = policy;
+    }
+    @Override protected long minimumBalance() { return 0; }
+    @Override public void monthEnd() {
+        long interest = policy.interestFor(balance());
+        if (interest &gt; 0) post("INTEREST", interest);
+    }
+}
+
+class CurrentAccount extends Account {
+    private final long overdraftLimit;
+    CurrentAccount(String number, long overdraftLimit) {
+        super(number);
+        this.overdraftLimit = overdraftLimit;
+    }
+    @Override protected long minimumBalance() { return -overdraftLimit; }   // may go negative
+}
+
+public class BankDemo {
+    public static void main(String[] args) {
+        InterestPolicy fourPercent = balance -&gt; balance * 4 / 1200;   // lambda: monthly 4% p.a.
+        Account s = new SavingsAccount("SB1001", fourPercent);
+        Account c = new CurrentAccount("CA2001", 500_000);          // Rs 5,000 overdraft
+
+        s.deposit(1_000_000);                                       // Rs 10,000
+        c.deposit(200_000);
+        c.withdraw(600_000);                                        // goes to -Rs 4,000: allowed
+        try {
+            s.withdraw(2_000_000);                                  // not allowed
+        } catch (IllegalStateException e) {
+            System.out.println(e.getMessage());
+        }
+
+        List&lt;Account&gt; accounts = List.of(s, c);                     // polymorphism
+        accounts.forEach(Account::monthEnd);                        // each type does its own thing
+        accounts.forEach(System.out::println);
+        System.out.println(s.history());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Insufficient funds in SB1001
+SavingsAccount SB1001 balance=Rs 10033.33
+CurrentAccount CA2001 balance=Rs -4000.00
+[Transaction[type=DEPOSIT, amountInPaise=1000000, balanceAfter=1000000], Transaction[type=INTEREST, amountInPaise=3333, balanceAfter=1003333]]</code></pre>
+
+  <h4>Where each pillar shows up</h4>
+  <ul>
+    <li><strong>Encapsulation:</strong> <code>balance</code> and <code>history</code> are private; the only way to change the balance is through <code>deposit</code>, <code>withdraw</code> or <code>post</code>, which check the rules. <code>history()</code> returns a copy. Money is a <code>long</code> in paise, never a <code>double</code>.</li>
+    <li><strong>Abstraction:</strong> <code>InterestPolicy</code> says what is needed, not how; the abstract <code>minimumBalance()</code> names a concept that each account type defines. Callers use <code>Account</code> only.</li>
+    <li><strong>Inheritance:</strong> both account types reuse the number, balance, history and all the rules from <code>Account</code>. <code>deposit</code> and <code>withdraw</code> are <code>final</code>, so a subclass cannot weaken them.</li>
+    <li><strong>Polymorphism:</strong> <code>accounts.forEach(Account::monthEnd)</code> runs interest for savings and nothing for current, chosen at run time.</li>
+    <li><strong>Composition:</strong> interest is a separate strategy object, not a subclass of savings per interest rate (<a href="#m2-composition-over-inheritance">composition</a>). The record <code>Transaction</code> is a simple value type (<a href="#m2-records">records</a>).</li>
+  </ul>
+  <p>In production you would add thread safety, <code>BigDecimal</code> or a money type, and persistence, but the structure stays the same. This is also the shape of a Spring service: a class that depends on interfaces and keeps its state private.</p>
+
+  <h4>SOLID teaser</h4>
+  <p><strong>SOLID</strong> is a set of five design guidelines that grow out of the pillars: <strong>S</strong>ingle responsibility (a class has one reason to change), <strong>O</strong>pen/closed (open for extension, closed for modification; our new account type needs no change in the loop), <strong>L</strong>iskov substitution (a subclass must work wherever its parent is expected), <strong>I</strong>nterface segregation (many small interfaces beat one fat one) and <strong>D</strong>ependency inversion (depend on abstractions such as <code>InterestPolicy</code>, not on concrete classes). The full treatment with examples is in <a href="08-system-design.html#m1">System Design · Module 1</a>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes that break the pillars</p>
+    <ul>
+      <li>Public fields, or getters that return internal mutable lists (breaks encapsulation).</li>
+      <li>Using <code>extends</code> only to reuse code, or a subclass that cannot do what the parent promises (breaks inheritance and Liskov).</li>
+      <li>Adding <code>instanceof</code> chains instead of overriding methods (misses polymorphism).</li>
+      <li>One interface per class "just because" (abstraction without a reason).</li>
+      <li>Saying "polymorphism is overloading" in an interview. Overloading is the compile-time form; the main idea is runtime polymorphism.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain the four pillars"</p>
+    <ul>
+      <li>Give each pillar in one sentence from the table and a one-line real example.</li>
+      <li>Offer a tie-together example (bank accounts) and point out each pillar in it.</li>
+      <li>Mention that composition and interfaces often serve the goals better than deep inheritance.</li>
+      <li>Expect follow-ups: abstraction vs encapsulation, overloading vs overriding, abstract class vs interface, why Java has no multiple class inheritance.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m2-interview">
+  <h3>Interview questions — Object-oriented programming</h3>
+
+  <details class="qa">
+    <summary>What are the four pillars of OOP? Give an example of each.</summary>
+    <div class="qa-a">
+      <p>Encapsulation (private fields plus validating methods, e.g. a bank balance), abstraction (an interface such as <code>PaymentGateway</code> hides the provider), inheritance (<code>SavingsAccount extends Account</code>) and polymorphism (<code>account.monthEnd()</code> runs the right version per object). Add that composition and interfaces often replace deep inheritance.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between a class and an object?</summary>
+    <div class="qa-a">
+      <p>A class is a blueprint: it defines fields and methods. An object is an instance created from it with <code>new</code>, with its own field values (state), behaviour from the class and an identity. The reference variable lives on the stack, and the object lives on the heap.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Overloading vs overriding?</summary>
+    <div class="qa-a">
+      <p>Overloading: same name, different parameter lists in one class (or its subclasses); chosen at compile time by the declared argument types. Overriding: a subclass gives a new body to an inherited instance method with the same signature; chosen at run time by the object's real class. Return type alone cannot distinguish overloads. Static, private and final methods cannot be overridden.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Abstract class vs interface: when do you use which?</summary>
+    <div class="qa-a">
+      <p>An abstract class can hold state, constructors and any-access methods, but a class can extend only one. An interface has only constants, public methods (abstract, default, static, private), no state, and a class can implement many. Use an interface for a capability across unrelated classes and an abstract class for closely related classes sharing fields and code. A skeleton abstract class implementing an interface gives both.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why does Java not support multiple inheritance of classes? How do interfaces help?</summary>
+    <div class="qa-a">
+      <p>Two parents could both supply the same field or method, so the diamond problem makes it unclear which copy the child inherits. Java allows only one parent class. Interfaces carry no state, so a class may implement many; if two default methods clash, the class must override and pick with <code>A.super.m()</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does this print?</summary>
+    <div class="qa-a">
+      <pre><code class="language-java">class A { String n = "A"; String who() { return "A"; } }
+class B extends A { String n = "B"; String who() { return "B"; } }
+A x = new B();
+System.out.println(x.n + x.who());</code></pre>
+      <p>It prints <code>AB</code>. The field is looked up by the declared type (<code>A</code>), the overridden method by the real object (<code>B</code>). Fields are not polymorphic.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the order of initialization when you create an object?</summary>
+    <div class="qa-a">
+      <p>First the class is loaded: parent static blocks and fields, then child static blocks (once). Then for each <code>new</code>: parent instance initializers and fields, parent constructor, then child instance initializers and fields, child constructor. If a parent constructor calls an overridden method, it sees the child's fields still at default values.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the contract between equals() and hashCode()? What happens if you break it?</summary>
+    <div class="qa-a">
+      <p>If <code>a.equals(b)</code> then <code>a.hashCode() == b.hashCode()</code>; the reverse need not hold. <code>equals</code> must be reflexive, symmetric, transitive, consistent and false for null. If you override <code>equals</code> only, equal objects get different hash codes, and a <code>HashSet</code> or <code>HashMap</code> stores duplicates or fails to find a key.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Does final make an object immutable?</summary>
+    <div class="qa-a">
+      <p>No. <code>final</code> fixes the reference: you cannot reassign it. The object can still change (<code>final List</code> still allows <code>add</code>). An immutable class needs: final class, private final fields, no setters, defensive copies of mutable inputs and outputs. Compare final, finally (cleanup block) and finalize (deprecated GC hook).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Composition or inheritance? Why "favor composition"?</summary>
+    <div class="qa-a">
+      <p>Inheritance couples the child to the parent's implementation (the fragile base class problem, e.g. a <code>HashSet</code> subclass counting <code>addAll</code> twice) and is fixed at compile time with one parent only. Composition holds a component behind an interface and delegates, which is flexible, testable and swappable at run time. Use inheritance for a true is-a with a parent designed for extension.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Static nested class vs inner class?</summary>
+    <div class="qa-a">
+      <p>An inner class belongs to an outer instance and holds a hidden reference to it (usable with <code>Outer.this</code>, created with <code>outer.new Inner()</code>); this can keep the outer object alive. A static nested class has no such reference and is created with <code>new Outer.Nested()</code>. Prefer static nested unless you need the outer instance.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why use enums instead of int or String constants? What are their pitfalls?</summary>
+    <div class="qa-a">
+      <p>Type safety, readable names, ability to hold fields and per-constant behaviour, exhaustive switch, <code>EnumMap</code> and <code>EnumSet</code>. Pitfalls: <code>valueOf</code> throws <code>IllegalArgumentException</code> on unknown names, <code>ordinal()</code> changes when you reorder (store the name, e.g. <code>EnumType.STRING</code> in JPA), and a new constant must be handled in every switch.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a record and when should you not use one?</summary>
+    <div class="qa-a">
+      <p>A record is a concise, final, shallowly immutable data class with generated constructor, accessors (<code>x()</code>), <code>equals</code>, <code>hashCode</code> and <code>toString</code>. Do not use it for JPA entities, for mutable state, or when you need inheritance or hidden representation. Copy mutable components in the compact constructor.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between ClassCastException and instanceof? How do you avoid the exception?</summary>
+    <div class="qa-a">
+      <p><code>instanceof</code> is a test that returns true when the object is an instance of the type (false for null). <code>ClassCastException</code> is what a downcast throws when the test would have been false. Guard with <code>if (a instanceof Dog d)</code>, or better, put the behaviour in the parent so no cast is needed.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a sealed class and why was it added?</summary>
+    <div class="qa-a">
+      <p>A sealed type lists its permitted direct subtypes with <code>permits</code>, and each must be <code>final</code>, <code>sealed</code> or <code>non-sealed</code>. It models closed hierarchies and lets the compiler check a pattern-matching <code>switch</code> for completeness, without a default branch.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m2-cheatsheet">
+  <h3>Cheat sheet — Object-oriented programming</h3>
+  <ul class="cheat">
+    <li><b>Class vs object</b> blueprint vs instance; <code>new</code> allocates on the heap, the variable holds a reference.</li>
+    <li><b>Constructor</b> same name as class, no return type; the default one exists only if you write none; chain with <code>this(...)</code> or <code>super(...)</code> as the first statement.</li>
+    <li><b>Init order</b> static (parent, child) once; per object: parent fields/blocks, parent constructor, child fields/blocks, child constructor.</li>
+    <li><b>static</b> belongs to the class; no <code>this</code>, no instance members directly.</li>
+    <li><b>Access</b> <code>private</code> (class) &lt; package-private &lt; <code>protected</code> (package + subclasses) &lt; <code>public</code>.</li>
+    <li><b>Encapsulation</b> private fields, validated setters or none, defensive copies; immutable = final class, final fields, no setters.</li>
+    <li><b>Inheritance</b> <code>extends</code>, one parent; constructors and private members are not inherited; <code>super.m()</code> calls the parent version.</li>
+    <li><b>Overriding rules</b> same signature, covariant return, access not narrower, no broader checked exceptions; always <code>@Override</code>.</li>
+    <li><b>Not overridable</b> <code>static</code> (hidden), <code>private</code>, <code>final</code>; fields are hidden, not overridden.</li>
+    <li><b>Polymorphism</b> overloading = compile time (declared types); overriding = run time (real object).</li>
+    <li><b>Casting</b> upcast implicit and safe; downcast explicit and may throw <code>ClassCastException</code>; check with <code>instanceof</code>.</li>
+    <li><b>Abstract class</b> cannot be instantiated; may have state, constructors, concrete and abstract methods; use for the Template Method.</li>
+    <li><b>Interface</b> constants, abstract/default/static/private methods; no state; implement many; implementations must be <code>public</code>.</li>
+    <li><b>Default method clash</b> class wins; more specific interface wins; else override and call <code>A.super.m()</code>.</li>
+    <li><b>final</b> variable assigned once; method not overridable; class not extendable; reference, not content.</li>
+    <li><b>final / finally / finalize</b> keyword / cleanup block / deprecated GC hook.</li>
+    <li><b>equals + hashCode</b> override together with the same fields; equal objects need equal hashes; use <code>Objects.equals</code> and <code>Objects.hash</code>.</li>
+    <li><b>toString</b> override it; never include secrets; use <code>Arrays.toString</code> for arrays.</li>
+    <li><b>Copying</b> shallow shares inner objects; deep duplicates them; prefer copy constructors or immutables over <code>clone()</code>.</li>
+    <li><b>Composition</b> has-a, delegate to a component behind an interface; inheritance only for true is-a.</li>
+    <li><b>Nested classes</b> static nested (no outer ref), inner (outer ref), local, anonymous; lambdas replace anonymous functional interfaces.</li>
+    <li><b>Packages</b> reverse-domain lowercase, folders match; <code>java.lang</code> is auto-imported; wildcard excludes subpackages.</li>
+    <li><b>Enum</b> fixed constants with fields, private constructor, per-constant bodies; compare with <code>==</code>; store names, not ordinals.</li>
+    <li><b>Record</b> <code>record P(int x, int y) {}</code>; compact constructor validates; shallow immutable; not for entities.</li>
+    <li><b>Sealed</b> <code>sealed ... permits</code>; subtypes are <code>final</code>, <code>sealed</code> or <code>non-sealed</code>; enables exhaustive switch.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m2-practice">
+  <h3>Practice — Object-oriented programming</h3>
+  <ol class="steps">
+    <li><strong>Class basics (easy).</strong> Write <code>Student</code> with private fields <code>id</code>, <code>name</code> and <code>marks</code>, a constructor that rejects marks outside 0-100, getters, and a good <code>toString</code>. Done when invalid marks throw <code>IllegalArgumentException</code> and printing a list of students shows readable text.</li>
+    <li><strong>Output prediction: initialization order.</strong> Write a parent and a child class, each with a static block, an instance block and a constructor that print a line; add a parent constructor that calls an overridden method reading a child field. Predict the order on paper, then run it. Done when you can explain every line, including why the field is still 0 or null.</li>
+    <li><strong>Output prediction: overloading vs overriding.</strong> Create <code>Animal</code> and <code>Dog</code> with <code>eat(Animal)</code> in both and <code>eat(Dog)</code> in <code>Dog</code>, plus overloads <code>show(Object)</code> and <code>show(String)</code>. Call them through <code>Animal</code> and <code>Dog</code> variables with <code>null</code> and cast arguments. Done when you can state the compile-time and run-time step for each call (<a href="#m2-dispatch-puzzles">puzzles</a>).</li>
+    <li><strong>Library model.</strong> Model <code>Book</code>, <code>Member</code> and <code>Loan</code>: a loan links one member and one book with a due date; a member can hold at most 3 loans; <code>Book</code> has an ISBN. Use inheritance or an interface only where it fits (for example <code>Member</code> types with different limits through a <code>LoanPolicy</code> interface). Done when borrowing a 4th book fails with a clear exception and <code>equals</code>/<code>hashCode</code> of <code>Book</code> use the ISBN.</li>
+    <li><strong>Bank model.</strong> Re-create <code>Account</code>, <code>SavingsAccount</code>, <code>CurrentAccount</code> and <code>Transaction</code> from the worked example without looking. Then add a <code>FixedDeposit</code> account that blocks withdrawals until a maturity date, and a second <code>InterestPolicy</code> with tiered rates. Done when the loop over <code>List&lt;Account&gt;</code> needs no change for the new type.</li>
+    <li><strong>Parking lot.</strong> Model <code>ParkingLot</code>, <code>Floor</code>, <code>Slot</code> and vehicles (bike, car, truck) with an enum <code>VehicleType</code> and an enum <code>SlotSize</code>. Decide where inheritance, composition (a lot has floors) and an interface (<code>PricingStrategy</code>) belong, and use a record for <code>Ticket</code>. Done when parking returns a ticket for the nearest fitting free slot, and a full lot reports a clear error.</li>
+    <li><strong>equals/hashCode test.</strong> Write <code>Email</code> as a normal class with a correct <code>equals</code> and <code>hashCode</code> (case-insensitive). First leave out <code>hashCode</code> and show a <code>HashSet</code> holding a duplicate; then fix it and add the same logic as a record with a compact constructor that lowercases the value. Done when both versions keep the set at size 1.</li>
+    <li><strong>Refactor to composition.</strong> Start with <code>class Stack&lt;E&gt; extends ArrayList&lt;E&gt;</code> and show that callers can call <code>add(0, x)</code> and break the stack rule. Rewrite it with a private list field and only <code>push</code>, <code>pop</code>, <code>peek</code> and <code>isEmpty</code>. Done when the public API has just those methods.</li>
+    <li><strong>Enum and sealed.</strong> Create an enum <code>OrderStatus</code> with the legal next states per constant (a method <code>canMoveTo</code>), and a sealed interface <code>PaymentResult</code> with record cases <code>Paid</code>, <code>Failed</code> and <code>Pending</code>. Write a <code>switch</code> over each without a <code>default</code>. Done when removing one case makes the code fail to compile.</li>
+  </ol>
+</article>

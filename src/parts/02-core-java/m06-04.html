@@ -1,0 +1,567 @@
+<article class="topic" id="m6-concurrent-collections">
+  <h3>Concurrent collections: ConcurrentHashMap and friends</h3>
+  <p class="tldr">The java.util.concurrent collections are built for many threads: ConcurrentHashMap gives fast thread-safe reads and atomic updates like merge and compute, CopyOnWriteArrayList suits read-heavy lists, and the BlockingQueue family passes work between threads.</p>
+
+  <h4>Why ordinary collections break</h4>
+  <p><code>HashMap</code> and <code>ArrayList</code> are not thread-safe. Two threads calling <code>put</code> at the same time can lose entries, corrupt the internal structure, or (in old Java versions) even loop forever during a resize. Iterating while another thread modifies the collection throws <code>ConcurrentModificationException</code>. The old fix, <code>Collections.synchronizedMap</code>, makes every call take one lock, which is safe but slow under load. The concurrent collections solve this with smarter designs.</p>
+
+  <h4>ConcurrentHashMap</h4>
+  <p><code>ConcurrentHashMap</code> is the default thread-safe map. It does not allow <code>null</code> keys or values: in a concurrent map, <code>get(k) == null</code> must unambiguously mean "absent", and a stored null would make that unclear (<code>NullPointerException</code> if you try).</p>
+  <h5>How it is thread-safe (Java 8 and later)</h5>
+  <ul>
+    <li>The table is an array of <strong>bins</strong> (buckets), like <code>HashMap</code>.</li>
+    <li>Putting into an <strong>empty bin</strong> uses a lock-free <strong>CAS</strong> (compare-and-set: "set this slot to the new node only if it is still empty").</li>
+    <li>Putting into a bin that already has nodes takes a <code>synchronized</code> lock on that bin's <strong>first node only</strong>. Threads working on different bins never block each other. (Java 7 used a fixed number of segments; Java 8 replaced them with this per-bin locking.)</li>
+    <li><code>get</code> takes <strong>no lock</strong>: node values and next-pointers are <code>volatile</code>, so reads see recent writes.</li>
+    <li>Long collision chains turn into trees, as in <code>HashMap</code> (when a bin has at least 8 nodes and the table has at least 64 slots).</li>
+    <li>The size is kept in counter cells (like <code>LongAdder</code>) so many threads can update it without fighting over one variable. <code>size()</code> is therefore an estimate while updates are running; <code>mappingCount()</code> returns a <code>long</code>.</li>
+    <li>Iterators are <strong>weakly consistent</strong>: they never throw <code>ConcurrentModificationException</code>, and they may or may not show changes made after the iterator was created.</li>
+  </ul>
+
+  <h4>Atomic compound operations</h4>
+  <p>Each single call (<code>get</code>, <code>put</code>) is atomic, but two calls together are not. This is the classic <strong>check-then-act</strong> race:</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: not atomic, two threads can both see null</p><pre><code class="language-java">Integer old = map.get(word);
+if (old == null) {
+    map.put(word, 1);
+} else {
+    map.put(word, old + 1);    // lost updates
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: one atomic call</p><pre><code class="language-java">map.merge(word, 1, Integer::sum);</code></pre></div>
+  </div>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Atomic action</th></tr></thead>
+    <tbody>
+      <tr><td><code>putIfAbsent(k, v)</code></td><td>Put only if the key is missing; returns the previous value or <code>null</code></td></tr>
+      <tr><td><code>computeIfAbsent(k, fn)</code></td><td>If missing, compute the value with <code>fn</code> and store it (the multi-value map idiom)</td></tr>
+      <tr><td><code>computeIfPresent(k, fn)</code></td><td>Recompute only if present</td></tr>
+      <tr><td><code>compute(k, fn)</code></td><td>Recompute whether present or not; returning <code>null</code> removes the entry</td></tr>
+      <tr><td><code>merge(k, v, fn)</code></td><td>If missing store <code>v</code>; otherwise store <code>fn(old, v)</code></td></tr>
+      <tr><td><code>replace(k, old, new)</code></td><td>Compare-and-replace</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="HitCounter.java"><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+
+public class HitCounter {
+    public static void main(String[] args) throws Exception {
+        Map&lt;String, Integer&gt; safe = new ConcurrentHashMap&lt;&gt;();
+        Map&lt;String, Integer&gt; unsafe = new HashMap&lt;&gt;();
+
+        try (ExecutorService pool = Executors.newFixedThreadPool(4)) {
+            for (int t = 0; t &lt; 4; t++) {
+                pool.execute(() -&gt; {
+                    for (int i = 0; i &lt; 50_000; i++) {
+                        safe.merge("/home", 1, Integer::sum);        // atomic
+                        unsafe.merge("/home", 1, Integer::sum);      // data race!
+                    }
+                });
+            }
+        }
+        System.out.println("ConcurrentHashMap: " + safe.get("/home"));
+        System.out.println("HashMap          : " + unsafe.get("/home"));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (one possible run)"><code class="language-plaintext">ConcurrentHashMap: 200000
+HashMap          : 143871</code></pre>
+  <p>The <code>HashMap</code> result changes on every run and is usually below 200,000 (it can even throw an exception, or hang in some versions). The <code>ConcurrentHashMap</code> result is always exact.</p>
+  <div class="co co-rule">
+    <p class="co-t">Rule: keep the function passed to compute and merge short</p>
+    <p>The function runs while a bin is locked. It must be quick, must not block, and must <strong>not modify the same map</strong> (that can deadlock or throw <code>IllegalStateException: Recursive update</code>).</p>
+  </div>
+
+  <h4>synchronizedMap vs ConcurrentHashMap</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>Collections.synchronizedMap</code></th><th><code>ConcurrentHashMap</code></th></tr></thead>
+    <tbody>
+      <tr><td>Locking</td><td>One lock for the whole map</td><td>CAS plus per-bin locks; reads lock-free</td></tr>
+      <tr><td>Concurrency</td><td>One thread at a time</td><td>Many threads at once</td></tr>
+      <tr><td>Null keys/values</td><td>Allowed (if the wrapped map allows)</td><td>Not allowed</td></tr>
+      <tr><td>Iteration</td><td>Must lock the map yourself; otherwise <code>ConcurrentModificationException</code></td><td>Weakly consistent; safe without locking</td></tr>
+      <tr><td>Atomic compound ops</td><td>Need external <code>synchronized</code></td><td><code>merge</code>, <code>compute</code>, <code>putIfAbsent</code> built in</td></tr>
+      <tr><td>Use when</td><td>Rarely; low traffic, need null or sorted wrapping</td><td>The default choice</td></tr>
+    </tbody>
+  </table></div>
+  <p>Also avoid the legacy <code>Hashtable</code> (a single lock on every method). For a sorted concurrent map use <code>ConcurrentSkipListMap</code> (and <code>ConcurrentSkipListSet</code>). For a concurrent set backed by a hash map: <code>ConcurrentHashMap.newKeySet()</code>.</p>
+
+  <h4>CopyOnWriteArrayList</h4>
+  <p>Every write (<code>add</code>, <code>set</code>, <code>remove</code>) makes a <strong>fresh copy</strong> of the internal array. Readers use the old array, with no locks, and an iterator works on a <strong>snapshot</strong>: it never throws <code>ConcurrentModificationException</code> and never sees later changes.</p>
+  <pre data-title="Listeners.java"><code class="language-java">import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+public class Listeners {
+    public static void main(String[] args) {
+        List&lt;String&gt; listeners = new CopyOnWriteArrayList&lt;&gt;(List.of("email", "sms"));
+
+        for (String l : listeners) {           // iterating a snapshot
+            System.out.println("notify " + l);
+            if (l.equals("email")) {
+                listeners.add("push");         // fine: no exception
+            }
+        }
+        System.out.println(listeners);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">notify email
+notify sms
+[email, sms, push]</code></pre>
+  <p>Good for: lists that are read very often and changed rarely, such as event listeners or a list of feature flags. Bad for: large lists with frequent writes, since each write copies everything (O(n)). With an ordinary <code>ArrayList</code> the same loop would throw <code>ConcurrentModificationException</code>. A set version exists: <code>CopyOnWriteArraySet</code>.</p>
+
+  <h4>BlockingQueue implementations</h4>
+  <p>A <code>BlockingQueue</code> makes <code>put</code> wait when full and <code>take</code> wait when empty, so producers and consumers need no <code>wait/notify</code>. It extends <code>Queue</code> with timed versions (<code>offer(e, time, unit)</code>, <code>poll(time, unit)</code>).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Class</th><th>Capacity</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>ArrayBlockingQueue</code></td><td>Fixed at creation</td><td>FIFO, one lock; optional fairness. Predictable memory</td></tr>
+      <tr><td><code>LinkedBlockingQueue</code></td><td>Optional bound; default <code>Integer.MAX_VALUE</code></td><td>FIFO, two locks (put and take) for higher throughput. Unbounded by default, so give it a limit</td></tr>
+      <tr><td><code>PriorityBlockingQueue</code></td><td>Unbounded</td><td>Ordered by <code>Comparable</code> or a <code>Comparator</code>, not FIFO; <code>put</code> never blocks</td></tr>
+      <tr><td><code>SynchronousQueue</code></td><td>Zero</td><td>Each <code>put</code> waits for a <code>take</code>; a direct hand-off (used by <code>newCachedThreadPool</code>)</td></tr>
+      <tr><td><code>DelayQueue</code></td><td>Unbounded</td><td>Elements become available after a delay (scheduling, expiry)</td></tr>
+    </tbody>
+  </table></div>
+  <p>For the non-blocking world: <code>ConcurrentLinkedQueue</code> and <code>ConcurrentLinkedDeque</code> are unbounded, lock-free (CAS-based) queues. <code>poll()</code> returns <code>null</code> when empty; there is no waiting. Use them when you never want to block. Note that their <code>size()</code> walks the whole queue, so it is O(n).</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>NullPointerException</code> — <code>ConcurrentHashMap.put(k, null)</code> or a null key; also <code>null</code> elements in blocking queues.</li>
+      <li><code>IllegalStateException: Queue full</code> — <code>add()</code> on a full bounded queue (<code>offer</code> returns <code>false</code>, <code>put</code> blocks).</li>
+      <li><code>UnsupportedOperationException</code> — <code>remove()</code> on an iterator of <code>CopyOnWriteArrayList</code>, which works on a snapshot.</li>
+      <li>Thread-safe collections do not make <em>your</em> compound logic safe: <code>if (!map.containsKey(k)) map.put(k, v)</code> is still a race. Use <code>putIfAbsent</code>.</li>
+      <li>Values stored in the map are not protected: a <code>ConcurrentHashMap&lt;String, List&lt;String&gt;&gt;</code> with an <code>ArrayList</code> value still needs the inner list to be thread-safe.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>In-memory caches (<code>computeIfAbsent</code> to load once per key), counters and rate-limit buckets per user, registries of active sessions or WebSocket connections, and work queues between an HTTP thread and background workers. Careful: <code>computeIfAbsent</code> with a slow loader holds the bin lock; for real caching use Caffeine.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How does ConcurrentHashMap work? synchronizedMap vs ConcurrentHashMap?"</p>
+    <ul>
+      <li>Java 8+: CAS for empty bins, <code>synchronized</code> on the first node of a bin otherwise; lock-free reads; no nulls; weakly consistent iterators.</li>
+      <li>Atomic <code>merge</code>, <code>compute</code>, <code>putIfAbsent</code> prevent check-then-act races.</li>
+      <li>synchronizedMap uses one global lock and needs manual locking for iteration and compound actions.</li>
+      <li>Copy-on-write is for read-mostly lists; blocking queues for producer-consumer.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-synchronizers">
+  <h3>Synchronizers: CountDownLatch, CyclicBarrier and Semaphore</h3>
+  <p class="tldr">Synchronizers coordinate threads without you writing wait/notify: a CountDownLatch waits for a number of events once, a CyclicBarrier makes a group of threads wait for each other repeatedly, and a Semaphore limits how many threads use a resource at once.</p>
+
+  <h4>CountDownLatch: wait until N things are done</h4>
+  <p>A <strong>latch</strong> starts with a count. Worker threads call <code>countDown()</code> when they finish; another thread calls <code>await()</code> and blocks until the count reaches zero. It is <strong>one-shot</strong>: once at zero it stays open and cannot be reset. Typical use: wait for services to start, or start many threads at the same instant (a "starting gun" with count 1).</p>
+  <pre data-title="StartupCheck.java"><code class="language-java">import java.util.concurrent.*;
+
+public class StartupCheck {
+    public static void main(String[] args) throws InterruptedException {
+        CountDownLatch ready = new CountDownLatch(3);
+
+        for (String svc : new String[] {"database", "cache", "queue"}) {
+            Thread.ofPlatform().start(() -&gt; {
+                try {
+                    Thread.sleep(200);                 // pretend to start up
+                    System.out.println(svc + " started");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    ready.countDown();                 // always count down
+                }
+            });
+        }
+
+        ready.await();                                 // main waits here
+        System.out.println("All services up, accepting traffic");
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (one possible run)"><code class="language-plaintext">cache started
+database started
+queue started
+All services up, accepting traffic</code></pre>
+  <p>Put <code>countDown()</code> in a <code>finally</code>. If a worker fails and never counts down, <code>await()</code> waits forever; the overload <code>await(timeout, unit)</code> returns <code>false</code> on timeout and is safer.</p>
+
+  <h4>CyclicBarrier: wait for each other, again and again</h4>
+  <p>A <strong>barrier</strong> is created for N parties. Each thread calls <code>await()</code>; the first N-1 block, and when the Nth arrives they all continue together. Then the barrier <strong>resets</strong> and can be used again, which makes it suit phased algorithms ("everyone finish step 1 before anyone starts step 2"). An optional <em>barrier action</em> runs once per round, in the last thread to arrive.</p>
+  <pre data-title="BarrierDemo.java"><code class="language-java">import java.util.concurrent.*;
+
+public class BarrierDemo {
+    public static void main(String[] args) {
+        CyclicBarrier barrier = new CyclicBarrier(3,
+                () -&gt; System.out.println("-- all three finished this round --"));
+
+        for (int w = 1; w &lt;= 3; w++) {
+            int id = w;
+            Thread.ofPlatform().start(() -&gt; {
+                try {
+                    for (int round = 1; round &lt;= 2; round++) {
+                        System.out.println("worker " + id + " done round " + round);
+                        barrier.await();               // wait for the others
+                    }
+                } catch (InterruptedException | BrokenBarrierException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (one possible run; order inside a round varies)"><code class="language-plaintext">worker 2 done round 1
+worker 1 done round 1
+worker 3 done round 1
+-- all three finished this round --
+worker 3 done round 2
+worker 1 done round 2
+worker 2 done round 2
+-- all three finished this round --</code></pre>
+
+  <h4>Semaphore: limit concurrent access</h4>
+  <p>A <strong>semaphore</strong> holds a number of <em>permits</em>. <code>acquire()</code> takes one (blocking when none are left); <code>release()</code> gives one back. With N permits at most N threads are inside the protected section. With 1 permit it works like a lock (but without an owner, so any thread can release). Use cases: limit calls to a rate-limited partner API, cap the number of open DB-heavy jobs, or limit concurrency when using virtual threads.</p>
+  <pre data-title="RateLimit.java"><code class="language-java">import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class RateLimit {
+    static final Semaphore permits = new Semaphore(3);       // max 3 calls at once
+    static final AtomicInteger inside = new AtomicInteger();
+
+    static void callPartnerApi(int id) throws InterruptedException {
+        permits.acquire();
+        try {
+            int now = inside.incrementAndGet();
+            System.out.println("request " + id + " running, concurrent=" + now);
+            Thread.sleep(300);                                // the slow call
+        } finally {
+            inside.decrementAndGet();
+            permits.release();                                // always release
+        }
+    }
+
+    public static void main(String[] args) {
+        try (ExecutorService pool = Executors.newFixedThreadPool(8)) {
+            for (int i = 1; i &lt;= 8; i++) {
+                int id = i;
+                pool.execute(() -&gt; {
+                    try { callPartnerApi(id); }
+                    catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                });
+            }
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (one possible run)"><code class="language-plaintext">request 1 running, concurrent=1
+request 2 running, concurrent=2
+request 3 running, concurrent=3
+request 4 running, concurrent=3
+request 5 running, concurrent=3
+request 6 running, concurrent=3
+request 7 running, concurrent=3
+request 8 running, concurrent=2</code></pre>
+  <p>Eight threads exist but never more than three are in the section at once. Other useful methods: <code>tryAcquire()</code> (do not wait; return <code>false</code>), <code>tryAcquire(time, unit)</code>, <code>availablePermits()</code> and the fair constructor <code>new Semaphore(3, true)</code> (longest waiter first).</p>
+
+  <h4>Which one?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>CountDownLatch</code></th><th><code>CyclicBarrier</code></th><th><code>Semaphore</code></th></tr></thead>
+    <tbody>
+      <tr><td>Purpose</td><td>Wait for N events</td><td>N threads meet at a point</td><td>Limit concurrent users of a resource</td></tr>
+      <tr><td>Reusable</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Who waits</td><td>The waiters; the counters do not wait</td><td>All parties wait</td><td>Threads without a permit</td></tr>
+      <tr><td>Counting down by</td><td>Any thread, any number of times</td><td>Each party once per round</td><td>Acquire and release</td></tr>
+    </tbody>
+  </table></div>
+  <p>Beyond these: <code>Phaser</code> (a flexible multi-phase barrier) and <code>Exchanger</code> (two threads swap objects) exist but are rare.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>BrokenBarrierException</code> — another party timed out, was interrupted or the barrier was reset; every waiting thread gets the exception.</li>
+      <li><code>TimeoutException</code> — timed <code>CyclicBarrier.await</code> ran out of time.</li>
+      <li><code>IllegalArgumentException</code> — negative count for a latch, or fewer than 1 party for a barrier.</li>
+      <li>A permit leak: <code>acquire()</code> without a <code>release()</code> in <code>finally</code> slowly drains the semaphore until everything blocks.</li>
+      <li>Calling <code>release()</code> more often than <code>acquire()</code> <em>increases</em> the permits beyond the initial value; a Semaphore does not check the owner.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: latch count that never reaches zero</p>
+    <p>If three workers must count down but one throws before reaching <code>countDown()</code>, the waiting thread hangs forever. Count down in <code>finally</code>, and prefer <code>await(timeout, unit)</code> in production.</p>
+  </div>
+  <h4 id="m6-synchronizers-inside">How they work, and why not wait/notify</h4>
+  <p>All three keep a small counter of "permits" or "arrivals" and park threads that must wait. <code>CountDownLatch</code> and <code>Semaphore</code> are built on <code>AbstractQueuedSynchronizer</code> (AQS), the same queue-and-park machinery behind <code>ReentrantLock</code>; <code>CyclicBarrier</code> uses a <code>ReentrantLock</code> and a condition. You get correct blocking, fairness options, timeouts and interruption for free. Writing the same with <code>wait()</code> and <code>notifyAll()</code> is possible (see <a href="#m6-locks-waiting">locks and waiting</a>) but easy to get wrong: lost wake-ups, missing loops, wrong lock. Use the ready-made class whenever one fits.</p>
+
+  <h4>Method reference</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Class</th><th>Key methods</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>CountDownLatch(n)</code></td><td><code>countDown()</code>, <code>await()</code>, <code>await(t, unit)</code>, <code>getCount()</code></td><td>Extra <code>countDown()</code> calls at zero do nothing</td></tr>
+      <tr><td><code>CyclicBarrier(n, action)</code></td><td><code>await()</code>, <code>await(t, unit)</code>, <code>getParties()</code>, <code>getNumberWaiting()</code>, <code>reset()</code>, <code>isBroken()</code></td><td><code>await()</code> returns the arrival index (n-1 for the first, 0 for the last)</td></tr>
+      <tr><td><code>Semaphore(permits, fair)</code></td><td><code>acquire()</code>, <code>acquire(n)</code>, <code>tryAcquire()</code>, <code>release()</code>, <code>availablePermits()</code></td><td>No owner: any thread may release</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Two latches in one test harness</h4>
+  <p>Two latches together are a standard pattern for measuring or testing concurrent code: a <strong>start gate</strong> (count 1) so that all workers begin together, and a <strong>done gate</strong> (count N) so that the caller knows when all have finished.</p>
+  <pre data-title="StartGate.java"><code class="language-java">import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class StartGate {
+    public static void main(String[] args) throws InterruptedException {
+        int workers = 4;
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(workers);
+        AtomicInteger counter = new AtomicInteger();
+
+        for (int i = 0; i &lt; workers; i++) {
+            Thread.ofPlatform().start(() -&gt; {
+                try {
+                    start.await();                       // all workers wait here
+                    for (int j = 0; j &lt; 1000; j++) counter.incrementAndGet();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        start.countDown();                               // fire the starting gun
+        done.await();                                    // wait for everybody
+        System.out.println("Total = " + counter.get());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Total = 4000</code></pre>
+
+  <h4>Semaphore as a mutex, and the permit-leak trap</h4>
+  <p>With one permit a semaphore allows a single thread at a time, but unlike <code>synchronized</code> or <code>ReentrantLock</code> it is <em>not reentrant</em> (a thread that acquires twice blocks itself) and has no owner. That can be useful (acquire in one thread, release in another, as in a hand-off) and dangerous. Placing <code>acquire()</code> inside the <code>try</code> block creates a subtle bug:</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: release runs even when acquire never succeeded</p><pre><code class="language-java">try {
+    permits.acquire();            // interrupted here → no permit taken
+    doWork();
+} finally {
+    permits.release();            // still releases: permits grow past the limit
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: acquire before the try</p><pre><code class="language-java">permits.acquire();
+try {
+    doWork();
+} finally {
+    permits.release();
+}</code></pre></div>
+  </div>
+  <p>For "do not wait if the resource is busy" use <code>tryAcquire()</code>: it returns <code>false</code> at once, and you can return a "429 Too Many Requests" or skip the job.</p>
+
+  <h4>Deadlock with a barrier and a small thread pool</h4>
+  <p>A <code>CyclicBarrier(4)</code> needs four threads waiting at the same time. If you run the four parties on a fixed pool of only two threads, the first two block at the barrier and the other two tasks never start. Nothing fails; the program just hangs. Make the pool at least as large as the number of parties, or use plain threads. The same trap exists for a latch when the task that must count down is queued behind tasks that are blocked in <code>await()</code>.</p>
+
+  <h4>Phaser and Exchanger in one paragraph</h4>
+  <p><code>Phaser</code> is a barrier whose number of parties can change while it runs (<code>register</code>, <code>arriveAndDeregister</code>) and that has numbered phases. It suits tasks that join and leave a multi-step process. <code>Exchanger</code> lets exactly two threads swap objects at a meeting point, for example a producer handing a full buffer to a consumer and taking back an empty one. Both are rare in application code; know the names and the idea.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>A latch cannot be reset. For a repeating event use <code>CyclicBarrier</code> or a new latch each round.</li>
+      <li>Release a semaphore in <code>finally</code>, and acquire <em>before</em> the <code>try</code>.</li>
+      <li>The number of parties in a barrier must match the number of threads that will call <code>await()</code> each round.</li>
+      <li>Do not hold a lock (<code>synchronized</code>) while waiting on a synchronizer unless you are sure the others can still make progress; it is a common way to build a <a href="#m6-deadlock">deadlock</a>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Use the timed <code>await</code> or <code>tryAcquire</code> forms in production and log what happened on timeout.</li>
+      <li>Restore the interrupt flag when you catch <code>InterruptedException</code>.</li>
+      <li>For ordinary "run these tasks and wait for all", prefer <code>invokeAll</code> or <code>CompletableFuture.allOf</code> (see <a href="#m6-callable-future">Callable and Future</a>); use a latch when the events come from different places.</li>
+      <li>Use a semaphore to cap concurrency; use a <code>ThreadPoolExecutor</code> with a bounded queue to cap threads. They solve different problems.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Latches appear in integration tests (wait until the Kafka consumer has processed the message) and in startup code. Semaphores guard connections to a partner API with a "10 calls at a time" contract, and bound the number of concurrent downloads in a virtual-thread application, where thread count no longer limits you. Barriers are the least common: parallel simulations and phased batch processing.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "CountDownLatch vs CyclicBarrier", "What is a Semaphore?"</p>
+    <ul>
+      <li>Latch: one-shot, waiting for events; barrier: reusable meeting point for the same threads.</li>
+      <li>Semaphore: counted permits; limit concurrent access; <code>acquire</code> / <code>release</code> in <code>finally</code>.</li>
+      <li>Give a real example for each: startup gate, phased computation, API rate limit.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-deadlock">
+  <h3>Deadlock, livelock and starvation</h3>
+  <p class="tldr">A deadlock happens when threads wait for each other's locks forever; you prevent it by always taking locks in the same order, using timeouts, or holding fewer locks, and you find it with a thread dump.</p>
+
+  <h4>What a deadlock is</h4>
+  <p>Thread A holds lock 1 and waits for lock 2. Thread B holds lock 2 and waits for lock 1. Neither can continue, and nothing will release the locks, so the program hangs (while using no CPU). The classic business example is a bank transfer: transferring from account X to Y locks X then Y, while a simultaneous transfer from Y to X locks Y then X.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  T1[Thread 1] -->|holds| L1[Lock A]
+  T2[Thread 2] -->|holds| L2[Lock B]
+  T1 -.->|waits for| L2
+  T2 -.->|waits for| L1
+</pre>
+<figcaption>Circular wait: each thread holds one lock and waits for the other's</figcaption>
+  </figure>
+
+  <h4>A minimal deadlock program</h4>
+  <pre data-title="DeadlockDemo.java"><code class="language-java">public class DeadlockDemo {
+    static final Object lockA = new Object();
+    static final Object lockB = new Object();
+
+    public static void main(String[] args) {
+        Thread t1 = new Thread(() -&gt; {
+            synchronized (lockA) {
+                System.out.println("T1 holds A");
+                pause();                                   // let T2 grab B
+                synchronized (lockB) {
+                    System.out.println("T1 holds A and B");
+                }
+            }
+        }, "T1");
+
+        Thread t2 = new Thread(() -&gt; {
+            synchronized (lockB) {
+                System.out.println("T2 holds B");
+                pause();
+                synchronized (lockA) {
+                    System.out.println("T2 holds B and A");
+                }
+            }
+        }, "T2");
+
+        t1.start();
+        t2.start();
+    }
+
+    static void pause() {
+        try { Thread.sleep(200); } catch (InterruptedException e) { }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (the program then hangs forever)"><code class="language-plaintext">T1 holds A
+T2 holds B</code></pre>
+  <p>Neither "holds A and B" line is ever printed. The <code>sleep</code> makes the problem happen every time; in real code the timing is rare, which is why deadlocks pass testing and appear in production under load.</p>
+
+  <h4>The four Coffman conditions</h4>
+  <p>A deadlock needs all four of these at once. Remove any one and it cannot happen.</p>
+  <dl class="terms">
+    <dt>Mutual exclusion</dt><dd>A resource can be held by only one thread at a time (a lock).</dd>
+    <dt>Hold and wait</dt><dd>A thread keeps what it has while waiting for more.</dd>
+    <dt>No preemption</dt><dd>A lock cannot be taken away from its holder; only the holder releases it.</dd>
+    <dt>Circular wait</dt><dd>A cycle exists: A waits for B, B waits for ... waits for A.</dd>
+  </dl>
+
+  <h4>Prevention</h4>
+  <ol class="steps">
+    <li><strong>Lock ordering</strong> (breaks circular wait): every thread takes locks in the same global order. For transfers, lock the account with the smaller id first.</li>
+    <li><strong>tryLock with timeout</strong> (breaks hold and wait / no preemption): use <code>ReentrantLock.tryLock(time, unit)</code>; if you cannot get the second lock, release the first, wait a random short time and retry.</li>
+    <li><strong>Fewer locks, smaller critical sections:</strong> one lock for related data, no calls to unknown code ("alien methods", listeners, callbacks) while holding a lock.</li>
+    <li><strong>Prefer higher-level tools:</strong> concurrent collections, atomics and immutable objects need no locks at all.</li>
+  </ol>
+  <pre data-title="Transfer.java"><code class="language-java">public class Transfer {
+    static class Account {
+        final long id;
+        long balance;
+        Account(long id, long balance) { this.id = id; this.balance = balance; }
+    }
+
+    static void transfer(Account from, Account to, long amount) {
+        // Always lock the account with the lower id first: same order for every thread
+        Account first = from.id &lt; to.id ? from : to;
+        Account second = from.id &lt; to.id ? to : from;
+
+        synchronized (first) {
+            synchronized (second) {
+                if (from.balance &lt; amount) {
+                    throw new IllegalStateException("Insufficient balance");
+                }
+                from.balance -= amount;
+                to.balance += amount;
+            }
+        }
+    }
+}</code></pre>
+  <p>Now <code>transfer(x, y, 100)</code> and <code>transfer(y, x, 50)</code> both lock the same account first, so a cycle is impossible. And a version with <code>tryLock</code>:</p>
+  <pre data-title="TryLock version"><code class="language-java">import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+boolean transferWithTimeout(ReentrantLock a, ReentrantLock b) throws InterruptedException {
+    if (a.tryLock(100, TimeUnit.MILLISECONDS)) {
+        try {
+            if (b.tryLock(100, TimeUnit.MILLISECONDS)) {
+                try {
+                    // ... move the money ...
+                    return true;
+                } finally {
+                    b.unlock();
+                }
+            }
+        } finally {
+            a.unlock();
+        }
+    }
+    return false;       // caller retries later or reports failure
+}</code></pre>
+
+  <h4>Detecting a deadlock with a thread dump</h4>
+  <p>A <strong>thread dump</strong> is a snapshot of every thread's state and stack. Find your process id with <code>jps</code> (or the task manager), then:</p>
+  <pre data-title="Taking a thread dump" class="out"><code class="language-shell">$ jps
+12840 DeadlockDemo
+$ jstack 12840
+$ jcmd 12840 Thread.print      # same result</code></pre>
+  <p>On Linux you can also send <kbd>Ctrl</kbd>+<kbd>\</kbd> (SIGQUIT) to a program started in the terminal. In IntelliJ, use the "Get Thread Dump" camera button while debugging. The JVM analyses the lock graph and prints a section like this (shortened):</p>
+  <pre class="out" data-title="Part of a thread dump (shortened)"><code class="language-plaintext">Found one Java-level deadlock:
+=============================
+"T1":
+  waiting to lock monitor 0x... (object 0x..., a java.lang.Object),
+  which is held by "T2"
+"T2":
+  waiting to lock monitor 0x... (object 0x..., a java.lang.Object),
+  which is held by "T1"
+
+Java stack information for the threads listed above:
+"T1":
+        at DeadlockDemo.lambda$main$0(DeadlockDemo.java:13)
+        - waiting to lock &lt;0x...&gt; (a java.lang.Object)
+        - locked &lt;0x...&gt; (a java.lang.Object)</code></pre>
+  <p>Read the stack lines to see which code line each thread is stuck on. Your own code can also check: <code>ManagementFactory.getThreadMXBean().findDeadlockedThreads()</code> returns the ids of deadlocked threads (or <code>null</code>). Monitoring tools use this. Thread dumps help for other hangs too: a thread state <code>BLOCKED</code> or <code>WAITING</code> everywhere points to a lock or pool problem.</p>
+
+  <h4>Livelock and starvation</h4>
+  <ul>
+    <li><strong>Livelock:</strong> threads are not blocked; they keep reacting to each other and make no progress, like two people in a corridor who both step aside in the same direction again and again. CPU is busy but nothing is done. A typical cause is a retry loop where both threads back off and retry at the same time. Fix: add a random delay (jitter) or a clear priority rule.</li>
+    <li><strong>Starvation:</strong> a thread never gets the resource because others keep winning. Examples: low-priority threads that never get CPU time, an unfair lock where one thread always loses, or one long task that fills a small thread pool. Fix: fair locks (<code>new ReentrantLock(true)</code>, with some throughput cost), separate pools, shorter critical sections.</li>
+  </ul>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Problem</th><th>Threads are...</th><th>CPU use</th><th>Typical fix</th></tr></thead>
+    <tbody>
+      <tr><td>Deadlock</td><td>Blocked forever, in a cycle</td><td>None</td><td>Lock ordering, timeouts</td></tr>
+      <tr><td>Livelock</td><td>Running but useless</td><td>High</td><td>Random back-off</td></tr>
+      <tr><td>Starvation</td><td>Waiting too long, others progress</td><td>Normal</td><td>Fairness, bounded work</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>If you need more than one lock, define and document the order in which they are taken.</li>
+      <li>Never call code you do not control (callbacks, overridable methods, other services) while holding a lock.</li>
+      <li>Always release locks in <code>finally</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Deadlocks are not only about <code>synchronized</code>. They also happen with database row locks (two transactions updating the same two rows in opposite order; the database aborts one with a deadlock error), with a thread pool whose tasks wait for other tasks of the same pool, and with <code>join()</code> cycles.</li>
+      <li><code>synchronized</code> blocks cannot be interrupted while waiting for the lock; <code>ReentrantLock.lockInterruptibly()</code> can.</li>
+      <li>A deadlock with <code>synchronized</code> leaves the JVM running; only restarting (or killing a thread through a different design) recovers.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a deadlock? How do you prevent and detect it?"</p>
+    <ul>
+      <li>Define it with a two-lock example and name the four Coffman conditions.</li>
+      <li>Prevent: consistent lock order, <code>tryLock</code> with timeout, fewer and smaller locks.</li>
+      <li>Detect: <code>jstack</code>/<code>jcmd Thread.print</code>, IntelliJ dump, <code>ThreadMXBean.findDeadlockedThreads()</code>.</li>
+      <li>Differentiate livelock (busy but no progress) and starvation (never gets a turn).</li>
+    </ul>
+  </div>
+</article>

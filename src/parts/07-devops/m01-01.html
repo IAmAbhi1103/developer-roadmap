@@ -1,0 +1,646 @@
+<div class="mintro">
+  <p>Almost every Java application you write will end up running on a Linux server: an AWS EC2 machine, a
+  Docker container, a Kubernetes pod, or a build agent in CI. Your laptop may run Windows, but production
+  does not. This module teaches you the Linux command line well enough to log in to a server, find your
+  app, read its logs, fix a crash, deploy a new JAR and keep it running after you log out.</p>
+  <p>Everything later on this page builds on it. Docker (Module 3) is Linux underneath. GitHub Actions
+  (Module 4) runs your steps in Linux shells. Cloud deployment (Module 5) starts with an SSH login. The
+  networking ideas in <a href="#m2">Module 2</a> use the same tools you meet here (<code>ss</code>,
+  <code>curl</code>). Operating-system theory (processes, files, memory) is explained in
+  <a href="09-cs-fundamentals.html#m1">CS Fundamentals · Module 1</a>; here we stay practical.</p>
+  <p>Plan for daily practice: open a Linux terminal every day, even for a ten-minute task. Typing the
+  commands is the only way they stick.</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>Set up Ubuntu (or WSL2 on Windows) and move around the filesystem confidently.</li>
+    <li>Read and change file permissions, and explain why an SSH key must be <code>600</code>.</li>
+    <li>List processes and ports, stop a stuck program, and fix "address already in use".</li>
+    <li>Run a Spring Boot JAR as a <code>systemd</code> service and read its logs with
+    <code>journalctl</code>.</li>
+    <li>Search and summarise logs with <code>grep</code>, <code>awk</code>, <code>sort</code> and
+    <code>uniq</code>.</li>
+    <li>Install software with <code>apt</code>, set environment variables, and log in with SSH keys.</li>
+    <li>Write a safe bash script, schedule it with cron, and test an API with <code>curl</code>.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m1-linux-basics">
+  <h3>Why servers run Linux: kernel, distributions, shells and WSL2</h3>
+  <p class="tldr">Linux is a free operating-system kernel that powers most servers and containers; you use
+  it through a shell (usually bash) inside a terminal, and on Windows 11 you get a real Ubuntu with
+  <code>wsl --install</code>.</p>
+
+  <h4>Why servers run Linux</h4>
+  <p>When you rent a virtual machine from AWS, Azure or Google Cloud, the default choice is Linux.
+  The reasons are practical, not fashion:</p>
+  <ul>
+    <li><strong>Cost.</strong> Linux is free. Windows Server needs a licence, which is added to your
+    cloud bill.</li>
+    <li><strong>Light and stable.</strong> A Linux server runs happily with 1 GB of RAM and stays up for
+    months without a reboot.</li>
+    <li><strong>Everything is text.</strong> Configuration is in plain files, and every task can be
+    scripted. That is what makes automation (CI/CD, Docker, Terraform) possible.</li>
+    <li><strong>Remote by default.</strong> You manage a server over SSH with no graphical desktop. A
+    server has no screen, so there is nothing to click.</li>
+    <li><strong>The ecosystem.</strong> Docker, Kubernetes, Nginx, PostgreSQL, Kafka and the JVM were
+    built and tested on Linux first.</li>
+  </ul>
+
+  <h4>Kernel versus distribution</h4>
+  <p>The <strong>kernel</strong> is the core of the operating system. It talks to the hardware, schedules
+  processes, manages memory and files. "Linux" strictly means this kernel. A
+  <strong>distribution</strong> (distro) packages the kernel with a package manager, system tools,
+  default settings and a release schedule. Two distros run the same kernel family but differ in how you
+  install software.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Distribution</th><th>Family</th><th>Package tool</th><th>Where you meet it</th></tr></thead>
+    <tbody>
+      <tr><td>Ubuntu (LTS releases)</td><td>Debian</td><td><code>apt</code></td><td>Most tutorials, EC2, WSL</td></tr>
+      <tr><td>Debian</td><td>Debian</td><td><code>apt</code></td><td>Base of many Docker images</td></tr>
+      <tr><td>Amazon Linux</td><td>Red Hat style</td><td><code>dnf</code> / <code>yum</code></td><td>Default AWS images</td></tr>
+      <tr><td>RHEL, Rocky, AlmaLinux</td><td>Red Hat</td><td><code>dnf</code> / <code>yum</code></td><td>Large enterprises, banks</td></tr>
+      <tr><td>Alpine</td><td>Independent</td><td><code>apk</code></td><td>Very small Docker images</td></tr>
+    </tbody>
+  </table></div>
+  <p>These notes use <strong>Ubuntu</strong>. An LTS (long-term support) release gets security updates for
+  years, so it is the safe choice for servers. The ideas (files, permissions, processes, SSH) are the
+  same on every distro; only the install command changes.</p>
+
+  <h4>Terminal, shell and bash</h4>
+  <dl class="terms">
+    <dt>Terminal</dt><dd>The window where you type. It only shows text and sends your keystrokes.</dd>
+    <dt>Shell</dt><dd>The program inside the terminal that reads your command, runs it and prints the
+    result. Common shells are <code>bash</code> (default on Ubuntu and most servers), <code>zsh</code>
+    (default on macOS) and <code>sh</code> (minimal; used by many scripts and Alpine).</dd>
+    <dt>Prompt</dt><dd>The text before your cursor, for example
+    <code>ubuntu@web-1:~$</code> = user <code>ubuntu</code> on host <code>web-1</code>, in the home
+    folder <code>~</code>. <code>$</code> means a normal user; <code>#</code> means root.</dd>
+  </dl>
+  <p>Learn bash. Scripts, CI pipelines and Dockerfiles are all written for it.</p>
+  <pre data-title="Your first commands"><code class="language-shell">$ whoami
+ubuntu
+$ hostname
+web-1
+$ echo $SHELL
+/bin/bash
+$ cat /etc/os-release | head -3
+PRETTY_NAME="Ubuntu 24.04 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+$ uname -r
+6.8.0-1012-aws</code></pre>
+  <p><code>uname -r</code> prints the kernel version; <code>/etc/os-release</code> tells you the distro.
+  Your numbers will differ — these are sample outputs.</p>
+
+  <h4>Installing WSL2 on Windows 11</h4>
+  <p><strong>WSL2</strong> (Windows Subsystem for Linux) runs a real Linux kernel in a lightweight virtual
+  machine inside Windows. You get Ubuntu in a terminal, with no dual-boot. Open PowerShell as
+  Administrator:</p>
+  <pre data-title="PowerShell (Administrator)"><code class="language-shell">PS&gt; wsl --install
+PS&gt; wsl --list --online
+PS&gt; wsl --install -d Ubuntu
+PS&gt; wsl -l -v
+  NAME      STATE           VERSION
+* Ubuntu    Running         2</code></pre>
+  <p><code>wsl --install</code> turns on the needed Windows features and installs Ubuntu by default;
+  restart when asked. On first launch Ubuntu asks you to create a Linux username and password. That
+  password is for <code>sudo</code> inside WSL, separate from your Windows password. Check that the
+  VERSION column says <code>2</code>.</p>
+
+  <h4>Windows files from WSL, and back</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>You want</th><th>How</th></tr></thead>
+    <tbody>
+      <tr><td>Open a Windows folder from WSL</td><td><code>cd /mnt/c/Users/asha/Downloads</code> (drive <code>C:</code> appears as <code>/mnt/c</code>)</td></tr>
+      <tr><td>Open a WSL folder in Windows Explorer</td><td><code>explorer.exe .</code> from the Linux folder, or type <code>\\wsl$\Ubuntu\home\you</code> in Explorer's address bar</td></tr>
+      <tr><td>Open a WSL project in VS Code</td><td><code>code .</code> inside the folder (VS Code's WSL extension connects)</td></tr>
+      <tr><td>Run a Windows program from WSL</td><td>Type its name with <code>.exe</code>, e.g. <code>notepad.exe notes.txt</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: keep your projects inside the Linux filesystem</p>
+    <p>Work in <code>~/projects</code>, not in <code>/mnt/c/...</code>. Reading thousands of small files
+    (a Maven build, <code>node_modules</code>) through <code>/mnt/c</code> is much slower, and file
+    permissions behave oddly there. Access the files from Windows through the <code>\\wsl$</code> path
+    when you need to.</p>
+  </div>
+
+  <h4>Git Bash versus WSL</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Git Bash</th><th>WSL2 (Ubuntu)</th></tr></thead>
+    <tbody>
+      <tr><td>What it is</td><td>Bash and common tools compiled for Windows, installed with Git</td><td>A real Linux system</td></tr>
+      <tr><td>Linux fidelity</td><td>Partial: no <code>apt</code>, <code>systemctl</code>, real permissions</td><td>Full: same as a server</td></tr>
+      <tr><td>Good for</td><td>Git commands, light bash scripts</td><td>Learning Linux, Docker, building like production</td></tr>
+      <tr><td>Paths</td><td><code>/c/Users/...</code></td><td><code>/mnt/c/Users/...</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Use WSL2 for this module. Git Bash is fine for daily Git work, but it will teach you habits that
+  do not match a server.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: copying Windows line endings into scripts</p>
+    <p>A script saved in Notepad with CRLF line endings fails on Linux with
+    <code>bad interpreter: /bin/bash^M</code> or <code>$'\r': command not found</code>. Save shell
+    scripts with LF endings (VS Code shows CRLF/LF in the status bar), or convert with
+    <code>dos2unix script.sh</code> after <code>sudo apt install dos2unix</code>.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>If <code>wsl --install</code> only prints help text, WSL is already present; use
+      <code>wsl --install -d Ubuntu</code> to add a distro.</li>
+      <li>WSL needs virtualisation enabled in BIOS/UEFI. The error mentions "virtualization" when it is
+      off.</li>
+      <li>Linux is case-sensitive: <code>App.java</code> and <code>app.java</code> are different files.
+      This is the classic "works on my Windows laptop, fails on the server" bug.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Why do most production servers run Linux?"</p>
+    <ul>
+      <li>Free, stable, light, scriptable, remote-first; the tools of the cloud era were built on it.</li>
+      <li>Know the difference: the kernel is the core; a distribution adds packages and defaults.</li>
+      <li>Mention that you practise on Ubuntu or WSL2 and can work without a GUI.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-filesystem">
+  <h3>The filesystem: hierarchy, paths and ls -la</h3>
+  <p class="tldr">Linux has one tree starting at <code>/</code>; know where config (<code>/etc</code>), logs
+  (<code>/var/log</code>) and your files (<code>/home</code>) live, and read <code>ls -la</code> column by
+  column.</p>
+
+  <h4>One tree, no drive letters</h4>
+  <p>Windows has <code>C:</code> and <code>D:</code>. Linux has a single tree that starts at the
+  <strong>root directory</strong>, written <code>/</code>. Other disks are <em>mounted</em> into the tree
+  at some folder. Every file on the machine has a place below <code>/</code>.</p>
+  <figure class="fig">
+<pre class="diagram">
+/
+├── bin, usr/bin     programs (ls, cp, java)
+├── etc              configuration files (nginx, ssh, systemd)
+├── home
+│   └── ubuntu       your files   (shortcut: ~)
+├── opt              optional / third-party apps (your JAR goes here)
+├── root             home of the root user
+├── tmp              temporary files (may be wiped on reboot)
+├── usr              installed software and libraries
+└── var
+    ├── log          log files
+    └── lib          app data (databases, docker)
+</pre>
+    <figcaption>The directories you will use most</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Directory</th><th>What lives there</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>/home</code></td><td>One folder per user</td><td><code>/home/ubuntu/projects</code></td></tr>
+      <tr><td><code>/etc</code></td><td>System-wide configuration (text files)</td><td><code>/etc/nginx/nginx.conf</code></td></tr>
+      <tr><td><code>/var/log</code></td><td>Logs from the system and services</td><td><code>/var/log/syslog</code>, <code>/var/log/nginx/</code></td></tr>
+      <tr><td><code>/opt</code></td><td>Self-contained third-party apps</td><td><code>/opt/billing/billing.jar</code></td></tr>
+      <tr><td><code>/usr/bin</code></td><td>Commands installed by packages</td><td><code>/usr/bin/java</code> (often a link)</td></tr>
+      <tr><td><code>/tmp</code></td><td>Scratch space for anyone</td><td>Upload staging, temporary dumps</td></tr>
+      <tr><td><code>/dev/null</code></td><td>A special file that discards everything written to it</td><td><code>cmd &gt; /dev/null</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Absolute and relative paths</h4>
+  <p>An <strong>absolute path</strong> starts with <code>/</code> and means the same thing from anywhere:
+  <code>/etc/nginx/nginx.conf</code>. A <strong>relative path</strong> does not start with
+  <code>/</code> and is read from your <em>current directory</em>. Three shortcuts help:</p>
+  <ul>
+    <li><code>~</code> is your home directory (<code>/home/ubuntu</code>). <code>~/logs</code> is always
+    the same place.</li>
+    <li><code>.</code> is the current directory. <code>./run.sh</code> runs the script in this folder.</li>
+    <li><code>..</code> is the parent directory. <code>cd ..</code> goes up one level.</li>
+  </ul>
+  <pre data-title="Moving around"><code class="language-shell">$ pwd
+/home/ubuntu
+$ cd /var/log
+$ pwd
+/var/log
+$ cd ../lib
+$ pwd
+/var/lib
+$ cd ~
+$ pwd
+/home/ubuntu
+$ cd -
+/var/lib</code></pre>
+  <p><code>cd -</code> jumps back to the previous directory. <code>cd</code> alone goes home.</p>
+
+  <h4>Hidden files</h4>
+  <p>A file whose name starts with a dot is <strong>hidden</strong>: <code>.bashrc</code>,
+  <code>.ssh</code>, <code>.gitignore</code>. Plain <code>ls</code> skips them; <code>ls -a</code> shows
+  them. Configuration for your user lives in such "dotfiles".</p>
+
+  <h4>Reading ls -la column by column</h4>
+  <pre data-title="ls -la"><code class="language-shell">$ ls -la
+total 24
+drwxr-xr-x  4 ubuntu ubuntu 4096 Nov 11 10:02 .
+drwxr-x--- 12 ubuntu ubuntu 4096 Nov 11 09:58 ..
+-rw-------  1 ubuntu ubuntu  412 Nov 10 18:30 .bash_history
+-rwxr-xr-x  1 ubuntu ubuntu  120 Nov 11 10:02 deploy.sh
+drwxr-xr-x  2 ubuntu ubuntu 4096 Nov 11 10:00 logs
+-rw-r--r--  1 ubuntu ubuntu   42 Nov 11 10:01 notes.txt</code></pre>
+  <p>Take the line <code>-rwxr-xr-x 1 ubuntu ubuntu 120 Nov 11 10:02 deploy.sh</code>:</p>
+  <ol class="steps">
+    <li><strong>Type and permissions</strong> (<code>-rwxr-xr-x</code>). The first character is the type:
+    <code>-</code> regular file, <code>d</code> directory, <code>l</code> symbolic link. The next nine
+    characters are three groups of <code>rwx</code> for owner, group and others (see
+    <a href="#m1-permissions">Permissions</a>).</li>
+    <li><strong>Link count</strong> (<code>1</code>). Number of hard links. For a directory it is roughly
+    2 plus the number of sub-directories. You rarely need it.</li>
+    <li><strong>Owner</strong> (<code>ubuntu</code>). The user who owns the file.</li>
+    <li><strong>Group</strong> (<code>ubuntu</code>). The group that owns the file.</li>
+    <li><strong>Size</strong> (<code>120</code>) in bytes. Add <code>-h</code> (<code>ls -lah</code>) for
+    <code>4.0K</code>, <code>2.1M</code>.</li>
+    <li><strong>Modified time</strong> (<code>Nov 11 10:02</code>). For files older than about six months
+    it shows the year instead of the time.</li>
+    <li><strong>Name</strong> (<code>deploy.sh</code>). A link shows <code>name -&gt; target</code>.</li>
+  </ol>
+  <p>The first two lines, <code>.</code> and <code>..</code>, are the directory itself and its parent.
+  <code>total 24</code> is the disk blocks used by the listed files, not a file count.</p>
+
+  <h4>Globbing: wildcards the shell expands</h4>
+  <p>Before a command runs, the shell expands patterns called <strong>globs</strong> into file names. The
+  command never sees the star; it sees the list.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pattern</th><th>Matches</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>*</code></td><td>Any characters (including none)</td><td><code>ls *.log</code></td></tr>
+      <tr><td><code>?</code></td><td>Exactly one character</td><td><code>ls app-?.log</code> → <code>app-1.log</code></td></tr>
+      <tr><td><code>[abc]</code>, <code>[0-9]</code></td><td>One character from the set or range</td><td><code>ls app-[1-3].log</code></td></tr>
+      <tr><td><code>{a,b}</code></td><td>Brace expansion (not a glob, but handy)</td><td><code>mkdir -p logs/{2025,2026}</code></td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Globs in action"><code class="language-shell">$ ls
+app-1.log  app-2.log  app-10.log  notes.txt
+$ ls app-?.log
+app-1.log  app-2.log
+$ ls app-*.log
+app-10.log  app-1.log  app-2.log
+$ echo *.txt
+notes.txt</code></pre>
+  <p>The star does not match hidden files, and it does not cross <code>/</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: quote names that contain spaces</p>
+    <p>The shell splits on spaces. <code>cd My Projects</code> passes two arguments. Write
+    <code>cd "My Projects"</code>, or better, never use spaces in file names on servers — use
+    <code>my-projects</code> or <code>my_projects</code>.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>If no file matches a glob, bash passes the pattern as plain text: <code>ls *.xyz</code> prints
+      <code>ls: cannot access '*.xyz': No such file or directory</code>.</li>
+      <li><code>/home/ubuntu</code> is not <code>/home/ubuntu/</code> to a human, but to the system both
+      are the same directory. A trailing slash matters only for a few tools such as
+      <code>rsync</code>.</li>
+      <li>Symbolic links: <code>/usr/bin/java</code> is usually a link to a JDK folder. <code>ls -l</code>
+      shows <code>-&gt;</code> and the target.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Where would you look for logs and config on a Linux server?"</p>
+    <ul>
+      <li>Logs in <code>/var/log</code> (and <code>journalctl</code> for systemd services); config in
+      <code>/etc</code>; apps you install by hand in <code>/opt</code>.</li>
+      <li>Explain absolute versus relative paths and the meaning of <code>~</code>, <code>.</code>,
+      <code>..</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-file-commands">
+  <h3>Everyday file commands: ls, cp, mv, rm, find, less and more</h3>
+  <p class="tldr">Create, copy, move, delete, view and find files with a small set of commands — and treat
+  <code>rm -rf</code> with respect, because Linux has no recycle bin.</p>
+
+  <h4>The core commands</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>Purpose</th><th>Common use</th></tr></thead>
+    <tbody>
+      <tr><td><code>pwd</code></td><td>Print the current directory</td><td><code>pwd</code></td></tr>
+      <tr><td><code>ls</code></td><td>List files</td><td><code>ls -lah</code>, <code>ls -lt</code> (newest first)</td></tr>
+      <tr><td><code>cd</code></td><td>Change directory</td><td><code>cd /opt/billing</code></td></tr>
+      <tr><td><code>mkdir</code></td><td>Make a directory</td><td><code>mkdir -p app/logs/archive</code></td></tr>
+      <tr><td><code>touch</code></td><td>Create an empty file or update its time</td><td><code>touch notes.txt</code></td></tr>
+      <tr><td><code>cp</code></td><td>Copy</td><td><code>cp a.txt b.txt</code>, <code>cp -r dir dir2</code></td></tr>
+      <tr><td><code>mv</code></td><td>Move or rename</td><td><code>mv old.txt new.txt</code></td></tr>
+      <tr><td><code>rm</code></td><td>Delete</td><td><code>rm file</code>, <code>rm -r dir</code></td></tr>
+      <tr><td><code>cat</code></td><td>Print a whole file</td><td><code>cat application.yml</code></td></tr>
+      <tr><td><code>less</code></td><td>Scroll through a file</td><td><code>less app.log</code></td></tr>
+      <tr><td><code>head</code> / <code>tail</code></td><td>First / last lines</td><td><code>tail -n 50 app.log</code></td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Build a small project folder"><code class="language-shell">$ mkdir -p demo/app/logs
+$ cd demo
+$ touch app/logs/app.log app/README.md
+$ cp app/README.md app/README.bak
+$ mv app/README.bak app/README.old
+$ cp -r app app-copy
+$ ls -R
+.:
+app  app-copy
+
+./app:
+README.md  README.old  logs
+
+./app/logs:
+app.log
+...
+$ rm app/README.old
+$ rm -r app-copy</code></pre>
+  <p><code>mkdir -p</code> creates all missing parent folders and does not complain if the folder exists.
+  <code>cp -r</code> (recursive) is required for folders. <code>mv</code> is both "move" and "rename":
+  moving to the same folder with a new name is a rename.</p>
+
+  <h4>The danger of rm -rf</h4>
+  <p><code>rm</code> deletes immediately and permanently. There is no trash. <code>-r</code> means
+  recursive (go into directories); <code>-f</code> means force (no questions, ignore missing files).
+  Together, <code>rm -rf</code> will wipe a whole tree without asking. Real incidents come from an empty
+  variable: <code>rm -rf "$APP_DIR"/*</code> becomes <code>rm -rf /*</code> when <code>APP_DIR</code> is
+  unset.</p>
+  <div class="co co-rule">
+    <p class="co-t">Rule: look before you delete</p>
+    <ul>
+      <li>Run <code>ls</code> with the same pattern first, then edit the command into <code>rm</code>.</li>
+      <li>Use <code>rm -ri</code> (interactive) when unsure; it asks for each file.</li>
+      <li>Never run <code>rm -rf</code> with a variable you have not checked. In scripts use
+      <code>set -u</code> (see <a href="#m1-bash-scripting">Bash scripting</a>).</li>
+      <li>Never type <code>sudo rm -rf /</code> or <code>rm -rf /*</code>. Ever.</li>
+    </ul>
+  </div>
+
+  <h4>Viewing files</h4>
+  <p><code>cat</code> prints everything; fine for short files, bad for a 2 GB log. For long files use
+  <code>less</code>, which opens a pager. Its keys are the same ones <code>man</code> uses:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Key in <code>less</code></th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td><kbd>Space</kbd> / <kbd>b</kbd></td><td>Page down / page up</td></tr>
+      <tr><td><kbd>↓</kbd> <kbd>↑</kbd> or <kbd>j</kbd> <kbd>k</kbd></td><td>Line down / up</td></tr>
+      <tr><td><kbd>g</kbd> / <kbd>G</kbd></td><td>Go to start / end of file</td></tr>
+      <tr><td><kbd>/error</kbd> then <kbd>n</kbd> / <kbd>N</kbd></td><td>Search forward; next / previous match</td></tr>
+      <tr><td><kbd>F</kbd></td><td>Follow the end of the file live (like <code>tail -f</code>); <kbd>Ctrl</kbd>+<kbd>C</kbd> to stop</td></tr>
+      <tr><td><kbd>q</kbd></td><td>Quit</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="head and tail"><code class="language-shell">$ head -n 3 app.log
+2026-11-11T10:00:01.120+05:30  INFO 4120 --- [main] c.e.BillingApplication : Starting
+2026-11-11T10:00:03.456+05:30  INFO 4120 --- [main] c.e.BillingApplication : Started in 2.4s
+2026-11-11T10:05:10.002+05:30  WARN 4120 --- [io-8080-exec-1] c.e.OrderService : Slow query
+$ tail -n 1 app.log
+2026-11-11T10:09:44.870+05:30 ERROR 4120 --- [io-8080-exec-3] c.e.PaymentClient : Timeout</code></pre>
+  <p><code>tail -f app.log</code> keeps the file open and prints new lines as they arrive; it is the
+  standard way to watch a log live (<a href="#m1-text-tools">Text tools</a>).</p>
+
+  <h4>Finding files with find</h4>
+  <p><code>find</code> walks a directory tree and tests each file. The shape is
+  <code>find WHERE TESTS ACTION</code>.</p>
+  <pre data-title="Common find searches"><code class="language-shell">$ find /var/log -name "*.log"
+/var/log/dpkg.log
+/var/log/nginx/access.log
+$ find . -type d -name logs
+./app/logs
+$ find /opt/billing -type f -mtime -1
+/opt/billing/billing.jar
+$ find /tmp -type f -size +100M
+/tmp/dump.sql
+$ find . -name "*.tmp" -delete</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Test</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>-name "*.log"</code></td><td>Name matches the pattern (quote it so the shell does not expand it); <code>-iname</code> ignores case</td></tr>
+      <tr><td><code>-type f</code> / <code>-type d</code></td><td>Regular files / directories</td></tr>
+      <tr><td><code>-mtime -1</code></td><td>Modified within the last 1 day; <code>-mtime +7</code> = older than 7 days</td></tr>
+      <tr><td><code>-size +100M</code></td><td>Bigger than 100 megabytes</td></tr>
+      <tr><td><code>-delete</code> / <code>-exec cmd {} \;</code></td><td>Delete matches / run a command on each match</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Getting help: which, man and --help</h4>
+  <pre data-title="Where is it, and how does it work?"><code class="language-shell">$ which java
+/usr/bin/java
+$ type cd
+cd is a shell builtin
+$ ls --help | head -3
+Usage: ls [OPTION]... [FILE]...
+List information about the FILEs (the current directory by default).
+$ man tail</code></pre>
+  <p><code>which</code> shows which program runs when you type a name — the first thing to check when
+  "the wrong Java" starts. <code>man tail</code> opens the manual page in <code>less</code> (quit with
+  <kbd>q</kbd>). <code>command --help</code> is a shorter summary. Shell builtins such as <code>cd</code>
+  have no man page of their own; use <code>help cd</code>.</p>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: speed up the terminal</p>
+    <ul>
+      <li><kbd>Tab</kbd> completes file and command names; press it twice to list options.</li>
+      <li><kbd>↑</kbd> recalls earlier commands; <kbd>Ctrl</kbd>+<kbd>R</kbd> searches your history.</li>
+      <li><kbd>Ctrl</kbd>+<kbd>C</kbd> stops a running command; <kbd>Ctrl</kbd>+<kbd>L</kbd> clears the
+      screen; <kbd>Ctrl</kbd>+<kbd>A</kbd> / <kbd>Ctrl</kbd>+<kbd>E</kbd> jump to the start / end of
+      the line.</li>
+      <li><code>!!</code> repeats the last command: <code>sudo !!</code> retries it as root.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: cp and mv silently overwrite</p>
+    <p><code>cp a.txt b.txt</code> replaces <code>b.txt</code> without a warning. Use
+    <code>cp -i</code> or <code>mv -i</code> to be asked first, and <code>cp -n</code> to never
+    overwrite. Also remember: <code>mv file dir</code> moves into the folder if <code>dir</code> exists,
+    but renames <code>file</code> to <code>dir</code> if it does not.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Errors you will see</p>
+    <ul>
+      <li><code>No such file or directory</code> — a wrong path, a typo, or a case difference.</li>
+      <li><code>Permission denied</code> — you lack the right on the file or folder (next article).</li>
+      <li><code>cp: -r not specified; omitting directory 'x'</code> — add <code>-r</code>.</li>
+      <li><code>rm: cannot remove 'x': Is a directory</code> — add <code>-r</code> (or use
+      <code>rmdir</code> for an empty folder).</li>
+      <li><code>Argument list too long</code> — a glob expanded to too many files; use
+      <code>find ... -delete</code> or <code>xargs</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you find large files or recent changes on a server?"</p>
+    <ul>
+      <li><code>find / -type f -size +500M 2&gt;/dev/null</code> for big files; <code>du -sh *</code> to
+      see which folder is big; <code>find -mtime -1</code> for what changed today.</li>
+      <li>Mention that <code>2&gt;/dev/null</code> hides "permission denied" noise.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-permissions">
+  <h3>Users, groups, permissions, chmod, chown and sudo</h3>
+  <p class="tldr">Every file has an owner, a group and three permission sets (read, write, execute for user,
+  group, others); <code>chmod</code> changes the bits, <code>chown</code> changes the owner, and
+  <code>sudo</code> runs one command as root.</p>
+
+  <h4>Why permissions exist</h4>
+  <p>Linux is multi-user. Your web server, your database and you should not be able to read each other's
+  secrets or delete each other's files. Every file therefore records <strong>who owns it</strong> and
+  <strong>who may do what</strong>. If a compromised app runs as a low-privilege user, the attacker
+  cannot touch the rest of the system. This is the base of server security.</p>
+
+  <h4>Reading rwx</h4>
+  <p>From the <a href="#m1-filesystem"><code>ls -l</code> output</a>: <code>-rwxr-xr--</code> has a type
+  character and three groups of three.</p>
+  <figure class="fig">
+<pre class="diagram">
+  -   r w x   r - x   r - -
+  │   └─┬─┘   └─┬─┘   └─┬─┘
+  │    owner   group   others
+  └─ type (- file, d directory, l link)
+</pre>
+    <figcaption>Nine permission bits: owner, group, others</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Bit</th><th>On a file</th><th>On a directory</th></tr></thead>
+    <tbody>
+      <tr><td><code>r</code> read (4)</td><td>View the contents</td><td>List the names inside (<code>ls</code>)</td></tr>
+      <tr><td><code>w</code> write (2)</td><td>Change the contents</td><td>Create, rename and delete files inside</td></tr>
+      <tr><td><code>x</code> execute (1)</td><td>Run it as a program or script</td><td>Enter it (<code>cd</code>) and access files by name</td></tr>
+    </tbody>
+  </table></div>
+  <p>The system checks in order: if you are the owner, the owner bits apply; else if you are in the
+  group, the group bits apply; else the "others" bits apply. Root ignores these checks.</p>
+
+  <h4>Octal notation</h4>
+  <p>Add the values r=4, w=2, x=1 for each group. <code>rwx</code> = 7, <code>r-x</code> = 5,
+  <code>rw-</code> = 6, <code>r--</code> = 4, <code>---</code> = 0. Three digits give owner, group,
+  others.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Octal</th><th>Symbolic</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><code>755</code></td><td><code>rwxr-xr-x</code></td><td>Programs, scripts, directories everyone may enter</td></tr>
+      <tr><td><code>644</code></td><td><code>rw-r--r--</code></td><td>Normal files, config others may read</td></tr>
+      <tr><td><code>600</code></td><td><code>rw-------</code></td><td>Private files: SSH private keys, <code>.env</code> secrets</td></tr>
+      <tr><td><code>700</code></td><td><code>rwx------</code></td><td>Private directories, e.g. <code>~/.ssh</code></td></tr>
+      <tr><td><code>777</code></td><td><code>rwxrwxrwx</code></td><td>Everyone can do everything. Almost never correct</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>chmod: change the mode</h4>
+  <p>Two styles. <strong>Octal</strong> sets all nine bits at once. <strong>Symbolic</strong> changes
+  some bits: who (<code>u</code> user/owner, <code>g</code> group, <code>o</code> others, <code>a</code>
+  all), an operator (<code>+</code>, <code>-</code>, <code>=</code>), and the bits.</p>
+  <pre data-title="chmod examples"><code class="language-shell">$ ls -l deploy.sh
+-rw-r--r-- 1 ubuntu ubuntu 120 Nov 11 10:02 deploy.sh
+$ ./deploy.sh
+bash: ./deploy.sh: Permission denied
+$ chmod +x deploy.sh
+$ ls -l deploy.sh
+-rwxr-xr-x 1 ubuntu ubuntu 120 Nov 11 10:02 deploy.sh
+$ chmod 600 secrets.env
+$ chmod u+x,g-w,o-rwx deploy.sh
+$ chmod -R 755 public/
+$ ls -l secrets.env deploy.sh
+-rw------- 1 ubuntu ubuntu  64 Nov 11 10:03 secrets.env
+-rwxr-x--- 1 ubuntu ubuntu 120 Nov 11 10:02 deploy.sh</code></pre>
+  <p><code>-R</code> applies the change to a whole tree. Be careful: giving <code>755</code> recursively
+  to a tree also makes every data file executable. Use <code>find -type d -exec chmod 755</code> and
+  <code>find -type f -exec chmod 644</code> to treat folders and files separately.</p>
+
+  <h4>chown: change the owner</h4>
+  <pre data-title="chown"><code class="language-shell">$ sudo chown billing:billing /opt/billing/billing.jar
+$ sudo chown -R billing:billing /opt/billing
+$ sudo chown ubuntu app.log
+$ ls -l /opt/billing/billing.jar
+-rw-r--r-- 1 billing billing 58123456 Nov 11 10:10 /opt/billing/billing.jar</code></pre>
+  <p>The format is <code>user:group</code>. Only root can give a file to another user, so you need
+  <code>sudo</code>. Common reason: you copied a JAR as <code>ubuntu</code> but the service runs as
+  <code>billing</code> and cannot write its own log folder.</p>
+
+  <h4>Users, groups and sudo</h4>
+  <pre data-title="Who am I?"><code class="language-shell">$ whoami
+ubuntu
+$ id
+uid=1000(ubuntu) gid=1000(ubuntu) groups=1000(ubuntu),27(sudo),999(docker)
+$ sudo adduser deploy
+$ sudo usermod -aG sudo deploy
+$ sudo usermod -aG docker deploy
+$ groups deploy
+deploy : deploy sudo docker</code></pre>
+  <ul>
+    <li><strong>root</strong> is the all-powerful user (UID 0). It can read, change and delete anything.
+    You should almost never log in as root.</li>
+    <li><strong>sudo</strong> ("superuser do") runs <em>one</em> command as root after asking for your
+    own password (on EC2 Ubuntu the default user has passwordless sudo). Members of the
+    <code>sudo</code> group on Ubuntu may use it. <code>sudo -i</code> opens a root shell; avoid
+    leaving it open.</li>
+    <li><code>adduser</code> creates a user with a home folder (the friendly Debian/Ubuntu command).
+    <code>usermod -aG GROUP USER</code> <em>adds</em> the user to a group. <strong>Always include
+    <code>-a</code></strong>: without it, you replace all the user's groups.</li>
+    <li>Adding a user to <code>docker</code> lets them run Docker without sudo, but it is effectively
+    root-level power. The user must log out and in for new groups to apply.</li>
+    <li>Service accounts: create a system user with no login for each app, for example
+    <code>sudo adduser --system --group billing</code> (checked on Ubuntu/Debian).</li>
+  </ul>
+
+  <h4>Why SSH keys must be 600</h4>
+  <p>An SSH private key is a password in a file. If other users could read it, they could log in as
+  you. So the SSH client refuses to use a key that is readable by others:</p>
+  <pre data-title="The famous SSH permissions error"><code class="language-shell">$ ssh -i mykey.pem ubuntu@203.0.113.10
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@         WARNING: UNPROTECTED PRIVATE KEY FILE!          @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+Permissions 0644 for 'mykey.pem' are too open.
+$ chmod 600 mykey.pem
+$ ssh -i mykey.pem ubuntu@203.0.113.10</code></pre>
+  <p>On the server, <code>~/.ssh</code> should be <code>700</code> and <code>authorized_keys</code>
+  <code>600</code>, or the SSH server may ignore it.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: fixing "Permission denied" with chmod 777</p>
+    <p><code>chmod 777</code> makes every user and every compromised process able to modify the file. It
+    hides the real problem (wrong owner, or missing <code>x</code>). Find out who needs access, then use
+    <code>chown</code> or the minimum bits, such as <code>chmod 750</code>.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: sudo for everything</p>
+    <p><code>sudo mvn package</code> or <code>sudo npm install</code> creates root-owned files in your
+    project, and later builds fail with permission errors. Run builds as yourself. Use <code>sudo</code>
+    only for things that really need root: <code>apt</code>, <code>systemctl</code>, editing
+    <code>/etc</code>.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>To delete a file you need <code>w</code> on the <em>directory</em>, not on the file.</li>
+      <li>A directory without <code>x</code> cannot be entered even if you can read its name.</li>
+      <li>A shell script needs <code>x</code> to run as <code>./script.sh</code>, but
+      <code>bash script.sh</code> needs only <code>r</code>.</li>
+      <li><code>sudo echo "x" &gt; /etc/file</code> fails: the redirection is done by <em>your</em> shell,
+      not by sudo. Use <code>echo "x" | sudo tee /etc/file</code> (add <code>-a</code> to append).</li>
+      <li>Special bits (setuid, sticky bit on <code>/tmp</code>) exist; you can ignore them for now.</li>
+      <li>On WSL, files under <code>/mnt/c</code> may show <code>777</code>-like permissions regardless of
+      <code>chmod</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What does chmod 755 mean? Why is chmod 777 bad?"</p>
+    <ul>
+      <li>7 = rwx for the owner; 5 = r-x for group and others. Owner full control, others read and run.</li>
+      <li>777 lets any user or process change or replace the file — a security hole and usually a sign of
+      a wrong owner.</li>
+      <li>Add: SSH private keys need 600; use least privilege, run services as a non-root user.</li>
+    </ul>
+  </div>
+</article>

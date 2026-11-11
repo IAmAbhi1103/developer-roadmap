@@ -1,0 +1,648 @@
+<article class="topic" id="m3-library-management">
+  <h3>Design a library management system</h3>
+  <p class="tldr">Separate the idea of a book (title, author) from a physical copy that can be loaned; model members, loans with due dates and a fine Strategy, and make check-out of one copy atomic.</p>
+
+  <h4>Requirements and assumptions</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>The library holds books; each book can have several physical copies, each with a barcode.</li>
+    <li>Members search books by title or author, borrow a copy and return it.</li>
+    <li>A member may hold at most 5 loans; a loan lasts 14 days.</li>
+    <li>Late returns cost a fine per overdue day.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> two members cannot borrow the same copy; fine rules must be easy to change.</p>
+  <p><strong>Assumptions:</strong> one library branch, in-memory, reservations and notifications are extensions, librarians are not modelled as separate roles in the core code.</p>
+
+  <h4>Entities and relationships</h4>
+  <p>The key insight: <code>Book</code> and <code>BookCopy</code> are two classes. "Clean Code" is a book (one title, one ISBN); the three shelf copies are <code>BookCopy</code> objects. Status belongs to the copy, not the book.</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class Library {
+    +addBook(Book b, int copies) void
+    +search(String text) List~Book~
+    +checkout(String memberId, String isbn) Loan
+    +returnCopy(String barcode) long
+  }
+  class Book {
+    -String isbn
+    -String title
+    -String author
+  }
+  class BookCopy {
+    -String barcode
+    -CopyStatus status
+    +tryCheckout() boolean
+    +release() void
+  }
+  class Member {
+    -String id
+    -String name
+    +tryAddLoan(String barcode) boolean
+    +removeLoan(String barcode) void
+  }
+  class Loan {
+    -LocalDate issued
+    -LocalDate due
+  }
+  class FineStrategy {
+    &lt;&lt;interface&gt;&gt;
+    +fine(long overdueDays) long
+  }
+  Library "1" o-- "many" Book
+  Book "1" *-- "many" BookCopy
+  Library "1" o-- "many" Member
+  Loan --> BookCopy
+  Loan --> Member
+  Library --> FineStrategy
+  FineStrategy &lt;|.. PerDayFine
+</pre>
+    <figcaption>A Book has many BookCopy objects; a Loan links one copy to one member</figcaption>
+  </figure>
+
+  <h4>Key design decisions</h4>
+  <ul>
+    <li><strong>Book vs copy split</strong> avoids a "copies available" integer that must be kept in sync with who holds what.</li>
+    <li><strong>Loan as an entity</strong> (not just a field) gives you due date, history and the fine calculation a home. Many-to-many "member borrows book" almost always needs a link class with its own data.</li>
+    <li><strong>Strategy for fines</strong> (<a href="#m2">Module 2</a>): per-day today, capped or category-based tomorrow.</li>
+    <li><strong>Search</strong> sits behind a method on <code>Library</code>; if asked for many criteria, extract a <code>SearchCriteria</code> interface or use predicates.</li>
+    <li>A <code>Clock</code> is injected so due dates are testable.</li>
+  </ul>
+
+  <h4>Core code: model</h4>
+  <pre data-title="LibraryModel.java"><code class="language-java">import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+enum CopyStatus { AVAILABLE, LOANED }
+
+record Book(String isbn, String title, String author) { }
+
+class BookCopy {
+    private final String barcode;
+    private final Book book;
+    private CopyStatus status = CopyStatus.AVAILABLE;
+
+    BookCopy(String barcode, Book book) {
+        this.barcode = barcode;
+        this.book = book;
+    }
+
+    String barcode() { return barcode; }
+    Book book() { return book; }
+
+    synchronized boolean tryCheckout() {            // check and set in one step
+        if (status != CopyStatus.AVAILABLE) return false;
+        status = CopyStatus.LOANED;
+        return true;
+    }
+
+    synchronized void release() { status = CopyStatus.AVAILABLE; }
+}
+
+class Member {
+    static final int MAX_LOANS = 5;
+    private final String id, name;
+    private final Set&lt;String&gt; borrowed = new HashSet&lt;&gt;();
+
+    Member(String id, String name) {
+        this.id = id;
+        this.name = name;
+    }
+
+    String id() { return id; }
+
+    synchronized boolean tryAddLoan(String barcode) {
+        if (borrowed.size() &gt;= MAX_LOANS) return false;
+        return borrowed.add(barcode);
+    }
+
+    synchronized void removeLoan(String barcode) { borrowed.remove(barcode); }
+}
+
+record Loan(BookCopy copy, Member member, LocalDate issued, LocalDate due) { }
+
+interface FineStrategy {
+    long fine(long overdueDays);                    // paise
+}
+
+class PerDayFine implements FineStrategy {
+    public long fine(long overdueDays) { return Math.max(0, overdueDays) * 200; }
+}</code></pre>
+
+  <h4>Core code: the library service</h4>
+  <pre data-title="Library.java"><code class="language-java">import java.time.Clock;
+import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+class Library {
+    private static final int LOAN_DAYS = 14;
+
+    private final Map&lt;String, Book&gt; books = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, List&lt;BookCopy&gt;&gt; copies = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Member&gt; members = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Loan&gt; loansByBarcode = new ConcurrentHashMap&lt;&gt;();
+    private final FineStrategy fines;
+    private final Clock clock;
+
+    Library(FineStrategy fines, Clock clock) {
+        this.fines = fines;
+        this.clock = clock;
+    }
+
+    void addMember(Member m) { members.put(m.id(), m); }
+
+    void addBook(Book b, int copyCount) {
+        books.put(b.isbn(), b);
+        List&lt;BookCopy&gt; list = copies.computeIfAbsent(b.isbn(), k -&gt; new ArrayList&lt;&gt;());
+        synchronized (list) {
+            for (int i = 0; i &lt; copyCount; i++) {
+                list.add(new BookCopy(b.isbn() + "-" + (list.size() + 1), b));
+            }
+        }
+    }
+
+    List&lt;Book&gt; search(String text) {
+        String q = text.toLowerCase();
+        return books.values().stream()
+                .filter(b -&gt; b.title().toLowerCase().contains(q)
+                          || b.author().toLowerCase().contains(q))
+                .toList();
+    }
+
+    Loan checkout(String memberId, String isbn) {
+        Member m = members.get(memberId);
+        List&lt;BookCopy&gt; list = copies.get(isbn);
+        if (m == null || list == null) throw new IllegalArgumentException("Unknown member or book");
+
+        for (BookCopy c : List.copyOf(list)) {
+            if (!c.tryCheckout()) continue;               // someone else holds this copy
+            if (!m.tryAddLoan(c.barcode())) {              // limit reached: undo
+                c.release();
+                throw new IllegalStateException("Loan limit reached");
+            }
+            LocalDate today = LocalDate.now(clock);
+            Loan loan = new Loan(c, m, today, today.plusDays(LOAN_DAYS));
+            loansByBarcode.put(c.barcode(), loan);
+            return loan;
+        }
+        throw new IllegalStateException("No copy available");
+    }
+
+    long returnCopy(String barcode) {
+        Loan loan = loansByBarcode.remove(barcode);
+        if (loan == null) throw new IllegalArgumentException("Copy is not on loan");
+        long overdue = ChronoUnit.DAYS.between(loan.due(), LocalDate.now(clock));
+        loan.member().removeLoan(barcode);
+        loan.copy().release();
+        return fines.fine(overdue);
+    }
+}</code></pre>
+  <pre data-title="LibraryDemo.java"><code class="language-java">import java.time.Clock;
+
+public class LibraryDemo {
+    public static void main(String[] args) {
+        Library lib = new Library(new PerDayFine(), Clock.systemDefaultZone());
+        lib.addMember(new Member("M1", "Asha"));
+        lib.addBook(new Book("978-0132350884", "Clean Code", "Robert C. Martin"), 2);
+
+        Loan loan = lib.checkout("M1", "978-0132350884");
+        System.out.println("Due: " + loan.due().isAfter(loan.issued()));
+        System.out.println("Fine: " + lib.returnCopy(loan.copy().barcode()));
+        System.out.println(lib.search("clean").size());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Due: true
+Fine: 0
+1</code></pre>
+
+  <h4>Concurrency</h4>
+  <ul>
+    <li><code>BookCopy.tryCheckout</code> is synchronized on the copy: two members racing for the last copy cannot both win.</li>
+    <li>The member's limit is checked inside the member's own lock; if the limit fails we <em>undo</em> the copy checkout. That is a compensating step, simpler than holding two locks.</li>
+    <li><code>loansByBarcode.remove</code> is atomic, so a double return does not double-charge a fine.</li>
+  </ul>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a counter on Book</p>
+    <p>Keeping <code>availableCopies++/--</code> on <code>Book</code> tempts you into an unsynchronized read-modify-write and loses updates under load. Derive availability from the copies themselves.</p>
+  </div>
+
+  <h4>Edge cases</h4>
+  <ul>
+    <li>Same member borrows two copies of the same title: policy question; add a check on the member's loans by ISBN if not allowed.</li>
+    <li>Return of a copy that is not on loan, or an unknown barcode: clean error.</li>
+    <li>Overdue by zero or negative days (early return): <code>Math.max(0, ...)</code> gives no fine.</li>
+    <li>Member with unpaid fines: block new loans (add a check in <code>checkout</code>).</li>
+    <li>Lost copy: a third status <code>LOST</code> and a replacement-cost fee.</li>
+  </ul>
+
+  <h4>Extensions interviewers ask</h4>
+  <ul>
+    <li><strong>Reservations:</strong> a queue of waiting members per ISBN; on return, notify the first one (Observer, <a href="#m2">Module 2</a>) and hold the copy for 2 days.</li>
+    <li><strong>Different member types</strong> (student 3 loans, staff 10): a <code>MembershipPolicy</code> Strategy holding the limit and loan days.</li>
+    <li><strong>Renewals:</strong> extend <code>due</code> once if nobody reserved the book; make <code>Loan</code> hold a mutable due date or create a new Loan.</li>
+    <li><strong>Multiple branches:</strong> add <code>Branch</code>; copies belong to a branch.</li>
+    <li><strong>Search by many fields:</strong> an index map (author to books) or a database full-text index.</li>
+  </ul>
+    <h4>What the interviewer is testing</h4>
+  <p>Library management is a favourite "warm-up" LLD problem because it looks easy and hides several design questions. The interviewer wants to see whether you (1) separate the <em>idea</em> of a book from a physical copy, (2) model the link between member and copy as its own thing with dates (a loan), (3) keep rules such as fines and limits out of the entities so they can change, and (4) notice that two members can race for the last copy. Candidates who put an <code>int availableCopies</code> on <code>Book</code> and a <code>borrow()</code> method on <code>Member</code> usually get stuck on all four. The general routine is in <a href="#m3-lld-method">The LLD method</a>; here it is applied with the talking points.</p>
+
+  <h4>Clarifying questions to ask, and the answers to assume</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>You ask</th><th>Why it matters</th><th>Assume if not told</th></tr></thead>
+    <tbody>
+      <tr><td>One branch or many?</td><td>Decides if copies belong to a branch</td><td>One branch</td></tr>
+      <tr><td>Same loan rules for all members?</td><td>Strategy for limits and days</td><td>Same rules; extension later</td></tr>
+      <tr><td>Reservations when all copies are out?</td><td>Adds a queue and notifications</td><td>Out of scope, discuss at the end</td></tr>
+      <tr><td>Can a book be renewed?</td><td>Mutable due date or new loan</td><td>Not in scope</td></tr>
+      <tr><td>Digital catalogue search by what?</td><td>Index or a simple filter</td><td>Title and author</td></tr>
+      <tr><td>Is it multi-threaded or persistent?</td><td>Locks vs database constraints</td><td>In-memory, thread-safe</td></tr>
+    </tbody>
+  </table></div>
+  <p>Say: "I will build checkout, return, search and fines. Reservations and renewals I will mention as extensions." That one sentence protects your time.</p>
+
+  <h4>The lifecycle of one copy</h4>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> AVAILABLE
+  AVAILABLE --> LOANED : checkout
+  LOANED --> AVAILABLE : return
+  LOANED --> LOST : reported lost
+  AVAILABLE --> RESERVED : held for a member
+  RESERVED --> LOANED : reserver collects
+  RESERVED --> AVAILABLE : hold expires
+</pre>
+    <figcaption>The core code has two states; RESERVED and LOST are the natural extensions</figcaption>
+  </figure>
+
+  <h4>The checkout flow, step by step</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant M as Member
+  participant L as Library
+  participant C as BookCopy
+  M->>L: checkout(memberId, isbn)
+  L->>C: tryCheckout() on each copy
+  C-->>L: true for the first free copy
+  L->>M: tryAddLoan(barcode)
+  M-->>L: false if the limit is reached
+  L->>C: release() when the limit failed
+  L-->>M: Loan with a due date
+</pre>
+    <figcaption>If the member's limit fails, the copy is released again (a compensating step)</figcaption>
+  </figure>
+
+  <h4>Extension in code: membership types and reservations</h4>
+  <pre data-title="LibraryExtensions.java"><code class="language-java">import java.util.Deque;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
+
+// Strategy: limits and days depend on the membership type
+enum Membership {
+    STUDENT(3, 14), STAFF(10, 30);
+
+    private final int maxLoans;
+    private final int loanDays;
+    Membership(int maxLoans, int loanDays) {
+        this.maxLoans = maxLoans;
+        this.loanDays = loanDays;
+    }
+    int maxLoans() { return maxLoans; }
+    int loanDays() { return loanDays; }
+}
+
+// Reservation queue: first come, first served, per ISBN
+class ReservationQueue {
+    private final Map&lt;String, Deque&lt;String&gt;&gt; waiting = new ConcurrentHashMap&lt;&gt;();
+
+    void reserve(String isbn, String memberId) {
+        waiting.computeIfAbsent(isbn, k -&gt; new ConcurrentLinkedDeque&lt;&gt;())
+               .addLast(memberId);
+    }
+
+    Optional&lt;String&gt; nextFor(String isbn) {
+        Deque&lt;String&gt; q = waiting.get(isbn);
+        return q == null ? Optional.empty() : Optional.ofNullable(q.pollFirst());
+    }
+}
+
+// Observer: told when a copy comes back, so it can notify the next member
+interface ReturnListener {
+    void onCopyReturned(String isbn, String nextMemberId);
+}</code></pre>
+  <p>In <code>returnCopy</code> you would call <code>reservations.nextFor(isbn)</code> and, if a member id is present, notify the listener and keep the copy in a <code>RESERVED</code> state until a deadline. Replacing the fixed <code>MAX_LOANS</code> and <code>LOAN_DAYS</code> constants with a field of type <code>Membership</code> on <code>Member</code> touches only those two places; <code>Library</code> asks the member for its limits.</p>
+
+  <h4>Concurrency: from JVM locks to database constraints</h4>
+  <ul>
+    <li><strong>In memory:</strong> the check-and-set on <code>BookCopy</code> is atomic because both steps are inside one <code>synchronized</code> method. Never hold two locks at once (copy and member) unless you always take them in the same order, or you invite a deadlock.</li>
+    <li><strong>In a database:</strong> the same rule becomes a constraint. In PostgreSQL, a partial unique index guarantees that a copy has at most one open loan, even with many application servers:</li>
+  </ul>
+  <pre data-title="loan.sql"><code class="language-sql">CREATE TABLE loan (
+    id          BIGSERIAL PRIMARY KEY,
+    copy_id     BIGINT NOT NULL REFERENCES book_copy(id),
+    member_id   BIGINT NOT NULL REFERENCES member(id),
+    issued_on   DATE   NOT NULL,
+    due_on      DATE   NOT NULL,
+    returned_on DATE
+);
+
+-- at most one active loan per copy: the second insert fails
+CREATE UNIQUE INDEX one_active_loan_per_copy
+    ON loan (copy_id) WHERE returned_on IS NULL;</code></pre>
+  <p>The application catches the unique-violation error, treats it as "someone else took this copy" and tries the next copy. This is the same idea as in <a href="#m3-concurrency-in-lld">Concurrency in LLD</a>: make the database the final referee.</p>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: availability as a counter</p><pre><code class="language-java">class Book {
+    int available = 3;
+    boolean borrow() {
+        if (available &gt; 0) { available--; return true; }   // race
+        return false;
+    }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: state lives on each copy</p><pre><code class="language-java">for (BookCopy c : copies) {
+    if (c.tryCheckout()) {          // atomic check-and-set on one copy
+        return new Loan(c, member, today, today.plusDays(14));
+    }
+}
+throw new IllegalStateException("No copy available");</code></pre></div>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>A <code>Book</code> is a title; a <code>BookCopy</code> is a physical item with its own barcode and status.</li>
+      <li>Limits, loan days and fines are policies, not constants buried in the entities.</li>
+      <li>Check-and-update of a copy's status must be one atomic step.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Give <code>Loan</code> the dates and let it answer "is it overdue on this day?" rather than computing in the service.</li>
+      <li>Inject a <code>Clock</code>; in tests use <code>Clock.fixed(...)</code> to test fines without waiting.</li>
+      <li>Keep search in its own method or class (<code>CatalogSearch</code>) so you can later swap the in-memory filter for a database query.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and exceptions</p>
+    <ul>
+      <li>Returning a copy twice: <code>loansByBarcode.remove</code> returns <code>null</code> the second time, so you throw <code>IllegalArgumentException</code> and charge no second fine.</li>
+      <li>Crash between "copy marked loaned" and "loan saved": in a database use one transaction; in memory the compensating <code>release()</code> covers the limit failure but not a JVM crash, which is why real systems persist.</li>
+      <li>A member returns a book after the library's closing time: the policy (count that day or not) is a requirement; ask the interviewer.</li>
+    </ul>
+  </div>
+<div class="co co-interview">
+    <p class="co-t">How to present this in 45 minutes</p>
+    <ol>
+      <li>5 min: ask about member types, limits, fines, reservations, branches.</li>
+      <li>7 min: diagram; stress Book vs BookCopy and Loan as a link entity.</li>
+      <li>20 min: code <code>BookCopy</code>, <code>Loan</code>, <code>Library.checkout/returnCopy</code>.</li>
+      <li>8 min: concurrency on the last copy, edge cases, then reservations with Observer.</li>
+    </ol>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: sentences that score points</p>
+    <ul>
+      <li>"I separate Book from BookCopy so availability is derived, not a counter I must keep in sync."</li>
+      <li>"Loan is an association class: it carries the due date, so fines and history have a home."</li>
+      <li>"Fines are a Strategy; membership limits are another small policy. Neither is hard-coded."</li>
+      <li>"Two members racing for the last copy are handled by an atomic check-and-set on the copy; in a database I would add a unique partial index."</li>
+      <li>"For reservations I would add a queue per ISBN and an Observer to notify the next member."</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-vending-machine">
+  <h3>Design a vending machine with the State pattern</h3>
+  <p class="tldr">A vending machine behaves differently depending on whether it is idle, holds money or is out of service, so give each situation its own State class and let the machine delegate every action to its current state instead of using nested if statements.</p>
+
+  <h4>Requirements and assumptions</h4>
+  <ul>
+    <li>The machine sells products identified by a code (A1, B2) with a price and a stock count.</li>
+    <li>Flow: insert money, choose a product, receive the product and change.</li>
+    <li>The user may cancel before choosing and gets a refund.</li>
+    <li>Reject: choosing without money, not enough money, sold-out product, unknown code.</li>
+    <li>An admin can refill stock (separate API, not covered by user states).</li>
+    <li>Assumptions: money is accepted as a total amount in paise (no coin hardware), change is always available, one user at a time, the machine object is shared by the keypad, so its methods are synchronized.</li>
+  </ul>
+
+  <h4>The state machine first</h4>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> HasMoney : insertMoney
+  HasMoney --> HasMoney : insertMoney
+  HasMoney --> Idle : select and dispense
+  HasMoney --> Idle : cancel and refund
+  Idle --> Idle : select rejected
+</pre>
+    <figcaption>States and the events that move between them</figcaption>
+  </figure>
+  <p>Draw this before the class diagram: states are the nodes, user actions are the arrows. Each state decides what every action means. In <code>Idle</code>, "select product" is an error; in <code>HasMoney</code>, "select product" tries to sell.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class VendingMachine {
+    -VendingState state
+    -Inventory inventory
+    -long balance
+    +insertMoney(long paise) void
+    +select(String code) Dispense
+    +cancel() long
+  }
+  class VendingState {
+    &lt;&lt;interface&gt;&gt;
+    +insertMoney(VendingMachine m, long paise) void
+    +select(VendingMachine m, String code) Dispense
+    +cancel(VendingMachine m) long
+  }
+  class IdleState
+  class HasMoneyState
+  class Inventory {
+    -Map~String, Product~ products
+    -Map~String, Integer~ stock
+  }
+  VendingMachine --> VendingState : current
+  VendingMachine --> Inventory
+  VendingState &lt;|.. IdleState
+  VendingState &lt;|.. HasMoneyState
+</pre>
+    <figcaption>The machine holds data; the states hold the behaviour (State pattern, Module 2)</figcaption>
+  </figure>
+
+  <h4>Key design decisions</h4>
+  <ul>
+    <li><strong>State pattern</strong> (<a href="#m2">Module 2</a>): the alternative is a <code>switch (state)</code> inside every method. Adding an <code>OutOfServiceState</code> then means editing every switch; with State it is one new class.</li>
+    <li><strong>Default methods throw</strong> <code>IllegalStateException</code>, so each concrete state overrides only what is valid for it.</li>
+    <li><strong>The machine owns data</strong> (balance, inventory); states own transitions. States are stateless, so they could be shared, but creating them keeps the code simple.</li>
+    <li><strong>Inventory is a separate class</strong> (single responsibility): stock changes do not touch the state logic.</li>
+  </ul>
+
+  <h4>Core code: inventory and state interface</h4>
+  <pre data-title="VendingBase.java"><code class="language-java">import java.util.HashMap;
+import java.util.Map;
+
+record Product(String code, String name, long pricePaise) { }
+
+record Dispense(Product product, long changePaise) { }
+
+class Inventory {
+    private final Map&lt;String, Product&gt; products = new HashMap&lt;&gt;();
+    private final Map&lt;String, Integer&gt; stock = new HashMap&lt;&gt;();
+
+    void add(Product p, int quantity) {
+        products.put(p.code(), p);
+        stock.merge(p.code(), quantity, Integer::sum);
+    }
+
+    Product find(String code) {
+        Product p = products.get(code);
+        if (p == null) throw new IllegalArgumentException("Unknown product " + code);
+        return p;
+    }
+
+    boolean inStock(String code) { return stock.getOrDefault(code, 0) &gt; 0; }
+
+    void take(String code) { stock.merge(code, -1, Integer::sum); }
+}
+
+interface VendingState {
+    default void insertMoney(VendingMachine m, long paise) {
+        throw new IllegalStateException("Cannot insert money now");
+    }
+    default Dispense select(VendingMachine m, String code) {
+        throw new IllegalStateException("Cannot select now");
+    }
+    default long cancel(VendingMachine m) {
+        throw new IllegalStateException("Nothing to cancel");
+    }
+}</code></pre>
+
+  <h4>Core code: the two states and the machine</h4>
+  <pre data-title="VendingStates.java"><code class="language-java">class IdleState implements VendingState {
+    @Override
+    public void insertMoney(VendingMachine m, long paise) {
+        if (paise &lt;= 0) throw new IllegalArgumentException("Amount must be positive");
+        m.addBalance(paise);
+        m.setState(new HasMoneyState());
+    }
+    // select and cancel inherit the default: they throw
+}
+
+class HasMoneyState implements VendingState {
+    @Override
+    public void insertMoney(VendingMachine m, long paise) {
+        if (paise &lt;= 0) throw new IllegalArgumentException("Amount must be positive");
+        m.addBalance(paise);
+    }
+
+    @Override
+    public Dispense select(VendingMachine m, String code) {
+        Product p = m.inventory().find(code);
+        if (!m.inventory().inStock(code)) {
+            throw new IllegalStateException("Sold out: " + p.name());
+        }
+        if (m.balance() &lt; p.pricePaise()) {
+            throw new IllegalStateException(
+                "Insert " + (p.pricePaise() - m.balance()) + " more paise");
+        }
+        m.inventory().take(code);
+        long change = m.balance() - p.pricePaise();
+        m.clearBalance();
+        m.setState(new IdleState());
+        return new Dispense(p, change);
+    }
+
+    @Override
+    public long cancel(VendingMachine m) {
+        long refund = m.balance();
+        m.clearBalance();
+        m.setState(new IdleState());
+        return refund;
+    }
+}
+
+class VendingMachine {
+    private VendingState state = new IdleState();
+    private final Inventory inventory;
+    private long balance;
+
+    VendingMachine(Inventory inventory) { this.inventory = inventory; }
+
+    synchronized void insertMoney(long paise) { state.insertMoney(this, paise); }
+    synchronized Dispense select(String code) { return state.select(this, code); }
+    synchronized long cancel() { return state.cancel(this); }
+
+    // used by states
+    Inventory inventory() { return inventory; }
+    long balance() { return balance; }
+    void addBalance(long p) { balance += p; }
+    void clearBalance() { balance = 0; }
+    void setState(VendingState s) { state = s; }
+}
+
+public class VendingDemo {
+    public static void main(String[] args) {
+        Inventory inv = new Inventory();
+        inv.add(new Product("A1", "Cola", 4_000), 2);
+        VendingMachine vm = new VendingMachine(inv);
+
+        vm.insertMoney(5_000);
+        Dispense d = vm.select("A1");
+        System.out.println(d.product().name() + ", change " + d.changePaise());
+        try {
+            vm.select("A1");                      // back to Idle: not allowed
+        } catch (IllegalStateException e) {
+            System.out.println("Error: " + e.getMessage());
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Cola, change 1000
+Error: Cannot select now</code></pre>
+
+  <h4>Concurrency</h4>
+  <p>The public methods of <code>VendingMachine</code> are <code>synchronized</code>, which makes each action (check state, change balance, move state) atomic. A physical machine has one keypad, so this is enough. For a networked fleet, each machine is still one object per JVM; the server-side stock count becomes a database row updated with <code>UPDATE ... SET stock = stock - 1 WHERE stock &gt; 0</code>.</p>
+
+  <h4>Edge cases</h4>
+  <ul>
+    <li>Money inserted, product sold out: stay in <code>HasMoney</code> so the user can pick another item or cancel.</li>
+    <li>Exact payment: change is 0.</li>
+    <li>Unknown code: <code>IllegalArgumentException</code> before touching stock.</li>
+    <li>Machine cannot make change: add a coin float to the machine and check it before selling (a real constraint; ask about it).</li>
+    <li>Power loss mid-transaction: persist balance, or refund on restart.</li>
+  </ul>
+  <div class="co co-exc">
+    <p class="co-t">Where State differs from Strategy</p>
+    <p>Both swap an object behind an interface. In Strategy the <em>client</em> chooses the algorithm and it rarely changes during use. In State the <em>object changes itself</em> from one state to the next as events happen, so states know about each other.</p>
+  </div>
+
+  <h4>Extensions interviewers ask</h4>
+  <ul>
+    <li><strong>Out-of-service state:</strong> add <code>OutOfServiceState</code> where everything throws except <code>cancel</code>; the machine enters it when a sensor fails. No existing state changes.</li>
+    <li><strong>Dispensing as its own state</strong> when the motor takes seconds: Idle, HasMoney, Dispensing, then Idle.</li>
+    <li><strong>Coin and note handling:</strong> a <code>CoinChanger</code> class with denominations and a greedy change algorithm.</li>
+    <li><strong>Several payment methods:</strong> a <code>PaymentMethod</code> Strategy (cash, UPI QR).</li>
+    <li><strong>Sales report and low-stock alerts:</strong> an Observer on <code>Inventory</code>.</li>
+  </ul>
+  <div class="co co-interview">
+    <p class="co-t">How to present this in 45 minutes</p>
+    <ol>
+      <li>5 min: flow, error cases, cash or UPI, admin refill.</li>
+      <li>8 min: draw the state diagram on the board first, then the classes.</li>
+      <li>20 min: code the interface with default methods, two states, the machine.</li>
+      <li>7 min: run the demo, discuss State vs switch, add out-of-service.</li>
+    </ol>
+  </div>
+</article>

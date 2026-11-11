@@ -1,0 +1,237 @@
+<article class="topic" id="m1-filesystems">
+  <h3>File systems: files, directories, inodes and allocation</h3>
+  <p class="tldr">A file system turns raw disk blocks into named files and directories; on Unix a file's metadata and block pointers live in an inode, directories map names to inode numbers, and allocation methods (contiguous, linked, indexed) decide how a file's blocks are placed on disk.</p>
+
+  <h4>Files and directories</h4>
+  <p>A <strong>file</strong> is a named collection of related bytes stored persistently. The OS hides disk sectors and presents a file as a stream of bytes. Its attributes include name, type, size, location, owner, permissions and timestamps. The main operations are create, open, read, write, seek, truncate, close and delete; the matching Java classes are in <code>java.io</code> and <code>java.nio.file</code> (see <a href="02-core-java.html#m3">Core Java · Module 3</a>).</p>
+  <p>A <strong>directory</strong> is a special file that maps names to files. Directory structures: single-level (one flat list, name clashes), two-level (one directory per user), <strong>tree-structured</strong> (directories inside directories, with absolute and relative paths; what you use daily) and <strong>acyclic graph</strong> (a file can appear under two names through links, but no loops).</p>
+  <p>When a program calls <code>open()</code>, the kernel returns a small integer, the <strong>file descriptor</strong>, an index into the process's table of open files. 0, 1 and 2 are standard input, output and error. Sockets and pipes also use descriptors, so "everything is a file" on Unix. Each process may open only a limited number of descriptors.</p>
+
+  <h4>The inode</h4>
+  <p>On Unix-style file systems (ext4, XFS and others) each file has an <strong>inode</strong> (index node), a fixed-size structure holding everything about the file <em>except its name</em>: type, owner, permissions, size, timestamps, link count and the pointers to the data blocks. The inode is identified by an <strong>inode number</strong>. A directory entry is simply (name → inode number). That separation makes links possible:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Hard link</th><th>Symbolic (soft) link</th></tr></thead>
+    <tbody>
+      <tr><td>What it is</td><td>Another directory entry pointing to the <em>same inode</em></td><td>A small file containing a path to another file</td></tr>
+      <tr><td>If the original name is deleted</td><td>File stays (inode link count falls from 2 to 1)</td><td>Link breaks (dangling)</td></tr>
+      <tr><td>Across file systems / to directories</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Create</td><td><code>ln a b</code></td><td><code>ln -s a b</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>A file's data is freed only when its link count reaches zero <em>and</em> no process still has it open. That is why a deleted log file still takes disk space while a process holds it open (a classic surprise in production; <code>df</code> shows full but <code>du</code> does not).</p>
+  <pre data-title="Looking at inodes"><code class="language-shell">$ ls -i report.txt
+524301 report.txt
+$ ln report.txt backup.txt &amp;&amp; ls -li report.txt backup.txt
+524301 -rw-r--r-- 2 asha asha 1204 Nov 11 10:00 backup.txt
+524301 -rw-r--r-- 2 asha asha 1204 Nov 11 10:00 report.txt</code></pre>
+  <p>Both names show the same inode number and a link count of 2. The numbers here are examples.</p>
+
+  <h4>File allocation methods</h4>
+  <p>How are a file's blocks placed on the disk?</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>How</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Contiguous</strong></td><td>File occupies consecutive blocks (start, length)</td><td>Fast sequential and direct access; simple</td><td>External fragmentation; file size must be known or hard to grow</td></tr>
+      <tr><td><strong>Linked</strong></td><td>Each block holds a pointer to the next block</td><td>No external fragmentation; grows easily</td><td>Slow random access (follow the chain); one broken pointer loses the rest; pointer space per block</td></tr>
+      <tr><td><strong>Indexed</strong></td><td>An index block lists all the file's block addresses</td><td>Direct access; no external fragmentation</td><td>Index block overhead, even for tiny files</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>FAT</strong> (the file allocation table, used on USB sticks and SD cards) is the linked method with the chain pointers moved into one table. Unix <strong>inodes</strong> use a clever indexed scheme: the inode holds some <em>direct</em> pointers to data blocks, plus a <em>single indirect</em> pointer (to a block of pointers), a <em>double indirect</em> and a <em>triple indirect</em> pointer. Small files stay fast; huge files are still possible.</p>
+  <p><strong>Worked example</strong> (the classic ext2-style layout): block size 4 KB, block pointer 4 bytes, 12 direct pointers.</p>
+  <ul>
+    <li>Pointers per indirect block = 4096 / 4 = 1,024.</li>
+    <li>Direct: 12 × 4 KB = <strong>48 KB</strong>.</li>
+    <li>Single indirect: 1,024 × 4 KB = <strong>4 MB</strong>.</li>
+    <li>Double indirect: 1,024 × 1,024 × 4 KB = <strong>4 GB</strong>.</li>
+    <li>Triple indirect: 1,024<sup>3</sup> × 4 KB = <strong>4 TB</strong>.</li>
+  </ul>
+  <p>Modern file systems such as ext4 use <em>extents</em> (a start block plus a length) instead of long pointer lists, but the indirect-block scheme remains the standard teaching example.</p>
+
+  <h4>Free-space management and reliability</h4>
+  <ul>
+    <li><strong>Bitmap:</strong> one bit per block (1 = free, or the reverse). Easy to find runs of free blocks.</li>
+    <li><strong>Linked list of free blocks</strong>, or a list of free runs (grouping and counting).</li>
+    <li><strong>Journaling:</strong> before changing the file system's structures, the OS writes the intended change to a log (the journal). After a crash it replays or discards the log instead of scanning the whole disk, which keeps the file system consistent. ext4, NTFS and XFS journal their metadata.</li>
+    <li><strong>Buffer (page) cache:</strong> recently used blocks stay in RAM, so most reads never touch the disk. Writes are normally buffered too, so a program must call <code>fsync</code> (Java: <code>FileChannel.force</code>) when it needs data on the disk before continuing; this is what databases do at commit.</li>
+  </ul>
+  <p>For Unix permissions (read, write, execute for owner, group and others, written like <code>rwxr-xr--</code>) and the shell commands around files, see <a href="07-devops.html#m1">DevOps · Linux and the command line</a>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the name lives in the directory, not in the inode</p>
+    <p>Rename and move within a file system change only directory entries; the inode and data stay put. That is why a rename is instant.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A file system can run out of <em>inodes</em> before it runs out of space (millions of tiny files); <code>df -i</code> shows it, and the error message is still "No space left on device".</li>
+      <li>Deleting a file does not erase its data; the blocks are only marked free.</li>
+      <li>On Windows the path separator and case rules differ; Java's <code>Path</code> hides most of that.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is an inode? Hard link vs soft link? File allocation methods?"</p>
+    <ul>
+      <li>Inode: per-file metadata and block pointers (not the name); directory entries map names to inode numbers.</li>
+      <li>Hard link shares the inode and survives deletion of the other name; soft link stores a path.</li>
+      <li>Contiguous / linked / indexed with one pro and con each; inode direct and indirect pointers.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-disk-io">
+  <h3>Disk scheduling and I/O: polling, interrupts and DMA</h3>
+  <p class="tldr">Disk scheduling orders pending requests to cut head movement (SSTF, SCAN, C-SCAN, LOOK beat FCFS), and the OS talks to devices with polling, interrupts or DMA, the last letting the device copy data to memory without the CPU.</p>
+
+  <h4>How a hard disk takes time</h4>
+  <p>A magnetic disk has spinning <strong>platters</strong> divided into circular <strong>tracks</strong>, each split into <strong>sectors</strong>; the same track on all platters forms a <strong>cylinder</strong>. A read or write costs:</p>
+  <ul>
+    <li><strong>Seek time:</strong> moving the head to the right track (usually the largest part).</li>
+    <li><strong>Rotational latency:</strong> waiting for the sector to rotate under the head.</li>
+    <li><strong>Transfer time:</strong> reading the data.</li>
+  </ul>
+  <p>Seek time dominates, so the OS reorders requests to reduce total head movement. <strong>SSDs</strong> have no moving parts, so seek time and rotational latency disappear and disk-scheduling algorithms matter much less (SSDs have their own issues, such as write wear and erase blocks). The algorithms below are still asked in interviews.</p>
+
+  <h4>Disk-scheduling algorithms: one worked example</h4>
+  <p>Disk with cylinders 0 to 199. The head is at cylinder <strong>53</strong>. The request queue (in arrival order) is: <strong>98, 183, 37, 122, 14, 124, 65, 67</strong>. We count total head movement in cylinders.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Algorithm</th><th>Rule</th><th>Service order</th><th>Total movement</th></tr></thead>
+    <tbody>
+      <tr><td><strong>FCFS</strong></td><td>Arrival order</td><td>98, 183, 37, 122, 14, 124, 65, 67</td><td>640</td></tr>
+      <tr><td><strong>SSTF</strong></td><td>Shortest seek time first: nearest request next</td><td>65, 67, 37, 14, 98, 122, 124, 183</td><td>236</td></tr>
+      <tr><td><strong>SCAN</strong> (elevator), initially moving toward 0</td><td>Sweep to the end, then reverse</td><td>37, 14, (0), 65, 67, 98, 122, 124, 183</td><td>236</td></tr>
+      <tr><td><strong>C-SCAN</strong>, moving toward 199</td><td>Sweep to the end, jump back to the start, sweep again</td><td>65, 67, 98, 122, 124, 183, (199), (0), 14, 37</td><td>382 counting the return jump (183 without)</td></tr>
+      <tr><td><strong>LOOK</strong>, initially toward 0</td><td>Like SCAN but reverse at the last request, not the disk end</td><td>37, 14, 65, 67, 98, 122, 124, 183</td><td>208</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Calculations.</strong></p>
+  <ul>
+    <li>FCFS: |53−98| + |98−183| + |183−37| + |37−122| + |122−14| + |14−124| + |124−65| + |65−67| = 45 + 85 + 146 + 85 + 108 + 110 + 59 + 2 = <strong>640</strong>.</li>
+    <li>SSTF: 12 (to 65) + 2 (67) + 30 (37) + 23 (14) + 84 (98) + 24 (122) + 2 (124) + 59 (183) = <strong>236</strong>.</li>
+    <li>SCAN toward 0: 53→37 is 16, →14 is 23, →0 is 14, then 0→65 is 65, →67 is 2, →98 is 31, →122 is 24, →124 is 2, →183 is 59. Sum = 16 + 23 + 14 + 65 + 2 + 31 + 24 + 2 + 59 = <strong>236</strong>.</li>
+    <li>C-SCAN toward 199: 53→65 is 12, →67 is 2, →98 is 31, →122 is 24, →124 is 2, →183 is 59, →199 is 16; that is 146. Return jump 199→0 is 199; then 0→14 is 14 and 14→37 is 23. Sum = 146 + 199 + 14 + 23 = <strong>382</strong>. Books differ on whether the return jump counts; without it the figure is 183.</li>
+    <li>LOOK toward 0: 16 + 23 (to 14) + 51 (14→65) + 2 + 31 + 24 + 2 + 59 = <strong>208</strong>.</li>
+  </ul>
+  <p>FCFS is fair but wasteful (640). SSTF is greedy and can <strong>starve</strong> far-away requests when new nearby ones keep arriving. SCAN gives a bounded wait and is fairer; C-SCAN gives more uniform wait times because requests at both ends are treated alike (it only services in one direction). LOOK and C-LOOK save the useless trip to the physical end. Linux's modern I/O schedulers are more complex (and for SSDs often "none" or simple deadline-style schedulers).</p>
+
+  <h4>How the CPU talks to I/O devices</h4>
+  <p>Every device has a <strong>controller</strong> with registers (status, command, data). A <strong>device driver</strong> (kernel code) knows how to operate one kind of device and offers the OS a uniform interface. Three ways to transfer data:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>How</th><th>CPU cost</th><th>Good for</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Polling</strong> (programmed I/O)</td><td>CPU repeatedly checks the device's status register until it is ready</td><td>High: busy waiting</td><td>Very fast devices, very short waits</td></tr>
+      <tr><td><strong>Interrupt-driven I/O</strong></td><td>CPU starts the operation and does other work; the device raises an <em>interrupt</em> when done and the CPU runs an interrupt handler</td><td>Medium: one interrupt per byte or block</td><td>Keyboards, network packets, mouse</td></tr>
+      <tr><td><strong>DMA</strong> (direct memory access)</td><td>CPU programs the DMA controller with source, destination and count; the controller moves the whole block between device and RAM; one interrupt at the end</td><td>Low</td><td>Disks, network cards, bulk transfers</td></tr>
+    </tbody>
+  </table></div>
+  <figure class="fig">
+<pre class="diagram">
+ Interrupt-driven read:                          DMA read:
+
+ 1. driver tells device: "read block"            1. driver sets up DMA: device -> RAM,
+ 2. CPU runs other processes                        address, length
+ 3. device finishes ──► interrupt                2. CPU runs other processes
+ 4. handler copies data, wakes the process       3. DMA controller copies the data itself
+                                                 4. ONE interrupt at the end
+</pre>
+    <figcaption>With DMA the CPU is interrupted once per block, not once per byte</figcaption>
+  </figure>
+  <p>An <strong>interrupt</strong> makes the CPU save its state, jump to the handler found through the <em>interrupt vector table</em>, and then resume. The timer interrupt that drives preemptive scheduling is the most important one.</p>
+
+  <h4>Blocking, non-blocking and asynchronous I/O</h4>
+  <ul>
+    <li><strong>Blocking:</strong> the call does not return until the data is ready; the process sleeps in the waiting state. Java's <code>InputStream.read()</code> and classic <code>Socket</code> work this way, so a thread is tied up per connection.</li>
+    <li><strong>Non-blocking:</strong> the call returns at once, perhaps with "no data yet". The program asks again later, or uses a readiness API (<code>select</code>, <code>poll</code>, <code>epoll</code> on Linux) to wait on many descriptors with one thread. Java NIO's <code>Selector</code> and Netty (under Spring WebFlux) are built on this.</li>
+    <li><strong>Asynchronous:</strong> the call returns at once and the OS notifies you when the operation has completed (Linux <code>io_uring</code>, Windows I/O completion ports; Java's <code>AsynchronousChannel</code>).</li>
+  </ul>
+  <p>Kernel I/O support also includes <strong>buffering</strong> (hold data in memory to smooth the speed difference between device and process), <strong>caching</strong> (keep a copy of data in fast memory) and <strong>spooling</strong> (queue output for a device that serves one job at a time, such as a printer).</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: an interrupt handler must be short</p>
+    <p>It runs with some interrupts masked, so it only acknowledges the device and schedules the longer work for later (the "bottom half" in Linux).</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Polling can be better than interrupts when the device is extremely fast and busy, since the cost of each interrupt exceeds the cost of a short spin. High-speed network stacks use a mix.</li>
+      <li>SSTF and SCAN assume the head position is known; modern disks and SSDs hide their geometry (logical block addresses), so the OS only approximates.</li>
+      <li>DMA competes with the CPU for the memory bus ("cycle stealing"), slowing the CPU slightly during transfers.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Disk scheduling algorithms? Polling vs interrupts vs DMA?"</p>
+    <ul>
+      <li>Do the 53-head example if asked: FCFS 640, SSTF 236, SCAN 236, LOOK 208. Name SSTF's starvation and why SCAN is the elevator.</li>
+      <li>Polling = CPU asks repeatedly; interrupt = device tells the CPU; DMA = device moves data to RAM by itself and interrupts once.</li>
+      <li>Blocking vs non-blocking vs async I/O, with the Java link (NIO <code>Selector</code>, virtual threads).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-os-backend">
+  <h3>How operating-system ideas show up in backend work</h3>
+  <p class="tldr">Thread pools, connection pools, memory limits in containers, the OOM killer and context-switch cost are the OS concepts you meet daily as a backend developer; knowing the theory tells you what to measure and how to size things.</p>
+
+  <h4>Thread pools and the cost of threads</h4>
+  <p>Every platform thread is a kernel thread with its own stack and scheduling cost (see <a href="#m1-threads">threads</a>). Creating one per request wastes time and memory, and thousands of runnable threads mean constant <strong>context switching</strong> (<a href="#m1-processes">context switch</a>) with cold caches. So servers use a <strong>thread pool</strong>: a fixed set of reusable worker threads that take tasks from a queue, which is the producer–consumer pattern from <a href="#m1-classic-problems">classic problems</a>. Embedded Tomcat in Spring Boot uses up to 200 request threads by default (property <code>server.tomcat.threads.max</code>), and Java's <code>ExecutorService</code> is the general tool (<a href="02-core-java.html#m6">Core Java · Module 6</a>).</p>
+  <p>How big should a pool be?</p>
+  <ul>
+    <li><strong>CPU-bound</strong> work (calculation): about the number of cores (or cores + 1). More threads only add context switches.</li>
+    <li><strong>I/O-bound</strong> work (database, HTTP calls): threads spend most of their time in the waiting state, so you can have many more. A rule of thumb from <em>Java Concurrency in Practice</em>: <code>threads = cores × target utilisation × (1 + wait time / compute time)</code>. For 4 cores, full utilisation and a task that waits 90 ms for every 10 ms of compute (ratio 9): 4 × 1 × (1 + 9) = <strong>40 threads</strong>. Treat this as a starting point and measure.</li>
+    <li>Virtual threads (Java 21) make the one-thread-per-request style cheap for I/O-bound work, because the OS no longer pays for each waiting thread.</li>
+  </ul>
+
+  <h4>Connection pools and semaphores</h4>
+  <p>A database connection is expensive to open and the database can serve only so many at once. A <strong>connection pool</strong> (HikariCP in Spring Boot, default maximum size 10) hands out a limited number of connections; further requests wait for one to be returned. It is exactly a counting semaphore with N permits (<a href="#m1-mutex-semaphore">semaphores</a>). Two consequences:</p>
+  <ul>
+    <li>If a request holds a connection while it calls a slow service, the pool drains and all other requests block: this looks like a deadlock but is really resource starvation. Hold connections briefly.</li>
+    <li>A pool can <em>deadlock</em> if a task holding a connection needs a second connection from the same pool, and every thread does the same. Keep one connection per unit of work.</li>
+  </ul>
+
+  <h4>Memory limits in containers</h4>
+  <p>A container does not get its own kernel; Linux <strong>cgroups</strong> limit how much memory and CPU its processes may use. If the processes in a container try to use more memory than the limit, the kernel kills one of them. Kubernetes reports this as <code>OOMKilled</code>, and the exit code is 137 (128 + signal 9, <code>SIGKILL</code>).</p>
+  <ul>
+    <li>The JVM's memory is more than the heap: it also holds metaspace, thread stacks (each thread has its own stack), code cache, direct buffers and garbage-collector structures. A container limit of 512 MB with <code>-Xmx512m</code> will be killed, because the total exceeds the limit.</li>
+    <li>Modern JVMs read the container limit (container support is on by default). Setting <code>-XX:MaxRAMPercentage</code> (for example 75.0) sizes the heap as a fraction of the limit and leaves room for the rest. More in <a href="02-core-java.html#m7">Core Java · Module 7</a>.</li>
+    <li>CPU limits work through scheduling: a container limited to half a CPU gets throttled (it is not given time slices) when it uses more, which shows up as latency spikes under load.</li>
+  </ul>
+
+  <h4>The OOM killer, swap and monitoring</h4>
+  <p>On a plain server, if RAM and swap run out, the kernel's OOM killer picks a process with a high score (mainly big memory users) and kills it. Typical sign: the database or your Java service vanishes with no stack trace; the kernel log (<code>dmesg</code>) says "Out of memory: Killed process". Do not confuse this with Java's own <code>OutOfMemoryError</code>, which the JVM throws when <em>its heap</em> is full while the OS still has memory.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Symptom</th><th>OS idea</th><th>Check with</th></tr></thead>
+    <tbody>
+      <tr><td>High load, low CPU use</td><td>Processes waiting on I/O, locks or swap</td><td><code>top</code>, <code>vmstat 1</code> (columns <code>b</code>, <code>wa</code>)</td></tr>
+      <tr><td>Service killed silently, container <code>OOMKilled</code></td><td>OOM killer / cgroup limit</td><td><code>dmesg</code>, <code>kubectl describe pod</code></td></tr>
+      <tr><td>Everything slow, disk busy, memory full</td><td>Thrashing</td><td><code>vmstat</code> (<code>si</code>, <code>so</code>), <code>free -m</code></td></tr>
+      <tr><td>Requests hang, threads stuck</td><td>Deadlock or lock contention</td><td><code>jstack &lt;pid&gt;</code> (twice, a few seconds apart)</td></tr>
+      <tr><td><code>Too many open files</code></td><td>Per-process file-descriptor limit</td><td><code>ulimit -n</code>, <code>lsof -p &lt;pid&gt;</code></td></tr>
+      <tr><td>Many <code>Z</code> processes</td><td>Zombies not reaped by their parent</td><td><code>ps aux</code>, fix the parent or use an init process</td></tr>
+    </tbody>
+  </table></div>
+  <p>Sockets also use file descriptors, so a service with a connection leak ends with "Too many open files". Leaked connections, unclosed streams and forgotten <code>try-with-resources</code> are the usual causes.</p>
+
+  <h4>Other everyday connections</h4>
+  <ul>
+    <li><strong>Page cache:</strong> a file read the second time is fast because the kernel cached it in RAM. "Free memory" is therefore a poor health metric; look at "available".</li>
+    <li><strong>Graceful shutdown:</strong> Kubernetes sends <code>SIGTERM</code>; Spring Boot can finish in-flight requests (<code>server.shutdown=graceful</code>) before exiting (<a href="#m1-ipc">signals</a>).</li>
+    <li><strong>Race conditions in singletons:</strong> a Spring <code>@Service</code> is shared by all request threads, so mutable fields need the tools from the <a href="#m1-sync-critical-section">synchronization article</a>.</li>
+    <li><strong>Locks in the database:</strong> row locks and deadlock detection behave as in the <a href="#m1-deadlock-detection-recovery">deadlock articles</a>; see <a href="#m3">DBMS theory</a>.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: bound every resource</p>
+    <p>Queues, pools, memory and open files must have limits, and callers must have timeouts. Unbounded resources fail suddenly (OOM, descriptor exhaustion); bounded ones fail early and visibly (rejected tasks, timeouts), which you can handle.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "just add more threads"</p>
+    <p>More threads on a CPU-bound or lock-bound service increases context switches and contention without adding capacity; on a memory-limited container, each thread's stack adds to the footprint. Measure first.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "A service is slow and its CPU is only 10% - what could be wrong?"</p>
+    <ul>
+      <li>Threads blocked on I/O, a slow downstream call, an exhausted connection pool, lock contention or a deadlock, or heavy swapping/GC pauses.</li>
+      <li>Take thread dumps, check pool metrics, <code>vmstat</code> for I/O wait and swap, and the GC log.</li>
+      <li>Tie the answer to OS ideas: waiting state, semaphores (pools), context switches, thrashing.</li>
+    </ul>
+  </div>
+</article>

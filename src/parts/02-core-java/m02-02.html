@@ -1,0 +1,727 @@
+<article class="topic" id="m2-this-keyword">
+  <h3>The this keyword: what it is and where you use it</h3>
+  <p class="tldr">Inside an instance method or constructor, <code>this</code> is a reference to the object being worked on; you use it to separate a field from a parameter, call another constructor, pass the object to someone else, return it for chaining and reach an outer object.</p>
+
+  <p>When you write <code>ravi.withdraw(500)</code>, the method <code>withdraw</code> runs on one particular object: <code>ravi</code>. Inside the method, the keyword <code>this</code> is a reference to that object. The compiler passes it as a hidden extra argument to every instance method call. Most of the time you do not write it, because Java adds it for you: <code>balance -= amount</code> means <code>this.balance -= amount</code>.</p>
+
+  <h4>Three facts about this</h4>
+  <ul>
+    <li>It exists only in <strong>instance context</strong>: instance methods, constructors, instance initializer blocks and instance field initializers. A <code>static</code> method belongs to the class, not to an object, so it has no <code>this</code> (see <a href="#m2-static">static</a>).</li>
+    <li>Its type is the class where the code is written, but at run time it can be an object of a subclass. In a method of <code>Account</code>, <code>this</code> may really be a <code>SavingsAccount</code>. This is what makes <a href="#m2-polymorphism">polymorphism</a> work.</li>
+    <li>You cannot assign to it: <code>this = other;</code> is a compile error. It is also never <code>null</code>. If you call a method on a <code>null</code> reference, the <code>NullPointerException</code> happens at the call, before the method starts.</li>
+  </ul>
+
+  <h4>Use 1: separate a field from a parameter</h4>
+  <p>When a parameter or local variable has the same name as a field, the parameter <strong>shadows</strong> (hides) the field. Inside that method, the plain name means the parameter. Write <code>this.name</code> to reach the field.</p>
+  <pre data-title="Customer.java"><code class="language-java">public class Customer {
+    private String name;
+    private int age;
+
+    public Customer(String name, int age) {
+        this.name = name;      // field = parameter
+        this.age = age;
+    }
+
+    public void setName(String name) {
+        this.name = name;      // same pattern in a setter
+    }
+}</code></pre>
+  <p>This is the most common use of <code>this</code>. Using the same name for the parameter and the field is a normal Java style, because the name says exactly what the value is. The risk is forgetting the <code>this.</code> — see the mistake in <a href="#m2-constructors">constructors</a>.</p>
+
+  <h4>Use 2: call another constructor with this(…)</h4>
+  <p>Inside a constructor, <code>this(…)</code> calls another constructor of the same class. You use it to write the setup and validation once and let the short constructors delegate to the full one. The rules (first statement, no loops, no instance members in the arguments) are in <a href="#m2-constructors">constructors in depth</a>.</p>
+
+  <h4>Use 3: pass the current object to someone else</h4>
+  <p>Sometimes an object must hand itself to another object — to register as a listener, to add itself to a list, or to ask a helper to work on it. You pass <code>this</code> as the argument.</p>
+  <pre data-title="PriceDemo.java"><code class="language-java">import java.util.*;
+
+public class PriceDemo {
+    static class PriceFeed {
+        private final List&lt;PriceAlert&gt; subscribers = new ArrayList&lt;&gt;();
+        void subscribe(PriceAlert alert) { subscribers.add(alert); }
+        void publish(long paise) {
+            for (PriceAlert a : subscribers) a.onPrice(paise);
+        }
+    }
+
+    static class PriceAlert {
+        private final String productId;
+        private final long targetPaise;
+
+        PriceAlert(String productId, long targetPaise) {
+            this.productId = productId;
+            this.targetPaise = targetPaise;
+        }
+
+        void watch(PriceFeed feed) {
+            feed.subscribe(this);          // "here I am": passes the current object
+        }
+
+        void onPrice(long paise) {
+            if (paise &lt;= targetPaise) {
+                System.out.println("Alert " + productId + ": price dropped to " + paise);
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        PriceFeed feed = new PriceFeed();
+        new PriceAlert("SKU-101", 45_000).watch(feed);
+        feed.publish(49_900);
+        feed.publish(44_900);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Alert SKU-101: price dropped to 44900</code></pre>
+  <p>Only the second price is at or below the target of 45,000 paise, so only one alert prints.</p>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: letting this escape from a constructor</p>
+    <p>If a constructor passes <code>this</code> to other code before all fields are assigned, that code can see a half-built object. In multithreaded code another thread may even call it at that moment (<a href="#m6">Module 6</a>).</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: this escapes first</p><pre><code class="language-java">PriceAlert(String productId, long target, PriceFeed feed) {
+    feed.subscribe(this);          // a callback now sees productId == null
+    this.productId = productId;
+    this.targetPaise = target;
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: finish building, then publish</p><pre><code class="language-java">static PriceAlert createAndWatch(String productId, long target, PriceFeed feed) {
+    PriceAlert alert = new PriceAlert(productId, target);   // fully built
+    feed.subscribe(alert);                                  // then shared
+    return alert;
+}</code></pre></div>
+    </div>
+  </div>
+
+  <h4>Use 4: return this for method chaining</h4>
+  <p>If a method changes the object and then returns <code>this</code>, callers can chain calls on one line. This is called a <strong>fluent</strong> style. <code>StringBuilder.append()</code> works this way, and builders use it heavily.</p>
+  <pre data-title="ThisDemo.java"><code class="language-java">import java.util.*;
+
+public class ThisDemo {
+    static class Pizza {
+        private String size = "M";
+        private boolean extraCheese;
+        private final List&lt;String&gt; toppings = new ArrayList&lt;&gt;();
+
+        Pizza size(String size) { this.size = size; return this; }
+        Pizza extraCheese()     { this.extraCheese = true; return this; }
+        Pizza topping(String t) { toppings.add(t); return this; }
+
+        @Override public String toString() {
+            return "Pizza[size=" + size + ", extraCheese=" + extraCheese
+                    + ", toppings=" + toppings + "]";
+        }
+    }
+
+    public static void main(String[] args) {
+        Pizza p = new Pizza().size("L").extraCheese().topping("onion").topping("capsicum");
+        System.out.println(p);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Pizza[size=L, extraCheese=true, toppings=[onion, capsicum]]</code></pre>
+  <p>Notice that the methods are named after the property (<code>size(…)</code>), not <code>setSize(…)</code>. That is the usual fluent-API naming, and it is different from the JavaBeans naming you will meet in <a href="#m2-encapsulation">encapsulation</a>. Immutable classes cannot change themselves, so their "chain" methods return a <em>new</em> object instead of <code>this</code>.</p>
+
+  <h4>Use 5: name the outer object with Outer.this</h4>
+  <p>An inner class (a class declared inside another class, see <a href="#m2-nested-classes">nested classes</a>) holds a hidden reference to an object of the outer class. If both classes have a field with the same name, <code>Outer.this</code> reaches the outer one.</p>
+  <pre data-title="OuterThis.java"><code class="language-java">public class OuterThis {
+    private String name = "outer";
+
+    class Inner {
+        private String name = "inner";
+        void show() {
+            System.out.println(name);               // the closest one: inner
+            System.out.println(this.name);          // inner
+            System.out.println(OuterThis.this.name);// outer
+        }
+    }
+
+    public static void main(String[] args) {
+        new OuterThis().new Inner().show();
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">inner
+inner
+outer</code></pre>
+
+  <h4>Quick reference</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Form</th><th>Meaning</th><th>Where you can use it</th></tr></thead>
+    <tbody>
+      <tr><td><code>this</code></td><td>The current object</td><td>Instance methods, constructors, instance blocks</td></tr>
+      <tr><td><code>this.x</code>, <code>this.m()</code></td><td>A field or method of the current object</td><td>Same; needed only when a local name hides the field</td></tr>
+      <tr><td><code>this(…)</code></td><td>Call another constructor of the same class</td><td>First statement of a constructor</td></tr>
+      <tr><td><code>Outer.this</code></td><td>The enclosing object of an inner class</td><td>Inside an inner (non-static) class</td></tr>
+      <tr><td><code>super.m()</code>, <code>super(…)</code></td><td>The parent's version (not this keyword, but its sibling)</td><td>Subclasses — see <a href="#m2-inheritance">inheritance</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for this</p>
+    <ul>
+      <li>It is allowed only in instance context. In a <code>static</code> method javac says <code>non-static variable this cannot be referenced from a static context</code>.</li>
+      <li>It cannot be reassigned.</li>
+      <li><code>this(…)</code> and <code>super(…)</code> must be the first statement of a constructor, and a constructor can use only one of them (Java 25 relaxes the "first" part, see the version note in <a href="#m2-constructors">constructors</a>).</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Lambdas and anonymous classes differ.</strong> Inside a lambda, <code>this</code> means the enclosing object, because a lambda is not a new object. Inside an anonymous class, <code>this</code> is the anonymous object itself, and you write <code>Outer.this</code> for the enclosing one (<a href="#m5">Module 5</a>).</li>
+      <li><strong>Overridable calls through this.</strong> A call like <code>describe()</code> in a constructor really means <code>this.describe()</code>, and it runs the <em>subclass</em> version, even though the subclass is not ready yet (see <a href="#m2-init-order">initialization order</a>).</li>
+      <li><strong>Field initializers may use this</strong>, but only fields declared above them are guaranteed to be set at that point.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">When to write this</p>
+    <ul>
+      <li>Write <code>this.</code> when you must: shadowing, passing the object on, returning it, <code>this(…)</code>. Leave it out elsewhere; extra <code>this.</code> everywhere is noise.</li>
+      <li>Some teams require <code>this.</code> on every field access to make fields stand out. Follow your team's style guide and stay consistent.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is this, and can you use it in a static method?"</p>
+    <ul>
+      <li><code>this</code> is a reference to the current object; it is passed implicitly to every instance method and constructor.</li>
+      <li>No, you cannot use it in a static method, because static code runs without any object.</li>
+      <li>Name the uses: disambiguate field vs parameter, <code>this(…)</code> chaining, passing the object, returning it for chaining, <code>Outer.this</code>.</li>
+      <li>Difference to remember: <code>this</code> is a reference to an object; <code>this(…)</code> is a constructor call. They are different things that share a word.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-static">
+  <h3>static: shared fields, methods, blocks and utility classes</h3>
+  <p class="tldr">A <code>static</code> member belongs to the class itself, not to any object: there is one shared copy, you use it without <code>new</code>, and because there is no <code>this</code> a static method cannot touch instance fields.</p>
+
+  <p>Normally every object has its own copy of each field. Two <code>Account</code> objects have two balances. Sometimes you need something that exists <strong>once for the whole class</strong>: a counter of created accounts, a constant, a helper like <code>Math.max()</code>. That is what <code>static</code> is for.</p>
+
+  <h4>Static fields: one copy for the class</h4>
+  <p>A static field is created once, when the class is first initialized, and every object (and every piece of code) sees the same value. Access it with the class name: <code>Account.totalAccounts</code>.</p>
+  <pre data-title="StaticDemo.java"><code class="language-java">public class StaticDemo {
+    static class Account {
+        private static int totalAccounts = 0;   // one copy, shared by all accounts
+        private final int id;                   // one copy per account
+
+        Account() {
+            id = ++totalAccounts;               // each new account takes the next number
+        }
+
+        static int getTotalAccounts() { return totalAccounts; }
+        int getId() { return id; }
+    }
+
+    public static void main(String[] args) {
+        Account a = new Account();
+        Account b = new Account();
+        System.out.println(a.getId() + " " + b.getId() + " total=" + Account.getTotalAccounts());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">1 2 total=2</code></pre>
+  <p>Static fields are good for constants (<code>static final</code>), counters and caches. They are risky for anything that changes, because the one copy is shared by every thread and every user of the program. The line <code>++totalAccounts</code> above is not safe when two threads create accounts at the same time; <a href="#m6">Module 6</a> shows <code>AtomicInteger</code> for that. A static field also lives as long as the class is loaded, which is normally the whole run of the application (<a href="#m7">Module 7</a>).</p>
+
+  <h4>Static methods: functions that need no object</h4>
+  <p>A static method is called with the class name and works only on its parameters and on other static members. The JDK is full of them: <code>Math.max()</code>, <code>Integer.parseInt()</code>, <code>Arrays.sort()</code>, <code>List.of()</code>, <code>String.valueOf()</code>. The <code>main</code> method is static because the JVM must start your program before any object exists.</p>
+  <p>A static method has no <code>this</code>, so it cannot use instance fields or call instance methods directly. The compiler asks the right question: <em>whose</em> field? There may be a hundred <code>Counter</code> objects, and the static method is not running on any of them.</p>
+  <pre data-title="Counter.java"><code class="language-java">public class Counter {
+    private int count = 0;
+
+    static void reset() {
+        count = 0;           // whose count?
+        this.count = 0;      // there is no this
+        increment();         // increment() needs an object too
+    }
+
+    void increment() { count++; }
+}</code></pre>
+  <pre class="out" data-title="javac output"><code class="language-plaintext">Counter.java:5: error: non-static variable count cannot be referenced from a static context
+        count = 0;
+        ^
+Counter.java:6: error: non-static variable this cannot be referenced from a static context
+        this.count = 0;
+        ^
+Counter.java:7: error: non-static method increment() cannot be referenced from a static context
+        increment();
+        ^
+3 errors</code></pre>
+  <p>You have three honest fixes. Make the field static if it really is shared state. Make the method an instance method if it works on one object. Or pass an object in: <code>static void reset(Counter c) { c.count = 0; }</code>. A static method <em>can</em> use instance members through an object reference; what it cannot do is use them without one.</p>
+
+  <h4>Static blocks: one-time setup for the class</h4>
+  <p>A <strong>static initializer block</strong> is code in <code>static { … }</code> that runs once, when the class is initialized. Use it when a static field needs more than one expression to set up.</p>
+  <pre data-title="CountryCodes.java"><code class="language-java">import java.util.*;
+
+public class CountryCodes {
+    private static final Map&lt;String, String&gt; DIAL_CODES = new HashMap&lt;&gt;();
+
+    static {                                  // runs once, when the class loads
+        DIAL_CODES.put("IN", "+91");
+        DIAL_CODES.put("US", "+1");
+        DIAL_CODES.put("GB", "+44");
+    }
+
+    public static String dialCode(String iso) {
+        return DIAL_CODES.get(iso);
+    }
+}</code></pre>
+  <p>A class can have several static blocks; they run in the order they appear, mixed with static field initializers. For a small constant map, <code>Map.of("IN", "+91", "US", "+1")</code> is shorter and the result cannot be modified. The exact order of everything is in <a href="#m2-init-order">initialization order</a>.</p>
+  <div class="co co-exc">
+    <p class="co-t">When a static initializer fails</p>
+    <p>If a static initializer throws, the class cannot be initialized. The first use gives <code>ExceptionInInitializerError</code> (with the real exception as its cause). Every later use gives <code>NoClassDefFoundError: Could not initialize class …</code>, which hides the original cause and confuses people. Look for the first error in the logs.</p>
+    <pre data-title="StaticInitFail.java"><code class="language-java">public class StaticInitFail {
+    static class Config {
+        static final int PORT = Integer.parseInt("80x");   // throws while loading Config
+        static int port() { return PORT; }
+    }
+
+    public static void main(String[] args) {
+        try { Config.port(); }
+        catch (Throwable t) { System.out.println(t.getClass().getName() + " &lt;- " + t.getCause()); }
+        try { Config.port(); }
+        catch (Throwable t) { System.out.println(t.getClass().getName() + ": " + t.getMessage()); }
+    }
+}</code></pre>
+    <pre class="out" data-title="Output"><code class="language-plaintext">java.lang.ExceptionInInitializerError &lt;- java.lang.NumberFormatException: For input string: "80x"
+java.lang.NoClassDefFoundError: Could not initialize class StaticInitFail$Config</code></pre>
+  </div>
+
+  <h4>Static versus instance at a glance</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Instance member</th><th>Static member</th></tr></thead>
+    <tbody>
+      <tr><td>Belongs to</td><td>One object</td><td>The class</td></tr>
+      <tr><td>Copies</td><td>One per object</td><td>One per class</td></tr>
+      <tr><td>Created when</td><td>Each <code>new</code></td><td>The class is first initialized</td></tr>
+      <tr><td>Accessed with</td><td>An object reference</td><td>The class name</td></tr>
+      <tr><td>Has <code>this</code>?</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Can use instance members?</td><td>Yes</td><td>Only through an object reference</td></tr>
+      <tr><td>Can use static members?</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Overriding</td><td>Methods can be overridden</td><td>Methods are hidden, never overridden (<a href="#m2-overriding">overriding</a>)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Utility classes</h4>
+  <p>A <strong>utility class</strong> is a class that only holds static methods, with no state. <code>Math</code>, <code>Arrays</code>, <code>Collections</code> and <code>Objects</code> are examples. Nobody should create an object of such a class, so the convention is: a <code>final</code> class with a <code>private</code> constructor.</p>
+  <pre data-title="RupeeFormat.java"><code class="language-java">public final class RupeeFormat {
+    private RupeeFormat() {
+        throw new AssertionError("Utility class, do not instantiate");
+    }
+
+    // assumes paise &gt;= 0
+    public static String ofPaise(long paise) {
+        return String.format("Rs. %d.%02d", paise / 100, paise % 100);
+    }
+}
+
+// RupeeFormat.ofPaise(1_29_900)  returns  "Rs. 1299.00"</code></pre>
+  <p>The private constructor stops <code>new RupeeFormat()</code> from outside, and the <code>AssertionError</code> stops accidental calls from inside the class. Use static helpers for pure functions (same input, same output, no hidden state). When logic needs state or must be replaced in a test, make it a normal class and let Spring inject it.</p>
+
+  <h4>Static and inheritance</h4>
+  <ul>
+    <li>A static field is shared with subclasses: there is still only one copy. A subclass that declares a field with the same name creates a second, separate field (that is <em>hiding</em>, not overriding).</li>
+    <li>A static method is inherited by name, but redeclaring it in a subclass hides it. Which one runs depends on the declared type of the reference, not on the object (<a href="#m2-overriding">overriding rules</a>).</li>
+    <li>Static members cannot be abstract, and an <code>interface</code> may have static methods that are <em>not</em> inherited by the classes that implement it (<a href="#m2-interfaces">interfaces</a>).</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and surprises</p>
+    <ul>
+      <li><strong>Calling a static method on a null reference works.</strong> <code>Util u = null; u.hello();</code> prints the result with no <code>NullPointerException</code>, because the compiler uses the <em>declared type</em> <code>Util</code> and ignores the value. Never write code like this; call <code>Util.hello()</code>.</li>
+      <li><strong>No static local variables.</strong> Unlike C, <code>static int x;</code> inside a method is a compile error. If a value must survive between calls, make it a field.</li>
+      <li><strong>Static fields are not serialized</strong> with the object, because they do not belong to it.</li>
+      <li><strong>The <code>main</code> method</strong> can be overloaded, but the JVM starts the program only through <code>public static void main(String[] args)</code>. Java 25 also allows simpler forms of <code>main</code>, for example without <code>String[] args</code>, mainly to make first programs easier to write (JEP 512); real projects still use the classic form.</li>
+      <li><strong>Constants are inlined.</strong> A <code>static final</code> primitive or <code>String</code> with a constant value is copied into the code that uses it (more in <a href="#m2-final">final</a>).</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using static for data that belongs to one user or one request</p>
+    <p>There is one copy of a static field per JVM. In a web application, one JVM serves all users at the same time, so a static "current user" is shared by everybody. Users see each other's data, and the bug shows up only under load.</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: one value for all users</p><pre><code class="language-java">public class UserContext {
+    private static String currentUser;     // shared by every request thread
+    public static void set(String user) { currentUser = user; }
+    public static String get() { return currentUser; }
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: pass it, or keep it per request</p><pre><code class="language-java">public class OrderService {
+    public Order place(String user, Cart cart) {   // pass the user as a parameter
+        return new Order(user, cart);
+    }
+}
+// Frameworks keep per-request data in ThreadLocal or request-scoped beans.</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Constants: <code>public static final</code> and UPPER_SNAKE_CASE, for example <code>MAX_RETRIES</code>.</li>
+      <li>Call static members through the class name (<code>Account.getTotalAccounts()</code>), never through an object. IDEs warn about the second form.</li>
+      <li>Keep static mutable state to a minimum. It makes code hard to test and unsafe across threads.</li>
+      <li>Utility class: <code>final</code> + <code>private</code> constructor + only static methods.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In a real Spring Boot project</p>
+    <p>You write exactly one important static method yourself: <code>public static void main</code> that calls <code>SpringApplication.run(…)</code>. Everything else is usually an instance method on a Spring bean. You will still call many static methods from the JDK and libraries (<code>LocalDate.now()</code>, <code>Objects.requireNonNull()</code>, <code>Collectors.toList()</code>) and write a few small static helpers and constants.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: static questions</p>
+    <ul>
+      <li><b>Why is main static?</b> The JVM calls it before any object exists, so it must not need one.</li>
+      <li><b>Can a static method use instance variables?</b> Not directly — there is no <code>this</code>. It can through an object reference.</li>
+      <li><b>Can static methods be overridden?</b> No. They are hidden; the declared type of the reference decides which runs.</li>
+      <li><b>Static block vs instance block?</b> Static: once, at class initialization. Instance: every <code>new</code>, before the constructor body.</li>
+      <li><b>When does a static block run?</b> When the class is first initialized (first <code>new</code>, static method call, or non-constant static field access).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-init-order">
+  <h3>Initialization order: static blocks, instance blocks and constructors</h3>
+  <p class="tldr">Static code runs once when the class is first used, parent before child; then for every <code>new</code>, the parent's field initializers, instance blocks and constructor run first, followed by the child's.</p>
+
+  <p>Output-prediction questions about "what prints first?" are among the most common Java interview puzzles. They are easy once you know the order and impossible if you guess. This article gives you the order, the reason behind it and the traps.</p>
+
+  <h4>Two kinds of initialization</h4>
+  <dl class="terms">
+    <dt>Class initialization</dt><dd>Happens <strong>once per class</strong>, the first time the class is really used. It runs <code>static</code> field initializers and <code>static { }</code> blocks, in the order they are written.</dd>
+    <dt>Instance initialization</dt><dd>Happens <strong>once per object</strong>, during <code>new</code>. It runs instance field initializers, instance blocks <code>{ }</code> and the constructor.</dd>
+  </dl>
+  <p>An <strong>instance initializer block</strong> is a plain <code>{ … }</code> in the class body. It runs for every object, before the constructor body. Constructor chaining (<code>this(…)</code>) is usually a better way to share code, but you will see instance blocks in puzzles and in anonymous classes, which cannot have constructors.</p>
+
+  <h4>The order, step by step</h4>
+  <p>Take <code>class Child extends Parent</code> and the statement <code>new Child()</code> executed for the first time:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Step</th><th>What runs</th><th>How often</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Parent: static fields and static blocks, in textual order</td><td>Once per class</td></tr>
+      <tr><td>2</td><td>Child: static fields and static blocks, in textual order</td><td>Once per class</td></tr>
+      <tr><td>3</td><td>Memory for the object is allocated; every field gets its default value (<code>0</code>, <code>false</code>, <code>null</code>)</td><td>Every <code>new</code></td></tr>
+      <tr><td>4</td><td>The Child constructor starts and first calls <code>super(…)</code> (written or implicit)</td><td>Every <code>new</code></td></tr>
+      <tr><td>5</td><td>Parent: instance field initializers and instance blocks, in textual order</td><td>Every <code>new</code></td></tr>
+      <tr><td>6</td><td>Parent constructor body</td><td>Every <code>new</code></td></tr>
+      <tr><td>7</td><td>Child: instance field initializers and instance blocks, in textual order</td><td>Every <code>new</code></td></tr>
+      <tr><td>8</td><td>Child constructor body</td><td>Every <code>new</code></td></tr>
+    </tbody>
+  </table></div>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A["First use of Child"] --> B["Parent: static fields and blocks (once)"]
+  B --> C["Child: static fields and blocks (once)"]
+  C --> D["new Child(): memory allocated, fields get defaults"]
+  D --> E["Child constructor calls super()"]
+  E --> F["Parent: instance fields and blocks"]
+  F --> G["Parent constructor body"]
+  G --> H["Child: instance fields and blocks"]
+  H --> I["Child constructor body"]
+</pre>
+  <figcaption>Static work happens once per class; the instance work repeats for every object, parent first</figcaption>
+  </figure>
+  <p>The reason for "parent first" is simple: the child may depend on things the parent sets up, so the parent part of the object must be complete before the child part starts. This is also why the <code>super(…)</code> call must come first in a constructor.</p>
+
+  <h4>A complete example</h4>
+  <pre data-title="InitOrder.java"><code class="language-java">public class InitOrder {
+    static class Parent {
+        static { System.out.println("1. Parent static block"); }
+        { System.out.println("3. Parent instance block"); }
+        Parent() { System.out.println("4. Parent constructor"); }
+    }
+
+    static class Child extends Parent {
+        static { System.out.println("2. Child static block"); }
+        { System.out.println("5. Child instance block"); }
+        Child() { System.out.println("6. Child constructor"); }
+    }
+
+    public static void main(String[] args) {
+        System.out.println("main starts");
+        new Child();
+        System.out.println("--- second object ---");
+        new Child();
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">main starts
+1. Parent static block
+2. Child static block
+3. Parent instance block
+4. Parent constructor
+5. Child instance block
+6. Child constructor
+--- second object ---
+3. Parent instance block
+4. Parent constructor
+5. Child instance block
+6. Child constructor</code></pre>
+  <p>Two things to notice. "main starts" comes first, because the nested classes are not initialized until they are used. And the second object skips the static blocks: they ran once, for the class.</p>
+  <p>Now a self-check with field initializers. Predict the output before you open the answer.</p>
+  <pre data-title="FieldInit.java"><code class="language-java">public class FieldInit {
+    static class Part { Part(String n) { System.out.println("Part " + n); } }
+
+    static class Base {
+        Part p1 = new Part("Base field");
+        Base() { System.out.println("Base()"); }
+    }
+
+    static class Sub extends Base {
+        Part p2 = new Part("Sub field");
+        Sub() { System.out.println("Sub()"); }
+    }
+
+    public static void main(String[] args) { new Sub(); }
+}</code></pre>
+  <details class="qa">
+    <summary>What does new Sub() print?</summary>
+    <div class="qa-a">
+      <pre class="out"><code class="language-plaintext">Part Base field
+Base()
+Part Sub field
+Sub()</code></pre>
+      <p>Field initializers run at the start of each class's part of construction (steps 5 and 7), before that class's constructor body, and the parent's part is complete before the child's part begins.</p>
+    </div>
+  </details>
+
+  <h4>When is a class initialized?</h4>
+  <p>Class initialization is lazy: it happens at the first <strong>active use</strong> of the class. These count as active use:</p>
+  <ul>
+    <li>creating an object with <code>new</code>;</li>
+    <li>calling a static method of the class;</li>
+    <li>reading or writing a static field that is <em>not</em> a compile-time constant;</li>
+    <li>initializing a subclass (the superclass is initialized first);</li>
+    <li>starting the program with the class that has <code>main</code>, or calling <code>Class.forName("…")</code>.</li>
+  </ul>
+  <p>These do <em>not</em> trigger initialization: declaring a variable or an array of the type, and reading a <strong>constant</strong> (a <code>static final</code> primitive or <code>String</code> set from a constant expression), because javac copies the value into the caller. Also, reading a static field through a subclass initializes only the class that <em>declares</em> the field.</p>
+  <pre data-title="Trig.java"><code class="language-java">public class Trig {
+    static class Parent { static int x = 10; static { System.out.println("Parent init"); } }
+    static class Child extends Parent { static { System.out.println("Child init"); } }
+    static class Consts {
+        static final int MAX = 5;                    // constant
+        static { System.out.println("Consts init"); }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(Child.x);                 // x is declared in Parent
+        System.out.println(Consts.MAX);              // constant: no initialization
+        System.out.println("now touching a non-constant");
+        Object o = new Consts();                     // new: initialization happens here
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Parent init
+10
+5
+now touching a non-constant
+Consts init</code></pre>
+
+  <h4>Textual order and forward references</h4>
+  <p>Field initializers and blocks of the same kind run in the order they appear in the file. If one initializer uses a field that is declared <em>later</em>, the field still has its default value. javac rejects the simplest form of this, but a method call hides it:</p>
+  <pre data-title="Fwd.java"><code class="language-java">public class Fwd {
+    static int a = initA();      // runs first
+    static int b = 5;            // runs second
+    static int initA() { return b + 1; }   // b is still 0 here
+
+    public static void main(String[] args) { System.out.println(a + " " + b); }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">1 5</code></pre>
+  <p>If you write <code>static int a = b + 1;</code> directly, javac stops with <code>illegal forward reference</code>. The method call is the loophole: it compiles, and <code>a</code> becomes 1, not 6.</p>
+
+  <h4>The classic trap: calling an overridable method from a constructor</h4>
+  <p>The parent constructor runs <em>before</em> the child's field initializers. If the parent constructor calls a method that the child overrides, the child's version runs on an object whose child fields are still at their default values.</p>
+  <pre data-title="Trap.java"><code class="language-java">public class Trap {
+    static class Base {
+        Base() { describe(); }                      // looks harmless...
+        void describe() { System.out.println("Base"); }
+    }
+
+    static class Derived extends Base {
+        private String name = "Derived";
+        private final int size = 10;
+        private int count = 5;
+
+        Derived() { super(); }
+
+        @Override void describe() {
+            System.out.println("name=" + name + ", size=" + size + ", count=" + count);
+        }
+    }
+
+    public static void main(String[] args) { new Derived(); }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">name=null, size=10, count=0</code></pre>
+  <p>The overridden <code>describe()</code> ran in step 4, while <code>name</code> and <code>count</code> were still <code>null</code> and <code>0</code> (step 3 defaults). The initializers <code>"Derived"</code> and <code>5</code> would run later, in step 7. The field <code>size</code> printed 10 only because <code>private final int size = 10;</code> is a compile-time constant: javac copies the 10 into <code>describe()</code>.</p>
+  <div class="co co-rule">
+    <p class="co-t">Rule: never call an overridable method from a constructor or initializer</p>
+    <p>A method is overridable if it is not <code>private</code>, <code>static</code> or <code>final</code>. Either call only <code>private</code> or <code>final</code> methods there, or finish construction first and then call a normal method (for example from a static factory). The same advice applies to <code>clone()</code> and deserialization hooks.</p>
+  </div>
+
+  <h4>Constructors that call this(…)</h4>
+  <p>Instance initializers run as part of the constructor that calls <code>super(…)</code>. A constructor that starts with <code>this(…)</code> does not run them again; they run once, in the constructor at the end of the chain.</p>
+  <pre data-title="Chain.java"><code class="language-java">public class Chain {
+    { System.out.println("instance block"); }
+    Chain() { this(1); System.out.println("Chain()"); }
+    Chain(int x) { System.out.println("Chain(int)"); }
+
+    public static void main(String[] args) { new Chain(); }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">instance block
+Chain(int)
+Chain()</code></pre>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Exceptions.</strong> An exception in an instance block or constructor comes out of <code>new</code>, and you get no object. An exception in a static block becomes <code>ExceptionInInitializerError</code> (see <a href="#m2-static">static</a>).</li>
+      <li><strong>Interfaces.</strong> Initializing a class does not initialize the interfaces it implements, unless those interfaces declare default methods.</li>
+      <li><strong>Singletons.</strong> The JVM runs class initialization under a lock, so <code>private static final Service INSTANCE = new Service();</code> is created safely once, even with many threads (<a href="08-system-design.html#m2">System Design · Module 2</a>).</li>
+      <li><strong>Enums</strong> create all their constants during class initialization, before any static block of the enum runs (<a href="#m2-enums">enums</a>).</li>
+    </ul>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: how to answer an order puzzle</p>
+    <p>Write the numbers 1 to 8 from the table on paper. First mark which classes are being initialized for the first time (static work), then walk through each <code>new</code> from the top of the hierarchy down. Output puzzles stop being scary when you do it mechanically. Remember the short version: <strong>static before instance, parent before child, blocks and field initializers before the constructor body</strong>.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "In what order do static blocks, instance blocks and constructors run?"</p>
+    <ul>
+      <li>Static blocks and static fields run once, when the class is first initialized, parent class first.</li>
+      <li>For each object: parent instance initializers, then parent constructor body, then child instance initializers, then child constructor body.</li>
+      <li>Add the trap: an overridden method called from the parent constructor sees default values in the child's fields.</li>
+      <li>Add one edge case: a constant (<code>static final int X = 5</code>) does not trigger class initialization.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-access-modifiers">
+  <h3>Access modifiers: private, package-private, protected and public</h3>
+  <p class="tldr">Access modifiers decide which code may use a class, field, method or constructor: <code>private</code> means this class only, no modifier means the same package, <code>protected</code> adds subclasses, and <code>public</code> means everyone.</p>
+
+  <p>Access modifiers are the tool behind <a href="#m2-encapsulation">encapsulation</a>. Every member you make visible becomes part of your class's public contract: other code can depend on it, and you cannot change it freely any more. So the rule is to show as little as possible.</p>
+
+  <h4>The four levels</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Modifier</th><th>Same class</th><th>Same package</th><th>Subclass in another package</th><th>Everyone else</th></tr></thead>
+    <tbody>
+      <tr><td><code>private</code></td><td>✓</td><td>✗</td><td>✗</td><td>✗</td></tr>
+      <tr><td>(none) package-private</td><td>✓</td><td>✓</td><td>✗</td><td>✗</td></tr>
+      <tr><td><code>protected</code></td><td>✓</td><td>✓</td><td>✓ (see below)</td><td>✗</td></tr>
+      <tr><td><code>public</code></td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><strong>private</strong> — visible only inside the class that declares it (and inside its nested classes). Use it for fields and helper methods. It is the default choice.</li>
+    <li><strong>package-private</strong> (also called <em>default</em> access) — you write nothing. Visible to every class in the same package. Use it for things that classes of one package share but the outside world must not see. There is no keyword for it: the word <code>default</code> is used only for interface default methods and <code>switch</code>.</li>
+    <li><strong>protected</strong> — visible in the same package and to subclasses in other packages. Use it for deliberate extension points, such as a hook method that subclasses override.</li>
+    <li><strong>public</strong> — visible everywhere. Use it only for the API you want other code to rely on.</li>
+  </ul>
+
+  <h4>The four levels across two packages</h4>
+  <p>Access rules are about packages, so an example needs two. <code>Account</code> lives in <code>com.bank</code>; <code>Savings</code> extends it from <code>com.bank.app</code>.</p>
+  <pre data-title="com/bank/Account.java"><code class="language-java">package com.bank;
+
+public class Account {
+    private long secret = 1;
+    long packageLevel = 2;                 // package-private
+    protected long balance = 3;
+    public long publicField = 4;
+
+    protected void audit() { System.out.println("audit"); }
+    protected Account() { }
+    public static Account open() { return new Account(); }
+}</code></pre>
+  <pre data-title="com/bank/app/Savings.java"><code class="language-java">package com.bank.app;
+
+import com.bank.Account;
+
+public class Savings extends Account {
+    void test(Savings s, Account a) {
+        this.balance = 1;                  // ok: inherited protected member
+        s.balance = 2;                     // ok: the reference is a Savings
+        a.balance = 3;                     // error
+        a.audit();                         // error
+        long x = secret;                   // error
+        long y = packageLevel;             // error
+        long z = publicField;              // ok
+        Account fresh = new Account();     // error
+    }
+}</code></pre>
+  <pre class="out" data-title="javac output"><code class="language-plaintext">Savings.java:9: error: balance has protected access in Account
+Savings.java:10: error: audit() has protected access in Account
+Savings.java:11: error: secret has private access in Account
+Savings.java:12: error: packageLevel is not public in Account; cannot be accessed from outside package
+Savings.java:14: error: Account() has protected access in Account
+5 errors</code></pre>
+
+  <h4>The protected subtlety</h4>
+  <p>Most people think <code>protected</code> means "my subclasses can use it". That is only half the rule. Outside the parent's package, subclass code can use a protected member <strong>only on objects of its own type</strong> (<code>this</code>, or any reference whose type is the subclass or below). It cannot use it on a plain parent-type reference. In the example, <code>s.balance</code> compiles because <code>s</code> is a <code>Savings</code>, but <code>a.balance</code> does not, because <code>a</code> is an <code>Account</code> and might really be some other subclass, such as a <code>CurrentAccount</code>, that <code>Savings</code> has no business changing.</p>
+  <p>Two more details follow from the same rule:</p>
+  <ul>
+    <li>Inside the same package, <code>protected</code> is as open as package-private plus subclasses. It is <em>wider</em> than package-private, not narrower.</li>
+    <li>A <code>protected</code> constructor cannot be called with <code>new</code> from another package, even from a subclass (last error above). A subclass reaches it through <code>super(…)</code>. An anonymous subclass such as <code>new Account() { }</code> is allowed, because it is itself a subclass.</li>
+  </ul>
+
+  <h4>Access rules for classes</h4>
+  <p>A <strong>top-level</strong> class can only be <code>public</code> or package-private. <code>private</code> and <code>protected</code> do not make sense for it, because there is no enclosing class or subclass context to restrict to.</p>
+  <pre data-title="TopLevel.java"><code class="language-java">private class Hidden { }       // error
+protected class Prot { }       // error
+public class TopLevel { }      // ok</code></pre>
+  <pre class="out" data-title="javac output"><code class="language-plaintext">TopLevel.java:1: error: modifier private not allowed here
+TopLevel.java:2: error: modifier protected not allowed here</code></pre>
+  <p>A <strong>nested</strong> class (declared inside another class) is a member, so it can use all four levels. A <code>public</code> top-level class must be in a file with the same name. A package-private class is invisible outside its package, which makes it a good way to hide helper classes (<a href="#m2-packages">packages</a>).</p>
+
+  <h4>Access modifiers in other places</h4>
+  <ul>
+    <li><strong>Interface members</strong> are <code>public</code> by default, so an implementing method must be declared <code>public</code> (<a href="#m2-interfaces">interfaces</a>).</li>
+    <li><strong>Overriding</strong> may widen access but never narrow it (<a href="#m2-overriding">overriding rules</a>).</li>
+    <li><strong>Enum constructors</strong> are always private, and record fields are private and final (<a href="#m2-enums">enums</a>, <a href="#m2-records">records</a>).</li>
+    <li><strong>Access is per class, not per object.</strong> Code inside <code>Account</code> may read the private fields of <em>another</em> <code>Account</code> object, which is why <code>equals()</code> and copy constructors can touch <code>other.balance</code>.</li>
+  </ul>
+
+  <h4>Which modifier should I choose?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>What</th><th>Default choice</th><th>Open it up when</th></tr></thead>
+    <tbody>
+      <tr><td>Fields</td><td><code>private</code></td><td>Never, except constants (<code>public static final</code>)</td></tr>
+      <tr><td>Helper methods</td><td><code>private</code></td><td>Another class in the package needs it (package-private) or a test does</td></tr>
+      <tr><td>Methods that form the API</td><td><code>public</code></td><td>—</td></tr>
+      <tr><td>Hook methods for subclasses</td><td><code>protected</code></td><td>—</td></tr>
+      <tr><td>Classes</td><td>Package-private</td><td>Code in other packages must use it</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>private is not a security feature.</strong> Reflection with <code>setAccessible(true)</code> can read private fields; frameworks such as Hibernate and Jackson do exactly that. Since Java 17 the JDK's own internals are closed to this by default (JEP 403), but your own classes are not.</li>
+      <li><strong>Nested classes and their outer class</strong> can see each other's private members. The compiler and JVM treat them as one unit.</li>
+      <li><strong>Sub-packages are unrelated.</strong> <code>com.bank</code> and <code>com.bank.app</code> are two different packages; package-private access does not cross between them.</li>
+      <li><strong>Modules (JPMS).</strong> If a library uses <code>module-info.java</code>, a public class in a package that the module does not <code>exports</code> is still not reachable from other modules. Most Spring Boot applications do not use modules.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: public fields</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: anyone can break the rule</p><pre><code class="language-java">public class Account {
+    public long balance;       // account.balance = -500; compiles and runs
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: private field, safe methods</p><pre><code class="language-java">public class Account {
+    private long balance;
+    public void deposit(long amount) {
+        if (amount &lt;= 0) throw new IllegalArgumentException("amount must be positive");
+        balance += amount;
+    }
+    public long getBalance() { return balance; }
+}</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: package-private helps testing</p>
+    <p>A test class in the same package (same folder path under <code>src/test/java</code>) can call package-private methods. So you can keep a helper off the public API and still test it directly. You do not have to make it <code>public</code> only for the test's sake.</p>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>JPA entities usually have a <code>protected</code> no-argument constructor: Hibernate can use it, but application code in other packages cannot create half-empty objects. Service classes keep their dependencies in <code>private final</code> fields. Most classes in a well-designed package are package-private; only the few that form the package's entry points are <code>public</code>.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: access modifier questions</p>
+    <ul>
+      <li><b>Draw the table.</b> Rows private, default, protected, public; columns class, package, subclass, world.</li>
+      <li><b>Difference between default and protected?</b> Both allow the same package; protected also allows subclasses in other packages (through a subclass-typed reference).</li>
+      <li><b>Can a top-level class be private or protected?</b> No — only public or package-private.</li>
+      <li><b>Can an overriding method have weaker access?</b> No; it can only keep or widen access.</li>
+      <li><b>Can an object read another object's private field?</b> Yes, if both are of the same class: access is per class.</li>
+    </ul>
+  </div>
+</article>

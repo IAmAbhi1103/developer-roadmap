@@ -1,0 +1,387 @@
+<article class="topic" id="m4-cherry-pick">
+  <h3>git cherry-pick: copy one commit to another branch</h3>
+  <p class="tldr"><code>git cherry-pick &lt;commit&gt;</code> applies the change made by one commit onto your current branch as a new commit, without merging the rest of the branch it came from.</p>
+
+  <p>Merge brings <em>all</em> commits of a branch. Sometimes you want only <em>one</em>. A typical case: a bug was fixed on <code>main</code>, and the same fix must also go into the old <code>release/1.4</code> branch that customers still run. You do not want to merge all of <code>main</code> into the release branch. <strong>Cherry-pick</strong> picks that one commit, like picking one cherry from a tree.</p>
+
+  <h4 id="m4-cherry-pick-how">How it works</h4>
+  <p>Git looks at the change the chosen commit made (the difference between the commit and its parent), applies that difference on your current branch, and creates a <em>new commit</em> with the same message and author but a different id and parent.</p>
+  <figure class="fig">
+<pre class="mermaid">
+gitGraph
+  commit id: "R1"
+  branch release
+  commit id: "R2"
+  checkout main
+  commit id: "M2"
+  commit id: "Fix NPE"
+  commit id: "M4"
+  checkout release
+  commit id: "Fix NPE copy"
+</pre>
+    <figcaption>The fix commit on main is copied onto the release branch as a new commit (new id); main is unchanged</figcaption>
+  </figure>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git log --oneline main -3
+e8a4c10 Update Swagger docs
+b21f7d9 Fix NullPointerException for empty cart
+5d02aa3 Add order history page
+$ git switch release/1.4
+Switched to branch 'release/1.4'
+$ git cherry-pick b21f7d9
+[release/1.4 7c93e5f] Fix NullPointerException for empty cart
+ Date: Fri Nov 6 16:20:11 2026 +0530
+ 1 file changed, 3 insertions(+), 1 deletion(-)</code></pre>
+  <p>The new commit is <code>7c93e5f</code>; the original on <code>main</code> is still <code>b21f7d9</code>. Git treats them as two unrelated commits, which has a consequence: when you later merge the two branches, Git handles the duplicate change fine in most cases (same change on both sides), but a long-term cherry-pick habit can confuse history.</p>
+
+  <h4 id="m4-cherry-pick-options">Options</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>git cherry-pick a1b2c3d</code></td><td>Copy one commit</td></tr>
+      <tr><td><code>git cherry-pick a1b2c3d e4f5a6b</code></td><td>Copy several commits, in the order given</td></tr>
+      <tr><td><code>git cherry-pick A..B</code></td><td>Copy the commits after A up to and including B (A itself is excluded)</td></tr>
+      <tr><td><code>git cherry-pick A^..B</code></td><td>Copy A through B (A included)</td></tr>
+      <tr><td><code>git cherry-pick -x a1b2c3d</code></td><td>Add the line <code>(cherry picked from commit a1b2c3d...)</code> to the message, so the origin is documented</td></tr>
+      <tr><td><code>git cherry-pick -n a1b2c3d</code></td><td>Apply the change to the working folder and index but do not commit (<code>--no-commit</code>)</td></tr>
+      <tr><td><code>git cherry-pick -e a1b2c3d</code></td><td>Edit the commit message while picking</td></tr>
+      <tr><td><code>git cherry-pick -m 1 &lt;merge&gt;</code></td><td>Pick a merge commit; <code>-m 1</code> says the mainline is parent number 1</td></tr>
+      <tr><td><code>--continue</code> / <code>--skip</code> / <code>--abort</code></td><td>Control a cherry-pick that stopped on a conflict</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4 id="m4-cherry-pick-conflicts">Conflicts</h4>
+  <p>If the target branch differs from where the commit was made, the change may not apply cleanly:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git cherry-pick b21f7d9
+CONFLICT (content): Merge conflict in src/main/java/com/acme/crm/CartService.java
+error: could not apply b21f7d9... Fix NullPointerException for empty cart
+hint: After resolving the conflicts, mark them with
+hint: "git add/rm &lt;pathspec&gt;", then run
+hint: "git cherry-pick --continue".
+hint: You can instead skip this commit with "git cherry-pick --skip".
+hint: To abort and get back to the state before "git cherry-pick",
+hint: run "git cherry-pick --abort".</code></pre>
+  <p>Resolve the markers as in a merge, <code>git add</code> the file and run <code>git cherry-pick --continue</code>. To give up, <code>git cherry-pick --abort</code>.</p>
+
+  <h4 id="m4-cherry-pick-uses">Typical uses</h4>
+  <ul>
+    <li><strong>Hotfix to a release branch:</strong> fix on <code>main</code> first, then cherry-pick (with <code>-x</code>) to each supported release branch. Fixing on <code>main</code> first makes sure the fix is not lost in the next version.</li>
+    <li><strong>Rescue a commit from the wrong branch:</strong> you committed on <code>main</code> but meant a feature branch: switch to the right branch, cherry-pick the commit, then remove it from <code>main</code> (<a href="#m4-disaster-recovery">playbook</a>).</li>
+    <li><strong>Take one useful commit from an abandoned branch</strong> or a teammate's PR.</li>
+    <li><strong>Backport</strong> a security patch to an older version.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>The picked commit gets a new id. The same fix now exists twice, in two branches.</li>
+      <li>Pick commits in the same order they were made when you pick more than one, or you risk conflicts.</li>
+      <li>Have a clean working folder before you start.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using cherry-pick instead of merge</p>
+    <p>If you keep cherry-picking commit after commit between two long-lived branches, you create duplicates and conflicts later when they are finally merged. Cherry-pick is for single, exceptional commits. If you need most of a branch, merge or rebase it. Also, a commit that depends on earlier commits (a method added two commits before) will not compile when picked alone.</p>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: preview with git cherry</p>
+    <p><code>git cherry -v release/1.4 main</code> lists commits in <code>main</code> that are not yet applied to <code>release/1.4</code>, comparing by content. A <code>-</code> at the start means an equivalent commit is already there; a <code>+</code> means it is missing.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is cherry-pick and when would you use it?"</p>
+    <ul>
+      <li>It copies a single commit onto the current branch as a new commit (new id).</li>
+      <li>Use it for hotfix backports, rescuing a commit from the wrong branch or taking one commit from another branch.</li>
+      <li>Mention <code>-x</code>, ranges and resolving conflicts with <code>--continue</code>; warn about duplicates.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-reset">
+  <h3>git reset: move the branch and choose what to keep (soft, mixed, hard)</h3>
+  <p class="tldr"><code>git reset &lt;commit&gt;</code> moves the current branch to another commit; <code>--soft</code> keeps your changes staged, <code>--mixed</code> (default) keeps them unstaged, and <code>--hard</code> throws them away — which makes <code>--hard</code> the risky one.</p>
+
+  <p>You committed something wrong. Maybe the message was bad, maybe the code was half-finished, maybe it should never have been committed. If the commit is still only on your machine, <code>git reset</code> can undo it. To understand the three modes you need to remember the three places Git keeps your files (from Module 1):</p>
+  <dl class="terms">
+    <dt>HEAD (the last commit)</dt><dd>The snapshot of the commit your branch points to.</dd>
+    <dt>Index (staging area)</dt><dd>What the next commit will contain; filled by <code>git add</code>.</dd>
+    <dt>Working folder</dt><dd>The real files you edit.</dd>
+  </dl>
+
+  <h4 id="m4-reset-modes">What each mode changes</h4>
+  <p>All modes first move the branch (and <code>HEAD</code>) to the target commit. They differ in what else they reset to match:</p>
+  <figure class="fig">
+<pre class="diagram">
+                 branch/HEAD    index (staging)    working folder
+git reset --soft     moved          unchanged         unchanged
+git reset --mixed    moved          reset             unchanged   (default)
+git reset --hard     moved          reset             reset  ← edits are gone
+</pre>
+    <figcaption>What each reset mode changes. Only --hard touches your files</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Mode</th><th>Your changes end up…</th><th>Use it to</th></tr></thead>
+    <tbody>
+      <tr><td><code>--soft</code></td><td>Staged, ready to commit again</td><td>Redo the last commit(s): change the message, or squash several commits into one</td></tr>
+      <tr><td><code>--mixed</code> (default)</td><td>In the working folder, unstaged</td><td>Un-commit and re-stage differently; split a commit; unstage files</td></tr>
+      <tr><td><code>--hard</code></td><td>Deleted</td><td>Throw away commits <em>and</em> local edits; match a known good state</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4 id="m4-reset-examples">Examples</h4>
+  <p>Start with three commits on a feature branch:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git log --oneline
+c3d4e5f Add cancel endpoint
+b2c3d4e Add OrderService.cancel
+a1b2c3d Add Order entity</code></pre>
+  <pre data-title="Undo the last commit, keep everything staged"><code class="language-bash">git reset --soft HEAD~1
+git status -s          # the changes of c3d4e5f are staged
+git commit -m "feat(order): add cancel endpoint"   # commit again with a better message</code></pre>
+  <pre data-title="Undo the last commit, keep the files but unstaged (default)"><code class="language-bash">git reset HEAD~1       # same as: git reset --mixed HEAD~1
+git status -s          # files show as modified, not staged
+git add -p             # stage them in smaller pieces and make two commits</code></pre>
+  <pre data-title="Throw away the last commit and its changes completely"><code class="language-bash">git reset --hard HEAD~1
+git log --oneline      # c3d4e5f is gone from the branch (still in the reflog)</code></pre>
+  <figure class="fig">
+<pre class="mermaid">
+gitGraph
+  commit id: "a1b2c3d"
+  commit id: "b2c3d4e"
+  commit id: "c3d4e5f"
+</pre>
+    <figcaption>Before: HEAD points to c3d4e5f. After git reset HEAD~1 the branch label moves back to b2c3d4e; c3d4e5f is no longer on any branch</figcaption>
+  </figure>
+
+  <h4 id="m4-reset-variants">Useful variants</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>git reset HEAD~1</code></td><td>Branch back one commit; keep changes unstaged</td></tr>
+      <tr><td><code>git reset --soft HEAD~3</code></td><td>Branch back three commits; keep all their changes staged — then one commit squashes them</td></tr>
+      <tr><td><code>git reset --hard origin/main</code></td><td>Make your branch exactly like the remote; local commits and edits are lost</td></tr>
+      <tr><td><code>git reset --hard ORIG_HEAD</code></td><td>Undo the last merge or pull (<code>ORIG_HEAD</code> remembers where HEAD was before a risky command)</td></tr>
+      <tr><td><code>git reset file</code> (= <code>git reset HEAD file</code>)</td><td>Unstage a file; the file is untouched. Modern form: <code>git restore --staged file</code></td></tr>
+      <tr><td><code>git restore file</code></td><td>Discard working-folder edits of one file. This is permanent; there is no undo</td></tr>
+    </tbody>
+  </table></div>
+  <p>Do not confuse <code>git reset file</code> (unstage one file; path given, branch does not move) with <code>git reset commit</code> (moves the branch).</p>
+
+  <h4 id="m4-reset-risk">Why reset --hard is risky</h4>
+  <ul>
+    <li>It deletes uncommitted edits in the working folder. These were never in a commit, so <strong>nothing can bring them back</strong> — not the reflog, nothing.</li>
+    <li>It silently drops commits from the branch. The commits can usually be recovered through the <a href="#m4-reflog">reflog</a> for some weeks, but only if you know to look.</li>
+    <li>On a shared branch it rewrites history. If you push it (which needs a force push), you remove teammates' work or cause diverged histories.</li>
+  </ul>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: hard reset with unsaved edits</p>
+    <p>Run <code>git status</code> and <code>git diff</code> before every <code>reset --hard</code>. If there is anything you might want, commit it to a temporary branch or <code>git stash</code> it first. For uncommitted work, <code>git stash</code> is the safety net; for committed work, the reflog is.</p>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Reset only commits you have <strong>not pushed</strong> (or on a private branch).</li>
+      <li>For a commit that is already shared, use <a href="#m4-revert">git revert</a>, which adds a new commit instead of rewriting history.</li>
+      <li>Check with <code>git status</code> and <code>git log --oneline</code> before and after.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>During a merge with conflicts, <code>git reset --merge</code> aborts safely (like <code>git merge --abort</code>); <code>git reset --hard</code> also works but is blunter.</li>
+      <li>If you reset a branch and your teammates already pulled the old commits, their next pull will try to merge them back. Coordinate, or use revert.</li>
+      <li><code>git reset --keep</code> is a safer cousin of <code>--hard</code>: it refuses if it would overwrite local edits.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain git reset soft, mixed and hard"</p>
+    <ul>
+      <li>All three move the branch to the target commit. Soft keeps changes staged; mixed (default) unstages them but keeps files; hard resets index and files too.</li>
+      <li>Hard deletes uncommitted work; risky on shared history.</li>
+      <li>Reset rewrites history (local); revert adds a new commit (safe for shared branches).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-revert">
+  <h3>git revert: undo a commit safely, and revert vs reset</h3>
+  <p class="tldr"><code>git revert &lt;commit&gt;</code> creates a new commit that does the opposite of an earlier one, undoing its effect without rewriting history — the right tool for commits that are already pushed.</p>
+
+  <p>Suppose commit <code>b21f7d9</code> broke production and it is already on <code>main</code>, which everyone has pulled. You cannot reset (that would rewrite shared history). Instead you add a new commit that cancels the old one:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git revert b21f7d9
+[main 4e6a91c] Revert "Add discount to every order"
+ 1 file changed, 2 insertions(+), 5 deletions(-)
+$ git push
+$ git log --oneline -3
+4e6a91c Revert "Add discount to every order"
+b21f7d9 Add discount to every order
+5d02aa3 Add order history page</code></pre>
+  <p>The history now shows both the mistake and its undo. Nothing was rewritten, so everyone can simply pull. The default message is <code>Revert "&lt;original subject&gt;"</code>; add the reason in the body ("rolled back, causes double discount in checkout").</p>
+
+  <h4 id="m4-revert-forms">Common forms</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>git revert HEAD</code></td><td>Undo the latest commit</td></tr>
+      <tr><td><code>git revert a1b2c3d</code></td><td>Undo one specific commit, wherever it is in history</td></tr>
+      <tr><td><code>git revert HEAD~3..HEAD</code></td><td>Undo the last three commits, one revert commit each (newest first)</td></tr>
+      <tr><td><code>git revert -n a1b2c3d</code></td><td>Apply the reversal but do not commit (<code>--no-commit</code>); combine several reverts into one commit</td></tr>
+      <tr><td><code>git revert -m 1 &lt;merge-commit&gt;</code></td><td>Undo a merge commit, keeping parent 1 (the mainline) as the base</td></tr>
+      <tr><td><code>git revert --continue / --abort</code></td><td>After a conflict</td></tr>
+    </tbody>
+  </table></div>
+  <p>If the reversal clashes with later changes, Git reports a conflict. Resolve it as always, <code>git add</code>, then <code>git revert --continue</code>.</p>
+
+  <h4 id="m4-revert-merge">Reverting a merge commit</h4>
+  <p>A merge commit has two parents, so Git does not know which side you want to keep. You must say: <code>-m 1</code> means "the first parent is the mainline", i.e. undo the changes the merged branch brought in:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git revert -m 1 0448514
+[main 91d3c2e] Revert "Merge pull request #14 from acme/feature/wishlist"
+$ git revert 0448514
+error: commit 0448514 is a merge but no -m option was given.</code></pre>
+  <div class="co co-exc">
+    <p class="co-t">Exception: reverting a merge, then merging the branch again</p>
+    <p>After you revert a merge, Git thinks the branch's commits are already merged, so merging the same branch again (after fixing it) brings in <em>nothing</em>. The fix: revert the revert commit first (which re-applies the changes), then add your new fixes. This surprises many people. With squash merges the problem does not exist, because each PR is just a normal commit and a plain <code>git revert</code> works.</p>
+  </div>
+
+  <h4 id="m4-revert-compare">Revert vs reset</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>git revert</code></th><th><code>git reset</code></th></tr></thead>
+    <tbody>
+      <tr><td>What it does</td><td>Adds a new commit that cancels an old one</td><td>Moves the branch pointer back (commits disappear from the branch)</td></tr>
+      <tr><td>History</td><td>Kept; grows by one commit</td><td>Rewritten</td></tr>
+      <tr><td>Safe on pushed / shared commits?</td><td>Yes</td><td>No — needs a force push and hurts teammates</td></tr>
+      <tr><td>Can undo a commit in the middle of history?</td><td>Yes</td><td>No — only the newest ones (everything after is dropped too)</td></tr>
+      <tr><td>Touches working folder?</td><td>Creates a new commit; folder must be clean</td><td>Depends on mode (<code>--hard</code> deletes edits)</td></tr>
+      <tr><td>Typical use</td><td>Undo a bug already on <code>main</code></td><td>Clean up local, unpushed commits</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4 id="m4-revert-three">Undo a mistake: choose the tool</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Situation</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td>Just committed, only the message or a missing file is wrong, not pushed</td><td><code>git commit --amend</code></td></tr>
+      <tr><td>Last commit is wrong, not pushed, want to redo it</td><td><code>git reset --soft HEAD~1</code></td></tr>
+      <tr><td>Commit already pushed or merged</td><td><code>git revert</code></td></tr>
+      <tr><td>Throw away everything since a commit, local only</td><td><code>git reset --hard &lt;commit&gt;</code></td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="The three ways to undo one mistake (exercise)"><code class="language-bash"># 1. amend: fix the last commit (message or content), before pushing
+git add Missing.java
+git commit --amend -m "feat: add cancel endpoint"
+
+# 2. reset --soft: take the commit apart and redo it
+git reset --soft HEAD~1
+
+# 3. revert: keep history, add an undo commit (safe after push)
+git revert HEAD</code></pre>
+  <p><code>git commit --amend</code> replaces the last commit with a new one (new id), so it also rewrites history: do not amend a pushed commit on a shared branch.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: pushed means revert</p>
+    <p>If a commit has reached a shared branch such as <code>main</code>, use <code>git revert</code>. Use <code>reset</code> and <code>amend</code> only while the commits are yours alone.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Say why in the revert commit body, and link the issue or incident.</li>
+      <li>On GitHub, the <em>Revert</em> button on a merged PR opens a new PR that reverts it — the usual way on protected branches.</li>
+      <li>After reverting urgently, fix the problem on a branch and re-apply the work through a new PR.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "git reset vs git revert? How do you undo a pushed commit?"</p>
+    <ul>
+      <li>Reset moves the branch pointer and rewrites history; revert adds an inverse commit and keeps history.</li>
+      <li>For a pushed commit use <code>git revert &lt;sha&gt;</code> and push normally; for a merge commit use <code>-m 1</code>.</li>
+      <li>Use reset only on local unpushed work; if you must reset a shared branch, a force push is needed and the team must be told — avoid it.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-reflog">
+  <h3>git reflog: recover "lost" commits</h3>
+  <p class="tldr">The reflog is Git's private diary of where <code>HEAD</code> and each branch pointed over time, so after a bad reset, rebase or branch delete you can find the old commit id and get your work back.</p>
+
+  <p>When Git "loses" a commit, it usually did not delete anything. It only moved a branch label away from it. The commit object is still stored. You just need its id. The <strong>reflog</strong> (reference log) records every move of <code>HEAD</code> and of your branches on <em>your</em> machine: commits, checkouts, resets, rebases, merges, pulls.</p>
+
+  <h4 id="m4-reflog-read">Reading the reflog</h4>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git reflog
+3f9d2a1 (HEAD -&gt; main) HEAD@{0}: reset: moving to HEAD~2
+b21f7d9 HEAD@{1}: commit: Add cancel endpoint
+7c93e5f HEAD@{2}: commit: Add OrderService.cancel
+5d02aa3 HEAD@{3}: checkout: moving from feature/cancel to main
+e8a4c10 HEAD@{4}: commit: Update Swagger docs</code></pre>
+  <p>Each line shows the commit id, a position name <code>HEAD@{n}</code> (0 = now, bigger = older), and what happened. Here, at <code>HEAD@{0}</code> someone ran <code>git reset HEAD~2</code>, and the two commits they dropped are still listed as <code>HEAD@{1}</code> and <code>HEAD@{2}</code>.</p>
+  <p>You can use these names anywhere a commit is expected: <code>git show HEAD@{1}</code>, <code>git diff HEAD@{2} HEAD</code>. Time-based names work too: <code>main@{yesterday}</code> or <code>HEAD@{2.hours.ago}</code>. <code>git reflog show feature/cancel</code> shows the log of one branch.</p>
+
+  <h4 id="m4-reflog-hardreset">Recover after a hard reset</h4>
+  <p>You ran <code>git reset --hard HEAD~2</code> and now realise the two commits were needed. Find the commit you were on before, then move back to it:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git reflog
+3f9d2a1 HEAD@{0}: reset: moving to HEAD~2
+b21f7d9 HEAD@{1}: commit: Add cancel endpoint
+$ git reset --hard b21f7d9        # or: git reset --hard HEAD@{1}
+HEAD is now at b21f7d9 Add cancel endpoint
+$ git log --oneline -2
+b21f7d9 Add cancel endpoint
+7c93e5f Add OrderService.cancel</code></pre>
+  <p>If you are nervous about moving your current branch, make a new branch at the old commit instead: <code>git branch rescue b21f7d9</code>. This is the safest way, since it changes nothing else.</p>
+
+  <h4 id="m4-reflog-branch">Recover a deleted branch</h4>
+  <p>This is the roadmap exercise. You deleted a branch that had commits not yet merged:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git branch -D feature/search
+Deleted branch feature/search (was 9e12b7c).</code></pre>
+  <p>Git even prints the commit id: <code>9e12b7c</code>. If you missed it, find it in the reflog (look for the last <code>checkout: moving from feature/search</code> or the last commit on it):</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git reflog
+a77c01d HEAD@{0}: checkout: moving from feature/search to main
+9e12b7c HEAD@{1}: commit: Add search filter
+$ git switch -c feature/search 9e12b7c
+Switched to a new branch 'feature/search'</code></pre>
+  <p>The branch is back with all its commits.</p>
+
+  <h4 id="m4-reflog-rebase">Undo a rebase, amend or merge</h4>
+  <ul>
+    <li>Before a rebase or merge Git saves the old tip as <code>ORIG_HEAD</code>, so right afterwards <code>git reset --hard ORIG_HEAD</code> undoes it.</li>
+    <li>Later, find the line before the rebase in the reflog (the entry just before <code>rebase (start)</code>) and reset to it.</li>
+    <li>For a bad <code>git commit --amend</code>, the old commit is the previous reflog entry.</li>
+  </ul>
+
+  <h4 id="m4-reflog-life">How long entries live</h4>
+  <p>Reflog entries expire. By default (the settings <code>gc.reflogExpire</code> and <code>gc.reflogExpireUnreachable</code>) entries that are still reachable stay for 90 days, and entries for commits that are no longer reachable from any branch stay for 30 days. After that, Git's cleanup (<code>git gc</code>, which runs automatically now and then) may delete the unreachable commits for good. So: recover soon, within a few weeks.</p>
+
+  <h4 id="m4-reflog-limits">What the reflog cannot do</h4>
+  <ul>
+    <li>It is <strong>local</strong>. It is not pushed, and a fresh clone has an empty reflog. If a colleague deleted a branch on their machine, the reflog on your machine will not help.</li>
+    <li>It only tracks <strong>committed</strong> (or stashed) work. Uncommitted edits lost by <code>git reset --hard</code> or <code>git checkout -- file</code> are gone; nothing records them. (A file you had at least staged with <code>git add</code> may still be recoverable with <code>git fsck --lost-found</code>, but do not count on that.)</li>
+    <li>A deleted <em>remote</em> branch can be restored on GitHub (the PR page has <em>Restore branch</em>), or by pushing a local copy again.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Commit before you experiment; the reflog only protects commits.</li>
+      <li>When something goes wrong, stop and run <code>git reflog</code> before you try more commands.</li>
+      <li>Recover onto a new branch first (<code>git branch rescue &lt;sha&gt;</code>) and inspect it before moving anything else.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: find an old commit by message</p>
+    <p><code>git reflog | grep -i "search filter"</code> finds the entry quickly. <code>git log -g</code> shows the reflog in the long <code>git log</code> format, which is better when you need the message and the date.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "I deleted a branch / did a hard reset. Can you recover?"</p>
+    <ul>
+      <li>Yes, if the work was committed: run <code>git reflog</code>, find the commit id, and create a branch there (<code>git switch -c name &lt;sha&gt;</code>) or <code>git reset --hard &lt;sha&gt;</code>.</li>
+      <li>The reflog is local and entries expire (about 30 days for unreachable commits, 90 for reachable).</li>
+      <li>Uncommitted changes cannot be recovered.</li>
+    </ul>
+  </div>
+</article>

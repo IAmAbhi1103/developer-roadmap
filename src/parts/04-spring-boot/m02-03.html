@@ -1,0 +1,803 @@
+<article class="topic" id="m2-request-flow">
+  <h3>How a request flows through Spring MVC</h3>
+  <p class="tldr">Every HTTP request enters the embedded Tomcat, passes the filters, reaches the single DispatcherServlet, which finds your controller method, calls it, and turns the return value into a response through an HttpMessageConverter such as Jackson.</p>
+
+  <p>When you write <code>@GetMapping("/products/{id}")</code> you never write code that opens a socket, parses text or sets headers. Spring Web MVC does all of that around your method. If you understand the path a request takes, errors like "404 for a URL that exists", "415 Unsupported Media Type" or "my filter runs but my interceptor does not" stop being mysteries. This article is the map for the rest of module 2.</p>
+
+  <h4>The big picture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant T as Tomcat
+  participant F as Filters
+  participant D as DispatcherServlet
+  participant H as HandlerMapping
+  participant A as HandlerAdapter
+  participant K as Controller
+  participant M as MessageConverter
+  C->>T: POST /api/v1/products (JSON)
+  T->>F: HttpServletRequest
+  F->>D: request (after CORS, security, logging)
+  D->>H: which handler for this request?
+  H-->>D: ProductController.create + interceptors
+  D->>A: invoke handler
+  A->>M: read body into CreateProductRequest
+  A->>K: create(request)
+  K-->>A: ResponseEntity of ProductResponse
+  A->>M: write ProductResponse as JSON
+  M-->>C: 201 Created + JSON body
+</pre>
+  <figcaption>The path of one request through an embedded Tomcat and Spring MVC</figcaption>
+  </figure>
+
+  <h4>Step by step</h4>
+  <ol class="steps">
+    <li><strong>Embedded Tomcat.</strong> Spring Boot starts Tomcat inside your JAR (default port 8080). Tomcat accepts the TCP connection, parses the HTTP text and builds an <code>HttpServletRequest</code> and an empty <code>HttpServletResponse</code>. One thread from Tomcat's pool handles the request from start to end (the classic "thread per request" model).</li>
+    <li><strong>Servlet filters.</strong> The request passes through a chain of <code>jakarta.servlet.Filter</code> objects: character encoding, CORS, request logging, and later Spring Security's filter chain. Filters see raw requests and responses and know nothing about controllers. A filter can stop the request, for example by returning 401.</li>
+    <li><strong>DispatcherServlet.</strong> This is the <strong>front controller</strong>: the one servlet mapped to <code>/</code>, so every URL that no other servlet handles comes to it. It does no business work; it coordinates the other pieces below.</li>
+    <li><strong>HandlerMapping.</strong> The dispatcher asks "which handler matches this method, path, <code>Content-Type</code> and <code>Accept</code>?". For annotated controllers the answer comes from <code>RequestMappingHandlerMapping</code>, which built a lookup table at startup from every <code>@RequestMapping</code>-style annotation. The result is a <strong>handler execution chain</strong>: your controller method plus any interceptors. If nothing matches you get 404 (or 405 if the path matches but the method does not).</li>
+    <li><strong>HandlerInterceptor.preHandle.</strong> Interceptors are Spring MVC's own, lighter hooks. They know the matched handler, so they suit things like auditing or per-endpoint timing. <code>preHandle</code> can return <code>false</code> to stop.</li>
+    <li><strong>HandlerAdapter.</strong> The adapter (<code>RequestMappingHandlerAdapter</code>) knows how to <em>call</em> your method. It resolves every parameter: path variables, query parameters, headers and the body. For <code>@RequestBody</code> it picks an <strong>HttpMessageConverter</strong> using the request's <code>Content-Type</code>; Jackson reads the JSON into your DTO. If the parameter has <code>@Valid</code>, Bean Validation runs here, before your method starts.</li>
+    <li><strong>Your controller method runs.</strong> It calls a service and returns an object, a <code>ResponseEntity</code>, or nothing.</li>
+    <li><strong>Return value handling.</strong> The adapter chooses a converter using the <code>Accept</code> header and the return type, writes the body (JSON by Jackson, <code>String</code> as text) and sets the status and headers.</li>
+    <li><strong>Back out.</strong> Interceptor <code>postHandle</code> / <code>afterCompletion</code> run, the response travels back through the filters in reverse order, and Tomcat sends it to the client.</li>
+    <li><strong>Exceptions.</strong> If anything throws, the dispatcher hands the exception to <code>HandlerExceptionResolver</code> beans. Your <code>@RestControllerAdvice</code> is one of them; see <a href="#m2-error-handling">global error handling</a>.</li>
+  </ol>
+
+  <h4>Key components</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Component</th><th>Job</th><th>You touch it when…</th></tr></thead>
+    <tbody>
+      <tr><td><code>Filter</code></td><td>Work on every request before Spring MVC</td><td>security, CORS, request-id logging</td></tr>
+      <tr><td><code>DispatcherServlet</code></td><td>Coordinates the whole flow</td><td>almost never (debug logging)</td></tr>
+      <tr><td><code>HandlerMapping</code></td><td>URL + method → handler</td><td>you debug a 404 or 405</td></tr>
+      <tr><td><code>HandlerAdapter</code></td><td>Resolves arguments, calls the method</td><td>custom argument resolvers (rare)</td></tr>
+      <tr><td><code>HttpMessageConverter</code></td><td>Body bytes ↔ Java objects</td><td>custom formats (CSV, XML)</td></tr>
+      <tr><td><code>HandlerInterceptor</code></td><td>Hooks around a matched handler</td><td>audit, per-endpoint rules</td></tr>
+      <tr><td><code>HandlerExceptionResolver</code></td><td>Exception → response</td><td>via <code>@RestControllerAdvice</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Filter vs interceptor</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Servlet Filter</th><th>HandlerInterceptor</th></tr></thead>
+    <tbody>
+      <tr><td>Belongs to</td><td>Servlet API (Tomcat)</td><td>Spring MVC</td></tr>
+      <tr><td>Runs</td><td>Before the DispatcherServlet</td><td>After the handler is chosen</td></tr>
+      <tr><td>Knows the controller method</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Sees requests for static files and 404s</td><td>Yes</td><td>Only for matched handlers</td></tr>
+      <tr><td>Typical use</td><td>Security, CORS, logging</td><td>Auditing, rate rules per endpoint</td></tr>
+    </tbody>
+  </table></div>
+  <p>Spring Security (<a href="#m4">module 4</a>) is built from filters for this reason: it must reject a request before any controller code is even chosen.</p>
+
+  <h4>See the flow yourself</h4>
+  <p>Turn on debug logging for web requests and read what Spring decides:</p>
+  <pre data-title="application.properties"><code class="language-properties">logging.level.org.springframework.web=DEBUG
+# very detailed: parameters and headers of each request
+spring.mvc.log-request-details=true</code></pre>
+  <pre class="out" data-title="Console (shortened)"><code class="language-plaintext">DispatcherServlet : POST "/api/v1/products", parameters={}
+RequestMappingHandlerMapping : Mapped to ProductController#create(CreateProductRequest)
+RequestResponseBodyMethodProcessor : Read "application/json;charset=UTF-8" to [...]
+RequestResponseBodyMethodProcessor : Writing [ProductResponse[id=1, ...]]
+DispatcherServlet : Completed 201 CREATED</code></pre>
+
+  <div class="co co-exc">
+    <p class="co-t">Where the common errors come from</p>
+    <ul>
+      <li><strong>404</strong>: <code>HandlerMapping</code> found nothing for the path. Check the class-level and method-level paths together and the context path.</li>
+      <li><strong>405 Method Not Allowed</strong>: the path matches but not the HTTP method (<code>HttpRequestMethodNotSupportedException</code>).</li>
+      <li><strong>415 Unsupported Media Type</strong>: no converter can read the request's <code>Content-Type</code>, or your method's <code>consumes</code> does not allow it (<code>HttpMediaTypeNotSupportedException</code>).</li>
+      <li><strong>406 Not Acceptable</strong>: no converter can produce what <code>Accept</code> asks for (<code>HttpMediaTypeNotAcceptableException</code>).</li>
+      <li><strong>400 Bad Request</strong>: broken JSON (<code>HttpMessageNotReadableException</code>), a missing required parameter, or a path variable that cannot be converted (<code>MethodArgumentTypeMismatchException</code>), or a validation failure.</li>
+      <li><strong>A 401/403 before your controller</strong>: a security filter answered; the DispatcherServlet never ran.</li>
+    </ul>
+  </div>
+
+  <div class="co co-version">
+    <p class="co-t">Servlet stack vs reactive stack</p>
+    <p>This flow is Spring <strong>MVC</strong> (servlet stack, blocking, Tomcat by default), which this module uses. Spring WebFlux is a separate reactive stack with <code>DispatcherHandler</code> instead of <code>DispatcherServlet</code>. Since Java 21 you can also run MVC on virtual threads (<code>spring.threads.virtual.enabled=true</code>) and keep the same simple code. The flow above stays the same in Spring Boot 3.x and 4.x.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Explain what happens when a request hits a Spring Boot application." Strong answer: Tomcat → filter chain → <code>DispatcherServlet</code> (front controller) → <code>HandlerMapping</code> finds the controller method → <code>HandlerAdapter</code> resolves arguments (message converter reads the JSON, validation runs) → controller → return value written by a message converter → response back through the filters. Add one failure case (exception resolver and <code>@RestControllerAdvice</code>) and the filter vs interceptor difference.</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-rest-controller">
+  <h3>@Controller vs @RestController</h3>
+  <p class="tldr">@RestController is @Controller plus @ResponseBody: every method's return value is written straight into the HTTP response body (as JSON), instead of being treated as the name of a view to render.</p>
+
+  <p>Spring MVC supports two styles of web app. In the older server-rendered style, a controller returns the <em>name</em> of an HTML template (Thymeleaf, JSP) and a <strong>view resolver</strong> renders it. In the REST style, the controller returns <em>data</em> and a <strong>message converter</strong> writes it as JSON. The annotation you choose on the class selects the style.</p>
+
+  <h4>The two annotations</h4>
+  <pre data-title="PageController.java (server-side HTML)"><code class="language-java">@Controller
+public class PageController {
+
+    @GetMapping("/welcome")
+    public String welcome(Model model) {
+        model.addAttribute("user", "Asha");
+        return "welcome";          // a VIEW name: templates/welcome.html
+    }
+}</code></pre>
+  <pre data-title="ProductController.java (REST)"><code class="language-java">@RestController
+@RequestMapping("/api/v1/products")
+public class ProductController {
+
+    private final ProductService productService;
+
+    public ProductController(ProductService productService) {
+        this.productService = productService;
+    }
+
+    @GetMapping("/{id}")
+    public ProductResponse get(@PathVariable Long id) {
+        return productService.findById(id);   // written as JSON
+    }
+}</code></pre>
+  <pre class="out" data-title="GET /api/v1/products/42"><code class="language-http">HTTP/1.1 200
+Content-Type: application/json
+
+{"id":42,"name":"Wireless Mouse","sku":"MS-100","price":799.00,"stock":25}</code></pre>
+  <p><code>@RestController</code> is a <strong>composed annotation</strong>: its source is just <code>@Controller</code> + <code>@ResponseBody</code>. <code>@Controller</code> itself is a <code>@Component</code> stereotype, so component scanning registers the class as a bean (see <a href="#m1-stereotypes-scanning">scanning</a>). <code>@ResponseBody</code> tells Spring: "do not look up a view; hand the return value to an <code>HttpMessageConverter</code>".</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>@Controller</code></th><th><code>@RestController</code></th></tr></thead>
+    <tbody>
+      <tr><td>Return value means</td><td>View name (<code>"welcome"</code>)</td><td>Response body</td></tr>
+      <tr><td>Equivalent to</td><td>—</td><td><code>@Controller</code> + <code>@ResponseBody</code></td></tr>
+      <tr><td>Output</td><td>HTML page</td><td>JSON (or text, XML)</td></tr>
+      <tr><td>Needs a template engine</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Used for</td><td>Server-rendered web apps</td><td>REST APIs for React, mobile, other services</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>How it works inside</h4>
+  <p>After <code>DispatcherServlet</code> finds your method (<a href="#m2-request-flow">request flow</a>), the <code>RequestMappingHandlerAdapter</code> calls it and then hands the return value to the first <strong>return value handler</strong> that supports it. This choice is the real difference between the two annotations:</p>
+  <ul>
+    <li>For a <code>@Controller</code> method returning <code>String</code>, a view-name handler takes the value, and the <code>ViewResolver</code> turns it into a template.</li>
+    <li>For a method with <code>@ResponseBody</code> (or any method of a <code>@RestController</code>), a body handler (<code>RequestResponseBodyMethodProcessor</code>) takes the value. It looks at the request's <code>Accept</code> header, goes through the registered <code>HttpMessageConverter</code> list, and uses the first converter that can write that Java type as an acceptable media type.</li>
+    <li>For a <code>ResponseEntity</code> return type, another handler writes the status and headers first and then the body in the same way (<a href="#m2-response-entity">ResponseEntity</a>).</li>
+  </ul>
+  <p>Boot registers the usual converters for you. A <code>String</code> is written as-is by the string converter. A <code>byte[]</code> or <code>Resource</code> is written as raw bytes. Records, classes, lists and maps are written by Jackson as JSON (<a href="#m2-json-jackson">Jackson basics</a>). The same list also <em>reads</em> request bodies for <code>@RequestBody</code> (<a href="#m2-body-header-status">next article</a>).</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A["Controller method returns a value"] --> B{"@ResponseBody or @RestController?"}
+  B -->|no| C["ViewResolver: template name to HTML"]
+  B -->|yes| D["HttpMessageConverter chosen by Accept and type"]
+  D --> E["JSON written to the response body"]
+</pre>
+<figcaption>What happens to the return value of a controller method</figcaption>
+  </figure>
+
+  <h4>What the return value becomes</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method returns</th><th>Response</th></tr></thead>
+    <tbody>
+      <tr><td>A record or class</td><td>JSON object, status 200</td></tr>
+      <tr><td><code>List&lt;ProductResponse&gt;</code></td><td>JSON array, status 200</td></tr>
+      <tr><td><code>String</code></td><td>The text as it is (not quoted JSON); content type depends on the request's <code>Accept</code></td></tr>
+      <tr><td><code>void</code></td><td>Empty body, status 200 (use <code>@ResponseStatus</code> for 204)</td></tr>
+      <tr><td><code>ResponseEntity&lt;T&gt;</code></td><td>Body <em>and</em> status <em>and</em> headers that you choose</td></tr>
+      <tr><td><code>null</code></td><td>Empty body, status 200 (often a bug; prefer an explicit 404)</td></tr>
+      <tr><td><code>Optional&lt;T&gt;</code></td><td>Not unwrapped to 404; Jackson writes it as the value or <code>null</code>. Unwrap in the service</td></tr>
+    </tbody>
+  </table></div>
+  <p>A small trap with <code>String</code>: <code>return "ok"</code> sends the three characters <code>ok</code>, not <code>"ok"</code> with quotes. A client that parses the response as JSON then fails. If the client expects JSON, return a record such as <code>new StatusResponse("ok")</code>.</p>
+
+  <h4>Mixing both styles</h4>
+  <p>You can have both kinds in one app: a <code>@Controller</code> serving an HTML landing page and several <code>@RestController</code> classes serving <code>/api/**</code>. You can also keep <code>@Controller</code> and put <code>@ResponseBody</code> on single methods, but when everything in the class is an API method, <code>@RestController</code> is cleaner. In a React plus Spring Boot project, nearly every controller is a <code>@RestController</code>, because React is a separate app that only asks for data (<a href="06-frontend.html#m6">Frontend · Module 6</a>). The same split exists for global error handlers: <code>@ControllerAdvice</code> versus <code>@RestControllerAdvice</code> (<a href="#m2-error-handling">error handling</a>).</p>
+  <pre data-title="One class, both styles"><code class="language-java">@Controller
+public class MixedController {
+
+    @GetMapping("/")
+    public String home() {
+        return "index";                       // view name
+    }
+
+    @GetMapping("/ping")
+    @ResponseBody                              // this one method is an API method
+    public Map&lt;String, String&gt; ping() {
+        return Map.of("status", "up");
+    }
+}</code></pre>
+
+  <h4>Rules for controllers</h4>
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Controllers are singletons shared by all threads: keep them <strong>stateless</strong>. No mutable instance fields.</li>
+      <li>Use constructor injection for the service (one constructor needs no <code>@Autowired</code>).</li>
+      <li>Put the common path prefix on the class with <code>@RequestMapping</code>; put method and sub-path on each method.</li>
+      <li>Keep controllers thin: bind the request, call one service method, shape the response. See <a href="#m2-layers">layers</a>.</li>
+      <li>Return DTOs (records), never JPA entities. Lazy relations can break serialization and you may leak fields (<a href="#m2-dtos">DTOs</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: one controller per resource</p>
+    <p>Name it after the resource: <code>ProductController</code>, <code>OrderController</code>, in a <code>web</code> or <code>controller</code> package. One class handles one noun and its sub-resources. A class with forty endpoints is a design smell. Version the prefix (<code>/api/v1/...</code>, see <a href="#m2-api-versioning">versioning</a>) and use plural nouns (<a href="#m2-url-design">URL design</a>).</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: @Controller on an API class</p>
+    <p>With <code>@Controller</code> and no <code>@ResponseBody</code>, a method that returns a <code>String</code> or object is treated as a view name. With no view found you see a Whitelabel error page or an error like <code>Circular view path</code>, and the JSON never appears. If your API "returns a 404 HTML page" for a URL that exists, check the class annotation first.</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: view lookup for a DTO</p><pre><code class="language-java">@Controller
+@RequestMapping("/api/v1/products")
+public class ProductController {
+    @GetMapping("/{id}")
+    public ProductResponse get(@PathVariable Long id) { ... }
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: body is written as JSON</p><pre><code class="language-java">@RestController
+@RequestMapping("/api/v1/products")
+public class ProductController {
+    @GetMapping("/{id}")
+    public ProductResponse get(@PathVariable Long id) { ... }
+}</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and errors you can meet</p>
+    <ul>
+      <li><code>HttpMediaTypeNotAcceptableException</code> (406): the client's <code>Accept</code> header asks for a type no converter can produce, for example <code>Accept: application/xml</code> with no XML library.</li>
+      <li><code>HttpMessageNotWritableException</code> (500): Jackson cannot write the object, for example a lazy JPA relation closed after the transaction, or a bean with no properties.</li>
+      <li>A <code>@Controller</code> whose URL equals the returned view name gives <code>Circular view path [welcome]: would dispatch back to the current handler URL</code> (common with JSP). With Thymeleaf a missing template gives <code>TemplateInputException</code> and a 500 page.</li>
+      <li>Two methods with the same path and HTTP method give <code>IllegalStateException: Ambiguous mapping</code> at startup.</li>
+      <li>A controller bean that is not scanned (outside the root package) simply produces 404 for its URLs, with no error at startup.</li>
+    </ul>
+  </div>
+
+  <div class="co co-version">
+    <p class="co-t">Boot 3 and Boot 4</p>
+    <p>The controller annotations are unchanged. What does change is the JSON library behind the converter: Boot 3 uses Jackson 2, while Boot 4 moves to Jackson 3 by default (different package names for custom modules and serializers). If you only write controllers and records, you do not notice. Check the Boot 4 release notes before porting custom serializers.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Question: "Difference between <code>@Controller</code> and <code>@RestController</code>?" Answer in three points: <code>@RestController = @Controller + @ResponseBody</code>; the return value goes through <code>HttpMessageConverter</code> instead of the view resolver; use <code>@Controller</code> for server-rendered HTML and <code>@RestController</code> for APIs. Then show depth: the converter is chosen by <code>Accept</code> and the Java type, and Jackson is the JSON one. A follow-up: "How do you return 201 or set a header?" → <code>ResponseEntity</code> (below). Another: "Is a controller thread-safe?" It is a singleton, so it is safe only while it holds no mutable state.</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-mapping-annotations">
+  <h3>Mapping annotations: @RequestMapping, @PathVariable, @RequestParam</h3>
+  <p class="tldr">@RequestMapping and its shortcuts (@GetMapping, @PostMapping and so on) connect an HTTP method and path to a Java method; @PathVariable reads values from the path and @RequestParam reads them from the query string or form.</p>
+
+  <p>Mapping annotations answer two questions: <em>which requests reach this method</em>, and <em>how do the parts of the request become Java parameters</em>. This article covers the routing side and the two parameter styles you use most. The body, headers and status come next in <a href="#m2-body-header-status">the following article</a>.</p>
+
+  <h4>@RequestMapping and the shortcuts</h4>
+  <p><code>@RequestMapping</code> is the general annotation. On a class it sets a shared prefix; on a method it can set the HTTP method, the path, and conditions on headers and media types. Because writing <code>method = RequestMethod.GET</code> everywhere is noisy, Spring gives one shortcut per method.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation</th><th>Same as</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><code>@GetMapping</code></td><td><code>@RequestMapping(method = GET)</code></td><td>Read one or many</td></tr>
+      <tr><td><code>@PostMapping</code></td><td><code>method = POST</code></td><td>Create; actions</td></tr>
+      <tr><td><code>@PutMapping</code></td><td><code>method = PUT</code></td><td>Replace a whole resource</td></tr>
+      <tr><td><code>@PatchMapping</code></td><td><code>method = PATCH</code></td><td>Partial update</td></tr>
+      <tr><td><code>@DeleteMapping</code></td><td><code>method = DELETE</code></td><td>Delete</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="ProductController.java (mappings only)"><code class="language-java">@RestController
+@RequestMapping("/api/v1/products")            // prefix for every method
+public class ProductController {
+
+    @GetMapping                                // GET    /api/v1/products
+    public List&lt;ProductResponse&gt; list() { ... }
+
+    @GetMapping("/{id}")                       // GET    /api/v1/products/42
+    public ProductResponse get(@PathVariable Long id) { ... }
+
+    @PostMapping                               // POST   /api/v1/products
+    public ResponseEntity&lt;ProductResponse&gt; create(...) { ... }
+
+    @PutMapping("/{id}")                       // PUT    /api/v1/products/42
+    public ProductResponse replace(@PathVariable Long id, ...) { ... }
+
+    @DeleteMapping("/{id}")                    // DELETE /api/v1/products/42
+    public void delete(@PathVariable Long id) { ... }
+}</code></pre>
+
+  <h4>consumes and produces</h4>
+  <p>Besides method and path, a mapping can be narrowed by media type. <code>consumes</code> matches the request's <code>Content-Type</code>; <code>produces</code> matches the request's <code>Accept</code> and sets the response <code>Content-Type</code>. A mismatch gives 415 or 406.</p>
+  <pre data-title="Narrowing by media type"><code class="language-java">@PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE,
+             produces = MediaType.APPLICATION_JSON_VALUE)
+public ProductResponse create(@RequestBody CreateProductRequest request) { ... }
+
+// same endpoint path, two representations
+@GetMapping(value = "/{id}", produces = "application/json")
+public ProductResponse json(@PathVariable Long id) { ... }
+
+@GetMapping(value = "/{id}", produces = "text/csv")
+public String csv(@PathVariable Long id) { ... }</code></pre>
+  <p>Most of the time you do not set them: JSON in and out is the default for REST controllers. Set them when one URL really serves two formats, or when you want a clear 415 for anything but JSON. More in <a href="#m2-negotiation-cors">content negotiation</a>.</p>
+
+  <h4>Path patterns</h4>
+  <ul>
+    <li><code>/products/{id}</code> — one segment, captured as a variable.</li>
+    <li><code>/products/{id:[0-9]+}</code> — a regex after the colon; only digits match. Anything else falls through to 404.</li>
+    <li><code>/files/*</code> — one segment of anything; <code>/files/**</code> — any number of segments (only as the last part of the pattern).</li>
+    <li>Static paths win over variables: with both <code>/products/featured</code> and <code>/products/{id}</code>, the request <code>/products/featured</code> goes to the first, because the more specific pattern wins.</li>
+    <li>Two methods with the identical method + path + media types cause an <code>IllegalStateException: Ambiguous mapping</code> at startup, so the error shows up early.</li>
+  </ul>
+
+  <h4>@PathVariable</h4>
+  <p>A <strong>path variable</strong> is part of the URL path that identifies a resource. Use it for ids: <code>/products/42</code>.</p>
+  <pre data-title="PathVariable examples"><code class="language-java">// Name matches the placeholder: works when compiled with -parameters (Boot default)
+@GetMapping("/{id}")
+public ProductResponse get(@PathVariable Long id) { ... }
+
+// Different name: say it explicitly
+@GetMapping("/{productId}")
+public ProductResponse get(@PathVariable("productId") Long id) { ... }
+
+// Several variables (nested resource)
+@GetMapping("/{productId}/reviews/{reviewId}")
+public ReviewResponse review(@PathVariable Long productId,
+                             @PathVariable Long reviewId) { ... }
+
+// Regex limits the match
+@GetMapping("/{code:[A-Z]{3}-\\d{4}}")
+public ProductResponse byCode(@PathVariable String code) { ... }</code></pre>
+  <ul>
+    <li>A path variable is <strong>required</strong> by nature. <code>@PathVariable(required = false)</code> exists but is awkward; define two methods instead.</li>
+    <li>Spring converts the text to your parameter type (<code>Long</code>, <code>UUID</code>, <code>LocalDate</code>, an <code>enum</code>). If conversion fails — <code>/products/abc</code> for a <code>Long</code> — you get <code>MethodArgumentTypeMismatchException</code> and a <strong>400</strong>.</li>
+    <li>A dot in the last variable (<code>/files/report.pdf</code>) is safe in current Spring versions; suffix-based content negotiation was removed.</li>
+  </ul>
+
+  <h4>@RequestParam</h4>
+  <p>A <strong>request parameter</strong> is a key in the query string (<code>?category=mouse&amp;page=2</code>) or in a form body. Use it for filtering, sorting and paging, not for identifying a resource.</p>
+  <pre data-title="RequestParam examples"><code class="language-java">// GET /api/v1/products?category=mouse
+@GetMapping
+public List&lt;ProductResponse&gt; list(
+        @RequestParam String category) { ... }                  // required: 400 if missing
+
+// optional, with a default
+@RequestParam(defaultValue = "20") int size                     // ?size absent → 20
+@RequestParam(required = false) String category                 // absent → null
+@RequestParam Optional&lt;BigDecimal&gt; maxPrice                    // absent → Optional.empty()
+
+// different name in the URL
+@RequestParam("q") String searchText
+
+// repeated or comma-separated values: ?tag=usb&amp;tag=wireless  or  ?tag=usb,wireless
+@RequestParam List&lt;String&gt; tag
+
+// every parameter as a map (rarely a good idea)
+@RequestParam Map&lt;String, String&gt; all</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Attribute</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>name</code> / <code>value</code></td><td>The key in the query string; defaults to the parameter name</td></tr>
+      <tr><td><code>required</code></td><td>Default <code>true</code>. Missing → <code>MissingServletRequestParameterException</code> → 400</td></tr>
+      <tr><td><code>defaultValue</code></td><td>Used when missing or empty; also makes the parameter not required</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>@PathVariable vs @RequestParam</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>@PathVariable</code></th><th><code>@RequestParam</code></th></tr></thead>
+    <tbody>
+      <tr><td>Lives in</td><td>The path: <code>/products/42</code></td><td>The query: <code>?category=mouse</code></td></tr>
+      <tr><td>Meaning</td><td>Which resource</td><td>How to filter, sort, page</td></tr>
+      <tr><td>Required</td><td>Always (part of the URL)</td><td>Optional by choice</td></tr>
+      <tr><td>Cache and bookmark</td><td>Each id is its own URL</td><td>Same path, many variations</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Binding many parameters to one object</h4>
+  <p>When the list of filters grows, group them in a plain object <em>without</em> any annotation. Spring binds query parameters to its properties (a record works too).</p>
+  <pre data-title="ProductFilter.java"><code class="language-java">public record ProductFilter(String category, BigDecimal minPrice, BigDecimal maxPrice) {}
+
+// GET /api/v1/products?category=mouse&amp;minPrice=500
+@GetMapping
+public List&lt;ProductResponse&gt; list(ProductFilter filter) { ... }</code></pre>
+  <p>Do not add <code>@RequestBody</code> here: a GET request should not carry a body.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: primitive types for optional parameters</p>
+    <p><code>@RequestParam(required = false) int size</code> fails with <code>IllegalStateException</code> when the parameter is absent, because <code>null</code> cannot become an <code>int</code>. Use <code>Integer</code>, <code>Optional&lt;Integer&gt;</code> or <code>defaultValue</code>.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Version the prefix on the class: <code>/api/v1/...</code> (see <a href="#m2-api-versioning">API versioning</a>).</li>
+      <li>Use the shortcut annotations, never bare <code>@RequestMapping</code> for a method.</li>
+      <li>Name query parameters in camelCase or lowercase and keep the style the same across the API (<code>minPrice</code>).</li>
+      <li>Do not trust path or query values: validate them (<a href="#m2-validation">Bean Validation</a>) and put a maximum on <code>size</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-body-header-status">
+  <h3>@RequestBody, @RequestHeader and @ResponseStatus</h3>
+  <p class="tldr">@RequestBody turns the JSON body into a Java object, @RequestHeader reads a header, and @ResponseStatus sets a fixed status code for a method or an exception class.</p>
+
+  <h4>@RequestBody</h4>
+  <p><code>@RequestBody</code> asks Spring to read the whole request body and convert it into the parameter type. The converter is chosen by the request's <code>Content-Type</code>; for <code>application/json</code> it is Jackson. Use it with POST, PUT and PATCH.</p>
+  <pre data-title="CreateProductRequest.java"><code class="language-java">public record CreateProductRequest(
+        String name,
+        String sku,
+        BigDecimal price,
+        int stock) {}</code></pre>
+  <pre data-title="ProductController.java (fragment)"><code class="language-java">@PostMapping
+public ResponseEntity&lt;ProductResponse&gt; create(
+        @Valid @RequestBody CreateProductRequest request) {
+    ProductResponse created = productService.create(request);
+    ...
+}</code></pre>
+  <pre data-title="Request" class="out"><code class="language-http">POST /api/v1/products HTTP/1.1
+Content-Type: application/json
+
+{ "name": "Wireless Mouse", "sku": "MS-100", "price": 799.00, "stock": 25 }</code></pre>
+
+  <h4>How the body is converted</h4>
+  <p>Spring keeps a list of <code>HttpMessageConverter</code> objects. For a parameter with <code>@RequestBody</code>, it asks them in order: "can you read this Java type from this <code>Content-Type</code>?" The first one that says yes does the work. Boot's list contains converters for <code>byte[]</code>, <code>String</code>, form data, and Jackson for JSON.</p>
+  <ol class="steps">
+    <li>The request arrives with <code>Content-Type: application/json</code> and a body.</li>
+    <li>The argument resolver for <code>@RequestBody</code> picks the Jackson converter, because it can read JSON into your type.</li>
+    <li>Jackson builds the record or class from the JSON. A record uses its constructor; a class needs a default constructor and setters or a suitable constructor.</li>
+    <li>If the parameter has <code>@Valid</code>, the validator then checks the constraints (<a href="#m2-validation">validation</a>).</li>
+    <li>The object is passed into your method. If any step fails, your method is never called.</li>
+  </ol>
+  <p>Because the converter works from the declared type, you can also bind to a <code>List&lt;CreateProductRequest&gt;</code> (a JSON array), a <code>Map&lt;String, Object&gt;</code> (any JSON object), a plain <code>String</code> (the raw text), a <code>byte[]</code>, or a record with nested records. Prefer a specific record: the contract is then visible in code and in the OpenAPI document (<a href="#m2-openapi">OpenAPI</a>).</p>
+  <pre data-title="Other body types"><code class="language-java">@PostMapping("/bulk")
+public List&lt;ProductResponse&gt; bulk(@RequestBody List&lt;CreateProductRequest&gt; items) { ... }
+
+@PostMapping("/webhook")
+public void webhook(@RequestBody String rawJson) { ... }   // needed to verify a signature
+
+@PutMapping("/{id}/note")
+public void note(@PathVariable Long id,
+        @RequestBody(required = false) NoteRequest note) { ... }  // body may be absent</code></pre>
+
+  <p>What can go wrong, and the status you get (before you add your own handler):</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Problem</th><th>Exception</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Body missing (<code>required = true</code> is the default)</td><td><code>HttpMessageNotReadableException</code></td><td>400</td></tr>
+      <tr><td>Invalid JSON (a trailing comma, a missing quote)</td><td><code>HttpMessageNotReadableException</code></td><td>400</td></tr>
+      <tr><td>Wrong type: <code>"price": "abc"</code> for a <code>BigDecimal</code></td><td><code>HttpMessageNotReadableException</code></td><td>400</td></tr>
+      <tr><td><code>Content-Type</code> is not JSON (for example <code>text/plain</code>)</td><td><code>HttpMediaTypeNotSupportedException</code></td><td>415</td></tr>
+      <tr><td><code>@Valid</code> constraint fails</td><td><code>MethodArgumentNotValidException</code></td><td>400</td></tr>
+      <tr><td>Class cannot be built by Jackson</td><td><code>InvalidDefinitionException</code> (your bug)</td><td>500</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li>Only <strong>one</strong> <code>@RequestBody</code> per method — the body stream can be read once. Wrap several parts in one DTO.</li>
+    <li>A JSON field the DTO does not have is ignored by Spring Boot (see <a href="#m2-json-jackson">Jackson basics</a>).</li>
+    <li>A missing JSON field becomes <code>null</code> (or <code>0</code> for a primitive). Required fields must be enforced with validation.</li>
+    <li>Never bind a JPA entity directly: see <a href="#m2-dtos">DTOs</a>.</li>
+  </ul>
+  <p>A bad request body shows up in the log as a warning, and the client sees a 400. With the default Boot error body, the reason is hidden; a global handler can return a helpful message (<a href="#m2-error-handling">error handling</a>).</p>
+  <pre class="out" data-title="Invalid JSON: client sees 400"><code class="language-http">HTTP/1.1 400
+Content-Type: application/json
+
+{"timestamp":"2026-11-11T09:30:12.411+00:00","status":400,
+ "error":"Bad Request","path":"/api/v1/products"}</code></pre>
+
+  <h4>@RequestHeader</h4>
+  <p>Reads one HTTP header. Header names are case-insensitive. Use it for things that describe the request rather than the resource: a correlation id, a client version, an idempotency key, a conditional-request <code>If-Match</code>.</p>
+  <pre data-title="@RequestHeader examples"><code class="language-java">// required: missing header → 400 (MissingRequestHeaderException)
+@GetMapping("/{id}")
+public ProductResponse get(@PathVariable Long id,
+        @RequestHeader("X-Request-Id") String requestId) { ... }
+
+// optional with a default
+@RequestHeader(value = "Accept-Language", defaultValue = "en") String lang
+
+// all headers
+@RequestHeader HttpHeaders headers
+
+// idempotency key for a safe retry of POST
+@PostMapping("/orders")
+public ResponseEntity&lt;OrderResponse&gt; place(
+        @RequestHeader(value = "Idempotency-Key", required = false) String key,
+        @Valid @RequestBody PlaceOrderRequest request) { ... }</code></pre>
+  <p>Spring converts the header text to the parameter type: <code>@RequestHeader("X-Page-Size") int size</code> works, and a value like <code>abc</code> gives <code>MethodArgumentTypeMismatchException</code> (400). A header that is sent several times can be bound to a <code>List&lt;String&gt;</code>. For the standard headers in more detail, see <a href="#m2-http-headers">HTTP headers</a>.</p>
+  <div class="co co-exc">
+    <p class="co-t">Do not read Authorization by hand</p>
+    <p>You can write <code>@RequestHeader("Authorization")</code>, but once Spring Security is in place the filter already parsed the token. Take the user from <code>@AuthenticationPrincipal</code> or <code>Authentication</code> instead (<a href="#m4">module 4</a>). The same applies to cookies: <code>@CookieValue("name")</code> reads one.</p>
+  </div>
+
+  <h4>@ResponseStatus</h4>
+  <p>The default status for a successful response is 200. <code>@ResponseStatus</code> changes it to a fixed value, on a controller method or on an exception class.</p>
+  <pre data-title="@ResponseStatus on a method"><code class="language-java">@DeleteMapping("/{id}")
+@ResponseStatus(HttpStatus.NO_CONTENT)       // 204, empty body
+public void delete(@PathVariable Long id) {
+    productService.delete(id);
+}
+
+@PostMapping("/{id}/archive")
+@ResponseStatus(HttpStatus.ACCEPTED)         // 202
+public void archive(@PathVariable Long id) { ... }</code></pre>
+  <pre data-title="@ResponseStatus on an exception"><code class="language-java">@ResponseStatus(HttpStatus.NOT_FOUND)
+public class ProductNotFoundException extends RuntimeException {
+    public ProductNotFoundException(Long id) {
+        super("Product " + id + " not found");
+    }
+}
+// throwing it anywhere in a request gives a 404 response</code></pre>
+  <p>Inside, the status on an exception is applied by <code>ResponseStatusExceptionResolver</code>, one of the resolvers that <code>DispatcherServlet</code> asks when a controller throws. It calls <code>response.sendError(404)</code>, and Boot's <code>/error</code> endpoint then builds the JSON error body. Note that by default Boot does <strong>not</strong> put the exception message into that body (the property <code>server.error.include-message</code> defaults to <code>never</code>), so the client sees status 404 and a generic body unless you set the property or write your own handler.</p>
+  <p>The limits of <code>@ResponseStatus</code>: the status is <em>fixed at compile time</em> (no choice by data), it cannot add headers such as <code>Location</code>, and on an exception it gives you no control over the JSON shape. For those cases use <code>ResponseEntity</code> and <code>@RestControllerAdvice</code>. Also, if a method with <code>@ResponseStatus</code> throws an exception, the exception's own status wins.</p>
+
+  <h4>Three ways to choose a status</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Way</th><th>Where</th><th>Good for</th></tr></thead>
+    <tbody>
+      <tr><td><code>@ResponseStatus</code> on a method</td><td>Controller</td><td>A fixed success status such as 204 or 202</td></tr>
+      <tr><td><code>@ResponseStatus</code> on an exception class</td><td>Exception</td><td>Quick prototypes; one fixed status per exception</td></tr>
+      <tr><td><code>ResponseStatusException</code></td><td>Thrown in code</td><td>One-off errors without a new class</td></tr>
+      <tr><td><code>@ExceptionHandler</code> in advice</td><td>Global</td><td>Uniform JSON errors (recommended)</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="ResponseStatusException: status chosen in code"><code class="language-java">@GetMapping("/{id}")
+public ProductResponse get(@PathVariable Long id) {
+    return productService.findOptional(id)
+            .orElseThrow(() -&gt; new ResponseStatusException(
+                    HttpStatus.NOT_FOUND, "Product " + id + " not found"));
+}</code></pre>
+
+  <h4>Other parameter annotations (short list)</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation or type</th><th>Reads</th></tr></thead>
+    <tbody>
+      <tr><td><code>@CookieValue</code></td><td>One cookie</td></tr>
+      <tr><td><code>@RequestPart</code> / <code>MultipartFile</code></td><td>A part of a <code>multipart/form-data</code> upload (<a href="#m6">module 6</a> has file storage notes)</td></tr>
+      <tr><td><code>@MatrixVariable</code></td><td>Path parameters with <code>;</code> — rare</td></tr>
+      <tr><td><code>HttpServletRequest</code></td><td>The raw request; avoid, it couples you to the servlet API</td></tr>
+      <tr><td><code>HttpEntity&lt;T&gt;</code> / <code>RequestEntity&lt;T&gt;</code></td><td>Body and headers together in one object</td></tr>
+      <tr><td><code>Pageable</code></td><td>Paging and sorting (<a href="#m2-pagination">pagination</a>)</td></tr>
+      <tr><td><code>Principal</code> / <code>Authentication</code></td><td>The logged-in user</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Comparison: where each input comes from</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation</th><th>Source</th><th>Missing means</th></tr></thead>
+    <tbody>
+      <tr><td><code>@PathVariable</code></td><td>URL path segment</td><td>404 (no route matches)</td></tr>
+      <tr><td><code>@RequestParam</code></td><td>Query string or form field</td><td>400 <code>MissingServletRequestParameterException</code></td></tr>
+      <tr><td><code>@RequestHeader</code></td><td>HTTP header</td><td>400 <code>MissingRequestHeaderException</code></td></tr>
+      <tr><td><code>@RequestBody</code></td><td>Request body (JSON)</td><td>400 <code>HttpMessageNotReadableException</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>See <a href="#m2-mapping-annotations">mapping annotations</a> for the first two.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Add <code>@Valid</code> next to <code>@RequestBody</code>; without it, constraint annotations on the record are not checked.</li>
+      <li>The client must send <code>Content-Type: application/json</code> for a JSON body, or it gets 415.</li>
+      <li>A 204 response has no body, so a <code>@ResponseStatus(NO_CONTENT)</code> method must return <code>void</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using the entity or reading the body twice</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: entity as body, two bodies</p><pre><code class="language-java">@PostMapping
+public Product create(@RequestBody Product entity,
+                      @RequestBody Audit audit) { ... }</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: one request DTO</p><pre><code class="language-java">@PostMapping
+public ProductResponse create(
+        @Valid @RequestBody CreateProductRequest request) { ... }</code></pre></div>
+    </div>
+    <p>An entity as the body lets a client set fields like <code>id</code> or <code>role</code> (mass assignment). Reading the stream twice, for example in a filter and again in the controller, gives an empty body the second time.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Name request bodies <code>CreateXRequest</code> and <code>UpdateXRequest</code>, and make them records.</li>
+      <li>Use custom headers sparingly; if a value belongs to the resource, put it in the body or the path. Older code prefixes custom headers with <code>X-</code>; newer standards do not require it.</li>
+      <li>Prefer one global error handler over <code>@ResponseStatus</code> on many exceptions once the API grows.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Teams give every request a correlation id: a filter reads <code>X-Request-Id</code> (or makes one), puts it in the logging context (MDC), and echoes it back in the response so a user's bug report can be traced across services. Payment-style POST endpoints take an <code>Idempotency-Key</code> header so a client can retry after a timeout without charging twice. Webhook endpoints (a payment gateway calling you) bind the body as a <code>String</code> first, because the signature in a header is calculated over the exact raw bytes.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How does <code>@RequestBody</code> work?" It reads the body through an <code>HttpMessageConverter</code> selected by <code>Content-Type</code> (Jackson for JSON) and passes the object to the method; errors are 400 or 415. "What if the JSON has extra fields?" Boot ignores them. "<code>@ResponseStatus</code> vs <code>ResponseEntity</code>?" The first is a fixed status, the second can vary status and add headers. A strong answer also names <code>MethodArgumentNotValidException</code> for <code>@Valid</code> failures and says why you never bind entities.</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-response-entity">
+  <h3>ResponseEntity and the Location header</h3>
+  <p class="tldr">ResponseEntity lets a method choose the status code, headers and body of a response, which you need for 201 Created with a Location header, 204 No Content, conditional 404s and cache headers.</p>
+
+  <p>Returning a plain object always means status 200. A real API needs more: <code>201</code> after creating, <code>204</code> after deleting, <code>404</code> when nothing exists, <code>Location</code> pointing to the new resource, <code>ETag</code> for caching. <code>ResponseEntity&lt;T&gt;</code> is the whole HTTP response as a Java object: status + headers + body. <code>T</code> is the body type, written by the message converter.</p>
+
+  <h4>How it works inside</h4>
+  <p><code>ResponseEntity</code> extends <code>HttpEntity</code>, a small class that holds headers and a body, and adds a status. When a controller method returns it, a dedicated return value handler (<code>HttpEntityMethodProcessor</code>) does three things in order: it copies the status to the response, copies your headers, and then writes the body through the same <code>HttpMessageConverter</code> chain used for a plain <code>@ResponseBody</code> (<a href="#m2-rest-controller">controller article</a>). A <code>null</code> body is allowed and produces an empty body. Because the handler is chosen by the <em>return type</em>, <code>ResponseEntity</code> works in a <code>@RestController</code> and also in a plain <code>@Controller</code>, with no <code>@ResponseBody</code> needed.</p>
+
+  <h4>The builders you use</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Builder</th><th>Status</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>ResponseEntity.ok(body)</code></td><td>200</td><td>Successful read or update</td></tr>
+      <tr><td><code>ResponseEntity.created(uri).body(body)</code></td><td>201 + <code>Location</code></td><td>POST that created a resource</td></tr>
+      <tr><td><code>ResponseEntity.accepted().build()</code></td><td>202</td><td>Work queued, not finished</td></tr>
+      <tr><td><code>ResponseEntity.noContent().build()</code></td><td>204</td><td>Delete, or update without a body</td></tr>
+      <tr><td><code>ResponseEntity.badRequest().body(e)</code></td><td>400</td><td>Rarely by hand; use the exception handler</td></tr>
+      <tr><td><code>ResponseEntity.notFound().build()</code></td><td>404</td><td>Missing resource (body-less)</td></tr>
+      <tr><td><code>ResponseEntity.status(HttpStatus.CONFLICT).body(e)</code></td><td>any</td><td>Any other status</td></tr>
+      <tr><td><code>ResponseEntity.of(optional)</code></td><td>200 or 404</td><td>Optional present → 200, empty → 404</td></tr>
+    </tbody>
+  </table></div>
+  <p>All builders end with <code>.build()</code> (no body) or <code>.body(x)</code>. Between them you can chain <code>.header(name, value)</code>, <code>.headers(...)</code>, <code>.contentType(...)</code>, <code>.eTag(...)</code>, <code>.lastModified(...)</code> and <code>.cacheControl(...)</code>. You can also call the constructor <code>new ResponseEntity&lt;&gt;(body, headers, status)</code>, which older code uses; the builder style is easier to read. For the meaning of each status, see <a href="#m2-http-status-codes">status codes</a>.</p>
+
+  <h4>Create with 201 and Location</h4>
+  <p>After <code>POST</code> creates something, the correct answer is <code>201 Created</code>, a <code>Location</code> header with the URL of the new resource, and normally the created resource in the body. Build the URL from the <em>current request</em> so it is right on every host, port and context path. Never hard-code <code>http://localhost:8080</code>.</p>
+  <pre data-title="ProductController.java"><code class="language-java">import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
+
+@PostMapping
+public ResponseEntity&lt;ProductResponse&gt; create(
+        @Valid @RequestBody CreateProductRequest request) {
+
+    ProductResponse created = productService.create(request);
+
+    URI location = ServletUriComponentsBuilder
+            .fromCurrentRequest()          // http://host/api/v1/products
+            .path("/{id}")                 // .../products/{id}
+            .buildAndExpand(created.id())  // .../products/42
+            .toUri();
+
+    return ResponseEntity.created(location).body(created);
+}</code></pre>
+  <pre class="out" data-title="Response"><code class="language-http">HTTP/1.1 201
+Location: http://localhost:8080/api/v1/products/42
+Content-Type: application/json
+
+{"id":42,"name":"Wireless Mouse","sku":"MS-100","price":799.00,"stock":25}</code></pre>
+  <p>A shorter alternative is <code>MvcUriComponentsBuilder.fromMethodName(...)</code>, but <code>fromCurrentRequest()</code> is the simplest and works well for the create-then-fetch pattern. You can also let Spring inject a <code>UriComponentsBuilder</code> as a method parameter; it is already initialised from the current request:</p>
+  <pre data-title="UriComponentsBuilder as a parameter"><code class="language-java">@PostMapping
+public ResponseEntity&lt;ProductResponse&gt; create(
+        @Valid @RequestBody CreateProductRequest request,
+        UriComponentsBuilder uriBuilder) {
+
+    ProductResponse created = productService.create(request);
+    URI location = uriBuilder.path("/api/v1/products/{id}")
+            .buildAndExpand(created.id()).toUri();
+    return ResponseEntity.created(location).body(created);
+}</code></pre>
+  <p>Behind a reverse proxy, make sure Boot honours <code>X-Forwarded-*</code> headers (<code>server.forward-headers-strategy=framework</code>), or the host in <code>Location</code> will be the internal one.</p>
+  <p>Why bother? A client that gets <code>Location</code> can fetch the new resource without guessing its id, and a browser-based client can follow it. It is also a REST rule that a response to a create should point to the new resource (<a href="#m2-rest-principles">REST principles</a>).</p>
+
+  <h4>Read: 200 or 404</h4>
+  <pre data-title="Two ways to answer a missing product"><code class="language-java">// 1. Throw. The exception handler produces a 404 body. (Preferred in services.)
+@GetMapping("/{id}")
+public ProductResponse get(@PathVariable Long id) {
+    return productService.findById(id);          // throws ProductNotFoundException
+}
+
+// 2. Decide in the controller with ResponseEntity
+@GetMapping("/{id}")
+public ResponseEntity&lt;ProductResponse&gt; get(@PathVariable Long id) {
+    return productService.findOptional(id)       // Optional&lt;ProductResponse&gt;
+            .map(ResponseEntity::ok)
+            .orElseGet(() -&gt; ResponseEntity.notFound().build());
+}</code></pre>
+  <p>The first style keeps controllers short and gives every 404 the same JSON error body from the global handler (<a href="#m2-error-handling">error handling</a>). The second gives a 404 with <em>no</em> body. In a big project choose the first.</p>
+
+  <h4>Delete, headers and caching</h4>
+  <pre data-title="More ResponseEntity patterns"><code class="language-java">// 204 No Content
+@DeleteMapping("/{id}")
+public ResponseEntity&lt;Void&gt; delete(@PathVariable Long id) {
+    productService.delete(id);
+    return ResponseEntity.noContent().build();
+}
+
+// Custom headers and cache control
+@GetMapping("/{id}/image-meta")
+public ResponseEntity&lt;ImageMeta&gt; meta(@PathVariable Long id) {
+    ImageMeta meta = productService.imageMeta(id);
+    return ResponseEntity.ok()
+            .cacheControl(CacheControl.maxAge(Duration.ofMinutes(10)).cachePublic())
+            .eTag("\"" + meta.version() + "\"")
+            .header("X-Total-Images", String.valueOf(meta.count()))
+            .body(meta);
+}
+
+// Download a file
+@GetMapping("/export")
+public ResponseEntity&lt;byte[]&gt; export() {
+    byte[] csv = productService.exportCsv();
+    return ResponseEntity.ok()
+            .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"products.csv\"")
+            .contentType(MediaType.parseMediaType("text/csv"))
+            .body(csv);
+}</code></pre>
+  <p>For large files, do not load everything into a <code>byte[]</code>. Return a <code>ResponseEntity&lt;Resource&gt;</code> (for example an <code>InputStreamResource</code>) or use a streaming body, so memory stays small (<a href="#m6-file-upload">file download</a>).</p>
+
+  <h4>Conditional requests with ETag</h4>
+  <p>An <code>ETag</code> is a version label for a response. The client sends it back in <code>If-None-Match</code>; if nothing changed, the server answers <code>304 Not Modified</code> with no body, saving bandwidth. Spring can do this check for you with <code>WebRequest.checkNotModified</code>:</p>
+  <pre data-title="Manual ETag handling"><code class="language-java">@GetMapping("/{id}")
+public ResponseEntity&lt;ProductResponse&gt; get(@PathVariable Long id, WebRequest request) {
+    ProductResponse p = productService.findById(id);
+    String etag = "\"" + p.version() + "\"";
+    if (request.checkNotModified(etag)) {
+        return null;                     // Spring already wrote 304
+    }
+    return ResponseEntity.ok().eTag(etag).body(p);
+}</code></pre>
+  <p>Returning <code>null</code> here is the documented pattern, because <code>checkNotModified</code> has already written the 304 response. This is the one case where <code>null</code> from a controller is correct. The same <code>ETag</code> idea is reused for optimistic updates with <code>If-Match</code> (<a href="#m3-locking">locking</a>).</p>
+
+  <h4>ResponseEntity vs @ResponseStatus vs a plain return</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Plain return</th><th><code>@ResponseStatus</code></th><th><code>ResponseEntity</code></th></tr></thead>
+    <tbody>
+      <tr><td>Status</td><td>200 always</td><td>One fixed status</td><td>Any, can depend on data</td></tr>
+      <tr><td>Headers</td><td>No</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Code size</td><td>Smallest</td><td>Small</td><td>A little more</td></tr>
+      <tr><td>Best for</td><td>Simple GET, PUT</td><td>Delete → 204</td><td>Create → 201 + Location, caching</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>The status code must match the result: 201 only for a created resource, 204 only with no body, 4xx for client errors.</li>
+      <li><code>ResponseEntity.created(uri)</code> needs a non-null <code>URI</code>; it sets the <code>Location</code> header for you.</li>
+      <li>Set the status and headers <em>before</em> the body is written; with <code>ResponseEntity</code> this is automatic because the whole response is built first.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention</p>
+    <p>Return the DTO directly for plain reads and updates. Use <code>ResponseEntity</code> only where you need to control status or headers: create (201 + Location), delete (204), caching and downloads. Always use a specific generic type (<code>ResponseEntity&lt;ProductResponse&gt;</code>), not <code>ResponseEntity&lt;?&gt;</code> or a raw type, so tools like springdoc can read the schema.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Returning <code>200</code> with <code>{"error": "not found"}</code> in the body. Clients and monitoring tools rely on the status code.</li>
+      <li>Returning <code>ResponseEntity.created(...)</code> with no <code>Location</code>, or hard-coding the host in the URI.</li>
+      <li>Returning <code>204</code> with a body. A 204 must have no body.</li>
+      <li>Returning <code>null</code> from a controller for "not found" (gives 200 and an empty body).</li>
+    </ul>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: success status with an error body</p><pre><code class="language-java">@GetMapping("/{id}")
+public ResponseEntity&lt;?&gt; get(@PathVariable Long id) {
+    var p = productService.findOptional(id);
+    if (p.isEmpty()) {
+        return ResponseEntity.ok(Map.of("error", "not found"));
+    }
+    return ResponseEntity.ok(p.get());
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: real 404 and a typed result</p><pre><code class="language-java">@GetMapping("/{id}")
+public ResponseEntity&lt;ProductResponse&gt; get(@PathVariable Long id) {
+    return ResponseEntity.of(productService.findOptional(id));
+}</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and errors</p>
+    <ul>
+      <li>Using <code>ResponseEntity.ok(null)</code> or <code>.build()</code> on a method declared <code>ResponseEntity&lt;ProductResponse&gt;</code> is fine: the body is just empty.</li>
+      <li>If the body cannot be written (for example Jackson fails on a lazy collection), you get <code>HttpMessageNotWritableException</code> and a 500, after the status was chosen but before it was sent.</li>
+      <li>If the client's <code>Accept</code> header cannot be satisfied, the result is 406 (<code>HttpMediaTypeNotAcceptableException</code>) even though you built a 200 entity.</li>
+      <li>A <code>HEAD</code> request to a <code>GET</code> method returns the headers of your <code>ResponseEntity</code> without the body.</li>
+      <li>A relative <code>Location</code> such as <code>/api/v1/products/42</code> is allowed by HTTP, but absolute URLs are safer for simple clients.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Most teams use <code>ResponseEntity</code> in three places only: create endpoints (201 + <code>Location</code>), file downloads (<code>Content-Disposition</code>), and cache-friendly reads (<code>ETag</code>, <code>Cache-Control</code>). Everything else returns a record, and errors go through one <code>@RestControllerAdvice</code>. Integration tests then assert the status and the <code>Location</code> header with MockMvc (<a href="#m5-webmvctest">controller tests</a>).</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you return 201 with the URL of the new object?" Use <code>ResponseEntity.created(uri).body(dto)</code> with the URI built by <code>ServletUriComponentsBuilder.fromCurrentRequest().path("/{id}").buildAndExpand(id).toUri()</code>. Then explain why <code>Location</code> matters (the client can fetch the new resource), and when you prefer throwing an exception for 404 (one consistent error format). Be ready for "difference between <code>ResponseEntity</code> and <code>@ResponseBody</code>": the first carries status, headers and body; the second only marks the return value as the body.</p>
+  </div>
+</article>

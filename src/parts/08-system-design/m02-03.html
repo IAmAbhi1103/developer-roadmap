@@ -1,0 +1,1056 @@
+<article class="topic" id="m2-proxy">
+  <h3>Proxy: control access with a stand-in, and how Spring AOP uses it</h3>
+  <p class="tldr">A proxy is a stand-in object with the same interface as the real one that controls access to it (lazy loading, security, caching, logging, transactions); Spring creates proxies, either JDK dynamic or CGLIB, to implement <code>@Transactional</code>, <code>@Cacheable</code> and <code>@Async</code>.</p>
+
+  <p><strong>Intent:</strong> provide a surrogate or placeholder for another object to control access to it.</p>
+
+  <h4>The problem</h4>
+  <p>Sometimes you cannot or should not let clients touch the real object directly. It may be expensive to create (a large report or image), it may need an access check (only admins can delete), it may live on another machine, or you want to add cross-cutting work (a transaction, a log line) without touching its code. The proxy looks exactly like the real object to the client, but it stands in front and decides when and whether to forward the call.</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class DocumentService {
+    &lt;&lt;interface&gt;&gt;
+    +read(String id) String
+    +delete(String id) void
+  }
+  class RealDocumentService
+  class SecureDocumentProxy {
+    -DocumentService target
+    -User current
+    +read(String id) String
+    +delete(String id) void
+  }
+  DocumentService &lt;|.. RealDocumentService
+  DocumentService &lt;|.. SecureDocumentProxy
+  SecureDocumentProxy --> DocumentService : forwards to
+  Client --> DocumentService
+</pre>
+    <figcaption>The client sees only the interface; it cannot tell the proxy from the real service</figcaption>
+  </figure>
+
+  <h4>Kinds of proxy</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Kind</th><th>What the proxy does</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Virtual (lazy)</td><td>Creates or loads the real object only on first use</td><td>Hibernate lazy entities and collections</td></tr>
+      <tr><td>Protection</td><td>Checks permission before forwarding</td><td>Spring Security <code>@PreAuthorize</code></td></tr>
+      <tr><td>Remote</td><td>Represents an object in another process; hides the network</td><td>Feign clients, gRPC stubs, Java RMI</td></tr>
+      <tr><td>Caching</td><td>Remembers results</td><td><code>@Cacheable</code></td></tr>
+      <tr><td>Smart reference / logging</td><td>Adds work around the call (counting, logging, transactions)</td><td><code>@Transactional</code>, <code>@Async</code>, <code>@Retryable</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A hand-written protection proxy</h4>
+  <pre data-title="ProtectionProxy.java"><code class="language-java">enum Role { VIEWER, ADMIN }
+record User(String name, Role role) { }
+
+interface DocumentService {
+    String read(String id);
+    void delete(String id);
+}
+
+class RealDocumentService implements DocumentService {
+    public String read(String id) { return "Contents of " + id; }
+    public void delete(String id) { System.out.println("Deleted " + id); }
+}
+
+class SecureDocumentProxy implements DocumentService {
+    private final DocumentService target;
+    private final User current;
+
+    SecureDocumentProxy(DocumentService target, User current) {
+        this.target = target;
+        this.current = current;
+    }
+
+    public String read(String id) {
+        return target.read(id);                          // anyone may read
+    }
+
+    public void delete(String id) {
+        if (current.role() != Role.ADMIN) {              // access control lives here
+            throw new SecurityException(current.name() + " may not delete");
+        }
+        target.delete(id);
+    }
+}
+
+public class ProxyDemo {
+    public static void main(String[] args) {
+        DocumentService real = new RealDocumentService();
+        DocumentService asViewer = new SecureDocumentProxy(real, new User("Ravi", Role.VIEWER));
+        System.out.println(asViewer.read("D1"));
+        asViewer.delete("D1");                           // throws SecurityException
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Contents of D1
+Exception in thread "main" java.lang.SecurityException: Ravi may not delete</code></pre>
+
+  <h4>A virtual (lazy) proxy</h4>
+  <pre data-title="LazyProxy.java"><code class="language-java">interface Report { String content(); }
+
+class HeavyReport implements Report {
+    HeavyReport() { System.out.println("Loading 200 MB report..."); }
+    public String content() { return "big report"; }
+}
+
+class LazyReport implements Report {
+    private Report real;                                  // not created yet
+    public String content() {
+        if (real == null) real = new HeavyReport();       // created on first use
+        return real.content();
+    }
+}</code></pre>
+  <p>(Not thread-safe as written; add <code>synchronized</code> or a holder if several threads can call <code>content()</code>.)</p>
+
+  <h4>The JDK dynamic proxy</h4>
+  <p>Writing one proxy class per interface is tedious. The JDK can create a proxy at run time for any <strong>interface</strong>, using <code>java.lang.reflect.Proxy</code> and an <code>InvocationHandler</code> that receives every call.</p>
+  <pre data-title="DynamicProxyDemo.java"><code class="language-java">import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Proxy;
+
+interface Greeter { String greet(String name); }
+
+public class DynamicProxyDemo {
+    public static void main(String[] args) {
+        Greeter real = name -&gt; "Hello, " + name;
+
+        InvocationHandler handler = (proxy, method, methodArgs) -&gt; {
+            System.out.println("before " + method.getName());
+            Object result = method.invoke(real, methodArgs);     // call the real object
+            System.out.println("after " + method.getName());
+            return result;
+        };
+
+        Greeter proxy = (Greeter) Proxy.newProxyInstance(
+                Greeter.class.getClassLoader(),
+                new Class&lt;?&gt;[] { Greeter.class },
+                handler);
+
+        System.out.println(proxy.greet("Asha"));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">before greet
+after greet
+Hello, Asha</code></pre>
+  <p>One handler can add logging, timing or transactions to any interface. This is the core idea behind Spring AOP.</p>
+
+  <h4>How Spring AOP uses proxies</h4>
+  <p>When you annotate a bean with <code>@Transactional</code>, <code>@Cacheable</code>, <code>@Async</code> or <code>@PreAuthorize</code>, Spring does not change your class. After creating the bean, a <code>BeanPostProcessor</code> wraps it in a <strong>proxy</strong> and puts the proxy in the container. Everyone who injects your bean gets the proxy. When a method is called, the proxy runs the extra work (begin transaction, check cache, run on another thread), calls your real method, and then finishes (commit or rollback).</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Caller (controller)
+  participant P as Proxy of OrderService
+  participant T as TransactionManager
+  participant S as Real OrderService
+  C->>P: placeOrder(cmd)
+  P->>T: begin transaction
+  P->>S: placeOrder(cmd)
+  S-->>P: result (or exception)
+  alt no exception
+    P->>T: commit
+  else RuntimeException
+    P->>T: rollback
+  end
+  P-->>C: result
+</pre>
+    <figcaption>What @Transactional does around your method, through the proxy</figcaption>
+  </figure>
+  <p>Spring has two ways to build the proxy:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>JDK dynamic proxy</th><th>CGLIB proxy</th></tr></thead>
+    <tbody>
+      <tr><td>How</td><td>Implements the target's interfaces</td><td>Generates a <em>subclass</em> of the target class at run time</td></tr>
+      <tr><td>Needs</td><td>The bean implements at least one interface</td><td>A non-final class; methods must be non-final and non-private to be intercepted</td></tr>
+      <tr><td>Inject as</td><td>The interface type only</td><td>The class type or an interface</td></tr>
+      <tr><td>Default in Spring Boot</td><td>No</td><td>Yes: Boot sets <code>spring.aop.proxy-target-class=true</code>, so class-based (CGLIB) proxies are used even when interfaces exist</td></tr>
+    </tbody>
+  </table></div>
+  <p>Spring Framework itself uses JDK proxies when the bean has interfaces and CGLIB otherwise, unless you set <code>proxyTargetClass</code>. In modern Boot applications, you can assume CGLIB. A related detail: a <code>@Transactional</code> class declared <code>final</code> cannot be subclassed, so proxying fails or the annotation is silently useless in some setups (Kotlin classes are final by default, which is why the Spring Kotlin plugin opens them).</p>
+
+  <h4>The self-invocation pitfall</h4>
+  <p>The proxy only sees calls that <em>come through it</em>. When a method calls another method of the same class using <code>this</code>, the call goes straight to the real object and skips the proxy, so the advice does not run.</p>
+  <pre data-title="SelfInvocation.java"><code class="language-java">@Service
+public class InvoiceService {
+
+    public void process(Long id) {
+        // ... some work
+        archive(id);                 // same as this.archive(id): NO proxy, NO transaction!
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void archive(Long id) {
+        // expected: a new transaction. Actual (when called from process): none or the caller's.
+    }
+}</code></pre>
+  <figure class="fig">
+<pre class="diagram">
+ Controller ──▶ [ Proxy ] ──▶ process()  ──▶  this.archive()
+                                  │                 ▲
+                                  └─ direct call ───┘   (the proxy is bypassed)
+</pre>
+    <figcaption>An internal call never goes back through the proxy</figcaption>
+  </figure>
+  <p>The same problem hits <code>@Cacheable</code>, <code>@Async</code> and <code>@Retryable</code>. The fixes, best first:</p>
+  <ol class="steps">
+    <li><strong>Move the method to another bean</strong> (<code>ArchiveService</code>) and inject it. The call then goes through its proxy. This is usually also a better design.</li>
+    <li>Inject the bean into itself (self-injection, often with <code>@Lazy</code>) and call through it. Works but looks odd.</li>
+    <li>Use AspectJ weaving (compile-time or load-time), which changes the bytecode instead of using proxies, so self-calls work.</li>
+    <li>Expose the proxy with <code>@EnableAspectJAutoProxy(exposeProxy = true)</code> and call <code>((InvoiceService) AopContext.currentProxy()).archive(id)</code>. Works but couples your code to Spring AOP.</li>
+  </ol>
+  <p>Related traps: the annotation on a <code>private</code> method is not applied by proxy-based AOP; <code>@Transactional</code> on public methods is the safe habit across Spring versions; and only a <code>RuntimeException</code> or <code>Error</code> triggers rollback by default (checked exceptions need <code>rollbackFor</code>). Full coverage is in the Spring notes (<a href="04-spring-boot.html#m3">Data access</a>).</p>
+
+  <h4>Proxies in the JDK, Hibernate and elsewhere</h4>
+  <ul>
+    <li><code>java.lang.reflect.Proxy</code>; <code>Collections.unmodifiableList</code> is also proxy-like.</li>
+    <li><strong>Hibernate</strong> returns a proxy for <code>getReference</code> and for <code>LAZY</code> associations. Touching it outside the session throws <code>LazyInitializationException</code>.</li>
+    <li><strong>Mockito</strong> creates proxy objects (mocks) at run time, as do Feign and Spring Data repositories (an interface you write becomes a proxy with a generated implementation).</li>
+    <li><strong>Remote proxies</strong>: gRPC and Feign client stubs hide network calls behind a Java interface.</li>
+  </ul>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Adds access control, laziness, caching or transactions without changing the real class.</li>
+      <li>Client code is unchanged because the interface is the same (OCP).</li>
+      <li>One handler can serve many classes (dynamic proxy / AOP).</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>Magic: behaviour that is invisible in the code, hard to debug (the self-invocation trap).</li>
+      <li>Extra indirection and a small cost per call; stack traces are longer.</li>
+      <li><code>equals</code>, <code>getClass()</code> and <code>instanceof</code> may behave unexpectedly with proxies.</li>
+      <li>CGLIB needs non-final classes and methods; JDK proxies need interfaces.</li>
+    </ul></div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to use a hand-written Proxy</p>
+    <ul>
+      <li>When the same concern applies to many classes: use AOP or an annotation, not one proxy class per service.</li>
+      <li>When simple code at the call site does the job (one <code>if</code> for a permission check).</li>
+      <li>When the "proxy" changes the interface or adds new behaviour the client must know about. That is a Decorator or an Adapter (see the <a href="#m2-structural-compare">comparison</a>).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: Proxy and Spring AOP</p>
+    <ul>
+      <li><b>How does <code>@Transactional</code> work?</b> A proxy wraps the bean; it begins a transaction, calls the target, then commits, or rolls back on a runtime exception.</li>
+      <li><b>JDK proxy vs CGLIB?</b> Interface-based vs subclass-based; Boot defaults to CGLIB.</li>
+      <li><b>Why does <code>@Transactional</code> not work when one method calls another in the same class?</b> The call bypasses the proxy. Fix by moving the method to another bean.</li>
+      <li><b>Proxy vs Decorator?</b> Same structure. Proxy controls access to the object (often creating or locating it itself); Decorator adds behaviour the client composes.</li>
+      <li><b>Name the types of proxy.</b> Virtual, protection, remote, caching.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-strategy">
+  <h3>Strategy: interchangeable algorithms behind an interface</h3>
+  <p class="tldr">Strategy puts each algorithm in its own class behind a common interface, so the code that needs the algorithm (the context) can pick or swap it at run time, replacing long if/else or switch chains.</p>
+
+  <p><strong>Intent:</strong> define a family of algorithms, encapsulate each one, and make them interchangeable.</p>
+
+  <h4>The problem</h4>
+  <p>A checkout supports UPI, credit card, net banking and cash on delivery. A first draft puts everything into one method:</p>
+  <pre data-title="PaymentNoStrategy.java"><code class="language-java">public Receipt pay(String method, long paise) {
+    if (method.equals("UPI")) {
+        // validate VPA, call UPI API, handle callbacks ...
+    } else if (method.equals("CARD")) {
+        // 3-D Secure, card network fees, ...
+    } else if (method.equals("NETBANKING")) {
+        // redirect to bank ...
+    } else if (method.equals("COD")) {
+        // add handling fee ...
+    }
+    throw new IllegalArgumentException(method);
+}</code></pre>
+  <p>Each branch is a different algorithm that changes for different reasons. The method grows with every new option, branches cannot be tested alone, and the same <code>if</code> chain is probably repeated for refunds and reports. This is the <a href="#m1-ocp">Open/Closed violation</a> from Module 1. Strategy is the fix.</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class PaymentStrategy {
+    &lt;&lt;interface&gt;&gt;
+    +pay(long amountInPaise) Receipt
+    +supports(PaymentMethod m) boolean
+  }
+  class UpiPayment
+  class CardPayment
+  class CodPayment
+  class CheckoutService {
+    -PaymentStrategy strategy
+    +checkout(Cart c) Receipt
+  }
+  PaymentStrategy &lt;|.. UpiPayment
+  PaymentStrategy &lt;|.. CardPayment
+  PaymentStrategy &lt;|.. CodPayment
+  CheckoutService o--> PaymentStrategy
+</pre>
+    <figcaption>The context holds a strategy; concrete strategies are interchangeable</figcaption>
+  </figure>
+
+  <h4>Implementation</h4>
+  <pre data-title="PaymentStrategyDemo.java"><code class="language-java">import java.util.EnumMap;
+import java.util.Map;
+
+enum PaymentMethod { UPI, CARD, COD }
+record Receipt(String mode, long chargedPaise) { }
+
+interface PaymentStrategy {                              // the strategy
+    Receipt pay(long amountInPaise);
+}
+
+class UpiPayment implements PaymentStrategy {
+    public Receipt pay(long amount) { return new Receipt("UPI", amount); }
+}
+class CardPayment implements PaymentStrategy {
+    public Receipt pay(long amount) {
+        long fee = amount * 2 / 100;                      // 2% card fee
+        return new Receipt("CARD", amount + fee);
+    }
+}
+class CodPayment implements PaymentStrategy {
+    public Receipt pay(long amount) { return new Receipt("COD", amount + 4000); }   // Rs 40
+}
+
+class CheckoutService {                                   // the context
+    private final Map&lt;PaymentMethod, PaymentStrategy&gt; strategies =
+            new EnumMap&lt;&gt;(PaymentMethod.class);
+
+    CheckoutService() {
+        strategies.put(PaymentMethod.UPI, new UpiPayment());
+        strategies.put(PaymentMethod.CARD, new CardPayment());
+        strategies.put(PaymentMethod.COD, new CodPayment());
+    }
+
+    Receipt checkout(PaymentMethod method, long amountInPaise) {
+        PaymentStrategy strategy = strategies.get(method);       // choose at run time
+        if (strategy == null) throw new IllegalArgumentException("Unsupported " + method);
+        return strategy.pay(amountInPaise);                      // no if/else chain
+    }
+}
+
+public class PaymentStrategyDemo {
+    public static void main(String[] args) {
+        CheckoutService checkout = new CheckoutService();
+        System.out.println(checkout.checkout(PaymentMethod.UPI, 100000));
+        System.out.println(checkout.checkout(PaymentMethod.CARD, 100000));
+        System.out.println(checkout.checkout(PaymentMethod.COD, 100000));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Receipt[mode=UPI, chargedPaise=100000]
+Receipt[mode=CARD, chargedPaise=102000]
+Receipt[mode=COD, chargedPaise=104000]</code></pre>
+  <p>To add net banking, write one new class and register it. <code>checkout()</code> does not change. Each strategy is tested alone.</p>
+
+  <h4>Strategy as a lambda</h4>
+  <p>If the interface has one method, a strategy can be a lambda or a method reference, which removes the class ceremony:</p>
+  <pre data-title="LambdaStrategy.java"><code class="language-java">interface DiscountRule { long apply(long amountInPaise); }
+
+DiscountRule none    = amount -&gt; amount;
+DiscountRule tenOff  = amount -&gt; amount * 90 / 100;
+DiscountRule flat200 = amount -&gt; Math.max(0, amount - 20000);
+
+long total = priceWith(tenOff, 150000);        // passes behaviour as a value
+
+static long priceWith(DiscountRule rule, long amount) { return rule.apply(amount); }</code></pre>
+
+  <h4>Strategy in the JDK</h4>
+  <ul>
+    <li><strong><code>Comparator</code></strong> is the best-known strategy: <code>list.sort(Comparator.comparing(Employee::salary))</code> passes a sorting algorithm to the <code>List</code> (the context). So are the comparators in <code>TreeMap</code> and <code>PriorityQueue</code>.</li>
+    <li><code>ThreadPoolExecutor</code> takes a <code>RejectedExecutionHandler</code> (what to do when the queue is full) and a <code>ThreadFactory</code>.</li>
+    <li><code>LayoutManager</code> in Swing/AWT; <code>java.util.zip.Deflater</code> compression levels; <code>Collections.shuffle(list, random)</code> with a pluggable <code>Random</code>.</li>
+  </ul>
+
+  <h4>Strategy in Spring</h4>
+  <p>Spring makes Strategy nearly free. Declare each strategy as a bean and inject all of them. You can inject a <code>Map&lt;String, PaymentStrategy&gt;</code> (key = bean name) or a <code>List&lt;PaymentStrategy&gt;</code> and let each strategy say what it supports:</p>
+  <pre data-title="SpringStrategy.java"><code class="language-java">public interface PaymentStrategy {
+    PaymentMethod method();                   // which key this strategy serves
+    Receipt pay(long amountInPaise);
+}
+
+@Component class UpiPayment implements PaymentStrategy {
+    public PaymentMethod method() { return PaymentMethod.UPI; }
+    public Receipt pay(long amount) { return new Receipt("UPI", amount); }
+}
+@Component class CardPayment implements PaymentStrategy { /* ... */ }
+
+@Service
+public class CheckoutService {
+    private final Map&lt;PaymentMethod, PaymentStrategy&gt; byMethod;
+
+    public CheckoutService(List&lt;PaymentStrategy&gt; strategies) {      // all beans injected
+        this.byMethod = strategies.stream()
+                .collect(Collectors.toMap(PaymentStrategy::method, s -&gt; s));
+    }
+
+    public Receipt checkout(PaymentMethod method, long amount) {
+        return byMethod.get(method).pay(amount);
+    }
+}</code></pre>
+  <p>A new payment method is a new <code>@Component</code> and nothing else. Spring's own strategies include <code>HandlerMethodArgumentResolver</code>, <code>ViewResolver</code>, <code>HttpMessageConverter</code>, <code>PasswordEncoder</code> and <code>ResourceLoader</code>. Strategies chosen by configuration also appear as <code>@ConditionalOnProperty</code> or profile-specific beans.</p>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Removes long conditionals; follows OCP.</li>
+      <li>Each algorithm is isolated, easy to test and reuse.</li>
+      <li>Behaviour can be changed at run time (by user choice or configuration).</li>
+      <li>Composition instead of inheritance.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>More classes (reduced by lambdas).</li>
+      <li>The client must know the strategies to choose one (or you need a selection mechanism).</li>
+      <li>For two simple, stable branches, it is overkill.</li>
+    </ul></div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to use Strategy, and the State comparison</p>
+    <ul>
+      <li>When there are two branches that will never grow: an <code>if</code> is clearer.</li>
+      <li>When the "algorithms" differ in only one number: use a parameter.</li>
+      <li><strong>Strategy vs State:</strong> the shape (a context holding an interface reference) is identical. In Strategy, the client usually picks the strategy and it rarely changes; strategies do not know each other. In <a href="#m2-state">State</a>, the object switches its own state as events occur, and states often know the next state.</li>
+    </ul>
+  </div>
+    <h4>Why the pattern exists</h4>
+  <p>An <code>if / else if</code> chain on a type code ("UPI", "CARD") looks harmless at first. Then it grows: every new payment method edits the same method, every change risks the others, the method becomes hundreds of lines, and unit tests need to set up all branches. This breaks the <a href="#m1-ocp">Open/Closed Principle</a> and the <a href="#m1-srp">Single Responsibility Principle</a>. Strategy fixes it by turning each branch into a class that implements one interface. The context (the checkout) no longer decides <em>how</em>; it only asks the chosen strategy to do it. Selecting which strategy to use becomes a separate, small decision.</p>
+
+  <h4>The parts and the flow</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant Cl as Caller
+  participant Ctx as Context
+  participant S as Strategy
+  Cl->>Ctx: setStrategy or constructor argument
+  Cl->>Ctx: doWork(data)
+  Ctx->>S: execute(data)
+  S-->>Ctx: result
+  Ctx-->>Cl: result
+</pre>
+    <figcaption>The context delegates the variable part to whichever strategy it was given</figcaption>
+  </figure>
+
+  <h4>A second example: retry back-off</h4>
+  <p>A client calls a flaky payment API and waits between attempts. Different callers want different waiting rules: a fixed pause for a batch job, exponential growth for user requests. The waiting rule is a strategy; the retry loop is the context.</p>
+  <pre data-title="BackoffStrategy.java"><code class="language-java">import java.time.Duration;
+import java.util.concurrent.Callable;
+
+interface BackoffPolicy {
+    Duration delayBefore(int attempt);              // attempt starts at 1
+}
+
+class FixedBackoff implements BackoffPolicy {
+    private final Duration pause;
+    FixedBackoff(Duration pause) { this.pause = pause; }
+    public Duration delayBefore(int attempt) { return pause; }
+}
+
+class ExponentialBackoff implements BackoffPolicy {
+    private final Duration base;
+    private final Duration cap;
+    ExponentialBackoff(Duration base, Duration cap) { this.base = base; this.cap = cap; }
+    public Duration delayBefore(int attempt) {
+        long millis = base.toMillis() * (1L &lt;&lt; Math.min(attempt - 1, 20));
+        return Duration.ofMillis(Math.min(millis, cap.toMillis()));
+    }
+}
+
+class Retrier {                                      // the context
+    private final int maxAttempts;
+    private final BackoffPolicy backoff;
+    Retrier(int maxAttempts, BackoffPolicy backoff) {
+        this.maxAttempts = maxAttempts;
+        this.backoff = backoff;
+    }
+    &lt;T&gt; T call(Callable&lt;T&gt; task) throws Exception {
+        for (int attempt = 1; ; attempt++) {
+            try { return task.call(); }
+            catch (Exception e) {
+                if (attempt &gt;= maxAttempts) throw e;
+                Thread.sleep(backoff.delayBefore(attempt).toMillis());
+            }
+        }
+    }
+}</code></pre>
+  <p>With <code>new ExponentialBackoff(Duration.ofMillis(100), Duration.ofSeconds(2))</code> the waits are 100, 200, 400, 800 ms and so on, capped at 2 seconds. Adding "exponential with jitter" is one new class; <code>Retrier</code> is not edited. (Libraries such as Resilience4j and Spring Retry ship ready-made policies, so write your own only to learn or for tiny needs.)</p>
+
+  <h4>Choosing the strategy</h4>
+  <ul>
+    <li><strong>By configuration:</strong> a property such as <code>payment.default=UPI</code> picks the bean at start-up.</li>
+    <li><strong>By request data:</strong> a registry <code>Map&lt;PaymentMethod, PaymentStrategy&gt;</code> and a lookup, as in the implementation above. This is the usual choice for a web app.</li>
+    <li><strong>By rules:</strong> each strategy has a <code>supports(request)</code> method and the context picks the first that matches (a small chain; see <a href="#m2-chain-of-responsibility">Chain of Responsibility</a>).</li>
+  </ul>
+  <p>Do not put the <code>switch</code> back into the client. One lookup in one place is fine; the same <code>switch</code> in ten places is the original problem again.</p>
+
+  <h4>Strategy vs the things it is confused with</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pattern</th><th>Who changes the behaviour?</th><th>Key idea</th></tr></thead>
+    <tbody>
+      <tr><td>Strategy</td><td>The client or configuration, from outside</td><td>Interchangeable algorithms; usually independent of each other</td></tr>
+      <tr><td><a href="#m2-state">State</a></td><td>The object itself, as its state changes</td><td>States know about each other and trigger transitions</td></tr>
+      <tr><td><a href="#m2-template-method">Template Method</a></td><td>Subclasses fill steps of a fixed skeleton</td><td>Inheritance instead of composition</td></tr>
+      <tr><td><a href="#m2-command">Command</a></td><td>The invoker runs a request object</td><td>One request, maybe queued or undone</td></tr>
+    </tbody>
+  </table></div>
+  <p>Strategy and Template Method solve the same problem in two ways. Prefer Strategy when the variation is a whole algorithm or must change at run time (<a href="#m1-composition-inheritance">composition over inheritance</a>). Choose Template Method when the order of steps is fixed and only some steps vary.</p>
+
+  <h4>An enum with behaviour: the lightweight form</h4>
+  <p>If the set of strategies is closed and small, an enum can carry the behaviour and avoids the extra interface and registry:</p>
+  <pre data-title="ShippingRate.java"><code class="language-java">enum ShippingRate {
+    STANDARD { long fee(long paise) { return paise &gt; 49_900 ? 0 : 4_900; } },
+    EXPRESS  { long fee(long paise) { return 9_900; } };
+
+    abstract long fee(long orderPaise);
+}
+// ShippingRate.EXPRESS.fee(20_000) -&gt; 9900</code></pre>
+  <p>The trade-off: the list is fixed in one file, so you lose the open-for-extension benefit and cannot add a strategy from another module.</p>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: the switch lives in the context</p><pre><code class="language-java">long fee(String courier, long paise) {
+    switch (courier) {
+        case "FAST":  return paise / 10;
+        case "CHEAP": return 4_900;
+        default: throw new IllegalArgumentException();
+    }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: the context asks a strategy</p><pre><code class="language-java">long fee(CourierRates rates, long paise) {
+    return rates.feeFor(paise);        // CourierRates is the strategy
+}</code></pre></div>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>All strategies share one interface and are interchangeable without the context knowing which one it has (<a href="#m1-lsp">LSP</a>).</li>
+      <li>The context depends on the interface only, never on a concrete strategy class.</li>
+      <li>Pass the data a strategy needs as parameters. Do not let it reach into the context's private state.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Make strategies stateless and reuse one instance; stateless objects are safe to share between threads.</li>
+      <li>Name them after the policy: <code>ExponentialBackoff</code>, <code>PercentOff</code>. In Spring, one <code>@Component</code> per strategy and inject the whole collection.</li>
+      <li>Provide a sensible default (a "no-op" or standard strategy) so the context never holds <code>null</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Unknown key:</strong> a registry lookup that returns <code>null</code> leads to <code>NullPointerException</code>. Fail early with a clear <code>IllegalArgumentException</code> naming the key.</li>
+      <li><strong>Strategies that need different inputs:</strong> the interface becomes a bag of parameters. Wrap them in a request record, or the abstraction is wrong.</li>
+      <li><strong>Stateful strategies</strong> (a counter, a cache) are not safe to share. Create one per context or make them thread-safe.</li>
+    </ul>
+  </div>
+<div class="co co-interview">
+    <p class="co-t">Interview: Strategy</p>
+    <ul>
+      <li><b>Which pattern replaces a big <code>if/else</code> or <code>switch</code> on type?</b> Strategy (or State if the type changes over time).</li>
+      <li><b>JDK example?</b> <code>Comparator</code> passed to <code>Collections.sort</code> or <code>list.sort</code>.</li>
+      <li><b>How do you implement it in Spring?</b> Beans implementing one interface, injected as a <code>Map</code> or <code>List</code>.</li>
+      <li><b>Strategy vs Template Method?</b> Strategy changes the whole algorithm by composition (swap an object); Template Method fixes the skeleton and lets subclasses fill in steps by inheritance.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: harder Strategy questions</p>
+    <ul>
+      <li><b>How does Strategy remove if/else?</b> Each branch becomes a class behind an interface; a registry picks the class; adding a branch needs no edit to the context.</li>
+      <li><b>Strategy vs State?</b> Same shape. State changes itself as the object moves between states; a strategy is chosen from outside and does not trigger transitions.</li>
+      <li><b>Where in the JDK?</b> <code>Comparator</code>, <code>RejectedExecutionHandler</code>.</li>
+      <li><b>When is it overkill?</b> Two branches that will never grow. A lambda or a simple <code>if</code> is enough.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-observer">
+  <h3>Observer: publish changes to many listeners</h3>
+  <p class="tldr">Observer lets one object (the subject) notify any number of registered listeners when something happens, without the subject knowing who they are; in Spring you do this with ApplicationEventPublisher and @EventListener.</p>
+
+  <p><strong>Intent:</strong> define a one-to-many dependency so that when one object changes state, all its dependents are notified and updated automatically.</p>
+
+  <h4>The problem</h4>
+  <p>When an order is placed, the system must send an email, reduce stock, award loyalty points and tell the analytics team. If <code>OrderService.place()</code> calls all four directly, it is coupled to every one of them: it needs four dependencies, a failure in analytics can break the order, and each new reaction means editing <code>OrderService</code> (against <a href="#m1-ocp">OCP</a> and <a href="#m1-srp">SRP</a>). With Observer, <code>OrderService</code> only announces "order placed", and interested parties subscribe.</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class OrderEventPublisher {
+    -List~OrderListener~ listeners
+    +subscribe(OrderListener l) void
+    +publish(OrderEvent e) void
+  }
+  class OrderListener {
+    &lt;&lt;interface&gt;&gt;
+    +onEvent(OrderEvent e) void
+  }
+  class EmailListener
+  class LoyaltyListener
+  class StockListener
+  OrderEventPublisher o--> OrderListener
+  OrderListener &lt;|.. EmailListener
+  OrderListener &lt;|.. LoyaltyListener
+  OrderListener &lt;|.. StockListener
+</pre>
+    <figcaption>The subject knows only the listener interface</figcaption>
+  </figure>
+
+  <h4>Implementation</h4>
+  <pre data-title="ObserverDemo.java"><code class="language-java">import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+enum OrderStatus { PLACED, PAID, SHIPPED, DELIVERED }
+record OrderEvent(String orderId, OrderStatus status) { }
+
+interface OrderListener {
+    void onEvent(OrderEvent event);
+}
+
+class OrderEventPublisher {                               // the subject
+    private final List&lt;OrderListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+
+    void subscribe(OrderListener l)   { listeners.add(l); }
+    void unsubscribe(OrderListener l) { listeners.remove(l); }
+
+    void publish(OrderEvent event) {
+        for (OrderListener l : listeners) {
+            try {
+                l.onEvent(event);
+            } catch (RuntimeException e) {                // one bad listener must not stop others
+                System.err.println("Listener failed: " + e.getMessage());
+            }
+        }
+    }
+}
+
+class EmailListener implements OrderListener {
+    public void onEvent(OrderEvent e) {
+        System.out.println("Email: order " + e.orderId() + " is " + e.status());
+    }
+}
+class LoyaltyListener implements OrderListener {
+    public void onEvent(OrderEvent e) {
+        if (e.status() == OrderStatus.DELIVERED) {
+            System.out.println("Loyalty: award points for " + e.orderId());
+        }
+    }
+}
+
+public class ObserverDemo {
+    public static void main(String[] args) {
+        OrderEventPublisher publisher = new OrderEventPublisher();
+        publisher.subscribe(new EmailListener());
+        publisher.subscribe(new LoyaltyListener());
+        publisher.subscribe(e -&gt; System.out.println("Audit: " + e));       // a lambda listener
+
+        publisher.publish(new OrderEvent("O-1", OrderStatus.SHIPPED));
+        publisher.publish(new OrderEvent("O-1", OrderStatus.DELIVERED));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Email: order O-1 is SHIPPED
+Audit: OrderEvent[orderId=O-1, status=SHIPPED]
+Email: order O-1 is DELIVERED
+Loyalty: award points for O-1
+Audit: OrderEvent[orderId=O-1, status=DELIVERED]</code></pre>
+  <p><code>CopyOnWriteArrayList</code> lets listeners subscribe or unsubscribe while a publish is looping, without <code>ConcurrentModificationException</code>. Two choices every observer design must make: <strong>push</strong> (send the data in the event, as here) or <strong>pull</strong> (send a reference and let listeners ask), and <strong>synchronous</strong> (the publisher waits for all listeners, as here) or <strong>asynchronous</strong> (listeners run on other threads or through a queue).</p>
+
+  <h4>Observer in the JDK</h4>
+  <ul>
+    <li><code>java.util.Observable</code> and <code>Observer</code> are <strong>deprecated since Java 9</strong>. They were not type-safe and not thread-safe. Do not use them in new code.</li>
+    <li><code>java.beans.PropertyChangeListener</code> and <code>PropertyChangeSupport</code> are still available for bound properties.</li>
+    <li>Event listeners in GUI toolkits (<code>ActionListener</code>, JavaFX properties); <code>ServletContextListener</code> and <code>HttpSessionListener</code> in servlets.</li>
+    <li><code>java.util.concurrent.Flow</code> (Java 9+) defines <code>Publisher</code>/<code>Subscriber</code> interfaces for reactive streams with back-pressure.</li>
+  </ul>
+
+  <h4>Observer in Spring: application events</h4>
+  <p>Spring has Observer built in. The container is the event bus: you publish an event object with <code>ApplicationEventPublisher</code>, and any bean method annotated <code>@EventListener</code> whose parameter type matches receives it. Since Spring 4.2 an event can be any object, so a record works.</p>
+  <pre data-title="SpringEvents.java"><code class="language-java">public record OrderPlacedEvent(String orderId, String customerEmail) { }
+
+@Service
+public class OrderService {
+    private final OrderRepository repository;
+    private final ApplicationEventPublisher events;
+
+    public OrderService(OrderRepository repository, ApplicationEventPublisher events) {
+        this.repository = repository;
+        this.events = events;
+    }
+
+    @Transactional
+    public void place(Order order) {
+        repository.save(order);
+        events.publishEvent(new OrderPlacedEvent(order.id(), order.email()));
+    }                                         // OrderService knows no listeners
+}
+
+@Component
+class EmailSender {
+    @EventListener
+    void on(OrderPlacedEvent e) {
+        // send the confirmation mail
+    }
+}
+
+@Component
+class LoyaltyService {
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    void on(OrderPlacedEvent e) {
+        // runs only if the order transaction committed
+    }
+}</code></pre>
+  <ul>
+    <li>By default, <code>@EventListener</code> methods run <strong>synchronously on the publisher's thread</strong>, inside its transaction. A slow or failing listener affects the publisher. Add <code>@Async</code> (with <code>@EnableAsync</code>) to run it on another thread.</li>
+    <li><code>@TransactionalEventListener</code> ties a listener to the transaction phase. <code>AFTER_COMMIT</code> avoids sending an email for an order that later rolls back.</li>
+    <li>Spring also publishes its own events: <code>ContextRefreshedEvent</code>, <code>ApplicationReadyEvent</code> and others, which you can listen to.</li>
+  </ul>
+  <p>For events that must cross process boundaries (microservices), in-memory observers are not enough; you need a message broker. That is the publish/subscribe pattern covered in <a href="#m6">Module 6</a> and in the messaging section of the Spring notes.</p>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Loose coupling: the subject does not know its observers (OCP, DIP).</li>
+      <li>Add or remove reactions at run time or by adding a new class.</li>
+      <li>Natural fit for events and notifications.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>Hidden control flow: hard to see who reacts to an event.</li>
+      <li>Order of notification is usually undefined (Spring: use <code>@Order</code>).</li>
+      <li>Memory leaks ("lapsed listener"): a forgotten subscription keeps an object alive.</li>
+      <li>Synchronous listeners can slow or break the publisher; exceptions need handling.</li>
+      <li>Event storms or cycles (a listener publishes an event that triggers itself).</li>
+    </ul></div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to use Observer</p>
+    <ul>
+      <li>When the caller needs a result from the other party: use a normal method call.</li>
+      <li>When the reaction must be part of the same atomic operation (debit and credit in one transaction). Hiding it behind events makes the flow unclear and the guarantee unclear.</li>
+      <li>When there is exactly one fixed collaborator and it will not change.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: Observer</p>
+    <ul>
+      <li><b>Explain Observer with an example.</b> Order placed event with email, loyalty and stock listeners; the order service knows none of them.</li>
+      <li><b>How is it done in Spring?</b> <code>ApplicationEventPublisher.publishEvent</code> and <code>@EventListener</code>; <code>@TransactionalEventListener(AFTER_COMMIT)</code> for transaction-safe reactions; <code>@Async</code> for non-blocking.</li>
+      <li><b>Is <code>java.util.Observable</code> recommended?</b> No, deprecated since Java 9.</li>
+      <li><b>Observer vs pub/sub?</b> Observer: in-process, direct references. Pub/sub: a broker decouples publishers and subscribers in space and time.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-command">
+  <h3>Command: turn a request into an object (undo, queues, Runnable)</h3>
+  <p class="tldr">Command wraps a request (an action and its data) in an object, so you can queue it, log it, schedule it, pass it around or undo it; in Java, Runnable and Callable are the everyday commands.</p>
+
+  <p><strong>Intent:</strong> encapsulate a request as an object, letting you parameterise clients with different requests, queue or log requests, and support undoable operations.</p>
+
+  <h4>The problem</h4>
+  <p>A text editor has buttons, menu items and keyboard shortcuts that all perform actions: type text, delete, bold. You want undo and redo, and a macro recorder. If the button code calls <code>document.insert(...)</code> directly, nothing remembers what was done or how to reverse it. If each action is an object with <code>execute()</code> and <code>undo()</code>, the editor can keep a history stack. The same idea gives you job queues: store commands now, run them later on a worker thread.</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class Command {
+    &lt;&lt;interface&gt;&gt;
+    +execute() void
+    +undo() void
+  }
+  class InsertTextCommand
+  class DeleteTextCommand
+  class Editor {
+    -Deque~Command~ undoStack
+    -Deque~Command~ redoStack
+    +run(Command c) void
+    +undo() void
+    +redo() void
+  }
+  class Document {
+    -StringBuilder text
+  }
+  Command &lt;|.. InsertTextCommand
+  Command &lt;|.. DeleteTextCommand
+  Editor o--> Command
+  InsertTextCommand --> Document : receiver
+  DeleteTextCommand --> Document : receiver
+</pre>
+    <figcaption>Invoker (Editor), Command, and receiver (Document)</figcaption>
+  </figure>
+  <dl class="terms">
+    <dt>Command</dt><dd>The interface with <code>execute()</code> (and <code>undo()</code> if needed).</dd>
+    <dt>Concrete command</dt><dd>Holds the receiver and the data needed, and calls the receiver in <code>execute()</code>.</dd>
+    <dt>Receiver</dt><dd>The object that really does the work (<code>Document</code>).</dd>
+    <dt>Invoker</dt><dd>Triggers commands and keeps history (<code>Editor</code>, a button, a scheduler). It does not know what the command does.</dd>
+  </dl>
+
+  <h4>Implementation: undo and redo</h4>
+  <pre data-title="CommandDemo.java"><code class="language-java">import java.util.ArrayDeque;
+import java.util.Deque;
+
+class Document {                                          // receiver
+    private final StringBuilder text = new StringBuilder();
+    void insert(int pos, String s) { text.insert(pos, s); }
+    void remove(int pos, int len)  { text.delete(pos, pos + len); }
+    int length() { return text.length(); }
+    @Override public String toString() { return text.toString(); }
+}
+
+interface Command {
+    void execute();
+    void undo();
+}
+
+class InsertCommand implements Command {
+    private final Document doc;
+    private final int pos;
+    private final String text;
+
+    InsertCommand(Document doc, int pos, String text) {
+        this.doc = doc; this.pos = pos; this.text = text;
+    }
+    public void execute() { doc.insert(pos, text); }
+    public void undo()    { doc.remove(pos, text.length()); }     // exact reverse
+}
+
+class DeleteCommand implements Command {
+    private final Document doc;
+    private final int pos;
+    private final int len;
+    private String removed = "";                          // saved so undo can restore it
+
+    DeleteCommand(Document doc, int pos, int len) {
+        this.doc = doc; this.pos = pos; this.len = len;
+    }
+    public void execute() {
+        removed = doc.toString().substring(pos, pos + len);
+        doc.remove(pos, len);
+    }
+    public void undo() { doc.insert(pos, removed); }
+}
+
+class Editor {                                            // invoker with history
+    private final Deque&lt;Command&gt; undoStack = new ArrayDeque&lt;&gt;();
+    private final Deque&lt;Command&gt; redoStack = new ArrayDeque&lt;&gt;();
+
+    void run(Command c) {
+        c.execute();
+        undoStack.push(c);
+        redoStack.clear();                                // a new action ends the redo history
+    }
+    void undo() {
+        if (undoStack.isEmpty()) return;
+        Command c = undoStack.pop();
+        c.undo();
+        redoStack.push(c);
+    }
+    void redo() {
+        if (redoStack.isEmpty()) return;
+        Command c = redoStack.pop();
+        c.execute();
+        undoStack.push(c);
+    }
+}
+
+public class CommandDemo {
+    public static void main(String[] args) {
+        Document doc = new Document();
+        Editor editor = new Editor();
+        editor.run(new InsertCommand(doc, 0, "Hello World"));
+        editor.run(new DeleteCommand(doc, 5, 6));
+        System.out.println(doc);          // Hello
+        editor.undo();
+        System.out.println(doc);          // Hello World
+        editor.undo();
+        System.out.println("[" + doc + "]");   // []
+        editor.redo();
+        System.out.println(doc);          // Hello World
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Hello
+Hello World
+[]
+Hello World</code></pre>
+
+  <h4>Command as a job queue</h4>
+  <p>Because a command is just an object, you can put it in a queue and run it later, on another thread, or after a failure (retry). This is the idea behind background jobs, task schedulers and even database write-ahead logs.</p>
+  <pre data-title="TaskQueue.java"><code class="language-java">import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+ExecutorService workers = Executors.newFixedThreadPool(4);
+
+Runnable sendInvoice = () -&gt; mailer.send("asha@example.com", "Invoice #42");   // a command
+Runnable resizeImage = () -&gt; imageService.resize("photo.jpg", 200, 200);
+
+workers.submit(sendInvoice);          // invoker: the executor runs commands off-thread
+workers.submit(resizeImage);
+workers.shutdown();</code></pre>
+  <p>(<code>mailer</code> and <code>imageService</code> stand for your own objects.) In Java, a <code>Runnable</code> is a command with no result and no undo, and a <code>Callable&lt;V&gt;</code> is a command that returns a value. Lambdas make small commands almost free.</p>
+
+  <h4>Command in the JDK and Spring</h4>
+  <ul>
+    <li><code>Runnable</code>, <code>Callable</code>, <code>ExecutorService.submit</code>, <code>Timer</code>/<code>TimerTask</code>, <code>ScheduledExecutorService</code>.</li>
+    <li>Swing <code>Action</code> and <code>ActionListener</code>.</li>
+    <li>Spring: <code>@Async</code> methods and <code>@Scheduled</code> tasks are commands run by an executor; Spring Batch steps; <code>TransactionCallback</code>.</li>
+    <li>Architecture level: a <em>command</em> message in messaging and CQRS ("PlaceOrder") is the same idea sent over a queue (<a href="#m6">Module 6</a>).</li>
+    <li>A single-method functional interface used with a lambda is also a command. The "macro" variant, <code>MacroCommand</code>, holds a list of commands and runs them in order (a Composite of commands).</li>
+  </ul>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Decouples who triggers an action from who performs it.</li>
+      <li>Enables undo/redo, queuing, scheduling, logging, retry and macros.</li>
+      <li>New commands are added without changing the invoker (OCP).</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>One class per action, so a lot of small classes (lambdas help).</li>
+      <li>Undo is hard when actions have side effects that cannot be reversed (sent emails, payments).</li>
+      <li>Undo needs saved state (the removed text), which costs memory.</li>
+    </ul></div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to use Command</p>
+    <ul>
+      <li>When you only call a method and need no queue, history or undo: a direct call is simpler.</li>
+      <li>For irreversible side effects, "undo" should be a compensating action (a refund), designed on purpose, not pretended (see the saga pattern in <a href="#m6">Module 6</a>).</li>
+    </ul>
+  </div>
+    <h4>Why the pattern exists</h4>
+  <p>A normal method call is instant and invisible: the caller says "do it now" and the moment it returns, nothing remains of the request. That is fine until you need to <em>do something with the request itself</em>: remember it for undo, run it later, run it on another thread, retry it after a failure, write it to a log, or send it over the network. For all of these, the request must be a thing you can hold, so you turn it into an object. The three roles are always the same: an <strong>invoker</strong> decides when, a <strong>command</strong> carries what, and a <strong>receiver</strong> does the real work.</p>
+
+  <h4>The flow with undo</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant U as User
+  participant E as Editor (invoker)
+  participant C as DeleteCommand
+  participant D as Document (receiver)
+  U->>E: run(new DeleteCommand)
+  E->>C: execute()
+  C->>D: remove(pos, len)
+  E->>E: push on undo stack
+  U->>E: undo()
+  E->>C: undo()
+  C->>D: insert(pos, removedText)
+</pre>
+    <figcaption>The invoker only keeps the history; each command knows how to reverse itself</figcaption>
+  </figure>
+
+  <h4>A second example: commands as data</h4>
+  <p>In a backend, a command is often a small immutable <code>record</code> that describes an intention, plus a handler that executes it. This lets you validate, log and queue commands in one place, which is the idea behind command buses and CQRS ("command" side).</p>
+  <pre data-title="CommandBus.java"><code class="language-java">import java.util.HashMap;
+import java.util.Map;
+import java.util.function.Consumer;
+
+sealed interface OrderCommand permits PlaceOrder, CancelOrder { }
+record PlaceOrder(String orderId, long paise) implements OrderCommand { }
+record CancelOrder(String orderId, String reason) implements OrderCommand { }
+
+class CommandBus {
+    private final Map&lt;Class&lt;?&gt;, Consumer&lt;Object&gt;&gt; handlers = new HashMap&lt;&gt;();
+
+    &lt;C extends OrderCommand&gt; void register(Class&lt;C&gt; type, Consumer&lt;C&gt; handler) {
+        handlers.put(type, c -&gt; handler.accept(type.cast(c)));
+    }
+
+    void send(OrderCommand command) {
+        System.out.println("LOG " + command);                   // one place to log
+        Consumer&lt;Object&gt; h = handlers.get(command.getClass());
+        if (h == null) throw new IllegalArgumentException("No handler for " + command);
+        h.accept(command);
+    }
+}
+
+public class BusDemo {
+    public static void main(String[] args) {
+        CommandBus bus = new CommandBus();
+        bus.register(PlaceOrder.class, c -&gt; System.out.println("placed " + c.orderId()));
+        bus.register(CancelOrder.class, c -&gt; System.out.println("cancelled " + c.orderId()));
+        bus.send(new PlaceOrder("O-7", 129900));
+        bus.send(new CancelOrder("O-7", "changed mind"));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">LOG PlaceOrder[orderId=O-7, paise=129900]
+placed O-7
+LOG CancelOrder[orderId=O-7, reason=changed mind]
+cancelled O-7</code></pre>
+  <p>Because a command here is plain data, you can also store it in a database table or send it through Kafka or RabbitMQ and execute it on another machine. That is a command <em>message</em>. The difference from an event: a command says "please do this" and is addressed to one handler; an event says "this happened" and has any number of listeners (<a href="#m2-observer">Observer</a>).</p>
+
+  <h4>Macro commands and composite undo</h4>
+  <pre data-title="MacroCommand.java"><code class="language-java">import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.List;
+
+class MacroCommand implements Command {                 // Command from the editor example
+    private final List&lt;Command&gt; steps;
+    MacroCommand(List&lt;Command&gt; steps) { this.steps = List.copyOf(steps); }
+    public void execute() { steps.forEach(Command::execute); }
+    public void undo() {
+        Deque&lt;Command&gt; reversed = new ArrayDeque&lt;&gt;();
+        steps.forEach(reversed::push);                  // last executed is undone first
+        reversed.forEach(Command::undo);
+    }
+}</code></pre>
+  <p>Undo must run in the reverse order of execute, or the positions stored in the commands will point to the wrong places. If step 3 of 5 fails during <code>execute</code>, a robust macro undoes steps 1 and 2 before rethrowing.</p>
+
+  <h4>Two ways to implement undo</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Approach</th><th>How</th><th>Good for</th></tr></thead>
+    <tbody>
+      <tr><td>Inverse operation</td><td>The command knows the opposite action (insert undoes delete)</td><td>Small, reversible changes; cheap memory</td></tr>
+      <tr><td>Snapshot (Memento)</td><td>Save the previous state before executing, restore on undo</td><td>Complex edits; costs more memory</td></tr>
+      <tr><td>Compensation</td><td>A new action that cancels the effect (a refund)</td><td>External side effects that cannot be reversed</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Command compared with its neighbours</h4>
+  <ul>
+    <li><strong>Strategy:</strong> a reusable algorithm the context calls again and again. A command is one specific request with its own data, run once (or redone).</li>
+    <li><strong>Callable / Runnable:</strong> a command with no undo. Use a plain functional interface when you need only "run this later".</li>
+    <li><strong>Memento:</strong> stores state for restore. Commands often use a memento for undo.</li>
+    <li><strong>Chain of Responsibility:</strong> passes a request along handlers until one handles it. A command bus has exactly one handler per command type.</li>
+  </ul>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: undo does not mirror execute</p><pre><code class="language-java">public void execute() { doc.insert(pos, text); }
+public void undo()    { doc.remove(0, text.length()); }   // wrong position</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: undo uses the same saved data</p><pre><code class="language-java">public void execute() { doc.insert(pos, text); }
+public void undo()    { doc.remove(pos, text.length()); }</code></pre></div>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>A command must carry everything it needs (the receiver and the arguments) so that it can run later, away from the code that created it.</li>
+      <li>If you offer undo, every command in the history must support it, and the history must be cleared of redo entries when a new command runs (as the <code>Editor</code> above does).</li>
+      <li>Make the data in a command immutable. If a captured object changes before the command runs, you execute a different request than the one the user made.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Name commands as imperative verbs: <code>PlaceOrder</code>, <code>CancelOrder</code>. Events use the past tense: <code>OrderPlaced</code>.</li>
+      <li>Use a lambda or <code>Runnable</code> for tiny fire-and-forget actions, and a class or record when you need history, logging or serialisation.</li>
+      <li>Give queued commands an id so that a retry can be made idempotent (processing the same id twice has the same effect as once).</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Unbounded history:</strong> an undo stack can grow without limit. Cap its size and drop the oldest entry.</li>
+      <li><strong>Lambdas and checked exceptions:</strong> <code>Runnable.run()</code> cannot throw a checked exception; use <code>Callable</code>, or catch and wrap.</li>
+      <li><strong>Captured variables:</strong> a lambda can only capture local variables that are effectively final, which pushes you towards immutable command data.</li>
+      <li><strong>Executor failures:</strong> an exception thrown from a task submitted with <code>submit</code> is stored in the returned <code>Future</code>; if you never call <code>get()</code>, you never see it.</li>
+    </ul>
+  </div>
+<div class="co co-interview">
+    <p class="co-t">Interview: Command</p>
+    <ul>
+      <li><b>When do you use Command?</b> When you need to queue, schedule, log or undo operations, or decouple the sender from the receiver. Give the editor undo example.</li>
+      <li><b>Which Java interface is a command?</b> <code>Runnable</code> (and <code>Callable</code>).</li>
+      <li><b>Command vs Strategy?</b> Both wrap behaviour in an object. A command represents <em>one request</em> (with its data, executed at a given time, maybe undone); a strategy represents <em>an interchangeable algorithm</em> that a context uses repeatedly.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: harder Command questions</p>
+    <ul>
+      <li><b>Name the four roles.</b> Command, concrete command, receiver, invoker (and the client that creates commands).</li>
+      <li><b>How does undo work?</b> Each command stores what it needs to reverse itself; the invoker keeps a stack. Redo is a second stack.</li>
+      <li><b>Command vs event?</b> Command: an instruction to one handler. Event: a fact for many listeners.</li>
+      <li><b>Where in Spring or the JDK?</b> <code>Runnable</code> and <code>ExecutorService</code>, <code>@Async</code>, <code>@Scheduled</code>, job queues.</li>
+    </ul>
+  </div>
+</article>

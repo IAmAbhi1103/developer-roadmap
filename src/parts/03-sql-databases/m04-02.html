@@ -1,0 +1,413 @@
+<article class="topic" id="m4-one-to-many-one-to-one">
+  <h3>One-to-many and one-to-one relationships in SQL</h3>
+  <p class="tldr">In a one-to-many relationship the foreign key goes on the "many" side; a one-to-one
+  relationship is the same foreign key plus a <code>UNIQUE</code> constraint (or a shared primary key).</p>
+
+  <h4>One-to-many: the foreign key lives on the many side</h4>
+  <p>One customer places many orders, and each order belongs to one customer. The child row (the order) holds
+  one value, so it can hold one foreign key column. The parent (the customer) could not hold "many" values in
+  one column without breaking first normal form. That is why the foreign key goes on the "many" side.</p>
+<pre data-title="customers and orders"><code class="language-sql">CREATE TABLE customers (
+    id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name  TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE orders (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id BIGINT NOT NULL,
+    placed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    total_paise BIGINT NOT NULL CHECK (total_paise &gt;= 0),
+    CONSTRAINT fk_orders_customer
+        FOREIGN KEY (customer_id) REFERENCES customers (id)
+);
+
+-- PostgreSQL does not index foreign key columns for you
+CREATE INDEX idx_orders_customer_id ON orders (customer_id);
+
+INSERT INTO customers (name, email) VALUES
+    ('Asha', 'asha@example.com'),
+    ('Bilal', 'bilal@example.com');
+INSERT INTO orders (customer_id, total_paise) VALUES (1, 25000), (1, 18000), (2, 9900);
+
+SELECT c.name, o.id AS order_id, o.total_paise
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+ORDER BY o.id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> name  | order_id | total_paise
+-------+----------+-------------
+ Asha  |        1 |       25000
+ Asha  |        2 |       18000
+ Bilal |        3 |        9900
+(3 rows)</code></pre>
+  <p>The foreign key now protects the data from both directions:</p>
+<pre data-title="What the database refuses"><code class="language-sql">-- A child with no parent
+INSERT INTO orders (customer_id, total_paise) VALUES (99, 25000);
+-- ERROR:  insert or update on table "orders" violates foreign key constraint "fk_orders_customer"
+-- DETAIL:  Key (customer_id)=(99) is not present in table "customers".
+
+-- A parent that still has children
+DELETE FROM customers WHERE id = 1;
+-- ERROR:  update or delete on table "customers" violates foreign key constraint
+--         "fk_orders_customer" on table "orders"
+-- DETAIL:  Key (id)=(1) is still referenced from table "orders".</code></pre>
+
+  <h4>Mandatory or optional</h4>
+  <p>Whether a child must have a parent is decided by <code>NOT NULL</code> on the foreign key column.
+  <code>orders.customer_id</code> is <code>NOT NULL</code>: an order always has a customer, so the relationship
+  is "exactly one" on that end. <code>employees.manager_id</code> or <code>orders.coupon_id</code> would be
+  nullable: "zero or one". A <code>NULL</code> foreign key is never checked, because "no parent" is a valid
+  state.</p>
+
+  <h4>What happens on delete: ON DELETE actions</h4>
+  <p>The foreign key also says what to do when the parent row is deleted or its key is updated.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Action</th><th>When the parent is deleted</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><code>NO ACTION</code> (default)</td><td>Error if children exist, checked at the end of the
+      statement</td><td>Safe default</td></tr>
+      <tr><td><code>RESTRICT</code></td><td>Error at once; cannot be deferred</td><td>"Never delete a customer who
+      has orders"</td></tr>
+      <tr><td><code>CASCADE</code></td><td>Delete the children too</td><td>Weak entities: order lines, link
+      rows</td></tr>
+      <tr><td><code>SET NULL</code></td><td>Set the child's foreign key to <code>NULL</code></td><td>Optional links:
+      coupon, manager</td></tr>
+      <tr><td><code>SET DEFAULT</code></td><td>Set the foreign key to its default value</td><td>Rare</td></tr>
+    </tbody>
+  </table></div>
+<pre data-title="Choosing the action per relationship"><code class="language-sql">-- Lines die with their order
+CONSTRAINT fk_order_items_order FOREIGN KEY (order_id)
+    REFERENCES orders (id) ON DELETE CASCADE
+
+-- An order keeps existing if its coupon is removed
+CONSTRAINT fk_orders_coupon FOREIGN KEY (coupon_id)
+    REFERENCES coupons (id) ON DELETE SET NULL
+
+-- Customers with orders can never be deleted by accident
+CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id)
+    REFERENCES customers (id) ON DELETE RESTRICT</code></pre>
+
+  <h4>One-to-one</h4>
+  <p>In a one-to-one relationship each row on one side matches at most one row on the other. A real example:
+  every <code>users</code> row may have one <code>user_profiles</code> row. Before you create a second table,
+  ask whether you need one. If every user always has exactly one profile and the columns are small, plain
+  columns on <code>users</code> are simpler and faster (no join). Split into two tables for a reason:</p>
+  <ul>
+    <li><strong>Rarely used or large columns</strong> (a long bio, a document) that you do not want on every
+    row you read.</li>
+    <li><strong>An optional group of attributes</strong> that most rows do not have (a restaurant's bank
+    details, a seller's GST data).</li>
+    <li><strong>Security</strong>: credentials or personal documents in a table with stricter
+    permissions.</li>
+    <li><strong>A subtype</strong>: columns that exist only for one kind of row.</li>
+  </ul>
+  <h5>Way 1: foreign key plus UNIQUE</h5>
+  <p>The dependent table has its own key and a foreign key that is also unique. The <code>UNIQUE</code> is what
+  turns "one-to-many" into "one-to-one": without it, one user could get many profile rows.</p>
+<pre data-title="user_profiles with a unique foreign key"><code class="language-sql">CREATE TABLE user_profiles (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id    BIGINT NOT NULL,
+    bio        TEXT,
+    avatar_url TEXT,
+    CONSTRAINT uq_user_profiles_user_id UNIQUE (user_id),
+    CONSTRAINT fk_user_profiles_user FOREIGN KEY (user_id)
+        REFERENCES users (id) ON DELETE CASCADE
+);
+
+INSERT INTO user_profiles (user_id, bio) VALUES (1, 'Java developer');
+INSERT INTO user_profiles (user_id, bio) VALUES (1, 'A second profile');
+-- ERROR:  duplicate key value violates unique constraint "uq_user_profiles_user_id"
+-- DETAIL:  Key (user_id)=(1) already exists.</code></pre>
+  <h5>Way 2: shared primary key</h5>
+  <p>The child's primary key <em>is</em> the foreign key. No extra id and no extra unique constraint are
+  needed, because a primary key is already unique. JPA supports this with <code>@OneToOne</code> and
+  <code>@MapsId</code> (see <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>).</p>
+<pre data-title="Shared primary key"><code class="language-sql">CREATE TABLE user_profiles (
+    user_id    BIGINT PRIMARY KEY,
+    bio        TEXT,
+    avatar_url TEXT,
+    CONSTRAINT fk_user_profiles_user FOREIGN KEY (user_id)
+        REFERENCES users (id) ON DELETE CASCADE
+);</code></pre>
+  <h5>Which side holds the foreign key?</h5>
+  <p>Put it on the side that depends on the other, usually the optional one: the profile points to the user,
+  not the other way round. That gives "a user has zero or one profile; a profile belongs to exactly one user".
+  If both sides must always exist ("every user has a profile and every profile has a user"), two foreign keys
+  cannot be created in one step without deferred constraints, which is a good sign to merge the two tables
+  into one.</p>
+
+  <h4>Self-reference: a table related to itself</h4>
+  <p>A foreign key may point to its own table. <code>employees.manager_id</code> refers to
+  <code>employees.id</code>: one manager has many reports, and the top person has <code>NULL</code>. This
+  is how trees and org charts are stored; see <a href="#m4-hierarchy-polymorphic-tenancy">Hierarchies</a>.</p>
+
+  <h4>Summary of the three relationship types</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Relationship</th><th>Foreign key lives in</th><th>Extra constraint</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>One-to-many</td><td>The "many" table</td><td><code>NOT NULL</code> if the parent is
+      compulsory</td><td><code>orders.customer_id</code></td></tr>
+      <tr><td>One-to-one</td><td>The dependent table</td><td><code>UNIQUE</code> (or shared primary key)</td>
+      <td><code>user_profiles.user_id</code></td></tr>
+      <tr><td>Many-to-many</td><td>A third, join table (next article)</td><td>Composite key or <code>UNIQUE</code>
+      pair</td><td><code>enrollments</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the foreign key and the key it points to must have the same type</p>
+    <p>A <code>BIGINT</code> id needs a <code>BIGINT</code> foreign key column. MySQL's InnoDB refuses
+    mismatched types or signedness. PostgreSQL accepts some compatible pairs, but always declare them
+    identical. Also, a foreign key must point to a primary key or a unique column.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: name and index every foreign key</p>
+    <p>Name the column after the parent: <code>customer_id</code> references <code>customers.id</code>. Name the
+    constraint <code>fk_&lt;child&gt;_&lt;parent&gt;</code>, as in <code>fk_orders_customer</code>, so error
+    messages are readable. Create an index on every foreign key column (<code>idx_orders_customer_id</code>).
+    MySQL's InnoDB creates one for you if none exists; PostgreSQL does not. Without it, "orders of this
+    customer" and every parent delete scan the whole child table (see
+    <a href="#m5-index-not-used">Module 5</a>).</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: the foreign key on the wrong side, or a missing UNIQUE</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: the "one" side points to the many</p><pre><code class="language-sql">-- a customer can only ever have one order!
+CREATE TABLE customers (
+    id       BIGINT PRIMARY KEY,
+    order_id BIGINT REFERENCES orders (id)
+);</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: the "many" side points to the one</p><pre><code class="language-sql">CREATE TABLE orders (
+    id          BIGINT PRIMARY KEY,
+    customer_id BIGINT NOT NULL REFERENCES customers (id)
+);</code></pre></div>
+    </div>
+    <p>For one-to-one, the other classic slip is forgetting <code>UNIQUE</code> on the foreign key. The model then
+    silently allows many rows per parent, and the JPA <code>@OneToOne</code> breaks later with "more than one
+    row with the given identifier".</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>ON DELETE SET NULL</code> on a <code>NOT NULL</code> column is a contradiction; the delete
+      fails with a not-null violation. Make the column nullable or choose another action.</li>
+      <li>Two tables that reference each other (a cycle) cannot both have <code>NOT NULL</code> foreign keys,
+      because neither row can be inserted first. Make one nullable, or use a
+      <code>DEFERRABLE INITIALLY DEFERRED</code> constraint so the check runs at <code>COMMIT</code>.</li>
+      <li><code>CASCADE</code> can ripple through many tables and lock or delete a huge number of rows in one
+      statement. Use it for true parts of a parent (order lines), not for independent data.</li>
+      <li>"One-to-one" often becomes "one-to-many" later (one address becomes many). Think before adding
+      <code>UNIQUE</code>, because removing it is an easy migration but fixing code that assumed one is
+      not.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>How do you implement one-to-many?</b> A foreign key column in the "many" table that references the
+      parent's primary key, indexed.</li>
+      <li><b>How do you enforce one-to-one?</b> A foreign key with a <code>UNIQUE</code> constraint, or make the
+      foreign key the child's primary key.</li>
+      <li><b>CASCADE vs RESTRICT vs SET NULL:</b> delete children, block the delete, or keep the child with no
+      parent.</li>
+      <li><b>Does PostgreSQL index a foreign key automatically?</b> No. MySQL InnoDB does.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-many-to-many">
+  <h3>Many-to-many relationships and join tables</h3>
+  <p class="tldr">A many-to-many relationship needs a third table, the join (junction) table, with one foreign
+  key to each side; its primary key is either the pair of foreign keys or a surrogate id plus a unique
+  constraint on the pair.</p>
+
+  <h4>Why two tables are not enough</h4>
+  <p>A student takes many courses, and a course has many students. A foreign key in <code>students</code> can
+  point to only one course; a foreign key in <code>courses</code> can point to only one student. Neither side
+  can hold "many". The fix is a third table where each row says "this student takes this course".</p>
+  <figure class="fig">
+<pre class="mermaid">
+erDiagram
+  students ||--o{ enrollments : "has"
+  courses ||--o{ enrollments : "has"
+  students {
+    bigint id PK
+    varchar name
+  }
+  courses {
+    bigint id PK
+    varchar title
+  }
+  enrollments {
+    bigint student_id PK, FK
+    bigint course_id PK, FK
+    date enrolled_on
+    varchar grade
+  }
+</pre>
+  <figcaption>One many-to-many relationship becomes two one-to-many relationships around a join table</figcaption>
+  </figure>
+
+  <h4>The join table</h4>
+<pre data-title="students, courses and enrollments"><code class="language-sql">CREATE TABLE students (
+    id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name TEXT NOT NULL
+);
+CREATE TABLE courses (
+    id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title TEXT NOT NULL
+);
+
+CREATE TABLE enrollments (
+    student_id  BIGINT NOT NULL,
+    course_id   BIGINT NOT NULL,
+    enrolled_on DATE   NOT NULL DEFAULT CURRENT_DATE,
+    grade       TEXT,
+    PRIMARY KEY (student_id, course_id),
+    CONSTRAINT fk_enrollments_student FOREIGN KEY (student_id)
+        REFERENCES students (id) ON DELETE CASCADE,
+    CONSTRAINT fk_enrollments_course FOREIGN KEY (course_id)
+        REFERENCES courses (id) ON DELETE CASCADE
+);
+
+-- The primary key index serves "courses of a student" (leftmost column).
+-- "Students of a course" needs its own index on the second column.
+CREATE INDEX idx_enrollments_course_id ON enrollments (course_id);
+
+INSERT INTO students (name) VALUES ('Asha'), ('Bilal');
+INSERT INTO courses (title) VALUES ('Databases'), ('Java'), ('Spring Boot');
+INSERT INTO enrollments (student_id, course_id, grade) VALUES
+    (1, 1, 'A'), (1, 2, 'B'), (2, 1, 'B'), (2, 3, 'A');</code></pre>
+  <p>The primary key <code>(student_id, course_id)</code> does two jobs: it makes each row unique and it forbids
+  enrolling the same student in the same course twice. Both columns are part of the key, so both are
+  <code>NOT NULL</code> automatically.</p>
+<pre data-title="Walk the relationship in both directions"><code class="language-sql">-- Courses of Asha
+SELECT c.title, e.grade
+FROM enrollments e
+JOIN courses c  ON c.id = e.course_id
+JOIN students s ON s.id = e.student_id
+WHERE s.name = 'Asha';
+
+-- Students per course, including courses nobody took
+SELECT c.title, COUNT(e.student_id) AS students
+FROM courses c
+LEFT JOIN enrollments e ON e.course_id = c.id
+GROUP BY c.title
+ORDER BY c.title;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">   title   | grade
+-----------+-------
+ Databases | A
+ Java      | B
+(2 rows)
+
+    title    | students
+-------------+----------
+ Databases   |        2
+ Java        |        1
+ Spring Boot |        1
+(3 rows)</code></pre>
+
+  <h4>Two styles of primary key for a join table</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Composite key <code>(a_id, b_id)</code></th><th>Surrogate <code>id</code> plus
+    <code>UNIQUE (a_id, b_id)</code></th></tr></thead>
+    <tbody>
+      <tr><td>Duplicate pairs</td><td>Impossible</td><td>Impossible while the unique constraint exists</td></tr>
+      <tr><td>Columns and indexes</td><td>Fewer; the key is the index</td><td>One more column and one more
+      index</td></tr>
+      <tr><td>Can the same pair repeat?</td><td>No</td><td>Yes, if you drop the unique constraint (a repeat
+      purchase)</td></tr>
+      <tr><td>Other tables pointing at a link row</td><td>They need two columns</td><td>They need one column</td></tr>
+      <tr><td>JPA</td><td>Needs <code>@EmbeddedId</code> or <code>@IdClass</code></td><td>Plain <code>@Id</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Use the composite key for a pure link that can exist only once (product to category, user to role). Use a
+  surrogate key when the same pair can legitimately appear again, or when the link row is itself referenced by
+  other tables.</p>
+
+  <h4>Extra columns: the association entity</h4>
+  <p>The join table may carry facts about the relationship itself: <code>enrolled_on</code> and
+  <code>grade</code> above, or <code>quantity</code> and <code>unit_price</code> on <code>order_items</code>.
+  When a join table has its own columns and its own life, it is a real entity. Give it a business name
+  (<code>enrollments</code>, <code>order_items</code>, <code>loans</code>) rather than
+  <code>student_courses</code>. This matters in JPA: <code>@ManyToMany</code> works only for a pure link with
+  two columns. As soon as the link has extra columns, map the join table as an entity with two
+  <code>@ManyToOne</code> associations (see <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>).</p>
+
+  <h4>Many-to-many to itself</h4>
+  <p>A user follows many users and is followed by many. Both columns point to the same table:</p>
+<pre data-title="follows"><code class="language-sql">CREATE TABLE follows (
+    follower_id BIGINT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    followed_id BIGINT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    followed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (follower_id, followed_id),
+    CHECK (follower_id &lt;&gt; followed_id)   -- nobody follows themselves
+);
+CREATE INDEX idx_follows_followed_id ON follows (followed_id);</code></pre>
+  <p>Here the order of the pair matters (A follows B is not B follows A). For a symmetric relationship such as
+  friendship, store each pair once with <code>CHECK (user_a_id &lt; user_b_id)</code>, so (3, 7) is allowed and
+  (7, 3) is not.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: a join table must forbid duplicate pairs</p>
+    <p>Always make the pair unique, by a composite primary key or a <code>UNIQUE</code> constraint, and make
+    both foreign keys <code>NOT NULL</code>. Otherwise "enrolled twice" becomes a data bug that shows up as
+    double counts in reports.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: name it after the business fact, then index the second column</p>
+    <p>Prefer a noun the business uses (<code>enrollments</code>, <code>order_items</code>,
+    <code>memberships</code>). For a plain link use both table names, such as <code>book_authors</code> or
+    <code>user_roles</code>. A composite primary key indexes the pair in order, so add an index that starts
+    with the second column (<code>idx_enrollments_course_id</code>) when you also look up from that side.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a list of ids in one column</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: comma-separated ids</p><pre><code class="language-sql">CREATE TABLE students (
+    id         BIGINT PRIMARY KEY,
+    name       TEXT,
+    course_ids TEXT   -- '1,2,5'
+);
+-- no foreign keys, no joins, LIKE '%2%' also matches 12 and 22</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: one row per link</p><pre><code class="language-sql">CREATE TABLE enrollments (
+    student_id BIGINT REFERENCES students (id),
+    course_id  BIGINT REFERENCES courses (id),
+    PRIMARY KEY (student_id, course_id)
+);</code></pre></div>
+    </div>
+    <p>An array or <code>JSONB</code> column of ids has the same problem: the database cannot check that the ids
+    exist, and cannot cascade deletes.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><b>COUNT with LEFT JOIN:</b> <code>COUNT(*)</code> counts the one row produced for a course with no
+      students; <code>COUNT(e.student_id)</code> counts only real rows and returns 0.</li>
+      <li><b>Three-way links:</b> a fact that relates three things (doctor, patient, clinic) is one join table
+      with three foreign keys and a key over all three.</li>
+      <li><b>ON DELETE CASCADE on both sides</b> is normal for a pure link: deleting a student removes only
+      their link rows, never the courses.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>You will see this pattern everywhere: <code>user_roles</code> and <code>role_permissions</code>
+    (security), <code>product_categories</code> and <code>product_tags</code> (a Flipkart-style catalogue),
+    <code>order_items</code> (the link between orders and products, with quantity and the price at that time).
+    Spring Data JPA models the first two with <code>@ManyToMany</code> and the last with an entity.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>How do you model many-to-many in a relational database?</b> A join table with a foreign key to each
+      side; its primary key is the pair, or a surrogate id with a unique pair.</li>
+      <li><b>Where do attributes of the relationship go?</b> Into the join table (quantity on
+      <code>order_items</code>).</li>
+      <li><b>Why not store a list of ids in a column?</b> It breaks first normal form, loses foreign key
+      checks and cascades, and makes joins and searches slow or impossible.</li>
+      <li><b>Composite key or surrogate key for the join table?</b> Composite for a pure unique link; surrogate
+      when pairs can repeat or the row is referenced elsewhere.</li>
+    </ul>
+  </div>
+</article>

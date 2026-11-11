@@ -1,0 +1,603 @@
+<article class="topic" id="m6-jwt-flow">
+  <h3>JWT login end to end: storing the token and handling 401</h3>
+  <p class="tldr">The login form POSTs credentials, Spring Boot returns a JWT, the app keeps it (best:
+  in memory, with a refresh token in an httpOnly cookie), attaches it as <code>Authorization: Bearer</code>
+  to every request, and reacts to 401 by refreshing or logging out.</p>
+
+  <h4>The flow</h4>
+  <p>The backend side (generating and verifying the JWT, the security filter) is covered in <a
+  href="04-spring-boot.html#m4">Spring Boot · Module 4</a>. Here is the frontend's half of the same
+  conversation.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant U as User
+  participant R as React app
+  participant S as Spring Boot
+  U->>R: enters email and password
+  R->>S: POST /api/auth/login (JSON)
+  S->>S: check password hash, build JWT
+  S-->>R: 200 {accessToken, user}
+  R->>R: keep token, set user in AuthContext
+  R->>S: GET /api/employees (Bearer token)
+  S-->>R: 200 data
+  Note over R,S: later the token expires
+  R->>S: GET /api/employees (Bearer expired)
+  S-->>R: 401 Unauthorized
+  R->>R: clear token, go to /login
+</pre>
+    <figcaption>Login, authenticated requests and expiry</figcaption>
+  </figure>
+
+  <ol class="steps">
+    <li><strong>Login request.</strong> Send <code>{ email, password }</code> over HTTPS to a public
+    endpoint such as <code>POST /api/auth/login</code>.</li>
+    <li><strong>Token response.</strong> The backend returns the JWT (and user info: id, name, roles).
+    A JWT is a signed string of three base64 parts: header, payload (claims such as <code>sub</code>,
+    <code>roles</code>, <code>exp</code>) and signature. The payload is readable by anyone, so never put
+    secrets in it.</li>
+    <li><strong>Store.</strong> Keep the token somewhere the next requests can read it (see the
+    trade-offs below).</li>
+    <li><strong>Attach.</strong> A request interceptor adds <code>Authorization: Bearer &lt;token&gt;</code>
+    to each call.</li>
+    <li><strong>Verify.</strong> Spring's JWT filter checks the signature and expiry on each request
+    (the server stays stateless).</li>
+    <li><strong>Expiry.</strong> When <code>exp</code> passes, the API answers 401. The client either
+    gets a new token with a refresh token, or sends the user back to the login page.</li>
+  </ol>
+
+  <h4>Where to store the token</h4>
+  <p>This is a security decision, and a favourite interview question. The two attacks to know:
+  <strong>XSS</strong> (cross-site scripting: attacker JavaScript runs on your page and can read
+  anything JavaScript can read) and <strong>CSRF</strong> (cross-site request forgery: another site
+  makes the browser send a request that carries your cookies automatically).</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Storage</th><th>XSS risk</th><th>CSRF risk</th><th>Survives reload?</th></tr></thead>
+    <tbody>
+      <tr><td><code>localStorage</code></td><td>High: any script can read the token</td><td>None (not sent automatically)</td><td>Yes</td></tr>
+      <tr><td><code>sessionStorage</code></td><td>High, same as above</td><td>None</td><td>Per tab only</td></tr>
+      <tr><td>JavaScript memory (a variable)</td><td>Lower: the token is not in a place scripts can scrape later, but running malicious code can still use it</td><td>None</td><td>No; needs a refresh to restore</td></tr>
+      <tr><td>httpOnly cookie</td><td>JavaScript cannot read it, so it cannot be stolen by XSS (it can still be used by injected code to make requests)</td><td>Yes: you need <code>SameSite</code> and/or CSRF tokens</td><td>Yes</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-conv">
+    <p class="co-t">The recommended pattern</p>
+    <ul>
+      <li>Keep the short-lived <strong>access token</strong> (say 15 minutes) in memory.</li>
+      <li>Keep a long-lived <strong>refresh token</strong> in an <code>httpOnly</code>,
+      <code>Secure</code>, <code>SameSite</code> cookie, scoped to the refresh endpoint
+      (<code>POST /api/auth/refresh</code>).</li>
+      <li>On page load, call the refresh endpoint: if the cookie is valid you get a new access token and
+      the session is restored. A reload therefore does not log the user out.</li>
+      <li>Use CSRF protection on the refresh endpoint (SameSite=Strict/Lax plus a check) since it relies
+      on a cookie.</li>
+    </ul>
+    <p><code>localStorage</code> is simple and very common in tutorials and small projects, and many
+    employers accept it, but you should be able to explain its XSS weakness. For learning projects it is
+    acceptable; say so honestly in an interview.</p>
+  </div>
+
+  <h4>Backend endpoints the frontend expects</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Endpoint</th><th>Request</th><th>Response</th></tr></thead>
+    <tbody>
+      <tr><td><code>POST /api/auth/login</code></td><td><code>{ email, password }</code></td><td><code>200 { accessToken, user }</code> (+ <code>Set-Cookie</code> refresh)</td></tr>
+      <tr><td><code>POST /api/auth/refresh</code></td><td>Cookie only</td><td><code>200 { accessToken, user }</code> or 401</td></tr>
+      <tr><td><code>POST /api/auth/logout</code></td><td>Cookie</td><td>204 and the cookie cleared</td></tr>
+      <tr><td><code>GET /api/me</code></td><td>Bearer token</td><td><code>200 { id, name, email, roles }</code></td></tr>
+    </tbody>
+  </table></div>
+
+<pre data-title="AuthController.java (login response, backend sketch)"><code class="language-java">public record LoginRequest(@NotBlank @Email String email, @NotBlank String password) {}
+public record UserDto(Long id, String name, String email, List&lt;String&gt; roles) {}
+public record AuthResponse(String accessToken, UserDto user) {}
+
+@PostMapping("/api/auth/login")
+public AuthResponse login(@Valid @RequestBody LoginRequest request) {
+    // authenticate, then: String jwt = jwtService.generate(user);
+    return new AuthResponse(jwt, userDto);
+}</code></pre>
+
+  <h4>AuthContext: login, logout and the current user</h4>
+  <p>The <a href="#m5-lifting-context">Context</a> pattern fits auth well: the user changes rarely and
+  many components need it. The provider exposes <code>user</code>, <code>isLoading</code>,
+  <code>login</code> and <code>logout</code>, and restores the session when the app starts.</p>
+
+<pre data-title="src/context/AuthContext.jsx"><code class="language-jsx">import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { api } from '../lib/axios.js';
+import { tokenStore } from '../lib/tokenStore.js';
+
+const AuthContext = createContext(null);
+
+export function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);    // true until we know if a session exists
+
+  // Restore the session on page load: the refresh cookie gives us a new access token
+  useEffect(() =&gt; {
+    let ignore = false;
+    api.post('/auth/refresh', null, { withCredentials: true })
+      .then(({ data }) =&gt; {
+        if (ignore) return;
+        tokenStore.set(data.accessToken);
+        setUser(data.user);
+      })
+      .catch(() =&gt; { /* no valid session: user stays null */ })
+      .finally(() =&gt; { if (!ignore) setIsLoading(false); });
+    return () =&gt; { ignore = true; };
+  }, []);
+
+  // The 401 interceptor fires this event when the token is rejected
+  useEffect(() =&gt; {
+    const onForcedLogout = () =&gt; setUser(null);
+    window.addEventListener('auth:logout', onForcedLogout);
+    return () =&gt; window.removeEventListener('auth:logout', onForcedLogout);
+  }, []);
+
+  const login = useCallback(async (email, password) =&gt; {
+    const { data } = await api.post('/auth/login', { email, password }, { withCredentials: true });
+    tokenStore.set(data.accessToken);
+    setUser(data.user);
+    return data.user;
+  }, []);
+
+  const logout = useCallback(async () =&gt; {
+    try {
+      await api.post('/auth/logout', null, { withCredentials: true });
+    } finally {
+      tokenStore.clear();
+      setUser(null);
+    }
+  }, []);
+
+  const value = useMemo(
+    () =&gt; ({ user, isLoading, isAuthenticated: user !== null, login, logout }),
+    [user, isLoading, login, logout],
+  );
+  return &lt;AuthContext.Provider value={value}&gt;{children}&lt;/AuthContext.Provider&gt;;
+}
+
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error('useAuth must be used inside AuthProvider');
+  return ctx;
+}</code></pre>
+
+  <p>The simpler variant, with <code>localStorage</code> and no refresh cookie, replaces the first effect
+  with reading the stored token and calling <code>GET /api/me</code> to load the user:</p>
+
+<pre data-title="Simple variant: tokenStore backed by localStorage"><code class="language-javascript">const KEY = 'access_token';
+
+export const tokenStore = {
+  get: () =&gt; localStorage.getItem(KEY),
+  set: (token) =&gt; localStorage.setItem(KEY, token),
+  clear: () =&gt; localStorage.removeItem(KEY),
+};
+
+// In AuthProvider's restore effect:
+//   if (!tokenStore.get()) { setIsLoading(false); return; }
+//   api.get('/me').then(({ data }) =&gt; setUser(data)).catch(() =&gt; tokenStore.clear())
+//      .finally(() =&gt; setIsLoading(false));</code></pre>
+
+  <h4>The login page</h4>
+<pre data-title="src/pages/LoginPage.jsx"><code class="language-jsx">import { useState } from 'react';
+import { Navigate, useLocation, useNavigate } from 'react-router';
+import { useAuth } from '../context/AuthContext.jsx';
+import { describeError } from '../lib/errors.js';
+
+function LoginPage() {
+  const { login, isAuthenticated } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const from = location.state?.from?.pathname ?? '/employees';   // where the user wanted to go
+
+  const [form, setForm] = useState({ email: '', password: '' });
+  const [error, setError] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  if (isAuthenticated) return &lt;Navigate to={from} replace /&gt;;
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setSubmitting(true);
+    setError(null);
+    try {
+      await login(form.email, form.password);
+      navigate(from, { replace: true });             // do not leave /login in history
+    } catch (err) {
+      setError(err.response?.status === 401 ? 'Wrong email or password' : describeError(err));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    &lt;form onSubmit={handleSubmit}&gt;
+      &lt;h1&gt;Login&lt;/h1&gt;
+      &lt;label htmlFor="email"&gt;Email&lt;/label&gt;
+      &lt;input id="email" type="email" autoComplete="username" required value={form.email}
+             onChange={(e) =&gt; setForm({ ...form, email: e.target.value })} /&gt;
+      &lt;label htmlFor="password"&gt;Password&lt;/label&gt;
+      &lt;input id="password" type="password" autoComplete="current-password" required
+             value={form.password}
+             onChange={(e) =&gt; setForm({ ...form, password: e.target.value })} /&gt;
+      {error &amp;&amp; &lt;p role="alert" className="error"&gt;{error}&lt;/p&gt;}
+      &lt;button disabled={submitting}&gt;{submitting ? 'Signing in…' : 'Login'}&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}
+
+export default LoginPage;</code></pre>
+
+  <h4>Handling 401 and 403</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Status</th><th>Meaning</th><th>Frontend reaction</th></tr></thead>
+    <tbody>
+      <tr><td>401 Unauthorized</td><td>Not authenticated: no token, bad token, expired token</td><td>Refresh the token once and retry; if that fails, clear the session and go to <code>/login</code></td></tr>
+      <tr><td>403 Forbidden</td><td>Authenticated but not allowed</td><td>Show "You do not have access"; do not log out</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>To refresh and retry transparently, extend the response interceptor. Share one refresh promise so
+  that ten simultaneous 401 responses trigger only one refresh call.</p>
+
+<pre data-title="src/lib/axios.js (refresh on 401)"><code class="language-javascript">let refreshPromise = null;
+
+api.interceptors.response.use(
+  (res) =&gt; res,
+  async (error) =&gt; {
+    const original = error.config;
+    const isAuthCall = original?.url?.includes('/auth/');
+
+    if (error.response?.status === 401 &amp;&amp; !original._retry &amp;&amp; !isAuthCall) {
+      original._retry = true;                           // retry each request only once
+      try {
+        refreshPromise ??= api.post('/auth/refresh', null, { withCredentials: true })
+          .then(({ data }) =&gt; { tokenStore.set(data.accessToken); return data.accessToken; })
+          .finally(() =&gt; { refreshPromise = null; });
+        const newToken = await refreshPromise;
+        original.headers.Authorization = `Bearer ${newToken}`;
+        return api(original);                           // repeat the failed request
+      } catch {
+        tokenStore.clear();
+        window.dispatchEvent(new Event('auth:logout'));
+      }
+    }
+    return Promise.reject(error);
+  },
+);</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Use HTTPS in production; a JWT sent over HTTP can be stolen on the network.</li>
+      <li>Keep access tokens short-lived. A JWT cannot be revoked before <code>exp</code> unless the
+      server keeps a deny list.</li>
+      <li>Never put passwords, personal data or secrets in the JWT payload; it is only encoded, not
+      encrypted.</li>
+      <li>Never trust client-side checks of the JWT (decoding <code>exp</code> or <code>roles</code>)
+      for security; they are for convenience. The server verifies every request.</li>
+      <li>Do not log tokens. Never commit real tokens to Git.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Sending the token as <code>Authorization: token</code> or <code>Bearer: token</code>. The
+      format is <code>Authorization: Bearer &lt;token&gt;</code> with a space.</li>
+      <li>Calling the app logged out after refresh because the token lived only in a variable and there
+      is no refresh step.</li>
+      <li>Handling 401 on the login request itself (redirect loop or lost message).</li>
+      <li>A refresh interceptor that retries forever; use a <code>_retry</code> flag and exclude auth
+      endpoints.</li>
+      <li>Forgetting <code>withCredentials</code> / CORS credentials settings when using cookies, so the
+      browser silently drops the cookie.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain the JWT login flow and where you store the token"</p>
+    <ul>
+      <li>Login POST → server verifies the password → returns signed JWT → client sends it as a Bearer
+      header → server verifies the signature and expiry on every request (stateless).</li>
+      <li>localStorage: easy but XSS-readable. httpOnly cookie: safe from XSS theft but needs CSRF
+      defence. Best practice: access token in memory plus refresh token in an httpOnly cookie.</li>
+      <li>401 means not authenticated (refresh or re-login); 403 means authenticated but forbidden.</li>
+      <li>On reload, restore the session by calling refresh (or <code>/me</code> with a stored token).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-protected-routes">
+  <h3>Protected routes and role-based UI</h3>
+  <p class="tldr">A <code>RequireAuth</code> route wrapper redirects anonymous users to
+  <code>/login</code> and remembers where they wanted to go; role checks hide UI and pages from the
+  wrong users, but only the backend can truly enforce access.</p>
+
+  <h4>The idea: three layers of access control</h4>
+  <p>"Who can see what" is decided in three places, and each has a different job. The browser layers
+  exist for a good user experience; only the last one is security.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Layer</th><th>Example</th><th>Purpose</th><th>Trusted?</th></tr></thead>
+    <tbody>
+      <tr><td>Route guard</td><td><code>RequireAuth</code> around <code>/employees</code></td><td>Send anonymous users to login</td><td>No (UX only)</td></tr>
+      <tr><td>UI hiding</td><td><code>HasRole</code> around a Delete button</td><td>Do not show actions that will fail</td><td>No (UX only)</td></tr>
+      <tr><td>API authorisation</td><td><code>@PreAuthorize</code>, 401/403</td><td>Actually protect data and actions</td><td>Yes</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>RequireAuth</h4>
+  <p>A <strong>protected route</strong> renders its page only for a logged-in user. The component
+  checks the auth context (see <a href="#m5-lifting-context">the AuthContext</a>); while the session
+  is still being restored on page load it shows a loading
+  state (otherwise a logged-in user would be bounced to the login page on every refresh); if there is
+  no user it redirects with <code>&lt;Navigate&gt;</code>, saving the current location in route state so
+  that the login page can send the user back afterwards.</p>
+
+<pre data-title="src/components/RequireAuth.jsx"><code class="language-jsx">import { Navigate, Outlet, useLocation } from 'react-router';
+import { useAuth } from '../context/AuthContext.jsx';
+
+function RequireAuth({ roles }) {
+  const { user, isLoading } = useAuth();
+  const location = useLocation();
+
+  if (isLoading) return &lt;p&gt;Checking your session…&lt;/p&gt;;          // do not redirect too early
+
+  if (!user) {
+    // Remember the page they wanted; replace so Back does not return to a blocked page
+    return &lt;Navigate to="/login" replace state={{ from: location }} /&gt;;
+  }
+
+  if (roles &amp;&amp; !roles.some((r) =&gt; user.roles.includes(r))) {
+    return &lt;Navigate to="/forbidden" replace /&gt;;                // logged in, wrong role
+  }
+
+  return &lt;Outlet /&gt;;                                            // render the child routes
+}
+
+export default RequireAuth;</code></pre>
+
+<pre data-title="src/App.jsx"><code class="language-jsx">function App() {
+  return (
+    &lt;Routes&gt;
+      &lt;Route path="/login" element={&lt;LoginPage /&gt;} /&gt;
+      &lt;Route path="/forbidden" element={&lt;ForbiddenPage /&gt;} /&gt;
+
+      {/* Every route inside needs a logged-in user */}
+      &lt;Route element={&lt;RequireAuth /&gt;}&gt;
+        &lt;Route element={&lt;Layout /&gt;}&gt;
+          &lt;Route index element={&lt;DashboardPage /&gt;} /&gt;
+          &lt;Route path="employees" element={&lt;EmployeeListPage /&gt;} /&gt;
+          &lt;Route path="employees/:id" element={&lt;EmployeeDetailPage /&gt;} /&gt;
+        &lt;/Route&gt;
+      &lt;/Route&gt;
+
+      {/* Only ADMIN users */}
+      &lt;Route element={&lt;RequireAuth roles={['ADMIN']} /&gt;}&gt;
+        &lt;Route element={&lt;Layout /&gt;}&gt;
+          &lt;Route path="admin/users" element={&lt;UserAdminPage /&gt;} /&gt;
+        &lt;/Route&gt;
+      &lt;/Route&gt;
+
+      &lt;Route path="*" element={&lt;NotFoundPage /&gt;} /&gt;
+    &lt;/Routes&gt;
+  );
+}</code></pre>
+
+  <p>Because <code>RequireAuth</code> renders an <code>&lt;Outlet /&gt;</code>, it works as a layout
+  route (a route with no path): one guard protects a whole group of pages. This is cleaner than
+  wrapping each page in its own guard component. The guard is also a normal component, so it re-renders
+  whenever the auth context changes; when the user logs out, it redirects by itself, with no extra
+  code.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A[Navigate to /employees/7] --> B{Session restored?}
+  B -->|No| C[Show loading]
+  B -->|Yes| D{User logged in?}
+  D -->|No| E["Redirect to /login with state.from"]
+  D -->|Yes| F{Role allowed?}
+  F -->|No| G[Redirect to /forbidden]
+  F -->|Yes| H[Render the page]
+</pre>
+    <figcaption>The decisions a guard makes, in order</figcaption>
+  </figure>
+
+  <h4>Sending the user back after login</h4>
+  <p>The guard saved <code>state.from</code>. The login page reads it with <code>useLocation</code>,
+  and after a successful login navigates to that path instead of always going to the dashboard. It also
+  redirects away if the user is already signed in.</p>
+
+<pre data-title="src/pages/LoginPage.jsx"><code class="language-jsx">import { Navigate, useLocation, useNavigate } from 'react-router';
+import { useAuth } from '../context/AuthContext.jsx';
+
+function LoginPage() {
+  const { user, login } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  // Same-app path only; fall back to the home page
+  const from = location.state?.from?.pathname ?? '/';
+
+  if (user) return &lt;Navigate to={from} replace /&gt;;       // already signed in
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    const form = new FormData(e.currentTarget);
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.fromEntries(form)),
+      credentials: 'include',
+    });
+    if (res.ok) {
+      login(await res.json());                 // sets the user in AuthContext
+      navigate(from, { replace: true });       // back to /employees/7
+    }
+  }
+
+  return (
+    &lt;form onSubmit={handleSubmit}&gt;
+      &lt;input name="email" type="email" required /&gt;
+      &lt;input name="password" type="password" required /&gt;
+      &lt;button&gt;Login&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+  <h4>Roles in the UI</h4>
+  <p>Hide buttons and menu items the user cannot use. A small helper keeps the check readable:</p>
+
+<pre data-title="src/components/HasRole.jsx"><code class="language-jsx">import { useAuth } from '../context/AuthContext.jsx';
+
+export function useHasRole(...roles) {
+  const { user } = useAuth();
+  return Boolean(user) &amp;&amp; roles.some((r) =&gt; user.roles.includes(r));
+}
+
+export function HasRole({ roles, children, fallback = null }) {
+  const allowed = useHasRole(...roles);
+  return allowed ? children : fallback;
+}
+
+// Use
+// &lt;HasRole roles={['ADMIN', 'HR']}&gt;&lt;button onClick={onDelete}&gt;Delete&lt;/button&gt;&lt;/HasRole&gt;</code></pre>
+
+  <p>The same hook can build a menu from a list, so the sidebar and the route table never disagree:</p>
+
+<pre data-title="Role-filtered navigation"><code class="language-jsx">const NAV = [
+  { to: '/employees', label: 'Employees', roles: ['USER', 'HR', 'ADMIN'] },
+  { to: '/payroll', label: 'Payroll', roles: ['HR', 'ADMIN'] },
+  { to: '/admin/users', label: 'Users', roles: ['ADMIN'] },
+];
+
+function Sidebar() {
+  const { user } = useAuth();
+  const items = NAV.filter((n) =&gt; n.roles.some((r) =&gt; user.roles.includes(r)));
+  return (
+    &lt;nav&gt;
+      {items.map((n) =&gt; (
+        &lt;NavLink key={n.to} to={n.to}&gt;{n.label}&lt;/NavLink&gt;
+      ))}
+    &lt;/nav&gt;
+  );
+}</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: frontend checks are for experience, the backend enforces security</p>
+    <p>Everything in the browser can be changed by the user: they can edit JavaScript, flip
+    <code>user.roles</code> in DevTools, or call your API with curl. A hidden delete button does not stop
+    <code>DELETE /api/employees/7</code>. Every endpoint must check authentication and authorisation
+    itself — <code>@PreAuthorize("hasRole('ADMIN')")</code> or <code>requestMatchers</code> rules in
+    Spring Security (<a href="04-spring-boot.html#m4">Spring Boot · Module 4</a>). The server must
+    answer 403 for a forbidden call, and the UI should handle that 403 gracefully.</p>
+  </div>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: the role check exists only in React</p><pre><code class="language-java">@DeleteMapping("/api/employees/{id}")
+public void delete(@PathVariable Long id) {
+    employeeService.delete(id);      // any logged-in user, or anyone with curl, can call this
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: the server checks the role too</p><pre><code class="language-java">@PreAuthorize("hasRole('ADMIN')")
+@DeleteMapping("/api/employees/{id}")
+public void delete(@PathVariable Long id) {
+    employeeService.delete(id);      // others get 403 Forbidden
+}</code></pre></div>
+  </div>
+
+  <h4>Handling 401 and 403 in the UI</h4>
+  <p>The two status codes mean different things, and your Axios interceptor or fetch wrapper (see
+  <a href="#m6-axios-fetch">Calling your API</a>) should treat them differently.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Status</th><th>Meaning</th><th>UI reaction</th></tr></thead>
+    <tbody>
+      <tr><td>401 Unauthorized</td><td>Not logged in, or the token expired</td><td>Clear the user in context; the guard redirects to login</td></tr>
+      <tr><td>403 Forbidden</td><td>Logged in, but not allowed</td><td>Show "You do not have access" or a toast; keep the user logged in</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: trusting a role stored in the browser</p>
+    <p>Reading the role from <code>localStorage</code> (<code>localStorage.getItem('role')</code>)
+    and deciding access from it is the most common beginner error. The user can type
+    <code>localStorage.setItem('role', 'ADMIN')</code> and see the admin pages. Take the roles from the
+    server response (<code>/me</code> or the decoded token), and remember that even those only change
+    what is <em>shown</em>. Another version: decoding the JWT in the browser and trusting its
+    <code>roles</code> claim for anything beyond display. The backend verifies the signature; the
+    browser cannot.</p>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Role names must match the backend</p>
+    <p>Spring's <code>hasRole('ADMIN')</code> checks for the authority <code>ROLE_ADMIN</code>. Decide
+    whether your <code>/me</code> response sends <code>ADMIN</code> or <code>ROLE_ADMIN</code> and be
+    consistent in the frontend comparisons. A typo here causes "I am admin but see nothing". Keep the
+    role names in one constants file (<code>roles.js</code>) instead of repeating string literals.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Use a layout route with <code>&lt;Outlet /&gt;</code> for guards instead of wrapping every
+      page.</li>
+      <li>Keep <code>user</code>, <code>isLoading</code>, <code>login</code>, <code>logout</code> in one
+      <code>AuthContext</code> and expose it through a <code>useAuth</code> hook.</li>
+      <li>Check permissions rather than raw roles when the rules grow (<code>can('employee:delete')</code>
+      instead of <code>roles.includes('ADMIN')</code>), so changing which role may do what touches one
+      place.</li>
+      <li>Always give a 403 page and a 404 page their own routes.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Flash of login: skipping the <code>isLoading</code> branch redirects logged-in users to the
+      login page for a moment (or permanently) on every refresh.</li>
+      <li>Deep links: a user opening <code>/employees/7</code> while logged out should land on login,
+      then come back to <code>/employees/7</code>; that is what <code>state.from</code> does. Only use
+      same-app paths from the state, never a full URL from a query string, to avoid open-redirect bugs.</li>
+      <li>When the token expires while the user is on a page, the interceptor fires logout, the context
+      sets <code>user</code> to <code>null</code>, and <code>RequireAuth</code> re-renders into the
+      redirect — you get this for free with the event pattern.</li>
+      <li>Multiple tabs: logging out in one tab does not update the others unless you listen to the
+      <code>storage</code> event or use <code>BroadcastChannel</code>.</li>
+      <li>Redirecting an already logged-in user away from <code>/login</code> (as in the login page above)
+      avoids showing the form to signed-in users.</li>
+      <li>Roles can change on the server while the user is logged in. Re-fetch <code>/me</code> after
+      important actions or on a timer; a stale role in the UI is harmless for security (the API still
+      decides) but confusing.</li>
+      <li>A route guard hides a page only after the JavaScript bundle is downloaded. The code of an
+      admin page is still visible to anyone who opens the files, so never put secrets or hidden endpoints'
+      keys in it.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>A common setup: Spring Security issues a JWT or session cookie at login; <code>/api/auth/me</code>
+    returns <code>{ id, name, roles }</code>; <code>AuthProvider</code> calls it once on load; a single
+    <code>RequireAuth</code> layout wraps all private pages and another with <code>roles</code> wraps
+    admin pages; buttons use <code>HasRole</code>. Tests then check the important part separately: that
+    the API returns 401 and 403 correctly without any React in front of it.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you implement protected routes? Is hiding a button enough?"</p>
+    <ul>
+      <li>A wrapper/layout route reads auth state; shows a loader while restoring the session; redirects
+      with <code>&lt;Navigate to="/login" replace state={{ from }} /&gt;</code> if anonymous; renders
+      <code>&lt;Outlet /&gt;</code> otherwise. Role checks add an allowed-roles prop.</li>
+      <li>Not enough: the client is untrusted. The API must enforce authentication and roles on every
+      endpoint (401/403), and the UI only mirrors that for usability.</li>
+      <li>Explain 401 vs 403, and why the loading state avoids a redirect flash.</li>
+      <li>Where does the role come from, and can the user fake it? It comes from the server; the user
+      can fake what the browser shows, never what the server allows.</li>
+    </ul>
+  </div>
+</article>

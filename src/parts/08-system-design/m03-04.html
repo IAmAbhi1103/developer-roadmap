@@ -1,0 +1,445 @@
+<article class="topic" id="m3-elevator-system">
+  <h3>Design an elevator system</h3>
+  <p class="tldr">Each elevator keeps its own direction and sorted sets of stops and serves them with a LOOK-style sweep (go one way serving stops, then reverse); a controller assigns each new request to the best elevator through a swappable selection Strategy.</p>
+
+  <h4>Requirements and assumptions</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>A building has N floors and M elevators.</li>
+    <li><strong>Hall call:</strong> a person on a floor presses UP or DOWN; the system sends one elevator.</li>
+    <li><strong>Cabin request:</strong> a person inside presses a destination floor.</li>
+    <li>Each elevator moves one floor at a time, stops at requested floors and idles when nothing is pending.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> requests arrive from many threads at once; the selection rule must be replaceable; no starvation of far floors.</p>
+  <p><strong>Assumptions:</strong> no weight limit, no door timing (doors open instantly), no emergency mode, time is simulated by calling <code>step()</code>, and a hall call is served as "go to that floor" (direction-aware pickup is an extension).</p>
+
+  <h4>The scheduling idea</h4>
+  <p>A naive elevator serves requests in arrival order (FCFS) and zig-zags. Disk schedulers solved the same problem with <strong>SCAN</strong>: keep going in one direction serving every request on the way, then reverse. <strong>LOOK</strong> is SCAN that reverses at the last pending request instead of the building's end. It is simple and avoids starvation.</p>
+  <figure class="fig">
+<pre class="diagram">
+ floor
+  9 |
+  8 |  * stop           elevator at 3, direction UP
+  7 |
+  6 |  * stop           up set   = {6, 8}   served in order 6, 8
+  5 |
+  4 |
+  3 |  [E] ->           down set = {1}      served after reaching 8
+  2 |
+  1 |  * stop (later)
+</pre>
+    <figcaption>LOOK: serve upward stops 6 and 8 first, then reverse for floor 1</figcaption>
+  </figure>
+
+  <h4>Entities</h4>
+  <ul>
+    <li><code>Direction</code> (enum UP, DOWN, IDLE).</li>
+    <li><code>Elevator</code>: id, current floor, direction, two <code>TreeSet</code>s of stops (up and down). Owns its movement.</li>
+    <li><code>ElevatorSelector</code> (interface): picks the elevator for a hall call. A Strategy.</li>
+    <li><code>ElevatorController</code>: receives requests, asks the selector, forwards. Facade.</li>
+  </ul>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class ElevatorController {
+    -List~Elevator~ elevators
+    -ElevatorSelector selector
+    +requestElevator(int floor, Direction d) void
+    +selectFloor(int elevatorId, int floor) void
+    +stepAll() void
+  }
+  class Elevator {
+    -int id
+    -int floor
+    -Direction direction
+    -TreeSet~Integer~ upStops
+    -TreeSet~Integer~ downStops
+    +addStop(int floor) void
+    +step() void
+  }
+  class ElevatorSelector {
+    &lt;&lt;interface&gt;&gt;
+    +select(List~Elevator~ all, int floor) Elevator
+  }
+  class NearestSelector
+  ElevatorController "1" o-- "many" Elevator
+  ElevatorController --> ElevatorSelector
+  ElevatorSelector &lt;|.. NearestSelector
+</pre>
+    <figcaption>Controller dispatches; each elevator runs its own sweep</figcaption>
+  </figure>
+
+  <h4>Key design decisions</h4>
+  <ul>
+    <li><strong>Two sorted sets per elevator:</strong> <code>TreeSet</code> gives ordered stops and O(log n) add and remove. Going up, the next stop is simply the next floor reached; going down likewise.</li>
+    <li><strong>Strategy for dispatch</strong> (<a href="#m2">Module 2</a>): nearest idle, nearest moving toward the caller, least loaded, zoned. Swap without touching the controller.</li>
+    <li><strong>State per elevator:</strong> the direction enum is the minimum. If doors, maintenance and overload matter, turn it into the State pattern (<a href="#m3-vending-machine">same idea as the vending machine</a>).</li>
+    <li><strong>Simulated time:</strong> <code>step()</code> moves one floor. A real scheduler thread calls <code>stepAll()</code> every second. Tests call it directly, no sleeping.</li>
+  </ul>
+
+  <h4>Core code: the elevator</h4>
+  <pre data-title="Elevator.java"><code class="language-java">import java.util.TreeSet;
+
+enum Direction { UP, DOWN, IDLE }
+
+class Elevator {
+    private final int id;
+    private int floor = 0;
+    private Direction direction = Direction.IDLE;
+    private final TreeSet&lt;Integer&gt; upStops = new TreeSet&lt;&gt;();
+    private final TreeSet&lt;Integer&gt; downStops = new TreeSet&lt;&gt;();
+
+    Elevator(int id) { this.id = id; }
+
+    synchronized int floor() { return floor; }
+    synchronized Direction direction() { return direction; }
+    int id() { return id; }
+
+    synchronized void addStop(int target) {
+        if (target == floor) { arrive(); return; }          // already here
+        if (target &gt; floor) upStops.add(target); else downStops.add(target);
+        if (direction == Direction.IDLE) {
+            direction = (target &gt; floor) ? Direction.UP : Direction.DOWN;
+        }
+    }
+
+    /** Move one floor in the current direction (one tick of time). */
+    synchronized void step() {
+        switch (direction) {
+            case UP -&gt; {
+                floor++;
+                if (upStops.remove(floor)) arrive();
+                if (upStops.isEmpty()) {
+                    direction = downStops.isEmpty() ? Direction.IDLE : Direction.DOWN;
+                }
+            }
+            case DOWN -&gt; {
+                floor--;
+                if (downStops.remove(floor)) arrive();
+                if (downStops.isEmpty()) {
+                    direction = upStops.isEmpty() ? Direction.IDLE : Direction.UP;
+                }
+            }
+            case IDLE -&gt; { }
+        }
+    }
+
+    private void arrive() {
+        System.out.println("Elevator " + id + " stops at " + floor);
+    }
+}</code></pre>
+
+  <h4>Core code: selector and controller</h4>
+  <pre data-title="ElevatorController.java"><code class="language-java">import java.util.Comparator;
+import java.util.List;
+
+interface ElevatorSelector {
+    Elevator select(List&lt;Elevator&gt; all, int floor);
+}
+
+class NearestSelector implements ElevatorSelector {
+    private static final int AWAY_PENALTY = 100;
+
+    public Elevator select(List&lt;Elevator&gt; all, int floor) {
+        return all.stream()
+                .min(Comparator.comparingInt((Elevator e) -&gt; cost(e, floor)))
+                .orElseThrow();
+    }
+
+    private int cost(Elevator e, int floor) {
+        int distance = Math.abs(e.floor() - floor);
+        Direction d = e.direction();
+        boolean toward = (d == Direction.UP &amp;&amp; floor &gt;= e.floor())
+                      || (d == Direction.DOWN &amp;&amp; floor &lt;= e.floor());
+        return (d == Direction.IDLE || toward) ? distance : distance + AWAY_PENALTY;
+    }
+}
+
+class ElevatorController {
+    private final List&lt;Elevator&gt; elevators;
+    private final ElevatorSelector selector;
+    private final int floors;
+
+    ElevatorController(List&lt;Elevator&gt; elevators, ElevatorSelector selector, int floors) {
+        this.elevators = List.copyOf(elevators);
+        this.selector = selector;
+        this.floors = floors;
+    }
+
+    void requestElevator(int floor, Direction wanted) {
+        checkFloor(floor);
+        selector.select(elevators, floor).addStop(floor);   // hall call
+    }
+
+    void selectFloor(int elevatorId, int floor) {
+        checkFloor(floor);
+        elevators.get(elevatorId).addStop(floor);          // cabin request
+    }
+
+    void stepAll() { elevators.forEach(Elevator::step); }
+
+    private void checkFloor(int floor) {
+        if (floor &lt; 0 || floor &gt;= floors) {
+            throw new IllegalArgumentException("No such floor: " + floor);
+        }
+    }
+}
+
+public class ElevatorDemo {
+    public static void main(String[] args) {
+        var ctl = new ElevatorController(
+                List.of(new Elevator(0), new Elevator(1)), new NearestSelector(), 10);
+        ctl.requestElevator(5, Direction.UP);     // elevator 0 is chosen (tie, first wins)
+        ctl.selectFloor(0, 8);
+        for (int i = 0; i &lt; 8; i++) ctl.stepAll();
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Elevator 0 stops at 5
+Elevator 0 stops at 8</code></pre>
+
+  <h4>Concurrency</h4>
+  <ul>
+    <li>All mutable state of an elevator is touched only inside <code>synchronized</code> methods, so a cabin press and the scheduler tick cannot corrupt the sets.</li>
+    <li>The selector reads floor and direction from several elevators without a global lock. The picture may be slightly stale, which is acceptable for a heuristic: the worst case is a slightly worse choice, never a wrong state.</li>
+    <li>One scheduler thread (<code>ScheduledExecutorService</code>) drives <code>stepAll()</code>; request threads only add stops.</li>
+  </ul>
+  <div class="co co-exc">
+    <p class="co-t">Edge case: never hold two elevator locks together</p>
+    <p>The controller never locks two elevators at once, so there is no deadlock. If a feature needs to move a stop from one elevator to another, lock in id order.</p>
+  </div>
+
+  <h4>Edge cases</h4>
+  <ul>
+    <li>Request for the current floor: open the door, no movement.</li>
+    <li>Duplicate requests for the same floor: sets ignore duplicates.</li>
+    <li>Invalid floor: rejected by the controller.</li>
+    <li>Request behind the current direction: parked in the other set; served after the sweep, so a far floor waits at most one sweep (no starvation).</li>
+    <li>Hall call direction: a person going DOWN at floor 6 should only be picked by an elevator that will continue down. The simple version ignores the direction; the direction-aware version keeps hall calls separate from cabin stops.</li>
+  </ul>
+
+  <h4>Extensions interviewers ask</h4>
+  <ul>
+    <li><strong>Multiple elevators:</strong> already modelled; discuss other selectors (zones, least busy).</li>
+    <li><strong>Peak-hour logic</strong> (morning rush to floor 0): a selector that parks idle elevators on the ground floor.</li>
+    <li><strong>Weight and capacity:</strong> a <code>load</code> field; skip hall calls if full.</li>
+    <li><strong>Express and VIP elevators:</strong> a flag per elevator and a filtering selector.</li>
+    <li><strong>Maintenance mode:</strong> a State that rejects new stops and finishes current ones.</li>
+    <li><strong>Display panel:</strong> an Observer on elevator movement.</li>
+  </ul>
+  <div class="co co-interview">
+    <p class="co-t">How to present this in 45 minutes</p>
+    <ol>
+      <li>5 min: hall vs cabin requests, number of elevators, how time is simulated.</li>
+      <li>5 min: explain SCAN/LOOK in two sentences with the floor drawing.</li>
+      <li>8 min: diagram: controller, elevator, selector Strategy.</li>
+      <li>20 min: code <code>Elevator.addStop/step</code>, then selector and controller.</li>
+      <li>7 min: thread safety, direction-aware hall calls, maintenance State.</li>
+    </ol>
+  </div>
+</article>
+
+<article class="topic" id="m3-lru-cache">
+  <h3>Design an LRU cache (HashMap + doubly linked list)</h3>
+  <p class="tldr">An LRU cache evicts the least recently used entry when full; combine a HashMap for O(1) lookup with a doubly linked list that keeps entries in recency order, so both get and put run in O(1).</p>
+
+  <h4>Requirements and assumptions</h4>
+  <ul>
+    <li><code>get(key)</code> returns the value or null, and marks the entry most recently used.</li>
+    <li><code>put(key, value)</code> inserts or updates, marks it most recently used, and if the size exceeds capacity removes the least recently used entry.</li>
+    <li>Both operations O(1) average time.</li>
+    <li>Generic in key and value; capacity fixed at construction (must be positive).</li>
+    <li>Then: thread safety.</li>
+  </ul>
+
+  <h4>Why two structures</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Structure alone</th><th>Lookup</th><th>Move to front</th><th>Evict oldest</th></tr></thead>
+    <tbody>
+      <tr><td>HashMap</td><td>O(1)</td><td>no order</td><td>no order</td></tr>
+      <tr><td>Doubly linked list</td><td>O(n)</td><td>O(1) if you hold the node</td><td>O(1) at the tail</td></tr>
+      <tr><td>Both together</td><td>O(1)</td><td>O(1)</td><td>O(1)</td></tr>
+    </tbody>
+  </table></div>
+  <p>The map gives you the <em>node</em> for a key in O(1). Because the list is doubly linked, you can unlink that node without scanning (you know its <code>prev</code> and <code>next</code>). The head side holds the most recently used; the tail side holds the eviction candidate.</p>
+  <figure class="fig">
+<pre class="diagram">
+ map: key -> node
+   A -> [A]    B -> [B]    C -> [C]
+
+ head (MRU)                              tail (LRU)
+ [sentinel] &lt;-&gt; [C] &lt;-&gt; [A] &lt;-&gt; [B] &lt;-&gt; [sentinel]
+                 ^ newest              ^ evicted first
+</pre>
+    <figcaption>The map points into the list; sentinel nodes remove null checks at the ends</figcaption>
+  </figure>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class LRUCache~K~ {
+    -int capacity
+    -Map~K, Node~ map
+    -Node head
+    -Node tail
+    +get(K key) V
+    +put(K key, V value) void
+  }
+  class Node~K~ {
+    K key
+    V value
+    Node prev
+    Node next
+  }
+  LRUCache "1" *-- "many" Node
+</pre>
+    <figcaption>One cache owns the nodes; the map and the list share the same node objects</figcaption>
+  </figure>
+
+  <h4>Key design decisions</h4>
+  <ul>
+    <li><strong>Sentinel head and tail</strong> nodes mean insert and remove never check for null neighbours.</li>
+    <li><strong>The node stores its key</strong> so eviction can remove the entry from the map: you find the tail node, then need its key to call <code>map.remove</code>.</li>
+    <li><strong>Private helper methods</strong> <code>unlink(node)</code> and <code>addFirst(node)</code>; <code>get</code> and <code>put</code> compose them.</li>
+    <li>A generic class, and no pattern needed. An eviction policy Strategy (LRU, LFU, FIFO) is the extension that earns one (<a href="#m2">Module 2</a>).</li>
+  </ul>
+
+  <h4>Core code</h4>
+  <pre data-title="LRUCache.java"><code class="language-java">import java.util.HashMap;
+import java.util.Map;
+
+public class LRUCache&lt;K, V&gt; {
+    private static final class Node&lt;K, V&gt; {
+        final K key;
+        V value;
+        Node&lt;K, V&gt; prev, next;
+        Node(K key, V value) {
+            this.key = key;
+            this.value = value;
+        }
+    }
+
+    private final int capacity;
+    private final Map&lt;K, Node&lt;K, V&gt;&gt; map = new HashMap&lt;&gt;();
+    private final Node&lt;K, V&gt; head = new Node&lt;&gt;(null, null);   // most recent side
+    private final Node&lt;K, V&gt; tail = new Node&lt;&gt;(null, null);   // least recent side
+
+    public LRUCache(int capacity) {
+        if (capacity &lt;= 0) throw new IllegalArgumentException("capacity must be &gt; 0");
+        this.capacity = capacity;
+        head.next = tail;
+        tail.prev = head;
+    }
+
+    public synchronized V get(K key) {
+        Node&lt;K, V&gt; n = map.get(key);
+        if (n == null) return null;
+        unlink(n);
+        addFirst(n);                       // now most recently used
+        return n.value;
+    }
+
+    public synchronized void put(K key, V value) {
+        Node&lt;K, V&gt; n = map.get(key);
+        if (n != null) {                   // update existing
+            n.value = value;
+            unlink(n);
+            addFirst(n);
+            return;
+        }
+        if (map.size() == capacity) {      // evict least recently used
+            Node&lt;K, V&gt; lru = tail.prev;
+            unlink(lru);
+            map.remove(lru.key);
+        }
+        n = new Node&lt;&gt;(key, value);
+        map.put(key, n);
+        addFirst(n);
+    }
+
+    public synchronized int size() { return map.size(); }
+
+    private void unlink(Node&lt;K, V&gt; n) {
+        n.prev.next = n.next;
+        n.next.prev = n.prev;
+    }
+
+    private void addFirst(Node&lt;K, V&gt; n) {
+        n.next = head.next;
+        n.prev = head;
+        head.next.prev = n;
+        head.next = n;
+    }
+}</code></pre>
+  <pre data-title="LRUDemo.java"><code class="language-java">public class LRUDemo {
+    public static void main(String[] args) {
+        LRUCache&lt;String, Integer&gt; cache = new LRUCache&lt;&gt;(2);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        System.out.println(cache.get("a"));   // a becomes most recent
+        cache.put("c", 3);                    // evicts b
+        System.out.println(cache.get("b"));
+        System.out.println(cache.get("c"));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">1
+null
+3</code></pre>
+
+  <h4>The LinkedHashMap shortcut</h4>
+  <p>Java already has this structure. A <code>LinkedHashMap</code> built with <code>accessOrder = true</code> moves an entry to the end on every access, and <code>removeEldestEntry</code> lets you evict automatically.</p>
+  <pre data-title="LruMap.java"><code class="language-java">import java.util.LinkedHashMap;
+import java.util.Map;
+
+class LruMap&lt;K, V&gt; extends LinkedHashMap&lt;K, V&gt; {
+    private final int capacity;
+
+    LruMap(int capacity) {
+        super(16, 0.75f, true);                  // true = access order
+        this.capacity = capacity;
+    }
+
+    @Override
+    protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) {
+        return size() &gt; capacity;                // called after each put
+    }
+}</code></pre>
+  <div class="co co-interview">
+    <p class="co-t">Which should you write in the interview?</p>
+    <p>Say the shortcut first ("in production I would use <code>LinkedHashMap</code> with access order, or Caffeine"), then offer to build it by hand, which is what the question usually wants. Writing only the shortcut can look like dodging the data structure.</p>
+  </div>
+
+  <h4>Thread safety</h4>
+  <p>The simplest correct version is what the code above does: <code>synchronized</code> on every method. Note that even <code>get</code> must be synchronized, because it <em>writes</em> (it reorders the list). A <code>ConcurrentHashMap</code> alone does not help, since map and list must change together as one step.</p>
+  <ul>
+    <li><strong>One lock:</strong> simple, correct, becomes a bottleneck under heavy reads.</li>
+    <li><strong>Read-write lock:</strong> does not help, because every read is a write.</li>
+    <li><strong>Segmented (striped) caches:</strong> N independent LRU caches chosen by <code>hash(key) % N</code>; each has its own lock, so threads rarely collide. Eviction becomes approximate per segment.</li>
+    <li><strong>Library route:</strong> Caffeine records accesses in buffers and applies reordering lazily, so reads barely block. In a Spring app you would use it through the cache abstraction rather than writing your own.</li>
+  </ul>
+
+  <h4>Edge cases</h4>
+  <ul>
+    <li>Capacity 1: every new key evicts the previous one. The code handles it because eviction happens before the insert.</li>
+    <li>Updating an existing key never evicts anything.</li>
+    <li>Null keys: <code>HashMap</code> allows them but the sentinel nodes also hold null keys; reject null keys explicitly if you want a clean contract.</li>
+    <li><code>get</code> of a stored null value is indistinguishable from a miss; use <code>Optional</code> or disallow null values.</li>
+  </ul>
+
+  <h4>Extensions interviewers ask</h4>
+  <ul>
+    <li><strong>TTL (expiry):</strong> store <code>expiresAt</code> in the node; check it in <code>get</code> and treat expired as a miss; optionally a cleaner thread.</li>
+    <li><strong>LFU instead of LRU:</strong> map from frequency to a linked list of keys, plus a <code>minFrequency</code> counter, for O(1).</li>
+    <li><strong>Pluggable eviction:</strong> an <code>EvictionPolicy</code> interface with <code>onAccess</code> and <code>evict</code> (Strategy).</li>
+    <li><strong>Write-through or load on miss:</strong> a loader function passed to the constructor, used by <code>get</code>.</li>
+    <li><strong>Distributed cache:</strong> consistent hashing across nodes (HLD topic, later modules).</li>
+  </ul>
+  <div class="co co-interview">
+    <p class="co-t">How to present this in 45 minutes</p>
+    <ol>
+      <li>3 min: clarify get/put semantics, capacity, generics, thread safety.</li>
+      <li>5 min: explain why a map alone or a list alone fails; draw map plus list.</li>
+      <li>20 min: write <code>Node</code>, <code>unlink</code>, <code>addFirst</code>, then <code>get</code> and <code>put</code>.</li>
+      <li>10 min: run the example, mention the <code>LinkedHashMap</code> version.</li>
+      <li>7 min: thread safety options and TTL or LFU follow-ups.</li>
+    </ol>
+  </div>
+</article>

@@ -1,0 +1,516 @@
+<article class="topic" id="m2-overriding">
+  <h3>Method overriding: the rules</h3>
+  <p class="tldr">A subclass overrides an inherited instance method by declaring one with the same signature; the access may not be narrower, the return type may be a subtype, checked exceptions may not be broader, and <code>@Override</code> makes the compiler check all of it.</p>
+
+  <p><strong>Overriding</strong> means a subclass provides its own version of an instance method that it inherited. When you call the method on a subclass object, Java runs the subclass version, even if the variable's type is the parent. That is the engine behind <a href="#m2-polymorphism">polymorphism</a>. You already used it when <code>Manager</code> replaced <code>monthlyPay()</code> in <a href="#m2-inheritance">inheritance</a>.</p>
+  <pre data-title="Overriding in one glance"><code class="language-java">class Account {
+    public long monthlyChargePaise() { return 0; }
+}
+
+class CurrentAccount extends Account {
+    @Override
+    public long monthlyChargePaise() { return 15_000; }   // replaces the parent's version
+}
+
+// in main():
+Account a = new CurrentAccount();
+System.out.println(a.monthlyChargePaise());               // 15000</code></pre>
+
+  <h4>The rules</h4>
+  <p>Overriding is strict. If one rule is broken, the code either fails to compile or quietly does something else. The first column is the rule; the last shows what the compiler tells you when you break it.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Rule</th><th>Detail</th><th>If you break it</th></tr></thead>
+    <tbody>
+      <tr><td>Same name and parameter types</td><td>That pair is the <strong>signature</strong>. A different parameter list makes a new overload, not an override</td><td>With <code>@Override</code>: <code>method does not override or implement a method from a supertype</code></td></tr>
+      <tr><td>Return type</td><td>The same, or a subtype of it for objects (<strong>covariant</strong>). Primitives and <code>void</code> must match exactly</td><td><code>return type long is not compatible with int</code></td></tr>
+      <tr><td>Access</td><td>The same or wider: <code>protected</code> may become <code>public</code>, never the other way</td><td><code>attempting to assign weaker access privileges; was public</code></td></tr>
+      <tr><td>Checked exceptions</td><td>None, the same, or narrower ones. Unchecked exceptions are always allowed</td><td><code>overridden method does not throw IOException</code></td></tr>
+      <tr><td>Not <code>final</code></td><td>A <code>final</code> method cannot be overridden</td><td><code>overridden method is final</code></td></tr>
+      <tr><td>Instance methods only</td><td>Static methods are hidden, not overridden. Static and instance cannot swap roles</td><td><code>overridden method is static</code> or <code>overriding method is static</code></td></tr>
+      <tr><td>Must be inherited</td><td><code>private</code> methods are not inherited. Package-private methods are inherited only inside the same package</td><td>No error: you silently created a new, unrelated method</td></tr>
+    </tbody>
+  </table></div>
+  <div class="co co-rule">
+    <p class="co-t">Rule: remember it as "same, wider, narrower, covariant"</p>
+    <p>The <strong>same</strong> signature; <strong>wider or equal</strong> access; <strong>narrower or equal</strong> checked exceptions; <strong>covariant</strong> (same or more specific) return type. The reason is substitutability: code that calls the parent method must still work with any subclass, so a subclass may not promise less (narrower access) or throw more.</p>
+  </div>
+
+  <h4>Always write @Override</h4>
+  <p><code>@Override</code> is an annotation that tells the compiler: "I intend to override a method from a parent class or interface. Check it." It has no effect at run time. Its value is that it turns a silent mistake into a compile error. The most famous such mistake is <code>equals</code>:</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: this is an overload, not an override</p><pre><code class="language-java">class Account {
+    long id;
+    Account(long id) { this.id = id; }
+
+    public boolean equals(Account other) {    // parameter is Account, not Object
+        return other != null &amp;&amp; id == other.id;
+    }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: @Override catches it for you</p><pre><code class="language-java">class Account {
+    long id;
+    Account(long id) { this.id = id; }
+
+    @Override
+    public boolean equals(Object other) {
+        return other instanceof Account a &amp;&amp; id == a.id;
+    }
+    @Override public int hashCode() { return Long.hashCode(id); }
+}</code></pre></div>
+  </div>
+  <p>With the wrong version, <code>equals</code> seems to work when you call it with an <code>Account</code> variable, and fails everywhere else:</p>
+  <pre data-title="EqBug.java"><code class="language-java">Account a = new Account(1), b = new Account(1);
+System.out.println(a.equals(b));              // true: calls equals(Account)
+Object o = b;
+System.out.println(a.equals(o));              // false: calls Object.equals, a different method
+List&lt;Account&gt; list = List.of(a);
+System.out.println(list.contains(b));         // false: collections call equals(Object)</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">true
+false
+false</code></pre>
+  <p>Put <code>@Override</code> on every overriding method, including implementations of interface methods. With the annotation, the wrong version above does not compile. It also protects you later: if someone renames the parent method, every override fails to compile instead of silently becoming a dead method.</p>
+
+  <h4>Covariant return types</h4>
+  <p>An override may return a more specific type than the parent method. Callers who know they hold the subclass get the specific type without a cast.</p>
+  <pre data-title="Covariant.java"><code class="language-java">class Animal {
+    Animal reproduce() { return new Animal(); }
+}
+
+class Dog extends Animal {
+    @Override
+    Dog reproduce() { return new Dog(); }      // Dog is a subtype of Animal: allowed
+}
+
+// in main():
+Dog puppy = new Dog().reproduce();              // no cast needed
+Animal other = new Dog().reproduce();           // still fine through the parent type</code></pre>
+  <p>Behind the scenes, javac adds a hidden <strong>bridge method</strong> with the parent's return type, so that the JVM can still dispatch the call correctly. You never write it. This is why <code>clone()</code> overrides can declare their own class as the return type.</p>
+
+  <h4>Exceptions in overriding methods</h4>
+  <pre data-title="Importer.java"><code class="language-java">import java.io.*;
+
+class Importer {
+    void load(String file) throws IOException { }
+}
+
+class CsvImporter extends Importer {
+    @Override void load(String file) throws FileNotFoundException { }   // narrower: OK
+}
+
+class CachedImporter extends Importer {
+    @Override void load(String file) { }                                // none: OK
+}
+
+class BadImporter extends Importer {
+    @Override void load(String file) throws Exception { }   // error: broader than IOException
+}</code></pre>
+  <p>The reason is again substitutability. A caller holding an <code>Importer</code> catches only <code>IOException</code>. If a subclass could throw <code>Exception</code>, that caller would be surprised by a checked exception it never prepared for. Unchecked exceptions (<code>RuntimeException</code> and its children) are not checked by the compiler, so they are always allowed.</p>
+
+  <h4>Calling the parent version with super</h4>
+  <p>An override often wants to extend the parent behaviour, not discard it. Call <code>super.method()</code> and add to the result. Two common places: <code>toString()</code> (<code>super.toString() + ", extra=" + extra</code>) and methods that do setup and teardown work in a base class.</p>
+
+  <h4>Static methods and fields: hidden, not overridden</h4>
+  <p>If a subclass declares a static method with the same signature as a static method of its parent, it <strong>hides</strong> the parent's method. A field with the same name as a parent field <strong>hides</strong> that field. In both cases, Java picks by the <em>declared type of the reference</em>, not by the object. Only instance methods are chosen by the object.</p>
+  <pre data-title="Hiding.java"><code class="language-java">public class Hiding {
+    static class P {
+        static String who() { return "P"; }
+        String name() { return "P"; }
+        String f = "P.f";
+    }
+
+    static class C extends P {
+        static String who() { return "C"; }                  // hides P.who()
+        @Override String name() { return "C"; }              // overrides P.name()
+        String f = "C.f";                                    // hides P.f
+    }
+
+    public static void main(String[] args) {
+        P p = new C();                    // declared type P, real object C
+        System.out.println(p.who());      // static: decided by declared type
+        System.out.println(p.name());     // instance method: decided by the object
+        System.out.println(p.f);          // field: decided by declared type
+        System.out.println(((C) p).f);    // after a cast the declared type is C
+        System.out.println(C.who());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">P
+C
+P.f
+C.f
+C</code></pre>
+  <p>Only <code>p.name()</code> printed the subclass value. That single line is polymorphism; the others are not. Do not redeclare a parent's field name in a subclass. If subclasses need different values, expose a method (for example <code>protected String label()</code>) because methods are chosen by the object.</p>
+
+  <h4>The silent trap: private and package-private methods</h4>
+  <p>A method that is not inherited cannot be overridden. A <code>private</code> method in the parent is invisible to the child, so a method with the same name in the child is a brand-new method. Package-private methods behave the same way when the child is in <em>another package</em>:</p>
+  <pre data-title="pkg1/Base.java"><code class="language-java">package pkg1;
+
+public class Base {
+    void hook() { System.out.println("Base hook"); }      // package-private
+    public void run() { hook(); }
+}</code></pre>
+  <pre data-title="pkg2/Derived.java"><code class="language-java">package pkg2;
+
+public class Derived extends pkg1.Base {
+    // NOT an override: Base.hook() is invisible in this package
+    void hook() { System.out.println("Derived hook"); }
+}
+
+// new Derived().run() prints:  Base hook</code></pre>
+  <p>Nothing warns you about this, except <code>@Override</code>: with the annotation on <code>Derived.hook()</code> the compiler reports <code>method does not override or implement a method from a supertype</code>. Yet another reason to always write it.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>An override may be <code>final</code> (to stop further overriding). Modifiers such as <code>synchronized</code> are not part of the signature, so they may differ.</li>
+      <li>An abstract class can re-declare an inherited concrete method as <code>abstract</code>, forcing subclasses to implement it again.</li>
+      <li>An abstract method must be overridden by the first concrete subclass, or javac reports <code>… is not abstract and does not override abstract method …</code> (<a href="#m2-abstract-classes">abstract classes</a>).</li>
+      <li>The overriding method may rename parameters and add or drop annotations freely; only the types matter.</li>
+      <li>A call through <code>super.method()</code> is not dynamic: it always runs the parent version.</li>
+      <li>Interface default methods can be overridden too, by a class or by a sub-interface (<a href="#m2-interfaces">interfaces</a>).</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes to avoid</p>
+    <ul>
+      <li><strong>Leaving out <code>@Override</code></strong> and shipping an overload (the <code>equals(Account)</code> bug above).</li>
+      <li><strong>Breaking the parent's promise.</strong> If <code>withdraw()</code> in the parent never throws for a valid amount, a subclass that throws for valid amounts violates substitutability even though it compiles.</li>
+      <li><strong>Calling overridable methods from a constructor</strong> (<a href="#m2-init-order">initialization order</a>).</li>
+      <li><strong>Assuming a field behaves like a method.</strong> Fields are never overridden.</li>
+    </ul>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: design for overriding on purpose</p>
+    <p>A class that allows overriding must document <em>how</em> (which other methods call this one, what must hold afterwards). If you did not plan for subclasses, mark the class or the key methods <code>final</code>. "Design and document for inheritance, or else prohibit it" is the advice of <em>Effective Java</em>.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: overriding questions</p>
+    <ul>
+      <li><b>What are the rules?</b> Same signature, same or wider access, same or narrower checked exceptions, same or covariant return type, instance methods only, not final.</li>
+      <li><b>Can we override static or private methods?</b> No. Static methods are hidden; private ones are not inherited.</li>
+      <li><b>What is a covariant return type?</b> An override that returns a subtype of the parent's return type (since Java 5).</li>
+      <li><b>Why use <code>@Override</code>?</b> The compiler checks that you really override; it catches typos and wrong parameter types.</li>
+      <li><b>Can an overriding method throw a broader exception?</b> No for checked exceptions; unchecked exceptions are fine.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-overloading">
+  <h3>Method overloading and how Java picks the method</h3>
+  <p class="tldr">Overloading means several methods with the same name but different parameter lists; the compiler chooses one at compile time from the declared types of the arguments, trying exact and widening matches first, then boxing, then varargs.</p>
+
+  <p><strong>Method overloading</strong> lets you reuse one name for related operations on different inputs. The JDK does this constantly: <code>System.out.println</code> has overloads for <code>int</code>, <code>double</code>, <code>char</code>, <code>String</code>, <code>Object</code> and more; <code>Math.max</code> works for <code>int</code>, <code>long</code>, <code>float</code> and <code>double</code>; <code>String.valueOf</code> and <code>StringBuilder.append</code> have a dozen overloads each. The caller writes the same name, and the compiler picks the right version.</p>
+  <pre data-title="Calculator.java"><code class="language-java">public class Calculator {
+    public int add(int a, int b)                { return a + b; }
+    public double add(double a, double b)       { return a + b; }
+    public int add(int a, int b, int c)         { return a + b + c; }
+    public String add(String a, String b)       { return a + b; }
+}</code></pre>
+
+  <h4>What counts as a different method</h4>
+  <p>The <strong>signature</strong> of a method is its name plus the types of its parameters, in order. Two methods in the same class (or in a class and its subclass) may share a name only if their signatures differ.</p>
+  <div class="co co-rule">
+    <p class="co-t">Rules of overloading</p>
+    <ul>
+      <li>The parameter lists must differ in the <strong>number</strong>, the <strong>types</strong> or the <strong>order</strong> of types: <code>f(int, String)</code> and <code>f(String, int)</code> are different methods.</li>
+      <li>These do <em>not</em> make methods different: the return type, the access modifier, the <code>throws</code> clause and the parameter names.</li>
+      <li>Two methods with the same signature and different return types do not compile: <code>method f(int) is already defined in class X</code>.</li>
+      <li>You can overload static methods, instance methods and constructors. A subclass can also add overloads of inherited methods.</li>
+    </ul>
+  </div>
+  <p>Why can the return type not be used? Because the compiler chooses a method from the <em>arguments</em>. A statement like <code>f();</code> ignores the result, so there would be nothing left to choose with.</p>
+
+  <h4>How the compiler picks: three phases</h4>
+  <p>When several overloads could accept a call, the compiler works in three phases and stops at the first phase that finds a match:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Phase</th><th>What is allowed</th><th>Example conversion</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Exact match, primitive widening, and passing a subtype. <strong>No boxing, no varargs</strong></td><td><code>byte → int → long</code>, <code>String → Object</code></td></tr>
+      <tr><td>2</td><td>Phase 1 plus boxing and unboxing</td><td><code>int → Integer</code>, <code>double → Double → Object</code></td></tr>
+      <tr><td>3</td><td>Phase 2 plus variable-arity (varargs) methods</td><td><code>f(1, 2)</code> to <code>f(int... x)</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Inside one phase, if more than one method applies, the <strong>most specific</strong> one wins (<code>int</code> is more specific than <code>long</code>; <code>String</code> is more specific than <code>Object</code>). If no single method is most specific, the call is <strong>ambiguous</strong> and does not compile.</p>
+  <pre data-title="OvRes.java"><code class="language-java">public class OvRes {
+    static void f(int x)     { System.out.println("f(int)"); }
+    static void f(long x)    { System.out.println("f(long)"); }
+    static void f(Integer x) { System.out.println("f(Integer)"); }
+    static void f(Object x)  { System.out.println("f(Object)"); }
+    static void f(int... x)  { System.out.println("f(int...)"); }
+
+    public static void main(String[] args) {
+        byte b = 1;
+        f(5);                    // exact match
+        f(b);                    // byte widens to int; int is more specific than long
+        f(5L);                   // exact match
+        f(Integer.valueOf(5));   // exact match
+        f(5.0);                  // no widening fits; double boxes to Double, which is an Object
+        f("hi");                 // String is an Object
+        f();                     // only the varargs method can take zero arguments
+        f(1, 2);                 // only the varargs method fits
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">f(int)
+f(int)
+f(long)
+f(Integer)
+f(Object)
+f(Object)
+f(int...)
+f(int...)</code></pre>
+  <p>Two more rules fall out of the phases. <strong>Widening beats boxing</strong>, because widening is phase 1 and boxing is phase 2. <strong>Boxing beats varargs</strong>, because varargs is phase 3.</p>
+  <pre data-title="Phases.java"><code class="language-java">static void g(long x)    { System.out.println("g(long)"); }
+static void g(Integer x) { System.out.println("g(Integer)"); }
+static void h(Integer x) { System.out.println("h(Integer)"); }
+static void h(int... x)  { System.out.println("h(int...)"); }
+
+// in main():
+g(5);    // g(long):    int widens to long (phase 1) before boxing is tried
+h(5);    // h(Integer): boxing (phase 2) wins over varargs (phase 3)</code></pre>
+
+  <h4>The declared type decides, not the real object</h4>
+  <p>Overloads are chosen at compile time, so only the <strong>declared types</strong> of the arguments count. The run-time type of the object is invisible to the compiler.</p>
+  <pre data-title="DeclaredType.java"><code class="language-java">static void show(Object o) { System.out.println("show(Object)"); }
+static void show(String s) { System.out.println("show(String)"); }
+
+// in main():
+Object o = "hi";
+show(o);                  // show(Object): the declared type of o is Object
+show("hi");               // show(String)
+show((Object) "hi");      // show(Object): the cast changes the declared type
+show(null);               // show(String): null fits both; String is more specific</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">show(Object)
+show(String)
+show(Object)
+show(String)</code></pre>
+  <p>This is the key difference from overriding, where the <em>object</em> decides at run time. The first output line surprises many people: the variable holds a <code>String</code>, yet <code>show(Object)</code> runs.</p>
+
+  <h4>Overloads and null</h4>
+  <p>A <code>null</code> argument fits every reference type, so the compiler picks the most specific overload. If two overloads are equally specific, the call is ambiguous:</p>
+  <pre data-title="OvErr2.java"><code class="language-java">static void print(String s) { }
+static void print(StringBuilder sb) { }
+
+// print(null);    // error: reference to print is ambiguous
+//                 //   both method print(String) and method print(StringBuilder) match
+print((String) null);   // fix: cast to the type you mean</code></pre>
+
+  <h4>The classic trap: List.remove(int) versus remove(Object)</h4>
+  <p><code>List</code> has two <code>remove</code> methods: <code>remove(int index)</code> and <code>remove(Object o)</code>. For a <code>List&lt;Integer&gt;</code>, phase 1 finds an exact match for an <code>int</code> argument, so the index version wins and boxing is never tried.</p>
+  <pre data-title="ListRemove.java"><code class="language-java">List&lt;Integer&gt; nums = new ArrayList&lt;&gt;(List.of(10, 20, 30, 1));
+nums.remove(1);                        // remove(int index): removes the element at index 1 (20)
+System.out.println(nums);              // [10, 30, 1]
+nums.remove(Integer.valueOf(1));       // remove(Object): removes the value 1
+System.out.println(nums);              // [10, 30]</code></pre>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>System.out.println('a')</code> prints <code>a</code>, but <code>System.out.println('a' + 1)</code> prints <code>98</code>: the sum is an <code>int</code>, so the <code>int</code> overload runs.</li>
+      <li>A varargs call with no extra argument prefers the fixed-arity method: <code>log("x")</code> picks <code>log(String)</code> over <code>log(String, Object...)</code>.</li>
+      <li>Overloading works across inheritance. In a subclass, <code>eat(Dog)</code> next to an inherited <code>eat(Animal)</code> is an overload, not an override, because the parameter types differ (see <a href="#m2-dispatch-puzzles">the output-prediction puzzles</a>).</li>
+      <li>A generic method and a non-generic method with the same erasure, such as <code>f(List&lt;String&gt;)</code> and <code>f(List&lt;Integer&gt;)</code>, do not compile as a pair: <code>name clash: … have the same erasure</code> (<a href="#m4">Module 4</a>).</li>
+      <li><code>main</code> can be overloaded, but the JVM starts the program only through the classic one.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions for overloading</p>
+    <ul>
+      <li>Overload only when the methods do the <em>same thing</em> on different inputs. If the behaviour differs, use different names: <code>DataOutputStream</code> has <code>writeInt</code> and <code>writeLong</code>, not ten <code>write</code> overloads.</li>
+      <li>Avoid overloads with the same number of parameters whose types are related (<code>Object</code> and <code>String</code>, <code>int</code> and <code>Integer</code>). The caller can no longer predict which one runs.</li>
+      <li>Do not overload with different functional interfaces at the same position; lambda arguments become ambiguous (<a href="#m5">Module 5</a>).</li>
+      <li>To keep the number of constructors small, use chaining with <code>this(…)</code> (<a href="#m2-constructors">constructors</a>) or static factory methods with distinct names.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: overloading questions</p>
+    <ul>
+      <li><b>What is overloading?</b> Same name, different parameter list, resolved at compile time. It is called compile-time or static polymorphism.</li>
+      <li><b>Can you overload by return type?</b> No; the return type is not part of the signature.</li>
+      <li><b>Which method runs for <code>f(null)</code>?</b> The most specific overload; ambiguity is a compile error.</li>
+      <li><b>Order of resolution?</b> Exact or widening, then boxing, then varargs.</li>
+      <li><b>Overloading vs overriding?</b> The comparison table is in <a href="#m2-polymorphism">polymorphism</a>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-polymorphism">
+  <h3>Polymorphism: compile-time vs runtime, dynamic method dispatch</h3>
+  <p class="tldr">Polymorphism ("many forms") lets one reference type stand for many real types, so the same call runs different code depending on the actual object: chosen at run time for overriding, at compile time for overloading.</p>
+
+  <p>Imagine the checkout page of a shopping app. The customer pays with UPI, a card or cash on delivery. The checkout code should not contain a branch for every payment type. It should say "pay this amount" and let each payment type know how. That is polymorphism, the third pillar of OOP: <strong>one interface, many implementations</strong>, and the right one runs automatically.</p>
+
+  <h4>A first example</h4>
+  <p>The type <code>PaymentMethod</code> below is an <strong>interface</strong>: a type that lists methods without bodies (see <a href="#m2-interfaces">interfaces</a>). Everything here works the same with a parent class and overriding.</p>
+  <pre data-title="Checkout.java"><code class="language-java">import java.util.*;
+
+interface PaymentMethod {
+    String pay(long amountPaise);
+}
+
+class UpiPayment implements PaymentMethod {
+    private final String upiId;
+    UpiPayment(String upiId) { this.upiId = upiId; }
+
+    @Override public String pay(long amountPaise) {
+        return "Paid " + amountPaise + " paise via UPI " + upiId;
+    }
+    String scanQr() { return "scanning QR"; }              // only UpiPayment has this
+}
+
+class CardPayment implements PaymentMethod {
+    private final String last4;
+    CardPayment(String last4) { this.last4 = last4; }
+
+    @Override public String pay(long amountPaise) {
+        return "Paid " + amountPaise + " paise by card ending " + last4;
+    }
+}
+
+class CashOnDelivery implements PaymentMethod {
+    @Override public String pay(long amountPaise) {
+        return "Will collect " + amountPaise + " paise at the door";
+    }
+}
+
+public class Checkout {
+    static void checkout(PaymentMethod method, long amountPaise) {   // knows only the interface
+        System.out.println(method.pay(amountPaise));
+    }
+
+    public static void main(String[] args) {
+        List&lt;PaymentMethod&gt; methods = List.of(
+                new UpiPayment("asha@upi"), new CardPayment("4242"), new CashOnDelivery());
+        for (PaymentMethod m : methods) {
+            checkout(m, 49_900);                           // same call, three behaviours
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Paid 49900 paise via UPI asha@upi
+Paid 49900 paise by card ending 4242
+Will collect 49900 paise at the door</code></pre>
+  <p>The method <code>checkout</code> was written once. If the shop adds <code>NetBanking</code> next month, you write one new class, and <code>checkout</code> does not change. New behaviour arrives without editing old, tested code — this is the open/closed idea you will meet again in design principles (<a href="08-system-design.html#m1">System Design · Module 1</a>).</p>
+
+  <h4>Compile-time and run-time polymorphism</h4>
+  <p>Java has two mechanisms that people call polymorphism. They differ in <em>when</em> the method is chosen.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Overloading (compile-time)</th><th>Overriding (run-time)</th></tr></thead>
+    <tbody>
+      <tr><td>Other names</td><td>Static polymorphism, early binding</td><td>Dynamic polymorphism, late binding, dynamic method dispatch</td></tr>
+      <tr><td>Where</td><td>Same class, or a class and its subclass</td><td>Parent class and subclass (or interface and implementation)</td></tr>
+      <tr><td>Signature</td><td>Must differ</td><td>Must be the same</td></tr>
+      <tr><td>Return type</td><td>Can be anything</td><td>Same or covariant</td></tr>
+      <tr><td>Access and exceptions</td><td>Free to differ</td><td>Access not narrower; checked exceptions not broader</td></tr>
+      <tr><td>Chosen by</td><td>The compiler, using the declared types of the arguments</td><td>The JVM, using the actual class of the object</td></tr>
+      <tr><td>Static and private methods</td><td>Can be overloaded</td><td>Cannot be overridden</td></tr>
+      <tr><td>Needs inheritance?</td><td>No</td><td>Yes (or an interface)</td></tr>
+      <tr><td><code>@Override</code></td><td>Not used</td><td>Recommended always</td></tr>
+    </tbody>
+  </table></div>
+  <p>When an interviewer says "polymorphism" without more words, they usually mean the run-time kind. Details of overloading are in <a href="#m2-overloading">their own article</a>.</p>
+
+  <h4>Reference type and object type</h4>
+  <p>In <code>PaymentMethod m = new UpiPayment("asha@upi");</code> there are two types in play:</p>
+  <ul>
+    <li>The <strong>reference type</strong> (also called the declared or compile-time type) is <code>PaymentMethod</code>. It decides <em>which methods you are allowed to call</em>. The compiler checks this.</li>
+    <li>The <strong>object type</strong> (the actual or run-time type) is <code>UpiPayment</code>. It decides <em>which implementation runs</em>. The JVM decides this while the program runs.</li>
+  </ul>
+  <p>Assigning a subclass object to a parent-type variable is called <strong>upcasting</strong>. It is always safe and needs no cast. The price is that the variable only offers the parent's methods:</p>
+  <pre data-title="Checkout2.java"><code class="language-java">PaymentMethod p = new UpiPayment("ravi@upi");
+p.pay(100);        // fine: pay() is in PaymentMethod
+p.scanQr();        // compile error: scanQr() exists in UpiPayment, not in PaymentMethod</code></pre>
+  <pre class="out" data-title="javac output"><code class="language-plaintext">Checkout2.java:4: error: cannot find symbol
+        p.scanQr();
+         ^
+  symbol:   method scanQr()
+  location: variable p of type PaymentMethod</code></pre>
+  <p>To call <code>scanQr()</code> you would need a downcast; see <a href="#m2-casting-instanceof">casting and instanceof</a>. A good design usually avoids the need: put what callers need into the shared type.</p>
+
+  <h4>How dynamic method dispatch works</h4>
+  <p><strong>Dynamic method dispatch</strong> is the run-time lookup that finds the right overriding method. It happens in two steps, one at each time:</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A["Call: m.pay(amount), m is a PaymentMethod"] --> B["Compile time: is pay(long) in PaymentMethod?"]
+  B --> C["Run time: the JVM reads the real class of the object in m"]
+  C --> D{"Does that class declare pay(long)?"}
+  D -->|yes| E["Run that version"]
+  D -->|no| F["Look in its parent class, then the next parent"]
+  F --> E
+</pre>
+  <figcaption>The compiler checks that the call is legal; the JVM picks the implementation</figcaption>
+  </figure>
+  <p>In bytecode, a call on a class type is an <code>invokevirtual</code> instruction and a call on an interface type is <code>invokeinterface</code>. Conceptually, each class has a table of its methods (a <strong>virtual method table</strong>). A subclass starts with a copy of its parent's table and replaces the entries for the methods it overrides. A call looks up the method in the table of the object's real class. The JIT compiler (<a href="#m7">Module 7</a>) often removes the cost: if a call site has only ever seen one class, it can inline the method directly. So polymorphism is not slow.</p>
+
+  <h4>What is polymorphic and what is not</h4>
+  <p>Only <strong>instance methods that can be overridden</strong> are chosen by the object. Everything else is fixed by the compiler. This is also the answer to the interview question "static binding versus dynamic binding": <strong>binding</strong> means linking a method call to the method body.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Thing</th><th>Chosen by</th><th>Binding</th></tr></thead>
+    <tbody>
+      <tr><td>Overridable instance method</td><td>Actual class of the object</td><td>Dynamic (late)</td></tr>
+      <tr><td><code>static</code> method</td><td>Declared type of the reference</td><td>Static (early)</td></tr>
+      <tr><td><code>private</code> and <code>final</code> methods, constructors</td><td>The class where they are declared</td><td>Static (early)</td></tr>
+      <tr><td>Field access (<code>p.f</code>)</td><td>Declared type of the reference</td><td>Static (early)</td></tr>
+      <tr><td>Which overload to call</td><td>Declared types of the arguments</td><td>Static (early)</td></tr>
+      <tr><td><code>super.method()</code></td><td>The parent class</td><td>Static (early)</td></tr>
+    </tbody>
+  </table></div>
+  <p>The proof for fields and static methods is the <code>Hiding</code> example in <a href="#m2-overriding">overriding</a>: <code>p.f</code> gave <code>P.f</code> although the object was a <code>C</code>.</p>
+
+  <h4>Replace conditionals with polymorphism</h4>
+  <p>Polymorphism removes long <code>if</code>/<code>switch</code> chains on a "type" value. Every new type forces you to find and edit every such chain.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: branch on a type code</p><pre><code class="language-java">static String pay(String type, long paise) {
+    if (type.equals("UPI"))  { return "UPI " + paise; }
+    else if (type.equals("CARD")) { return "Card " + paise; }
+    else if (type.equals("COD"))  { return "COD " + paise; }
+    throw new IllegalArgumentException(type);   // edit here for every new type
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: let each type know itself</p><pre><code class="language-java">static String pay(PaymentMethod method, long paise) {
+    return method.pay(paise);         // new types need no change here
+}</code></pre></div>
+  </div>
+
+  <h4>Polymorphism is everywhere in Java</h4>
+  <ul>
+    <li><code>List&lt;String&gt; names = new ArrayList&lt;&gt;();</code> — you code against <code>List</code>; the object may be an <code>ArrayList</code> or a <code>LinkedList</code>.</li>
+    <li><code>Comparator</code>, <code>Runnable</code> and <code>Iterator</code> — you pass behaviour; the library calls it.</li>
+    <li>Spring injects a <code>PaymentGateway</code> bean, and your service calls <code>gateway.charge(…)</code> without knowing whether Razorpay or a test fake is behind it.</li>
+    <li>JDBC: your code calls <code>Connection</code> and <code>PreparedStatement</code>; the real classes come from the database driver.</li>
+  </ul>
+  <p>Java also has a third kind, <strong>parametric polymorphism</strong>: generics let one class or method work for many types (<code>List&lt;T&gt;</code>, <a href="#m4">Module 4</a>). The run-time and compile-time kinds above are the ones about methods.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules to remember</p>
+    <ul>
+      <li>The <strong>reference type</strong> decides what you can call; the <strong>object type</strong> decides which override runs.</li>
+      <li>Only overridable instance methods are dynamic. Fields, static methods, private methods and overload choice are fixed at compile time.</li>
+      <li>Upcasting is implicit and safe; downcasting needs a cast and can fail at run time.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Calling a method on a <code>null</code> reference throws <code>NullPointerException</code>; there is no object to dispatch on.</li>
+      <li>A call to an overridden method from a parent's constructor runs the child's version, before the child's fields are ready (<a href="#m2-init-order">initialization order</a>).</li>
+      <li>Inside a parent's method, calling another overridable method means <code>this.other()</code>, which is dispatched dynamically. This is the basis of the Template Method pattern (<a href="#m2-abstract-classes">abstract classes</a>).</li>
+      <li>Dispatch also works for interface default methods: the most specific implementation of the object's class wins.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes to avoid</p>
+    <ul>
+      <li><strong>Believing the reference type picks the override.</strong> It does not: <code>Employee e = new Manager(…); e.monthlyPay()</code> runs the Manager's version.</li>
+      <li><strong>Long <code>instanceof</code> chains</strong> in the caller instead of a method in the types (see the Wrong example above).</li>
+      <li><strong>Mixing up overloading and overriding</strong> in puzzles. Ask first: is the choice about <em>arguments</em> (compile time) or about the <em>receiver object</em> (run time)?</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain polymorphism with an example"</p>
+    <ul>
+      <li>Definition: one type, many forms; the same method call behaves differently depending on the actual object.</li>
+      <li>Two kinds: compile-time (overloading, chosen by the compiler from argument types) and run-time (overriding, chosen by the JVM from the object's class).</li>
+      <li>Example: <code>PaymentMethod</code> with UPI, card and COD; <code>checkout()</code> is written once and works with any of them.</li>
+      <li>How it works: upcasting plus dynamic method dispatch (a virtual method table lookup).</li>
+      <li>What is not polymorphic: fields, static methods, private methods.</li>
+      <li>Benefit: add new types without changing existing code; remove <code>if/else</code> chains.</li>
+    </ul>
+  </div>
+</article>

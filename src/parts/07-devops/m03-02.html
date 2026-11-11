@@ -1,0 +1,415 @@
+<article class="topic" id="m3-dockerfile">
+  <h3>Dockerfile instructions, ENTRYPOINT vs CMD and best practices</h3>
+  <p class="tldr">A Dockerfile is a recipe of instructions that builds an image layer by layer; order the
+  instructions so dependencies are cached, run as a non-root user, keep images small, and never put secrets
+  inside.</p>
+
+  <h4>What a Dockerfile is</h4>
+  <p>A <strong>Dockerfile</strong> is a text file (named exactly <code>Dockerfile</code>) with one
+  instruction per step. <code>docker build -t shop-api:1.0 .</code> reads it, runs the steps in order, and
+  stores the result as an image. The final <code>.</code> is the <strong>build context</strong>: the folder
+  whose files <code>COPY</code> may use. Docker sends the whole context to the daemon, so keep it small with
+  a <code>.dockerignore</code>.</p>
+
+  <h4>The instructions</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Instruction</th><th>Purpose</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>FROM</code></td><td>Base image; starts a build stage</td><td><code>FROM eclipse-temurin:21-jre</code></td></tr>
+      <tr><td><code>WORKDIR</code></td><td>Set (and create) the working directory for later steps</td><td><code>WORKDIR /app</code></td></tr>
+      <tr><td><code>COPY</code></td><td>Copy files from the build context (or another stage) into the image</td><td><code>COPY target/app.jar app.jar</code></td></tr>
+      <tr><td><code>ADD</code></td><td>Like <code>COPY</code>, plus unpacks local tar files and fetches URLs; prefer <code>COPY</code></td><td><code>ADD site.tar.gz /var/www</code></td></tr>
+      <tr><td><code>RUN</code></td><td>Run a command at <em>build</em> time; creates a layer</td><td><code>RUN ./mvnw -B package</code></td></tr>
+      <tr><td><code>ENV</code></td><td>Set an environment variable, kept in the image and at runtime</td><td><code>ENV TZ=Asia/Kolkata</code></td></tr>
+      <tr><td><code>ARG</code></td><td>Build-time variable, passed with <code>--build-arg</code>; not available at runtime</td><td><code>ARG APP_VERSION=dev</code></td></tr>
+      <tr><td><code>EXPOSE</code></td><td>Documents the port the app listens on; does <em>not</em> publish it</td><td><code>EXPOSE 8080</code></td></tr>
+      <tr><td><code>USER</code></td><td>Run later steps and the container as this user</td><td><code>USER spring</code></td></tr>
+      <tr><td><code>ENTRYPOINT</code></td><td>The executable that always runs</td><td><code>ENTRYPOINT ["java", "-jar", "app.jar"]</code></td></tr>
+      <tr><td><code>CMD</code></td><td>Default arguments (or default command); easy to override</td><td><code>CMD ["--spring.profiles.active=prod"]</code></td></tr>
+      <tr><td><code>HEALTHCHECK</code></td><td>Command Docker runs to decide if the container is healthy</td><td><code>HEALTHCHECK CMD curl -f http://localhost:8080/actuator/health</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Lines starting with <code>#</code> are comments. <code>RUN</code>, <code>ENTRYPOINT</code> and
+  <code>CMD</code> each have two forms:</p>
+  <ul>
+    <li><strong>Exec form</strong> <code>["java", "-jar", "app.jar"]</code> (JSON array). Runs the program
+    directly as PID 1, so it receives <code>SIGTERM</code> from <code>docker stop</code>. Use this for
+    <code>ENTRYPOINT</code> and <code>CMD</code>.</li>
+    <li><strong>Shell form</strong> <code>java -jar app.jar</code>. Docker wraps it in
+    <code>/bin/sh -c</code>, the shell becomes PID 1, and signals may never reach Java, so shutdown is not
+    graceful.</li>
+  </ul>
+
+  <h4>ENTRYPOINT versus CMD</h4>
+  <p><code>ENTRYPOINT</code> is "what this container <em>is</em>" and <code>CMD</code> is "default arguments".
+  When both exist, Docker runs <code>ENTRYPOINT</code> followed by <code>CMD</code>.
+  <code>docker run image extra args</code> replaces <code>CMD</code> but not <code>ENTRYPOINT</code>
+  (override it with <code>--entrypoint</code>).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Dockerfile</th><th>docker run image</th><th>Runs</th></tr></thead>
+    <tbody>
+      <tr><td><code>CMD ["java","-jar","app.jar"]</code></td><td>(nothing)</td><td><code>java -jar app.jar</code></td></tr>
+      <tr><td><code>CMD ["java","-jar","app.jar"]</code></td><td><code>sh</code></td><td><code>sh</code> (CMD replaced; the app is gone)</td></tr>
+      <tr><td><code>ENTRYPOINT ["java","-jar","app.jar"]</code></td><td>(nothing)</td><td><code>java -jar app.jar</code></td></tr>
+      <tr><td><code>ENTRYPOINT ["java","-jar","app.jar"]</code></td><td><code>--server.port=9000</code></td><td><code>java -jar app.jar --server.port=9000</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>For a Spring Boot service use <code>ENTRYPOINT</code> in exec form; that way extra arguments become
+  Spring command-line arguments, and nobody starts a shell by accident.</p>
+
+  <h4>.dockerignore</h4>
+  <p>A <code>.dockerignore</code> file lists paths excluded from the build context. It makes builds faster,
+  keeps secrets out, and stops stale files from invalidating the cache.</p>
+  <pre data-title=".dockerignore"><code class="language-plaintext">.git
+.idea
+.vscode
+target
+node_modules
+*.log
+.env
+.env.*
+Dockerfile
+compose.yaml
+README.md</code></pre>
+
+  <h4>Best practices</h4>
+  <ol class="steps">
+    <li><strong>Order layers for the cache.</strong> Copy <code>pom.xml</code> and download dependencies
+    <em>before</em> copying <code>src</code>. Dependencies change rarely, source changes on every commit; so
+    the slow download layer stays cached.</li>
+    <li><strong>Use multi-stage builds.</strong> Compile with the JDK and Maven in one stage; ship only the
+    JRE and the JAR in the final stage (next article).</li>
+    <li><strong>Run as a non-root user.</strong> If an attacker breaks into the app, they are not root inside
+    the container.</li>
+    <li><strong>One main process per container.</strong> The app in one, the database in another, a cache in
+    a third. Compose joins them.</li>
+    <li><strong>Keep images small.</strong> A JRE base, no build tools, no caches; fewer packages mean less
+    to patch and faster pulls.</li>
+    <li><strong>Pin versions.</strong> <code>eclipse-temurin:21-jre</code>, not <code>latest</code>; pin
+    Maven and Node versions too.</li>
+    <li><strong>No secrets in the image.</strong> Every layer is readable by anyone who can pull the image,
+    even if a later step deletes the file.</li>
+    <li><strong>Combine related <code>RUN</code> steps</strong> with <code>&amp;&amp;</code> and clean up in
+    the same step (for example <code>apt-get install … &amp;&amp; rm -rf /var/lib/apt/lists/*</code>).
+    Deleting in a <em>later</em> layer does not shrink the image.</li>
+    <li><strong>Use exec form</strong> for <code>ENTRYPOINT</code>/<code>CMD</code>, and add a healthcheck
+    where the platform uses it.</li>
+  </ol>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: source copied first, cache never helps</p><pre><code class="language-dockerfile">FROM maven:3.9-eclipse-temurin-21
+WORKDIR /build
+COPY . .
+RUN mvn -B package
+ENTRYPOINT java -jar target/app.jar</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: dependencies cached, exec form</p><pre><code class="language-dockerfile">FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /build
+COPY pom.xml .
+RUN mvn -B dependency:go-offline
+COPY src src
+RUN mvn -B package -DskipTests
+# ...runtime stage copies only the JAR</code></pre></div>
+  </div>
+  <p>In the wrong version any edit to any file invalidates the <code>COPY . .</code> layer, so Maven
+  downloads all dependencies again on every build, and the final image carries Maven, the JDK and the source.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: ARG and ENV values are not secrets</p>
+    <p>Build args and environment variables baked into an image can be read with <code>docker history</code>
+    and <code>docker inspect</code>. Pass real secrets at runtime (see
+    <a href="#m3-secrets">Environment variables and secrets</a>) or use BuildKit secret mounts for build-time
+    needs.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>EXPOSE</code> changes nothing at runtime. Without <code>-p</code> (or compose
+      <code>ports</code>) the host cannot reach the port.</li>
+      <li><code>CMD</code> or <code>ENTRYPOINT</code> given twice: only the last counts.</li>
+      <li><code>ARG</code> declared before <code>FROM</code> is usable only in <code>FROM</code> lines;
+      redeclare it inside the stage to use it there.</li>
+      <li><code>ADD</code> auto-extracts local archives and downloads URLs, which surprises people; it is the
+      reason to prefer <code>COPY</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you make Docker builds fast and images small?"</p>
+    <ul>
+      <li>Order instructions by change frequency so the build cache works; copy the dependency manifest first.</li>
+      <li>Multi-stage build, JRE base image, <code>.dockerignore</code>, combine and clean <code>RUN</code> steps.</li>
+      <li>Non-root user, pinned tags, no secrets.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-spring-dockerfile">
+  <h3>A complete multi-stage Dockerfile for Spring Boot, line by line</h3>
+  <p class="tldr">Stage one uses a Maven + JDK image to download dependencies and build the JAR; stage two
+  starts from a small JRE image, copies only the JAR, switches to a non-root user and starts the app with
+  an exec-form <code>ENTRYPOINT</code> — typically a few hundred MB smaller than a single-stage image.</p>
+
+  <h4>Why two stages</h4>
+  <p>Building needs Maven, the JDK, your source and about 200 MB of downloaded dependencies. Running needs
+  only a JRE and one JAR. A <strong>multi-stage build</strong> uses several <code>FROM</code> lines in one
+  Dockerfile; each starts a fresh stage, and <code>COPY --from=</code> takes chosen files from an earlier
+  stage. Everything else in the earlier stage is dropped from the final image.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  subgraph S1["Stage 1: build (maven + JDK)"]
+    A[pom.xml] --> B[download dependencies]
+    B --> C[copy src]
+    C --> D["mvn package -> app.jar"]
+  end
+  subgraph S2["Stage 2: runtime (JRE only)"]
+    E[eclipse-temurin JRE] --> F[copy app.jar]
+    F --> G[USER spring]
+    G --> H[ENTRYPOINT java -jar]
+  end
+  D -->|"COPY --from=build"| F
+</pre>
+    <figcaption>Only the JAR crosses from the build stage to the runtime stage</figcaption>
+  </figure>
+
+  <h4>The Dockerfile</h4>
+  <p>Project layout: <code>pom.xml</code>, <code>src/</code>, and optionally the Maven wrapper
+  (<code>mvnw</code>, <code>.mvn/</code>). This version uses the Maven image, so it does not need the wrapper.</p>
+  <pre data-title="Dockerfile"><code class="language-dockerfile"># syntax=docker/dockerfile:1
+
+# ---------- Stage 1: build ----------
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /build
+
+# Copy only the dependency manifest first, so this layer is cached
+COPY pom.xml .
+RUN mvn -B -q dependency:go-offline
+
+# Now copy the source and build the JAR
+COPY src ./src
+RUN mvn -B -q package -DskipTests
+
+# ---------- Stage 2: runtime ----------
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+
+# Create a non-root user and group
+RUN groupadd --system spring &amp;&amp; useradd --system --gid spring --no-create-home spring
+
+# Take only the built JAR from stage 1
+COPY --from=build /build/target/*.jar app.jar
+
+USER spring
+EXPOSE 8080
+
+# Tune the JVM for containers (see the JVM article)
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
+  CMD curl -fs http://localhost:8080/actuator/health || exit 1
+
+ENTRYPOINT ["java", "-jar", "app.jar"]</code></pre>
+
+  <h4>Every line explained</h4>
+  <dl class="terms">
+    <dt># syntax=docker/dockerfile:1</dt><dd>Optional first line that selects the current stable Dockerfile
+    syntax for BuildKit (the default builder). It enables newer features such as <code>RUN --mount</code>.</dd>
+    <dt>FROM maven:3.9-eclipse-temurin-21 AS build</dt><dd>The base for stage 1: Maven 3.9 on Temurin JDK 21.
+    <code>AS build</code> names the stage so we can copy from it later.</dd>
+    <dt>WORKDIR /build</dt><dd>Creates <code>/build</code> and makes it the current folder. All following
+    relative paths start here.</dd>
+    <dt>COPY pom.xml .</dt><dd>Copies just the POM. If the POM has not changed, this layer and the next
+    stay cached.</dd>
+    <dt>RUN mvn -B -q dependency:go-offline</dt><dd>Downloads dependencies and plugins into the image's
+    <code>~/.m2</code> as its own layer. <code>-B</code> is batch mode (no colours or progress bars) and
+    <code>-q</code> is quiet. Some plugins are only resolved when they run, so a rare "missing artifact"
+    can still appear later; it only costs speed, not correctness.</dd>
+    <dt>COPY src ./src</dt><dd>Brings in your code. From here down, layers are rebuilt on every code change.</dd>
+    <dt>RUN mvn -B -q package -DskipTests</dt><dd>Compiles and builds the executable Spring Boot JAR into
+    <code>target/</code>. Tests are skipped here because CI runs them in an earlier step; running them
+    inside the image build would need a database.</dd>
+    <dt>FROM eclipse-temurin:21-jre</dt><dd>Starts stage 2 from a JRE-only image. Nothing from stage 1
+    comes along automatically.</dd>
+    <dt>RUN groupadd … &amp;&amp; useradd …</dt><dd>Creates a system user <code>spring</code>. These are the
+    Debian/Ubuntu commands; on Alpine you would use <code>addgroup</code>/<code>adduser</code>.</dd>
+    <dt>COPY --from=build /build/target/*.jar app.jar</dt><dd>Copies the JAR from the build stage and renames it
+    <code>app.jar</code>. Keep exactly one JAR in <code>target/</code> (the glob fails or misbehaves if a
+    <code>-plain.jar</code> is also produced, e.g. by the Gradle <code>jar</code> task; Maven's Boot plugin
+    produces one executable JAR).</dd>
+    <dt>USER spring</dt><dd>From now on, and at runtime, the process runs as <code>spring</code>, not root.</dd>
+    <dt>EXPOSE 8080</dt><dd>Documentation: the app listens on 8080.</dd>
+    <dt>ENV JAVA_TOOL_OPTIONS=…</dt><dd>The JVM reads this variable at start-up and applies the flags.</dd>
+    <dt>HEALTHCHECK …</dt><dd>Docker runs the command inside the container every 30 s. <code>start-period</code>
+    gives Spring time to boot. It needs <code>curl</code> and the Actuator health endpoint; the Temurin
+    Ubuntu-based images include <code>curl</code>, but Alpine and distroless images do not.</dd>
+    <dt>ENTRYPOINT ["java", "-jar", "app.jar"]</dt><dd>Exec form: Java is PID 1 and gets
+    <code>SIGTERM</code> on <code>docker stop</code>.</dd>
+  </dl>
+
+  <h4>Build and run</h4>
+  <pre data-title="Build, run, test"><code class="language-shell">$ docker build -t shop-api:1.0 .
+[+] Building 94.2s (13/13) FINISHED
+$ docker images shop-api
+REPOSITORY   TAG   IMAGE ID       CREATED          SIZE
+shop-api     1.0   5a1b2c3d4e5f   10 seconds ago   310MB
+$ docker run -d --name shop-api -p 8080:8080 \
+    -e SPRING_PROFILES_ACTIVE=prod shop-api:1.0
+$ curl -s localhost:8080/actuator/health
+{"status":"UP"}
+$ docker build -t shop-api:1.0 .       # second build after a code change
+[+] Building 12.8s (13/13) FINISHED     # dependency layer came from the cache</code></pre>
+  <p>The sizes and times above are examples; yours will differ. The point to notice is the second build: the
+  dependency layer is cached, so only the compile and copy steps run.</p>
+
+  <h4>Optional: layered JARs for faster pulls</h4>
+  <p>A Spring Boot JAR is mostly third-party libraries that rarely change, plus a small part that is your
+  code. Spring Boot can split the JAR into layers (dependencies, application classes) that Docker caches
+  separately, so a code change re-pushes only a few KB instead of the whole fat JAR. You extract the layers in
+  the build stage with <code>java -Djarmode=tools -jar app.jar extract --layers</code> (Spring Boot 3.3 and
+  later; older versions use <code>-Djarmode=layertools</code> with <code>extract</code>) and copy each folder
+  with its own <code>COPY</code>. This is an optimisation; start with the simple version above and see the
+  Spring Boot reference ("Efficient container images") before you add it.</p>
+
+  <div class="co co-version">
+    <p class="co-t">Java versions</p>
+    <p>Replace <code>21</code> with <code>17</code> or <code>25</code> to match your project's
+    <code>java.version</code>. The build and runtime stages must use the same major version (or the runtime
+    must be newer), otherwise you get <em>UnsupportedClassVersionError</em>.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: building the JAR on the host and forgetting to rebuild</p>
+    <p>A Dockerfile that does <code>COPY target/app.jar</code> uses whatever is in <code>target/</code> on your
+    machine, possibly an old build, and breaks in CI where <code>target/</code> does not exist. The multi-stage
+    version builds inside Docker, so the result does not depend on your laptop.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Errors you will see</p>
+    <ul>
+      <li><strong>Error: Unable to access jarfile app.jar</strong> — the JAR was not copied to the path the
+      <code>ENTRYPOINT</code> expects, or the glob matched nothing.</li>
+      <li><strong>no main manifest attribute</strong> — a plain (non-Boot) JAR was copied; build with the
+      <code>spring-boot-maven-plugin</code> repackage goal.</li>
+      <li><strong>UnsupportedClassVersionError</strong> — compiled with a newer JDK than the runtime image.</li>
+      <li><strong>Container becomes "unhealthy"</strong> — <code>curl</code> missing, Actuator not on the
+      classpath, or the app needs more than <code>start-period</code> to start.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Walk me through a Dockerfile for a Spring Boot app."</p>
+    <ul>
+      <li>Two stages: Maven/JDK builds the JAR (POM and dependencies first for caching); a JRE image runs it.</li>
+      <li><code>COPY --from=build</code>, non-root <code>USER</code>, exec-form <code>ENTRYPOINT</code>,
+      <code>EXPOSE 8080</code>, healthcheck; secrets come from the environment at runtime.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-jvm-containers">
+  <h3>The JVM in containers, Buildpacks and Jib</h3>
+  <p class="tldr">Modern JVMs read the container's memory and CPU limits; set the heap as a percentage with
+  <code>-XX:MaxRAMPercentage</code>, always set a container memory limit, and consider Spring Boot's
+  Buildpacks or Jib when you want an image without writing a Dockerfile.</p>
+
+  <h4>Container-aware JVM</h4>
+  <p>A container limit (for example <code>-m 512m</code>) is enforced by the kernel through cgroups. Old JVMs
+  (Java 8 before update 191) looked at the <em>host</em> memory and sized the heap for 16 GB while the
+  container had 512 MB, and the kernel killed the container. Modern JVMs (Java 10+, and 8u191+) are
+  <strong>container-aware</strong> by default (<code>-XX:+UseContainerSupport</code> is on): they read the
+  cgroup limits for memory and CPU count.</p>
+  <p>By default the maximum heap is about <strong>25%</strong> of the container memory — safe but often too
+  low. Control it with a percentage so the setting follows the limit:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>-XX:MaxRAMPercentage=75.0</code></td><td>Max heap as a percentage of container memory (default 25)</td></tr>
+      <tr><td><code>-XX:InitialRAMPercentage=50.0</code></td><td>Initial heap size as a percentage</td></tr>
+      <tr><td><code>-Xmx512m</code></td><td>Fixed maximum heap; does not follow the container limit</td></tr>
+      <tr><td><code>-XX:ActiveProcessorCount=2</code></td><td>Override the CPU count the JVM believes it has</td></tr>
+      <tr><td><code>-XX:+ExitOnOutOfMemoryError</code></td><td>Exit on OOM so the platform restarts the container</td></tr>
+    </tbody>
+  </table></div>
+  <p>Why not 100%? The JVM also needs memory outside the heap: metaspace, thread stacks, the code cache,
+  direct buffers and garbage collector structures. A container with a 1 GB limit and
+  <code>MaxRAMPercentage=75</code> gets a heap up to 768 MB, leaving about 256 MB for everything else. For
+  very small containers (under 512 MB) use a lower percentage, around 50–60.</p>
+  <pre data-title="Passing JVM flags without changing the image"><code class="language-shell">$ docker run -d --name shop-api -m 1g --cpus 2 -p 8080:8080 \
+    -e JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError" \
+    shop-api:1.0
+$ docker logs shop-api | head -3
+Picked up JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError
+$ docker stats --no-stream shop-api
+CONTAINER ID   NAME       CPU %   MEM USAGE / LIMIT   MEM %
+8c1d2e3f4a5b   shop-api   0.6%    412MiB / 1GiB       40.23%</code></pre>
+  <p><code>JAVA_TOOL_OPTIONS</code> is read by every JVM start, so it also affects tools like
+  <code>jcmd</code> that run in the same container (they print the "Picked up" line). That is harmless.</p>
+
+  <h4>Other container tips for the JVM</h4>
+  <ul>
+    <li><strong>Always set a memory limit</strong> (<code>-m</code>, or <code>deploy.resources.limits</code> /
+    <code>mem_limit</code> in compose, or the platform setting). Without one, the JVM sees the whole host.</li>
+    <li><strong>CPU limits change the GC and thread pools.</strong> With under 2 CPUs the JVM may choose the
+    Serial GC. If start-up is slow, give it more than one CPU while it boots.</li>
+    <li><strong>Start-up time.</strong> A Spring Boot app often needs 5–20 s to start; set the healthcheck
+    <code>start-period</code> and the platform's readiness delay accordingly.</li>
+    <li><strong>Heap dumps and logs.</strong> Write logs to stdout (the default), not to files inside the
+    container; Docker and platforms collect stdout.</li>
+    <li>See <a href="02-core-java.html#m7">Core Java · Module 7</a> for heap, GC and memory in detail.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: container killed with exit code 137, no Java stack trace</p>
+    <p>Exit code 137 = 128 + 9 (<code>SIGKILL</code>). When the whole container exceeds its memory limit the
+    kernel's OOM killer kills it silently; Java never prints an <em>OutOfMemoryError</em>. Check
+    <code>docker inspect -f '{{.State.OOMKilled}}' name</code>. Fix: lower <code>MaxRAMPercentage</code> to leave
+    room for non-heap memory, raise the limit, or find the leak.</p>
+  </div>
+
+  <h4>Alternative 1: Spring Boot Buildpacks (no Dockerfile)</h4>
+  <p><strong>Cloud Native Buildpacks</strong> inspect your project and build an optimised, layered image for
+  you. Spring Boot wraps them in the Maven and Gradle plugins:</p>
+  <pre data-title="Build an image with Buildpacks"><code class="language-shell">$ ./mvnw -DskipTests spring-boot:build-image \
+    -Dspring-boot.build-image.imageName=shop-api:1.0
+...
+Successfully built image 'docker.io/library/shop-api:1.0'
+$ docker run --rm -p 8080:8080 shop-api:1.0</code></pre>
+  <p>It needs a running Docker daemon, downloads builder images on the first run (slow), and configures the
+  JVM memory settings automatically at start-up. Good for quick builds and teams that want standard images;
+  less control than a Dockerfile.</p>
+
+  <h4>Alternative 2: Jib</h4>
+  <p><strong>Jib</strong> (a Google plugin for Maven and Gradle) builds a layered image directly from your
+  compiled classes and dependencies <em>without a Docker daemon and without a Dockerfile</em>. It can push
+  straight to a registry, which suits CI servers where Docker is not available.</p>
+  <pre data-title="pom.xml (fragment): add the plugin"><code class="language-xml">&lt;plugin&gt;
+    &lt;groupId&gt;com.google.cloud.tools&lt;/groupId&gt;
+    &lt;artifactId&gt;jib-maven-plugin&lt;/artifactId&gt;
+    &lt;!-- use the latest version from the plugin's README --&gt;
+    &lt;configuration&gt;
+        &lt;to&gt;&lt;image&gt;ghcr.io/asha/shop-api:1.0&lt;/image&gt;&lt;/to&gt;
+    &lt;/configuration&gt;
+&lt;/plugin&gt;</code></pre>
+  <pre data-title="Build with Jib"><code class="language-shell">$ ./mvnw compile jib:dockerBuild    # build into the local Docker daemon
+$ ./mvnw compile jib:build          # build and push straight to the registry</code></pre>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Dockerfile</th><th>Buildpacks</th><th>Jib</th></tr></thead>
+    <tbody>
+      <tr><td>Control</td><td>Full</td><td>Limited</td><td>Medium</td></tr>
+      <tr><td>Needs Docker daemon</td><td>Yes</td><td>Yes</td><td>No (for <code>jib:build</code>)</td></tr>
+      <tr><td>Learning cost</td><td>Learn Dockerfile</td><td>One command</td><td>Plugin config</td></tr>
+      <tr><td>Best for</td><td>Any app, interviews, most teams</td><td>Spring Boot with defaults</td><td>CI without Docker</td></tr>
+    </tbody>
+  </table></div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: know the Dockerfile first</p>
+    <p>Interviews and most existing projects use Dockerfiles. Learn that well; reach for Buildpacks or Jib when
+    a project already uses them or when you need to avoid a Docker daemon.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Your Java container keeps getting killed. Why?"</p>
+    <ul>
+      <li>Exit 137 and <code>OOMKilled=true</code>: total memory (heap plus non-heap) exceeded the limit.</li>
+      <li>Set an explicit limit, use <code>MaxRAMPercentage</code> (60–75), leave room for metaspace and
+      threads, and look for leaks.</li>
+    </ul>
+  </div>
+</article>

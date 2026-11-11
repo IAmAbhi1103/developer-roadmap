@@ -1,0 +1,604 @@
+<article class="topic" id="m6-race-synchronized">
+  <h3>Race conditions and synchronized</h3>
+  <p class="tldr">A race condition happens when the result depends on how threads interleave; synchronized makes a block of code a critical section that only one thread at a time can enter, using the lock (monitor) of one chosen object.</p>
+
+  <p>A <strong>race condition</strong> is a bug where the outcome depends on the timing of threads. The most common form is <strong>check-then-act</strong> or <strong>read-modify-write</strong> on shared data without protection. The code that touches the shared data and must not be interleaved is called a <strong>critical section</strong>.</p>
+
+  <h4>The roadmap exercise: two threads, one counter</h4>
+  <p>Two threads each add 1 to a shared counter 1,000,000 times. The expected total is 2,000,000.</p>
+  <pre data-title="RaceCondition.java"><code class="language-java">public class RaceCondition {
+    static int counter = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+        Runnable task = () -&gt; {
+            for (int i = 0; i &lt; 1_000_000; i++) {
+                counter++;                 // read, add, write: NOT atomic
+            }
+        };
+        Thread t1 = new Thread(task, "t1");
+        Thread t2 = new Thread(task, "t2");
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+        System.out.println("Expected 2000000, got " + counter);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (one possible run - differs every time)"><code class="language-plaintext">Expected 2000000, got 1316742</code></pre>
+  <p>Updates are lost whenever both threads read the same old value (the picture in <a href="#m6-jmm">the memory model article</a>). The wrong answer is silent: no exception, no warning.</p>
+
+  <h4>Fix 1: synchronized</h4>
+  <pre data-title="SyncCounter.java"><code class="language-java">public class SyncCounter {
+    private int count = 0;
+
+    public synchronized void increment() {   // lock = this
+        count++;
+    }
+
+    public synchronized int get() {
+        return count;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        SyncCounter c = new SyncCounter();
+        Runnable task = () -&gt; {
+            for (int i = 0; i &lt; 1_000_000; i++) {
+                c.increment();
+            }
+        };
+        Thread t1 = new Thread(task);
+        Thread t2 = new Thread(task);
+        t1.start(); t2.start();
+        t1.join();  t2.join();
+        System.out.println("Expected 2000000, got " + c.get());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Expected 2000000, got 2000000</code></pre>
+
+  <h4>Fix 2: AtomicInteger</h4>
+  <pre data-title="AtomicCounter.java"><code class="language-java">import java.util.concurrent.atomic.AtomicInteger;
+
+public class AtomicCounter {
+    public static void main(String[] args) throws InterruptedException {
+        AtomicInteger counter = new AtomicInteger();
+        Runnable task = () -&gt; {
+            for (int i = 0; i &lt; 1_000_000; i++) {
+                counter.incrementAndGet();   // one atomic operation, no lock
+            }
+        };
+        Thread t1 = new Thread(task);
+        Thread t2 = new Thread(task);
+        t1.start(); t2.start();
+        t1.join();  t2.join();
+        System.out.println("Expected 2000000, got " + counter.get());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Expected 2000000, got 2000000</code></pre>
+  <p>Both are correct. <code>AtomicInteger</code> is simpler and faster for a single counter (details in <a href="#m6-volatile-atomic">the next article</a>). <code>synchronized</code> is the general tool when several variables must change together.</p>
+
+  <h4>How synchronized works: the monitor</h4>
+  <p>Every Java object has a hidden <strong>intrinsic lock</strong>, also called its <strong>monitor</strong>. <code>synchronized</code> acquires that lock on entry and releases it on exit — even if an exception is thrown. While one thread holds the lock, any other thread that wants the <em>same</em> lock goes to the <code>BLOCKED</code> state and waits. Entering also gives a happens-before edge: the next thread to take the lock sees everything the previous holder wrote. So <code>synchronized</code> gives you <strong>both</strong> mutual exclusion (atomicity of the block) <strong>and</strong> visibility.</p>
+
+  <h4>Synchronized methods vs blocks: which object is locked</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Form</th><th>Lock used</th></tr></thead>
+    <tbody>
+      <tr><td><code>public synchronized void m()</code></td><td><code>this</code> (the instance)</td></tr>
+      <tr><td><code>public static synchronized void m()</code></td><td>The <code>Class</code> object, e.g. <code>Bank.class</code></td></tr>
+      <tr><td><code>synchronized (this) { … }</code></td><td><code>this</code></td></tr>
+      <tr><td><code>synchronized (lockObj) { … }</code></td><td>The object you name, often a private final field</td></tr>
+      <tr><td><code>synchronized (Bank.class) { … }</code></td><td>The class object</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two threads exclude each other only if they use the <strong>same lock object</strong>. A static synchronized method and an instance synchronized method use different locks (the class and the instance) and do <em>not</em> block each other. Two different instances of the same class have two different locks.</p>
+  <pre data-title="Account.java"><code class="language-java">public class Account {
+    private final Object lock = new Object();   // private: nobody else can lock on it
+    private long balance;
+    private int transactions;
+
+    public void deposit(long amount) {
+        validate(amount);                 // slow, thread-safe work outside the lock
+        synchronized (lock) {             // keep the critical section small
+            balance += amount;
+            transactions++;               // both fields change together
+        }
+    }
+
+    public long getBalance() {
+        synchronized (lock) {             // reads need the same lock for visibility
+            return balance;
+        }
+    }
+
+    private void validate(long amount) {
+        if (amount &lt;= 0) throw new IllegalArgumentException("amount must be positive");
+    }
+}</code></pre>
+
+  <h4>Reentrancy</h4>
+  <p>Intrinsic locks are <strong>reentrant</strong>: a thread that already holds a lock can enter another <code>synchronized</code> block on the same lock without blocking itself. The JVM keeps a hold count. Without this, a synchronized method calling another synchronized method of the same object would deadlock on itself.</p>
+  <pre data-title="Reentrant.java"><code class="language-java">class Printer {
+    synchronized void printAll() {
+        printOne();                       // same lock, same thread: allowed
+    }
+    synchronized void printOne() {
+        System.out.println("printing by " + Thread.currentThread().getName());
+    }
+}</code></pre>
+
+  <h4>Keep critical sections small</h4>
+  <p>While a thread is inside a lock, all others wait. Do only the shared-data work inside, and do slow things (network calls, file I/O, heavy computation, <code>sleep</code>) outside. Never call unknown code — a callback or overridable method — while holding a lock; it may take other locks and cause a <a href="#m6-deadlock">deadlock</a>.</p>
+
+  <h4>Synchronized vs no synchronization at all</h4>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: check-then-act without a lock</p><pre><code class="language-java">if (!cache.containsKey(id)) {
+    cache.put(id, load(id));   // two threads
+}                              // may both load</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: one atomic operation</p><pre><code class="language-java">cache.computeIfAbsent(id, this::load);
+// cache is a ConcurrentHashMap</code></pre></div>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for synchronized</p>
+    <ul>
+      <li>Protect <strong>every</strong> access (read and write) to a shared variable with the <strong>same</strong> lock. A synchronized setter with an unsynchronized getter is still a bug.</li>
+      <li>Synchronize compound actions as a unit (check-then-act, read-modify-write, "update two fields together").</li>
+      <li>Constructors cannot be <code>synchronized</code>; the keyword is a compile error there.</li>
+      <li><code>synchronized</code> cannot be put on fields or on a method in an interface.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Prefer a private final lock object over <code>synchronized(this)</code> or a synchronized method: outside code can lock <code>this</code> and interfere with you.</li>
+      <li>Never lock on a <code>String</code> literal, a boxed <code>Integer</code> or a pooled/shared object: unrelated code may lock the same instance. Never lock on a value that changes (a non-final field).</li>
+      <li>Document which lock guards which field (Java Concurrency in Practice style: <code>// guarded by lock</code>).</li>
+      <li>Keep lock order consistent when taking more than one lock (see <a href="#m6-deadlock">deadlock</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>synchronized (null)</code> throws <code>NullPointerException</code>.</li>
+      <li>If a <code>synchronized</code> block throws, the lock is still released.</li>
+      <li>Synchronization does not stop a thread from being interrupted or from being <code>BLOCKED</code> forever — there is no timeout. Use <code>ReentrantLock.tryLock</code> when you need one.</li>
+      <li>Locks are per object, so <code>synchronized</code> on a method protects instance data only per instance. For a shared static field you need a static lock.</li>
+      <li>Locking is not fair: the thread that waited longest is not guaranteed to get the lock next.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: locking on a different object each time</p>
+    <p><code>synchronized (new Object()) { … }</code> locks a brand-new object that no other thread ever sees, so it protects nothing. Likewise <code>synchronized (counter)</code> where <code>counter</code> is an <code>Integer</code> that gets re-boxed on every <code>counter++</code> locks a different object each time.</p>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>Spring singletons (<code>@Service</code>, <code>@Controller</code>) are shared by all request threads. Avoid mutable instance fields in them; if you need one (a counter, a cache), make it a concurrent type or an atomic, rather than adding <code>synchronized</code> to every method. Heavy use of <code>synchronized</code> on hot paths causes lock contention: many threads in <code>BLOCKED</code>, low CPU, high latency.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What does synchronized do? Which lock does a static synchronized method use?"</p>
+    <ul>
+      <li>Mutual exclusion plus visibility, via the object's monitor. Release on exit even on exceptions.</li>
+      <li>Instance method → <code>this</code>; static method → the <code>Class</code> object; block → the object in parentheses.</li>
+      <li>Reentrant: the same thread can re-enter locks it holds.</li>
+      <li>Keep blocks small; do not lock on public or shared objects; same lock for every access.</li>
+      <li>Alternatives: atomics for one variable, concurrent collections, <code>ReentrantLock</code> for timeouts and fairness.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-volatile-atomic">
+  <h3>volatile and the atomic classes</h3>
+  <p class="tldr">volatile guarantees that every thread sees the latest write to a variable but does not make count++ atomic; atomic classes such as AtomicInteger make single-variable updates atomic without locks by using compare-and-set (CAS).</p>
+
+  <h4>volatile: visibility and ordering, not atomicity</h4>
+  <p>Marking a field <code>volatile</code> tells the JVM that reads and writes go to main memory in a way every thread can see. A write to a volatile variable <em>happens-before</em> every later read of it, and the compiler may not reorder surrounding code across it unsafely. It is a light-weight tool, but a narrow one.</p>
+  <h5>Use case 1: a stop flag</h5>
+  <pre data-title="StopFlag.java"><code class="language-java">public class StopFlag {
+    private static volatile boolean running = true;   // fixes the visibility bug
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -&gt; {
+            long loops = 0;
+            while (running) {
+                loops++;
+            }
+            System.out.println("Worker stopped after looping");
+        });
+        worker.start();
+        Thread.sleep(300);
+        running = false;       // visible to the worker immediately
+        worker.join();
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Worker stopped after looping</code></pre>
+  <p>This works because one thread writes and the others only read. For stopping a thread, <code>interrupt()</code> is usually better (<a href="#m6-creating-threads">see interruption</a>), since it also wakes a sleeping thread.</p>
+
+  <h5>Why volatile does not fix count++</h5>
+  <pre data-title="VolatileCounter.java"><code class="language-java">static volatile int counter = 0;
+// two threads each run: for (int i = 0; i &lt; 1_000_000; i++) counter++;
+// Result: still less than 2,000,000</code></pre>
+  <pre class="out" data-title="Output (one possible run)"><code class="language-plaintext">Expected 2000000, got 1543180</code></pre>
+  <p>Each thread sees fresh values, but read–add–write is still three steps, and another thread can slip in between them. <code>volatile</code> fixes visibility only.</p>
+
+  <h5>Use case 2: safe publication of an immutable snapshot</h5>
+  <p>Swap a whole immutable object by writing one volatile reference. Readers always see either the old or the new complete object (a config reload is a typical case).</p>
+  <pre data-title="ConfigHolder.java"><code class="language-java">public class ConfigHolder {
+    record Config(String region, int timeoutMs) { }
+
+    private volatile Config current = new Config("ap-south-1", 3000);
+
+    public Config get() { return current; }                  // lock-free read
+    public void reload(Config fresh) { current = fresh; }    // one atomic reference write
+}</code></pre>
+
+  <h5>Use case 3: double-checked locking needs volatile</h5>
+  <p>A lazy singleton avoids locking on every call by checking twice. Without <code>volatile</code>, another thread can see a non-null reference to an object whose constructor has not finished, because the reference write may be reordered before the field writes.</p>
+  <pre data-title="Singleton.java"><code class="language-java">public class Singleton {
+    private static volatile Singleton instance;      // volatile is required
+
+    private Singleton() { }
+
+    public static Singleton getInstance() {
+        if (instance == null) {                      // first check: no lock
+            synchronized (Singleton.class) {
+                if (instance == null) {              // second check: under the lock
+                    instance = new Singleton();
+                }
+            }
+        }
+        return instance;
+    }
+}</code></pre>
+  <p>Simpler alternatives: an <code>enum</code> singleton, or the initialization-on-demand holder idiom (a private static nested class that holds the instance, loaded lazily by the class loader). Prefer those, or let Spring manage the singleton.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>volatile</code></th><th><code>synchronized</code></th></tr></thead>
+    <tbody>
+      <tr><td>Visibility</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Atomic compound actions</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Blocks other threads</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Applies to</td><td>Fields only</td><td>Methods and blocks</td></tr>
+      <tr><td>Can be <code>null</code> / sleep inside</td><td>Not applicable</td><td>Holds lock while inside</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Atomic classes and CAS</h4>
+  <p>The package <code>java.util.concurrent.atomic</code> has <code>AtomicInteger</code>, <code>AtomicLong</code>, <code>AtomicBoolean</code>, <code>AtomicReference&lt;V&gt;</code>, array versions, and more. They are built on a CPU instruction called <strong>compare-and-swap (CAS)</strong>: "set the value to <em>new</em> only if it is currently <em>expected</em>; tell me whether it worked." Code that uses CAS is <strong>lock-free</strong>: no thread is ever blocked; a thread whose CAS fails just retries.</p>
+  <figure class="fig">
+<pre class="diagram">
+ incrementAndGet() in a loop:
+
+   ┌─► read current value (say 7)
+   │   compute new value  (8)
+   │   CAS: if value is still 7, set to 8
+   │        success ──► done, return 8
+   └────────failure (someone changed it) ── retry
+</pre>
+    <figcaption>CAS retry loop: no lock, but a loser has to try again</figcaption>
+  </figure>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>get()</code> / <code>set(v)</code></td><td>Volatile read / write</td></tr>
+      <tr><td><code>incrementAndGet()</code>, <code>getAndIncrement()</code></td><td>Atomic <code>++x</code> / <code>x++</code></td></tr>
+      <tr><td><code>addAndGet(n)</code>, <code>getAndAdd(n)</code></td><td>Atomic add</td></tr>
+      <tr><td><code>compareAndSet(expected, new)</code></td><td>Sets only if the value equals <code>expected</code>; returns <code>true</code>/<code>false</code></td></tr>
+      <tr><td><code>updateAndGet(fn)</code>, <code>getAndUpdate(fn)</code></td><td>Atomic update with a function (must be side-effect free; may run more than once)</td></tr>
+      <tr><td><code>accumulateAndGet(x, fn)</code></td><td>Atomic combine with <code>x</code></td></tr>
+      <tr><td><code>getAndSet(v)</code></td><td>Atomic swap; returns old value</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="AtomicDemo.java"><code class="language-java">import java.util.concurrent.atomic.*;
+
+public class AtomicDemo {
+    public static void main(String[] args) {
+        AtomicInteger stock = new AtomicInteger(5);
+
+        // Reserve one item safely: never goes below zero
+        boolean reserved = false;
+        while (true) {
+            int current = stock.get();
+            if (current == 0) break;                                  // sold out
+            if (stock.compareAndSet(current, current - 1)) {          // CAS
+                reserved = true;
+                break;
+            }
+            // CAS failed: another thread changed stock; loop and try again
+        }
+        System.out.println("reserved=" + reserved + ", left=" + stock.get());
+
+        AtomicLong visits = new AtomicLong();
+        System.out.println(visits.incrementAndGet() + " " + visits.addAndGet(10));
+
+        AtomicInteger maxSeen = new AtomicInteger(3);
+        maxSeen.accumulateAndGet(9, Math::max);       // atomic "max so far"
+        System.out.println(maxSeen.get());
+
+        AtomicReference&lt;String&gt; status = new AtomicReference&lt;&gt;("PENDING");
+        System.out.println(status.compareAndSet("PENDING", "PAID") + " "
+                + status.compareAndSet("PENDING", "FAILED") + " " + status.get());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">reserved=true, left=4
+1 11
+9
+true false PAID</code></pre>
+
+  <h4>LongAdder for high contention</h4>
+  <p>With many threads hammering one <code>AtomicLong</code>, most CAS attempts fail and retry, wasting CPU. <code>LongAdder</code> (and <code>LongAccumulator</code>, <code>DoubleAdder</code>) spreads updates across several internal cells and adds them up when you read. It is much faster for write-heavy counters such as metrics and request counts. The trade-off: <code>sum()</code> is not an exact snapshot while updates are in flight, and you cannot do compare-and-set on it.</p>
+  <pre data-title="LongAdder"><code class="language-java">LongAdder hits = new LongAdder();
+hits.increment();      // many threads, low contention cost
+hits.add(5);
+System.out.println(hits.sum());   // 6</code></pre>
+
+  <h4>The ABA problem (brief)</h4>
+  <p>CAS only checks "is the value still equal to what I read?" If another thread changed A → B → A in between, CAS succeeds although things changed. For plain counters this is harmless. For linked structures it can corrupt data; <code>AtomicStampedReference</code> adds a version stamp to detect it.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: atomic operations compose only within one variable</p>
+    <p>Two separate atomic calls are not atomic together. <code>if (a.get() &lt; 10) a.incrementAndGet();</code> has a gap between the check and the update. Use <code>compareAndSet</code> in a loop, <code>updateAndGet</code>, or a lock. Likewise, two atomics that must stay consistent with each other need a lock around both.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>volatile</code> on an array or object reference makes the <em>reference</em> volatile, not the elements or fields it points to.</li>
+      <li><code>AtomicReference.compareAndSet</code> compares with <code>==</code> (reference identity), not <code>equals()</code>. For boxed numbers or strings that are not the same instance, CAS may fail unexpectedly.</li>
+      <li>The function passed to <code>updateAndGet</code> may be called several times under contention. Keep it pure.</li>
+      <li>A <code>volatile long</code> or <code>double</code> read/write is atomic; a plain one technically is not (in practice 64-bit JVMs do it).</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using volatile for a counter or a check-then-act</p>
+    <p>Reviewers see <code>private volatile int count; count++;</code> far too often. Use <code>AtomicInteger</code> or <code>LongAdder</code>.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Reach for the highest-level tool first: concurrent collection, then atomic, then lock. Plain <code>volatile</code> is for flags and snapshot references.</li>
+      <li>Metrics counters: <code>LongAdder</code> (or Micrometer, which Spring Boot uses). Sequence numbers or IDs where you need the exact next value: <code>AtomicLong</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "volatile vs synchronized vs AtomicInteger"</p>
+    <ul>
+      <li>volatile: visibility + ordering for a single variable; no atomicity of read-modify-write; never blocks.</li>
+      <li>synchronized: mutual exclusion + visibility for any block; blocks other threads.</li>
+      <li>AtomicInteger: atomic read-modify-write on one value via CAS; lock-free; retries on contention.</li>
+      <li>Why does double-checked locking need volatile? Without it, publication can be reordered and a thread may see a half-constructed object.</li>
+      <li>High contention counters: <code>LongAdder</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-locks-waiting">
+  <h3>wait/notify, BlockingQueue and explicit locks</h3>
+  <p class="tldr">wait() and notify() let threads hand signals to each other inside synchronized code but are low-level and error-prone, so modern code uses BlockingQueue for producer-consumer and ReentrantLock, ReadWriteLock and Condition when synchronized is not flexible enough.</p>
+
+  <h4>wait, notify, notifyAll (legacy, but asked in interviews)</h4>
+  <p>Sometimes a thread must pause until a <em>condition</em> becomes true — a queue gets an item, a payment is confirmed. The old way uses three methods of <code>Object</code>:</p>
+  <ul>
+    <li><code>wait()</code> — release the monitor and sleep until another thread notifies (state <code>WAITING</code>).</li>
+    <li><code>notify()</code> — wake <strong>one</strong> waiting thread of this monitor.</li>
+    <li><code>notifyAll()</code> — wake <strong>all</strong> waiting threads (safer default).</li>
+  </ul>
+  <p>Rules: you must hold the object's lock (be inside <code>synchronized</code> on that same object) when you call them, otherwise you get <code>IllegalMonitorStateException</code>. Always call <code>wait()</code> inside a <code>while</code> loop that re-checks the condition, because of <strong>spurious wake-ups</strong> (the thread may wake without any notify) and because another thread may have consumed the item first.</p>
+  <pre data-title="SimpleBuffer.java"><code class="language-java">import java.util.LinkedList;
+import java.util.Queue;
+
+public class SimpleBuffer {
+    private final Queue&lt;Integer&gt; queue = new LinkedList&lt;&gt;();
+    private final int capacity = 2;
+
+    public synchronized void put(int item) throws InterruptedException {
+        while (queue.size() == capacity) {   // while, never if
+            wait();                          // releases the lock while waiting
+        }
+        queue.add(item);
+        notifyAll();                         // wake consumers waiting for items
+    }
+
+    public synchronized int take() throws InterruptedException {
+        while (queue.isEmpty()) {
+            wait();
+        }
+        int item = queue.remove();
+        notifyAll();                         // wake producers waiting for space
+        return item;
+    }
+}</code></pre>
+  <p>This works, but note how easy it is to get wrong: wrong lock, <code>if</code> instead of <code>while</code>, missed notification, <code>notify</code> waking the wrong kind of thread. That is why you rarely write it by hand.</p>
+
+  <h4>BlockingQueue: the modern producer–consumer</h4>
+  <p>A <strong>BlockingQueue</strong> is a thread-safe queue where <code>put()</code> waits if the queue is full and <code>take()</code> waits if it is empty. All the wait/notify logic is inside. A <strong>producer</strong> adds work; a <strong>consumer</strong> processes it. This decouples the two speeds and gives you <strong>back-pressure</strong> (a full bounded queue slows producers down).</p>
+  <pre data-title="ProducerConsumer.java"><code class="language-java">import java.util.concurrent.*;
+
+public class ProducerConsumer {
+    private static final int POISON = -1;   // signal "no more work"
+
+    public static void main(String[] args) throws InterruptedException {
+        BlockingQueue&lt;Integer&gt; queue = new ArrayBlockingQueue&lt;&gt;(3);   // bounded
+
+        Thread producer = new Thread(() -&gt; {
+            try {
+                for (int orderId = 1; orderId &lt;= 5; orderId++) {
+                    queue.put(orderId);              // waits if the queue is full
+                    System.out.println("Produced order " + orderId);
+                }
+                queue.put(POISON);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "producer");
+
+        Thread consumer = new Thread(() -&gt; {
+            try {
+                while (true) {
+                    int orderId = queue.take();      // waits if the queue is empty
+                    if (orderId == POISON) break;
+                    System.out.println("  Processed order " + orderId);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "consumer");
+
+        producer.start();
+        consumer.start();
+        producer.join();
+        consumer.join();
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (one possible run - interleaving differs)"><code class="language-plaintext">Produced order 1
+Produced order 2
+  Processed order 1
+Produced order 3
+  Processed order 2
+Produced order 4
+  Processed order 3
+Produced order 5
+  Processed order 4
+  Processed order 5</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operation</th><th>Throws</th><th>Returns special value</th><th>Blocks</th><th>Times out</th></tr></thead>
+    <tbody>
+      <tr><td>Insert</td><td><code>add(e)</code></td><td><code>offer(e)</code></td><td><code>put(e)</code></td><td><code>offer(e, time, unit)</code></td></tr>
+      <tr><td>Remove</td><td><code>remove()</code></td><td><code>poll()</code></td><td><code>take()</code></td><td><code>poll(time, unit)</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>The poison-pill value (a special item meaning "stop") is a common way to shut consumers down. Implementations are covered in <a href="#m6-concurrent-collections">concurrent collections</a>.</p>
+
+  <h4>ReentrantLock</h4>
+  <p><code>java.util.concurrent.locks.ReentrantLock</code> is an explicit lock object with the same reentrant mutual exclusion as <code>synchronized</code>, plus features <code>synchronized</code> lacks: try to lock without waiting, lock with a timeout, interruptible waiting, optional fairness, and multiple conditions. The price: you must unlock manually, <strong>always in <code>finally</code></strong>.</p>
+  <pre data-title="Wallet.java"><code class="language-java">import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class Wallet {
+    private final ReentrantLock lock = new ReentrantLock();   // fair=false by default
+    private long balance;
+
+    public void deposit(long amount) {
+        lock.lock();
+        try {
+            balance += amount;
+        } finally {
+            lock.unlock();                  // runs even if an exception is thrown
+        }
+    }
+
+    public boolean tryDeposit(long amount) throws InterruptedException {
+        if (lock.tryLock(200, TimeUnit.MILLISECONDS)) {   // give up after 200 ms
+            try {
+                balance += amount;
+                return true;
+            } finally {
+                lock.unlock();
+            }
+        }
+        return false;                       // could not get the lock in time
+    }
+}</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Feature</th><th><code>synchronized</code></th><th><code>ReentrantLock</code></th></tr></thead>
+    <tbody>
+      <tr><td>Release</td><td>Automatic at block end</td><td>Manual: <code>unlock()</code> in <code>finally</code></td></tr>
+      <tr><td>Try without waiting / timeout</td><td>No</td><td><code>tryLock()</code>, <code>tryLock(time, unit)</code></td></tr>
+      <tr><td>Interruptible while waiting</td><td>No</td><td><code>lockInterruptibly()</code></td></tr>
+      <tr><td>Fairness option</td><td>No</td><td><code>new ReentrantLock(true)</code> (FIFO, slower)</td></tr>
+      <tr><td>Multiple wait conditions</td><td>One per monitor</td><td>Many <code>Condition</code> objects</td></tr>
+      <tr><td>Simplicity, fewer bugs</td><td>Better</td><td>Easy to forget <code>unlock</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Use <code>synchronized</code> by default; reach for <code>ReentrantLock</code> only for the extra features. A <strong>fair</strong> lock gives the lock to the longest-waiting thread; this prevents starvation but lowers throughput. Calling <code>unlock()</code> when you do not hold the lock throws <code>IllegalMonitorStateException</code>.</p>
+
+  <h4>ReadWriteLock</h4>
+  <p>Many reads, few writes? <code>ReentrantReadWriteLock</code> lets any number of readers hold the <strong>read lock</strong> at once, but a writer needs the <strong>write lock</strong> exclusively.</p>
+  <pre data-title="PriceCache.java"><code class="language-java">import java.util.*;
+import java.util.concurrent.locks.*;
+
+public class PriceCache {
+    private final ReadWriteLock rw = new ReentrantReadWriteLock();
+    private final Map&lt;String, Long&gt; prices = new HashMap&lt;&gt;();
+
+    public Long get(String sku) {
+        rw.readLock().lock();                 // many readers at the same time
+        try { return prices.get(sku); }
+        finally { rw.readLock().unlock(); }
+    }
+
+    public void put(String sku, long price) {
+        rw.writeLock().lock();                // exclusive
+        try { prices.put(sku, price); }
+        finally { rw.writeLock().unlock(); }
+    }
+}</code></pre>
+  <p>A thread holding the read lock cannot upgrade to the write lock (it would deadlock); it can downgrade (take the read lock before releasing the write lock). For most cases a <code>ConcurrentHashMap</code> is simpler. Java 8 also added <code>StampedLock</code> with optimistic reads — an advanced tool; know it exists.</p>
+
+  <h4>Condition</h4>
+  <p>A <code>Condition</code> (from <code>lock.newCondition()</code>) is the <code>wait/notify</code> of explicit locks, but a lock can have several, e.g. <code>notFull</code> and <code>notEmpty</code>. Methods: <code>await()</code>, <code>signal()</code>, <code>signalAll()</code>. The same rules apply: hold the lock, and wait in a <code>while</code> loop.</p>
+  <pre data-title="Bounded buffer with Condition"><code class="language-java">class BoundedBuffer&lt;T&gt; {
+    private final Object[] items = new Object[10];
+    private int putIdx, takeIdx, count;
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition notFull = lock.newCondition();
+    private final Condition notEmpty = lock.newCondition();
+
+    void put(T x) throws InterruptedException {
+        lock.lock();
+        try {
+            while (count == items.length) notFull.await();   // wait for space
+            items[putIdx] = x;
+            putIdx = (putIdx + 1) % items.length;
+            count++;
+            notEmpty.signal();                               // wake one consumer
+        } finally {
+            lock.unlock();
+        }
+    }
+    // take() is the mirror image: await notEmpty, then signal notFull
+}</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li><code>wait/notify</code> require holding the monitor, or <code>IllegalMonitorStateException</code>.</li>
+      <li>Always <code>wait()</code>/<code>await()</code> in a <code>while</code> loop that re-checks the condition.</li>
+      <li><code>lock.lock()</code> goes <em>before</em> the <code>try</code>; <code>unlock()</code> goes in <code>finally</code>.</li>
+      <li>Lock and unlock the same number of times (locks are reentrant with a hold count).</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: lock() inside try, or no finally</p>
+    <p>If <code>lock()</code> is inside the <code>try</code> and fails, <code>finally</code> calls <code>unlock()</code> on a lock you do not hold. If you skip <code>finally</code>, one exception leaves the lock held forever and every other thread hangs.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>notify()</code> before any thread is waiting is lost — notifications are not remembered. That is why you check the condition in a loop <em>first</em>.</li>
+      <li><code>notify()</code> can wake the wrong type of thread (a producer waking a producer) and leave the system stuck; <code>notifyAll()</code> avoids this.</li>
+      <li><code>BlockingQueue</code> does not allow <code>null</code> elements (<code>NullPointerException</code>).</li>
+      <li>Starvation: with an unfair lock, a thread can wait very long under heavy contention.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "wait vs sleep", "How do you implement producer–consumer?"</p>
+    <ul>
+      <li><code>wait()</code> belongs to <code>Object</code>, needs the monitor, releases it, wakes on notify. <code>sleep()</code> belongs to <code>Thread</code>, holds locks, wakes on time.</li>
+      <li>Producer–consumer: best answer is <code>BlockingQueue</code> (<code>put</code>/<code>take</code>); second answer is wait/notify with a <code>while</code> loop.</li>
+      <li>Why a <code>while</code> loop? Spurious wake-ups and stolen conditions.</li>
+      <li>ReentrantLock vs synchronized: tryLock, timeout, fairness, multiple conditions; must unlock in <code>finally</code>.</li>
+    </ul>
+  </div>
+</article>

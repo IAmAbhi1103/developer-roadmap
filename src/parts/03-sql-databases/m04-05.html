@@ -1,0 +1,486 @@
+<article class="topic" id="m4-food-delivery-design">
+  <h3>Worked design: a food-delivery app</h3>
+  <p class="tldr">Follow the design process end to end for a Swiggy-style app: requirements, entities, ER
+  diagram, full PostgreSQL DDL in 3NF with constraints and indexes, then the queries the app must run.</p>
+
+  <h4>1. Requirements</h4>
+  <p>Write the requirements as plain sentences first. Every noun is a candidate entity, every verb a candidate
+  relationship (see <a href="#m4-design-process">the design process</a>).</p>
+  <ul>
+    <li>A <strong>user</strong> signs up with an email and a mobile number and can save several
+    <strong>addresses</strong>.</li>
+    <li>A <strong>restaurant</strong> has a name, a city and an open/closed flag, and sells many <strong>menu
+    items</strong>, each with a price and an availability flag.</li>
+    <li>A user places an <strong>order</strong> with exactly one restaurant. It has many <strong>order
+    items</strong>, each with a quantity. The price and name at the time of ordering must be kept, and the
+    delivery address must be remembered even if the saved address changes later.</li>
+    <li>An order moves through PLACED, ACCEPTED, PREPARING, OUT_FOR_DELIVERY, DELIVERED or CANCELLED.</li>
+    <li>An order is paid with one or more <strong>payments</strong>: a failed UPI attempt can be retried by card.
+    Each payment has a method, an amount and a status.</li>
+  </ul>
+
+  <h4>2. Entities, relationships and the ER diagram</h4>
+  <figure class="fig">
+<pre class="mermaid">
+erDiagram
+  users ||--o{ addresses : "saves"
+  users ||--o{ orders : "places"
+  restaurants ||--o{ menu_items : "sells"
+  restaurants ||--o{ orders : "receives"
+  orders ||--|{ order_items : "contains"
+  menu_items ||--o{ order_items : "ordered as"
+  orders ||--o{ payments : "paid by"
+  users {
+    bigint id PK
+    varchar email UK
+    varchar mobile UK
+    varchar name
+  }
+  addresses {
+    bigint id PK
+    bigint user_id FK
+    varchar line1
+    varchar city
+    varchar pincode
+  }
+  restaurants {
+    bigint id PK
+    varchar name
+    varchar city
+    boolean is_open
+  }
+  menu_items {
+    bigint id PK
+    bigint restaurant_id FK
+    varchar name
+    bigint price_paise
+    boolean is_available
+  }
+  orders {
+    bigint id PK
+    bigint user_id FK
+    bigint restaurant_id FK
+    varchar status
+    bigint total_paise
+    timestamptz placed_at
+  }
+  order_items {
+    bigint order_id PK, FK
+    bigint menu_item_id PK, FK
+    varchar item_name
+    bigint unit_price_paise
+    int quantity
+  }
+  payments {
+    bigint id PK
+    bigint order_id FK
+    varchar method
+    bigint amount_paise
+    varchar status
+  }
+</pre>
+  <figcaption>ER diagram of the food-delivery schema in crow's foot notation</figcaption>
+  </figure>
+  <p>Reading it: a user has zero or many addresses and orders; an order has exactly one user and one restaurant,
+  at least one order item (<code>||--|{</code>), and zero or many payments (zero while unpaid, several if the
+  first attempt fails). <code>order_items</code> is the join table between orders and menu items with extra
+  columns, so it is a real entity.</p>
+
+  <h4>3. Design decisions</h4>
+  <ul>
+    <li><strong>Keys:</strong> surrogate <code>BIGINT</code> identity everywhere; <code>email</code> and
+    <code>mobile</code> are <code>UNIQUE</code>. <code>order_items</code> uses the composite key
+    <code>(order_id, menu_item_id)</code>: one line per item, and the quantity says how many.</li>
+    <li><strong>Money:</strong> integer paise (<code>_paise</code> suffix) with <code>CHECK</code>s.</li>
+    <li><strong>3NF check:</strong> user data lives only in <code>users</code>, restaurant data only in
+    <code>restaurants</code>, and so on; no non-key column depends on another non-key column. Restaurant name on
+    an order is reached by a join, not copied.</li>
+    <li><strong>Deliberate denormalization:</strong> <code>order_items.item_name</code> and
+    <code>unit_price_paise</code> (price at order time), the delivery address text on <code>orders</code>, and
+    <code>orders.total_paise</code> (sum of lines, written in the same transaction). Each has a reason; see
+    <a href="#m4-denormalization">Denormalization</a>.</li>
+    <li><strong>Delete rules:</strong> lines die with their order (<code>CASCADE</code>); users, restaurants and
+    menu items that have orders cannot be deleted (<code>RESTRICT</code>); a deleted saved address does not
+    affect old orders.</li>
+    <li><strong>Status:</strong> text with <code>CHECK</code> for orders and payments.</li>
+  </ul>
+
+  <h4>4. The DDL</h4>
+<pre data-title="food_delivery.sql (1 of 2): users, addresses, restaurants, menu items"><code class="language-sql">CREATE TABLE users (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY,
+    email      TEXT NOT NULL,
+    mobile     TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_users PRIMARY KEY (id),
+    CONSTRAINT uq_users_email  UNIQUE (email),
+    CONSTRAINT uq_users_mobile UNIQUE (mobile),
+    CONSTRAINT ck_users_mobile CHECK (mobile ~ '^\+[0-9]{8,15}$')
+);
+
+CREATE TABLE addresses (
+    id      BIGINT GENERATED ALWAYS AS IDENTITY,
+    user_id BIGINT NOT NULL,
+    label   TEXT,                            -- 'Home', 'Office'
+    line1   TEXT NOT NULL,
+    city    TEXT NOT NULL,
+    pincode CHAR(6) NOT NULL,
+    CONSTRAINT pk_addresses PRIMARY KEY (id),
+    CONSTRAINT fk_addresses_user FOREIGN KEY (user_id)
+        REFERENCES users (id) ON DELETE CASCADE,
+    CONSTRAINT ck_addresses_pincode CHECK (pincode ~ '^[0-9]{6}$')
+);
+CREATE INDEX idx_addresses_user_id ON addresses (user_id);
+
+CREATE TABLE restaurants (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY,
+    name       TEXT NOT NULL,
+    city       TEXT NOT NULL,
+    is_open    BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_restaurants PRIMARY KEY (id)
+);
+CREATE INDEX idx_restaurants_city ON restaurants (city);
+
+CREATE TABLE menu_items (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY,
+    restaurant_id BIGINT NOT NULL,
+    name          TEXT NOT NULL,
+    price_paise   BIGINT NOT NULL,
+    is_available  BOOLEAN NOT NULL DEFAULT true,
+    CONSTRAINT pk_menu_items PRIMARY KEY (id),
+    CONSTRAINT fk_menu_items_restaurant FOREIGN KEY (restaurant_id)
+        REFERENCES restaurants (id) ON DELETE RESTRICT,
+    CONSTRAINT uq_menu_items_restaurant_name UNIQUE (restaurant_id, name),
+    CONSTRAINT ck_menu_items_price CHECK (price_paise &gt;= 0)
+);</code></pre>
+  <p>The unique pair <code>(restaurant_id, name)</code> also serves as the index for "items of a restaurant", so
+  no separate index on <code>restaurant_id</code> is needed.</p>
+<pre data-title="food_delivery.sql (2 of 2): orders, order items, payments"><code class="language-sql">CREATE TABLE orders (
+    id               BIGINT GENERATED ALWAYS AS IDENTITY,
+    user_id          BIGINT NOT NULL,
+    restaurant_id    BIGINT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'PLACED',
+    delivery_address TEXT NOT NULL,          -- snapshot of the address text
+    total_paise      BIGINT NOT NULL,        -- sum of lines, set when the order is placed
+    placed_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_orders PRIMARY KEY (id),
+    CONSTRAINT fk_orders_user FOREIGN KEY (user_id)
+        REFERENCES users (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_orders_restaurant FOREIGN KEY (restaurant_id)
+        REFERENCES restaurants (id) ON DELETE RESTRICT,
+    CONSTRAINT ck_orders_status CHECK (status IN ('PLACED','ACCEPTED','PREPARING',
+        'OUT_FOR_DELIVERY','DELIVERED','CANCELLED')),
+    CONSTRAINT ck_orders_total CHECK (total_paise &gt;= 0)
+);
+CREATE INDEX idx_orders_user_placed ON orders (user_id, placed_at DESC);
+CREATE INDEX idx_orders_restaurant_placed ON orders (restaurant_id, placed_at);
+CREATE INDEX idx_orders_active ON orders (status)
+    WHERE status NOT IN ('DELIVERED','CANCELLED');           -- partial index
+
+CREATE TABLE order_items (
+    order_id         BIGINT NOT NULL,
+    menu_item_id     BIGINT NOT NULL,
+    item_name        TEXT   NOT NULL,        -- snapshot
+    unit_price_paise BIGINT NOT NULL,        -- snapshot
+    quantity         INT    NOT NULL,
+    CONSTRAINT pk_order_items PRIMARY KEY (order_id, menu_item_id),
+    CONSTRAINT fk_order_items_order FOREIGN KEY (order_id)
+        REFERENCES orders (id) ON DELETE CASCADE,
+    CONSTRAINT fk_order_items_menu_item FOREIGN KEY (menu_item_id)
+        REFERENCES menu_items (id) ON DELETE RESTRICT,
+    CONSTRAINT ck_order_items_qty CHECK (quantity &gt; 0),
+    CONSTRAINT ck_order_items_price CHECK (unit_price_paise &gt;= 0)
+);
+CREATE INDEX idx_order_items_menu_item_id ON order_items (menu_item_id);
+
+CREATE TABLE payments (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY,
+    order_id     BIGINT NOT NULL,
+    method       TEXT   NOT NULL,
+    amount_paise BIGINT NOT NULL,
+    status       TEXT   NOT NULL DEFAULT 'PENDING',
+    gateway_ref  TEXT,                       -- id from the payment gateway
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_payments PRIMARY KEY (id),
+    CONSTRAINT fk_payments_order FOREIGN KEY (order_id)
+        REFERENCES orders (id) ON DELETE RESTRICT,
+    CONSTRAINT uq_payments_gateway_ref UNIQUE (gateway_ref),
+    CONSTRAINT ck_payments_method CHECK (method IN ('UPI','CARD','NETBANKING','COD')),
+    CONSTRAINT ck_payments_status CHECK (status IN ('PENDING','SUCCESS','FAILED','REFUNDED')),
+    CONSTRAINT ck_payments_amount CHECK (amount_paise &gt; 0)
+);
+CREATE INDEX idx_payments_order_id ON payments (order_id);</code></pre>
+  <p>Why <code>payments</code> is separate from <code>orders</code>: an order can have several attempts, and
+  payment facts (gateway id, status, refund) change independently of the order. The gateway reference is
+  <code>UNIQUE</code>, which makes a repeated callback (webhook) from the gateway harmless: the second insert
+  fails instead of charging twice.</p>
+
+  <h4>5. Sample data</h4>
+<pre data-title="Seed data"><code class="language-sql">INSERT INTO users (email, mobile, name) VALUES
+    ('asha@example.com',  '+919810000001', 'Asha'),
+    ('bilal@example.com', '+919810000002', 'Bilal');
+INSERT INTO addresses (user_id, label, line1, city, pincode) VALUES
+    (1, 'Home', '12 MG Road', 'Pune', '411001');
+INSERT INTO restaurants (name, city) VALUES ('Spice Hub', 'Pune'), ('Dosa Point', 'Pune');
+INSERT INTO menu_items (restaurant_id, name, price_paise) VALUES
+    (1, 'Paneer Tikka', 22000), (1, 'Butter Naan', 4000), (2, 'Masala Dosa', 12000);</code></pre>
+
+  <h4>6. The key queries</h4>
+  <p>The last design step is to <em>run the queries the app needs</em> and check each is simple and can use an
+  index. If a query is awkward, the model may be wrong.</p>
+  <h5>Show a restaurant's menu</h5>
+<pre data-title="Menu"><code class="language-sql">SELECT id, name, price_paise / 100.0 AS price_rupees
+FROM menu_items
+WHERE restaurant_id = 1 AND is_available
+ORDER BY name;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> id |     name     | price_rupees
+----+--------------+--------------
+  2 | Butter Naan  |        40.00
+  1 | Paneer Tikka |       220.00
+(2 rows)</code></pre>
+  <h5>Place an order, in one transaction</h5>
+<pre data-title="Place an order (Asha: 2 x Paneer Tikka, 4 x Butter Naan)"><code class="language-sql">BEGIN;
+
+WITH new_order AS (
+    INSERT INTO orders (user_id, restaurant_id, delivery_address, total_paise)
+    VALUES (1, 1, '12 MG Road, Pune 411001', 2 * 22000 + 4 * 4000)
+    RETURNING id
+)
+INSERT INTO order_items (order_id, menu_item_id, item_name, unit_price_paise, quantity)
+SELECT new_order.id, m.id, m.name, m.price_paise, v.qty
+FROM new_order
+JOIN (VALUES (1, 2), (2, 4)) AS v(menu_item_id, qty) ON TRUE
+JOIN menu_items m ON m.id = v.menu_item_id AND m.restaurant_id = 1 AND m.is_available;
+
+INSERT INTO payments (order_id, method, amount_paise, status, gateway_ref)
+VALUES (currval(pg_get_serial_sequence('orders', 'id')), 'UPI', 60000, 'SUCCESS', 'pay_001');
+
+COMMIT;</code></pre>
+  <p>The service computes the total from the same prices it reads, in one transaction, so the order, its lines
+  and the payment appear together or not at all (transactions are explained in
+  <a href="#m5-transactions-acid">Module 5</a>). In Spring this is a <code>@Transactional</code> method.
+  A real service would read the prices first and compute the total from the rows it inserted; the literal
+  total here only keeps the example short.</p>
+  <h5>One order with its lines</h5>
+<pre data-title="Order details"><code class="language-sql">SELECT o.id, o.status, r.name AS restaurant, oi.item_name, oi.quantity,
+       oi.unit_price_paise * oi.quantity AS line_paise, o.total_paise
+FROM orders o
+JOIN restaurants r ON r.id = o.restaurant_id
+JOIN order_items oi ON oi.order_id = o.id
+WHERE o.id = 1;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> id |  status  | restaurant |  item_name   | quantity | line_paise | total_paise
+----+----------+------------+--------------+----------+------------+-------------
+  1 | PLACED   | Spice Hub  | Paneer Tikka |        2 |      44000 |       60000
+  1 | PLACED   | Spice Hub  | Butter Naan  |        4 |      16000 |       60000
+(2 rows)</code></pre>
+  <h5>A user's order history, newest first</h5>
+<pre data-title="Uses idx_orders_user_placed"><code class="language-sql">SELECT o.id, r.name AS restaurant, o.status, o.total_paise, o.placed_at
+FROM orders o
+JOIN restaurants r ON r.id = o.restaurant_id
+WHERE o.user_id = 1
+ORDER BY o.placed_at DESC
+LIMIT 20;</code></pre>
+  <h5>Reports: revenue per restaurant per day, best-selling items</h5>
+<pre data-title="Reporting queries"><code class="language-sql">SELECT r.name, o.placed_at::date AS day, COUNT(*) AS orders, SUM(o.total_paise) / 100.0 AS revenue
+FROM orders o
+JOIN restaurants r ON r.id = o.restaurant_id
+WHERE o.status = 'DELIVERED' AND o.placed_at &gt;= now() - INTERVAL '30 days'
+GROUP BY r.name, o.placed_at::date
+ORDER BY day DESC, revenue DESC;
+
+SELECT oi.item_name, SUM(oi.quantity) AS sold
+FROM order_items oi
+JOIN orders o ON o.id = oi.order_id
+WHERE o.restaurant_id = 1 AND o.status = 'DELIVERED'
+GROUP BY oi.item_name
+ORDER BY sold DESC
+LIMIT 5;</code></pre>
+  <h5>Orders still unpaid, and the live kitchen queue</h5>
+<pre data-title="Operational queries"><code class="language-sql">-- Orders with no successful payment
+SELECT o.id, o.total_paise
+FROM orders o
+WHERE o.status &lt;&gt; 'CANCELLED'
+  AND NOT EXISTS (SELECT 1 FROM payments p
+                  WHERE p.order_id = o.id AND p.status = 'SUCCESS');
+
+-- Live orders (served by the partial index idx_orders_active)
+SELECT id, status FROM orders
+WHERE status NOT IN ('DELIVERED','CANCELLED') ORDER BY id;</code></pre>
+
+  <h4>7. Review checklist</h4>
+  <ol class="steps">
+    <li>Every table has a primary key and every relationship a named foreign key.</li>
+    <li>Every foreign key column is indexed (the composite keys cover their first column).</li>
+    <li>Every column is <code>NOT NULL</code> unless "unknown" is real.</li>
+    <li>Every rule that data must follow has a <code>CHECK</code>, <code>UNIQUE</code> or foreign key.</li>
+    <li>Each key query was written and its plan looked at with <code>EXPLAIN</code> (see
+    <a href="#m5-explain">Module 5</a>).</li>
+    <li>Denormalized columns have a documented source of truth.</li>
+  </ol>
+
+  <div class="co co-exc">
+    <p class="co-t">What this design leaves out on purpose</p>
+    <ul>
+      <li>Riders and delivery tracking, coupons, taxes and delivery fees, reviews and ratings, menu categories
+      and restaurant opening hours. Each is a new table or two (for example <code>coupons</code> and
+      <code>order_coupons</code>).</li>
+      <li>A status history table (<code>order_status_history</code>) for audit and for the "where is my order"
+      timeline.</li>
+      <li>Soft delete for menu items: here <code>is_available = false</code> does the job, and old orders keep
+      their snapshot.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: no snapshot of price or address</p>
+    <p>Joining an old order to the <em>current</em> menu price rewrites history: a ₹220 order becomes ₹250 the
+    day the restaurant changes the menu. Copy what must not change into the order.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Design the database for a food-delivery app" is a classic. A strong answer: list entities from the
+    requirements, draw the ER diagram, name each relationship's cardinality, implement the many-to-many through
+    <code>order_items</code> with price snapshot, put money in paise, add status <code>CHECK</code>s and foreign
+    key indexes, normalize to 3NF, justify each denormalization, and finish by writing the key queries.</p>
+  </div>
+</article>
+
+<article class="topic recap" id="m4-interview">
+  <h3>Interview questions — Database design</h3>
+  <details class="qa"><summary>What are the steps of a database design process?</summary><div class="qa-a">
+    <p>Collect requirements; find entities (nouns) and attributes; define relationships and their cardinality;
+    draw the ER diagram; choose primary and foreign keys; normalize (usually to 3NF); add constraints and
+    indexes; finally write the key queries and check they are simple and fast. If a needed query is awkward, go
+    back and adjust the model.</p></div></details>
+  <details class="qa"><summary>How do you implement one-to-one, one-to-many and many-to-many in SQL?</summary><div class="qa-a">
+    <p>One-to-many: a foreign key on the "many" table. One-to-one: a foreign key with a <code>UNIQUE</code>
+    constraint, or a shared primary key. Many-to-many: a join table with a foreign key to each side, and a
+    composite primary key (or a surrogate key plus a unique pair). Attributes of the relationship, such as
+    quantity, live in the join table.</p></div></details>
+  <details class="qa"><summary>Candidate key vs primary key vs alternate key vs super key?</summary><div class="qa-a">
+    <p>A super key is any column set that is unique. A candidate key is a minimal super key. The primary key is
+    the candidate key you choose; the other candidate keys are alternate keys, implemented with
+    <code>UNIQUE</code>. Example: in <code>employees</code>, <code>id</code>, <code>email</code> and
+    <code>pan</code> are candidate keys, <code>id</code> is the primary key, and <code>{id, name}</code> is a
+    super key but not a candidate key.</p></div></details>
+  <details class="qa"><summary>Surrogate or natural primary key? Why?</summary><div class="qa-a">
+    <p>Prefer a surrogate key (a generated <code>BIGINT</code>): it never changes, is small, and does not
+    leak personal data into child tables. Keep natural keys (email, SKU) as <code>UNIQUE</code> constraints.
+    Natural keys are fine for tiny stable code tables such as currency <code>INR</code>. The risk with natural
+    keys is that "stable" values change, forcing updates in every referencing table.</p></div></details>
+  <details class="qa"><summary>BIGINT identity or UUID for a primary key?</summary><div class="qa-a">
+    <p>BIGINT is 8 bytes, readable, and inserts append at the end of the index. UUIDs are 16 bytes but can be
+    created anywhere and are hard to guess. Random v4 UUIDs scatter inserts and bloat indexes; time-ordered v7
+    UUIDs fix most of that. A common compromise is a <code>BIGINT</code> primary key plus a
+    <code>public_id UUID</code> for URLs.</p></div></details>
+  <details class="qa"><summary>What are update, insert and delete anomalies?</summary><div class="qa-a">
+    <p>They are problems of a table that mixes subjects. Update: the same fact is stored in many rows and some
+    copies change. Insert: you cannot record a restaurant until it has an order. Delete: deleting the last order
+    deletes the only record of the restaurant. Normalization removes them by giving each fact one home.</p></div></details>
+  <details class="qa"><summary>Explain 1NF, 2NF and 3NF with an example.</summary><div class="qa-a">
+    <p>1NF: atomic cells, no repeating groups (one row per ordered item). 2NF: no column depends on only
+    part of a composite key (item price moves out of <code>order_lines</code> into <code>menu_items</code>).
+    3NF: no non-key column depends on another non-key column (customer city moves from <code>orders</code>
+    to <code>customers</code>). Summary phrase: the key, the whole key, and nothing but the key.</p></div></details>
+  <details class="qa"><summary>What is the difference between 3NF and BCNF?</summary><div class="qa-a">
+    <p>BCNF requires that for every dependency X → Y, X is a super key. 3NF also accepts it when Y is part of
+    a candidate key. The difference shows only with overlapping composite candidate keys, for example
+    <code>dispatcher → zone</code> in <code>(rider_id, zone, dispatcher)</code>. BCNF can lose the ability to
+    enforce a dependency with a plain constraint; 3NF decomposition never does.</p></div></details>
+  <details class="qa"><summary>When would you denormalize, and how do you keep the data correct?</summary><div class="qa-a">
+    <p>For measured read problems (reports, counters like average rating) and for history snapshots such as the
+    unit price on an order line. Keep one source of truth and refresh the copy in the same transaction, with a
+    trigger, a materialized view, or a periodic recompute job. Store the sum and count, not the average.</p></div></details>
+  <details class="qa"><summary>How do you store money and why not FLOAT?</summary><div class="qa-a">
+    <p>Use <code>NUMERIC(p,s)</code> or integer paise in a <code>BIGINT</code>. Floating point cannot represent
+    values like 0.1 exactly, so sums drift (<code>0.1 + 0.2</code> gives <code>0.30000000000000004</code>).
+    Name the unit in the column (<code>amount_paise</code>) and add a currency column if needed.</p></div></details>
+  <details class="qa"><summary>TIMESTAMP vs TIMESTAMPTZ?</summary><div class="qa-a">
+    <p>In PostgreSQL, <code>TIMESTAMPTZ</code> stores an exact instant (converted to UTC) and shows it in the
+    session time zone. <code>TIMESTAMP</code> keeps a wall-clock reading with no zone, which is ambiguous across
+    servers and daylight changes. Use <code>TIMESTAMPTZ</code> for events and convert to local time in the UI.</p></div></details>
+  <details class="qa"><summary>What are the problems with soft delete?</summary><div class="qa-a">
+    <p>Every query must filter <code>deleted_at IS NULL</code> (use a view or framework support); unique
+    constraints clash with deleted rows (use a partial unique index); cascades do not fire; tables grow; and
+    privacy deletion requests need real removal or anonymising.</p></div></details>
+  <details class="qa"><summary>Why are polymorphic associations discouraged?</summary><div class="qa-a">
+    <p>A <code>(target_type, target_id)</code> pair cannot be a foreign key, so the database cannot prevent
+    orphans or cascade deletes. Use one nullable foreign key per target with a <code>CHECK</code> that exactly
+    one is set, or separate tables.</p></div></details>
+  <details class="qa"><summary>Why does a phone number not belong in an INT column?</summary><div class="qa-a">
+    <p>It is an identifier, not a quantity: you never add phone numbers, and leading zeros, <code>+</code>
+    and country codes get lost. Store it as text in E.164 form, with a <code>CHECK</code> on the pattern.</p></div></details>
+  <details class="qa"><summary>Design the tables for a food-delivery app.</summary><div class="qa-a">
+    <p>Entities: users, addresses, restaurants, menu_items, orders, order_items, payments. Users to orders and
+    restaurants to menu items are one-to-many; orders to menu items is many-to-many through
+    <code>order_items</code>, which carries quantity and the price at order time. Orders to payments is
+    one-to-many (retries). Use surrogate <code>BIGINT</code> keys, paise for money, <code>CHECK</code>s for
+    status, and index every foreign key.</p></div></details>
+</article>
+
+<article class="topic recap" id="m4-cheatsheet">
+  <h3>Cheat sheet — Database design</h3>
+  <ul class="cheat">
+    <li><b>Process</b> requirements → entities → attributes → relationships → keys → normalize → constraints and indexes → review queries</li>
+    <li><b>One-to-many</b> foreign key on the many side; <code>NOT NULL</code> if the parent is mandatory</li>
+    <li><b>One-to-one</b> foreign key + <code>UNIQUE</code>, or shared primary key</li>
+    <li><b>Many-to-many</b> join table; composite PK, or surrogate id + <code>UNIQUE (a_id, b_id)</code></li>
+    <li><b>Super key</b> any unique column set; <b>candidate key</b> minimal one; <b>primary key</b> the chosen one; <b>alternate key</b> the others</li>
+    <li><b>Surrogate key</b> generated id (default choice); <b>natural key</b> real-world value, keep as <code>UNIQUE</code></li>
+    <li><b>IDs</b> <code>BIGINT GENERATED ALWAYS AS IDENTITY</code>; UUID v7 over v4; <code>public_id</code> for URLs</li>
+    <li><b>FD</b> A → B means each A has exactly one B; keys decide all columns</li>
+    <li><b>Anomalies</b> update (many copies), insert (no row for a new fact), delete (lose another fact)</li>
+    <li><b>1NF</b> atomic cells, no repeating groups</li>
+    <li><b>2NF</b> no dependency on part of a composite key</li>
+    <li><b>3NF</b> no transitive dependency; the practical target for OLTP</li>
+    <li><b>BCNF</b> every determinant is a super key; may lose dependency preservation</li>
+    <li><b>4NF</b> split independent multi-valued facts into separate tables</li>
+    <li><b>Denormalize</b> only after measuring, or for snapshots and counters; keep one source of truth</li>
+    <li><b>Audit columns</b> <code>created_at</code>, <code>updated_at</code> (<code>NOT NULL</code>, <code>DEFAULT now()</code>), <code>created_by</code></li>
+    <li><b>Soft delete</b> <code>deleted_at</code> + partial unique index + view; purge old rows</li>
+    <li><b>Status</b> text + <code>CHECK</code>, or a lookup table; avoid numeric codes and risky ENUMs</li>
+    <li><b>Money</b> <code>NUMERIC</code> or paise <code>BIGINT</code>; never FLOAT</li>
+    <li><b>Time</b> <code>TIMESTAMPTZ</code> in UTC; <code>DATE</code> for dates only</li>
+    <li><b>JSONB</b> for variable, rarely joined data; GIN index; promote hot keys to columns</li>
+    <li><b>Trees</b> <code>parent_id</code> + recursive CTE; polymorphic <code>(type,id)</code> is a trap</li>
+    <li><b>Names</b> snake_case, <code>id</code>, <code>customer_id</code>, <code>fk_orders_customer</code>, <code>uq_users_email</code>, <code>idx_orders_customer_id</code>, <code>is_active</code></li>
+    <li><b>Types</b> phone and pincode as text; files as URL or key in the database</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m4-practice">
+  <h3>Practice — Database design</h3>
+  <ol class="steps">
+    <li><strong>Draw it.</strong> From the sentence "a library lends books to members; a book can have many
+    authors; a loan has a due date" list entities, attributes and cardinalities, and draw the Mermaid
+    <code>erDiagram</code>. Done when every relationship has the right crow's foot symbols and the many-to-many
+    has a join table.</li>
+    <li><strong>Implement the relationships.</strong> Write <code>CREATE TABLE</code> for the library with named
+    constraints: one-to-many (member to loans), many-to-many (books to authors) and a one-to-one
+    (member to library card with <code>UNIQUE</code>). Insert rows and prove that duplicates and orphans are
+    rejected.</li>
+    <li><strong>Find the keys.</strong> For <code>employees(id, email, pan, name)</code> list all super keys of
+    size one and two, the candidate keys, the primary key and the alternate keys. Done when you can explain
+    each choice.</li>
+    <li><strong>Normalize.</strong> Take the wide table <code>order_sheet</code> from
+    <a href="#m4-fd-anomalies">the anomalies article</a>, create it with data, demonstrate one update, one insert
+    and one delete anomaly, then normalize step by step to 3NF and show the tables after each step.</li>
+    <li><strong>BCNF.</strong> Create <code>rider_zones</code>, show the redundancy, decompose it into two tables
+    and note which rule can no longer be a single constraint.</li>
+    <li><strong>Patterns.</strong> Add audit columns with an <code>updated_at</code> trigger to a table, then
+    add soft delete with a partial unique index on email. Show that a deleted user's email can be reused.</li>
+    <li><strong>Roadmap exercise: food delivery.</strong> Without looking at the worked design, design tables for
+    users, restaurants, menu items, orders, order items and payments, normalized to 3NF, with an ER diagram.
+    Compare with the article and list the differences. Done when every foreign key is indexed and the price
+    snapshot is explained.</li>
+    <li><strong>Key queries.</strong> Load seed data and write the queries: menu, place order (transaction), order
+    history, revenue per restaurant per day, best sellers, unpaid orders. Done when all six run and you can
+    state which index each uses.</li>
+    <li><strong>Choose types.</strong> Review a table you wrote earlier and fix every wrong type (phone as number,
+    money as float, timestamp without zone). Explain each fix in one sentence.</li>
+    <li><strong>Review a schema.</strong> Take a classmate's or an online sample schema and write a review: missing
+    keys, missing indexes, wrong types, naming problems, normalization problems.</li>
+  </ol>
+</article>

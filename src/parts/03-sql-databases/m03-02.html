@@ -1,0 +1,458 @@
+<article class="topic" id="m3-window-intro">
+  <h3>Window functions: OVER, PARTITION BY and ORDER BY</h3>
+  <p class="tldr">A <strong>window function</strong> calculates something across a set of related rows
+  (the "window") but, unlike <code>GROUP BY</code>, keeps every row. <code>OVER (PARTITION BY … ORDER BY …)</code>
+  defines the window: partition = which rows belong together, order = their sequence.</p>
+
+  <h4>The problem GROUP BY cannot solve</h4>
+  <p>You want each employee's salary <em>next to</em> the average salary of their department, to see who is above
+  or below. <code>GROUP BY dept_id</code> returns one row per department and loses the employees. A subquery or
+  a join back to a grouped result works, but is clumsy. A window function does it directly:</p>
+  <pre data-title="Salary compared with the department average"><code class="language-sql">SELECT first_name,
+       salary,
+       ROUND(AVG(salary) OVER w, 2)          AS dept_avg,
+       ROUND(salary - AVG(salary) OVER w, 2) AS diff
+FROM employees
+WHERE dept_id = 1
+WINDOW w AS (PARTITION BY dept_id)
+ORDER BY emp_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name |  salary   | dept_avg  |   diff
+------------+-----------+-----------+-----------
+ Vikram     | 220000.00 | 144000.00 |  76000.00
+ Priya      | 150000.00 | 144000.00 |   6000.00
+ Rahul      | 150000.00 | 144000.00 |   6000.00
+ Arjun      | 110000.00 | 144000.00 | -34000.00
+ Divya      |  90000.00 | 144000.00 | -54000.00
+(5 rows)</code></pre>
+  <p>All five employees are still there, and every row has the average of its own department. The
+  <code>WINDOW w AS (…)</code> clause names a window so you do not repeat it.</p>
+
+  <h4>Syntax</h4>
+  <pre data-title="The anatomy"><code class="language-sql">function_name(arguments) OVER (
+    PARTITION BY column1, column2      -- optional: split rows into independent groups
+    ORDER BY column3 [DESC]            -- optional: order within each partition
+    frame_clause                       -- optional: which rows around the current row (next article)
+)</code></pre>
+  <ul>
+    <li><strong><code>OVER ()</code></strong> with nothing inside: the window is the whole result set.
+    <code>SUM(salary) OVER ()</code> is the grand total on every row.</li>
+    <li><strong><code>PARTITION BY</code></strong>: like <code>GROUP BY</code> but without collapsing rows. The
+    function restarts for every partition. Omit it and there is one partition.</li>
+    <li><strong><code>ORDER BY</code> inside <code>OVER</code></strong>: required by ranking and navigation
+    functions (<code>ROW_NUMBER</code>, <code>LAG</code>); for aggregates it makes the result
+    <em>cumulative</em> (running total) instead of the same value on every row. It is independent from the final
+    <code>ORDER BY</code> of the query.</li>
+  </ul>
+
+  <h4>Three families of window functions</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Family</th><th>Functions</th><th>Answers</th></tr></thead>
+    <tbody>
+      <tr><td>Aggregates</td><td><code>SUM</code>, <code>AVG</code>, <code>COUNT</code>, <code>MIN</code>, <code>MAX</code> with <code>OVER</code></td><td>totals, running totals, averages, share of total</td></tr>
+      <tr><td>Ranking</td><td><code>ROW_NUMBER</code>, <code>RANK</code>, <code>DENSE_RANK</code>, <code>NTILE</code>, <code>PERCENT_RANK</code></td><td>position, top N, percentile buckets (<a href="#m3-window-ranking">next</a>)</td></tr>
+      <tr><td>Value / navigation</td><td><code>LAG</code>, <code>LEAD</code>, <code>FIRST_VALUE</code>, <code>LAST_VALUE</code>, <code>NTH_VALUE</code></td><td>previous or next row, first or last in group (<a href="#m3-window-frames">after that</a>)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Window functions vs GROUP BY</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>GROUP BY</code></th><th>Window function</th></tr></thead>
+    <tbody>
+      <tr><td>Rows returned</td><td>one per group</td><td>every input row</td></tr>
+      <tr><td>Can show row details with the aggregate</td><td>no (only grouped columns)</td><td>yes</td></tr>
+      <tr><td>Rank, previous row, running total</td><td>not possible</td><td>yes</td></tr>
+      <tr><td>Filter on the result</td><td><code>HAVING</code></td><td>subquery or CTE (below)</td></tr>
+      <tr><td>Needs an aggregate</td><td>yes</td><td>no; ranking functions have none</td></tr>
+    </tbody>
+  </table></div>
+  <p>You can combine them: grouping runs first, then windows run over the grouped rows
+  (<code>RANK() OVER (ORDER BY SUM(salary) DESC)</code> is legal in a <code>GROUP BY</code> query).</p>
+
+  <h4>Where windows run, and why you cannot filter on them</h4>
+  <p>From the <a href="#m2-logical-order">logical order</a>: windows are computed in the <code>SELECT</code>
+  step, after <code>WHERE</code>, <code>GROUP BY</code> and <code>HAVING</code>. Two consequences:</p>
+  <ul>
+    <li>A window only sees rows that survived <code>WHERE</code>. Filtering first changes the result: the average
+    over "dept 1 only" differs from the average over everyone.</li>
+    <li>You cannot use a window function in <code>WHERE</code>, since it does not exist yet:
+    <code>ERROR:  window functions are not allowed in WHERE</code>. To filter on a rank or running total, compute
+    it in a subquery or CTE and filter outside.</li>
+  </ul>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: filter on the window in WHERE</p><pre><code class="language-sql">SELECT first_name, salary
+FROM employees
+WHERE ROW_NUMBER() OVER (ORDER BY salary DESC) &lt;= 3;
+-- ERROR:  window functions are not allowed in WHERE</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: compute in a CTE, filter outside</p><pre><code class="language-sql">WITH ranked AS (
+    SELECT first_name, salary,
+           ROW_NUMBER() OVER (ORDER BY salary DESC, emp_id) AS rn
+    FROM employees
+)
+SELECT first_name, salary FROM ranked WHERE rn &lt;= 3;</code></pre></div>
+  </div>
+  <p>Databases like Snowflake and BigQuery have a <code>QUALIFY</code> clause for this; PostgreSQL and MySQL do
+  not, so the CTE pattern above is the one to memorise.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: windows need PostgreSQL 8.4+ or MySQL 8.0+</p>
+    <p>MySQL 5.7 has no window functions at all, so interview answers for MySQL 5.7 use variables or
+    correlated subqueries. Every maintained MySQL (8.x) supports everything in this module.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: forgetting that ORDER BY inside OVER changes an aggregate</p>
+    <p><code>SUM(salary) OVER (PARTITION BY dept_id)</code> gives the department total on every row.
+    <code>SUM(salary) OVER (PARTITION BY dept_id ORDER BY hire_date)</code> gives a running total. Adding an
+    <code>ORDER BY</code> is a change of meaning, not a cosmetic choice.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>NULL partition keys form one partition (Meera, with <code>dept_id = NULL</code>, is a partition of
+      one).</li>
+      <li>Window functions cannot be nested inside each other or inside aggregates of the same level; wrap one in
+      a subquery.</li>
+      <li>Query-level <code>ORDER BY</code> sorts the final output only; the window <code>ORDER BY</code> decides
+      the calculation.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is a window function and how does it differ from GROUP BY?" Rows are kept; the function looks at a
+    window defined by <code>PARTITION BY</code>/<code>ORDER BY</code>. "Why can't you use it in WHERE?" Logical
+    order. Then expect ranking and top N per group.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-window-ranking">
+  <h3>ROW_NUMBER, RANK, DENSE_RANK and NTILE</h3>
+  <p class="tldr">All four number rows in an ordered window. They differ only in how they treat ties:
+  <code>ROW_NUMBER</code> never repeats, <code>RANK</code> repeats and skips, <code>DENSE_RANK</code> repeats and
+  does not skip, and <code>NTILE(n)</code> splits rows into n equal buckets.</p>
+
+  <h4>The four on the same data</h4>
+  <p>Ananya, Priya and Rahul all earn 150,000, so the sample data is ideal for seeing ties.</p>
+  <pre data-title="Ranking all employees by salary"><code class="language-sql">SELECT first_name, salary,
+       ROW_NUMBER() OVER w AS row_num,
+       RANK()       OVER w AS rnk,
+       DENSE_RANK() OVER w AS dense_rnk,
+       NTILE(4)     OVER w AS quartile
+FROM employees
+WINDOW w AS (ORDER BY salary DESC)
+ORDER BY salary DESC, emp_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name |  salary   | row_num | rnk | dense_rnk | quartile
+------------+-----------+---------+-----+-----------+----------
+ Meera      | 300000.00 |       1 |   1 |         1 |        1
+ Vikram     | 220000.00 |       2 |   2 |         2 |        1
+ Karan      | 160000.00 |       3 |   3 |         3 |        1
+ Ananya     | 150000.00 |       4 |   4 |         4 |        2
+ Priya      | 150000.00 |       5 |   4 |         4 |        2
+ Rahul      | 150000.00 |       6 |   4 |         4 |        2
+ Sunita     | 120000.00 |       7 |   7 |         5 |        3
+ Arjun      | 110000.00 |       8 |   8 |         6 |        3
+ Divya      |  90000.00 |       9 |   9 |         7 |        3
+ Neha       |  75000.00 |      10 |  10 |         8 |        4
+ Farhan     |  65000.00 |      11 |  11 |         9 |        4
+ Isha       |  55000.00 |      12 |  12 |        10 |        4
+(12 rows)</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Function</th><th>Ties</th><th>After a tie</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>ROW_NUMBER()</code></td><td>different numbers (arbitrary among ties unless you add a tie-breaker)</td><td>continues 1, 2, 3, 4, 5…</td><td>exactly N rows; de-duplication; pagination</td></tr>
+      <tr><td><code>RANK()</code></td><td>same number</td><td>skips: 4, 4, 4, then 7</td><td>competition ranking ("top 3 places")</td></tr>
+      <tr><td><code>DENSE_RANK()</code></td><td>same number</td><td>no gap: 4, 4, 4, then 5</td><td>Nth highest value; "top 3 salaries"</td></tr>
+      <tr><td><code>NTILE(n)</code></td><td>n buckets of equal size (sizes differ by at most one)</td><td>n/a</td><td>quartiles, deciles, splitting work</td></tr>
+    </tbody>
+  </table></div>
+  <p>Ranking functions take no argument (except <code>NTILE</code>) and <strong>require</strong> an
+  <code>ORDER BY</code> in the window. With ties, <code>ROW_NUMBER</code> is not deterministic: the database may
+  number Ananya, Priya and Rahul in any order, and a different one on the next run. Add a unique tie-breaker
+  (<code>ORDER BY salary DESC, emp_id</code>) to make it repeatable. Also available: <code>PERCENT_RANK()</code>
+  (relative rank from 0 to 1) and <code>CUME_DIST()</code> (share of rows at or below).</p>
+
+  <h4>Ranking inside groups</h4>
+  <p><code>PARTITION BY</code> restarts the numbering for every group. Rank within each department:</p>
+  <pre data-title="Position inside the department"><code class="language-sql">SELECT dept_id, first_name, salary,
+       DENSE_RANK() OVER (PARTITION BY dept_id ORDER BY salary DESC) AS pos
+FROM employees
+WHERE dept_id = 1
+ORDER BY salary DESC, emp_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id | first_name |  salary   | pos
+---------+------------+-----------+-----
+       1 | Vikram     | 220000.00 |   1
+       1 | Priya      | 150000.00 |   2
+       1 | Rahul      | 150000.00 |   2
+       1 | Arjun      | 110000.00 |   3
+       1 | Divya      |  90000.00 |   4
+(5 rows)</code></pre>
+
+  <h4>Top N per group</h4>
+  <p>The most common use. Wrap the ranking in a CTE and filter on it. "Top 3 salaries in each department":</p>
+  <pre data-title="Top 3 salaries per department"><code class="language-sql">WITH ranked AS (
+    SELECT dept_id, first_name, salary,
+           DENSE_RANK() OVER (PARTITION BY dept_id ORDER BY salary DESC) AS pos
+    FROM employees
+    WHERE dept_id IS NOT NULL
+)
+SELECT dept_id, first_name, salary, pos
+FROM ranked
+WHERE pos &lt;= 3
+ORDER BY dept_id, pos, first_name;</code></pre>
+  <pre class="out" data-title="Output (10 rows)"><code class="language-plaintext"> dept_id | first_name |  salary   | pos
+---------+------------+-----------+-----
+       1 | Vikram     | 220000.00 |   1
+       1 | Priya      | 150000.00 |   2
+       1 | Rahul      | 150000.00 |   2
+       1 | Arjun      | 110000.00 |   3
+       2 | Karan      | 160000.00 |   1
+       2 | Ananya     | 150000.00 |   2
+       2 | Neha       |  75000.00 |   3
+       3 | Sunita     | 120000.00 |   1
+       3 | Farhan     |  65000.00 |   2
+       3 | Isha       |  55000.00 |   3
+(10 rows)</code></pre>
+  <p>Department 1 returns four rows because two people share second place, so the top 3 <em>salaries</em> are
+  220000, 150000 and 110000. Which function you pick answers a different question:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Question</th><th>Use</th><th>Dept 1 returns</th></tr></thead>
+    <tbody>
+      <tr><td>The 3 highest <em>salary values</em></td><td><code>DENSE_RANK() &lt;= 3</code></td><td>Vikram, Priya, Rahul, Arjun (4 rows)</td></tr>
+      <tr><td>Everyone in the first 3 <em>places</em> (gaps after ties)</td><td><code>RANK() &lt;= 3</code></td><td>Vikram, Priya, Rahul (3 rows)</td></tr>
+      <tr><td>Exactly 3 <em>employees</em></td><td><code>ROW_NUMBER() &lt;= 3</code></td><td>Vikram, Priya, Rahul (3 rows; tie broken by emp_id)</td></tr>
+    </tbody>
+  </table></div>
+  <p>In an interview, ask which one the interviewer means; that question alone shows maturity. Two other ways to
+  write top N per group, both without a window function:</p>
+  <pre data-title="Alternatives"><code class="language-sql">-- Correlated subquery: fewer than 3 distinct higher salaries in the same department
+SELECT e.dept_id, e.first_name, e.salary
+FROM employees e
+WHERE e.dept_id IS NOT NULL
+  AND (SELECT COUNT(DISTINCT x.salary)
+       FROM employees x
+       WHERE x.dept_id = e.dept_id AND x.salary &gt; e.salary) &lt; 3;
+
+-- LATERAL join (PostgreSQL): the top 3 rows of each department
+SELECT d.name, t.first_name, t.salary
+FROM departments d
+CROSS JOIN LATERAL (SELECT first_name, salary FROM employees e
+                    WHERE e.dept_id = d.dept_id
+                    ORDER BY salary DESC LIMIT 3) AS t;</code></pre>
+  <p>The first has the same meaning as <code>DENSE_RANK</code> and works on MySQL 5.7; the second returns
+  exactly 3 rows per department and is fast with an index on <code>(dept_id, salary DESC)</code>.</p>
+
+  <h4>Other uses</h4>
+  <ul>
+    <li><strong>The latest row per group</strong>: <code>ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY
+    order_date DESC) = 1</code> gives each customer's most recent order. PostgreSQL's <code>DISTINCT ON
+    (customer_id)</code> is a shortcut (<a href="#m1-distinct">DISTINCT</a>).</li>
+    <li><strong>De-duplication</strong>: number the copies of each duplicate and delete those above 1
+    (<a href="#m3-classic-duplicates">Duplicates</a>).</li>
+    <li><strong>Buckets</strong>: <code>NTILE(4)</code> labels each employee's pay quartile; <code>NTILE(100)</code>
+    approximates percentiles. With 12 rows and 4 buckets each gets 3; with 10 rows and 4 buckets the sizes are 3,
+    3, 2, 2 (the extra rows go to the first buckets).</li>
+    <li><strong>Pagination with a numbered list</strong> (rarely better than <code>LIMIT</code>).</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: pick the function from the tie behaviour you need</p>
+    <p>Same rank for equal values and no gaps: <code>DENSE_RANK</code>. Same rank but gaps: <code>RANK</code>.
+    Always unique: <code>ROW_NUMBER</code>, with a deterministic tie-breaker in <code>ORDER BY</code>.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: ROW_NUMBER for "Nth highest salary"</p>
+    <p>If three people share the second salary, <code>ROW_NUMBER() = 2</code> returns just one of them and may
+    skip the real second value entirely (the second row can hold the same salary as the first). For "Nth highest
+    value" use <code>DENSE_RANK</code>.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>NULLs in the ordering column sort last in <code>ASC</code> and first in <code>DESC</code> in
+      PostgreSQL (MySQL: smallest). Use <code>NULLS LAST</code> or filter them out.</li>
+      <li><code>NTILE(5)</code> on 3 rows gives buckets 1, 2, 3 and leaves 4 and 5 empty.</li>
+      <li>Rank values are <code>BIGINT</code>; comparing with an integer literal is fine.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Difference between RANK, DENSE_RANK and ROW_NUMBER" with the 150000-tie example is the single most
+    common window-function question. Then "top 3 salaries in each department" and "latest order per customer".
+    Mention the CTE needed to filter on the rank.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-window-frames">
+  <h3>Frames, running totals, LAG/LEAD and FIRST/LAST_VALUE</h3>
+  <p class="tldr">A <strong>frame</strong> narrows the window around the current row
+  (<code>ROWS BETWEEN 2 PRECEDING AND CURRENT ROW</code>). Frames power running totals and moving averages.
+  <code>LAG</code>/<code>LEAD</code> read the previous or next row, and <code>LAST_VALUE</code> needs a full frame
+  to behave as expected.</p>
+
+  <h4>What a frame is</h4>
+  <p>Inside a partition, the <strong>frame</strong> is the set of rows the function actually reads for the current
+  row. Syntax: <code>ROWS | RANGE | GROUPS BETWEEN start AND end</code>, where the boundaries are
+  <code>UNBOUNDED PRECEDING</code>, <code>n PRECEDING</code>, <code>CURRENT ROW</code>, <code>n FOLLOWING</code>
+  and <code>UNBOUNDED FOLLOWING</code>.</p>
+  <figure class="fig">
+<pre class="diagram">
+ partition rows (ordered)        frame for the highlighted row (ROWS 2 PRECEDING .. CURRENT ROW)
+
+   row 1    300000
+   row 2    220000
+   row 3    150000  ─┐
+   row 4    120000   │ frame of row 5 = rows 3, 4, 5
+   row 5    150000  ─┘ ◀── current row
+   row 6    150000
+   ...
+</pre>
+  <figcaption>For each row the database slides this frame forward; AVG over it is a moving average</figcaption>
+  </figure>
+  <p><strong>Defaults matter.</strong> With no <code>ORDER BY</code> in the window, the frame is the whole
+  partition. With an <code>ORDER BY</code> and no explicit frame, it is
+  <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>: from the first row up to the current row
+  <em>and all its peers</em> (rows with the same sort value). That default causes the next two surprises.</p>
+
+  <h4>ROWS vs RANGE</h4>
+  <p><code>ROWS</code> counts physical rows. <code>RANGE</code> works on values and includes every peer of the
+  current row. The difference only shows when the sort column has ties. Department 1, running total by salary:</p>
+  <pre data-title="ROWS and RANGE with ties"><code class="language-sql">SELECT first_name, salary,
+       SUM(salary) OVER (ORDER BY salary DESC)                                  AS default_range,
+       SUM(salary) OVER (ORDER BY salary DESC, emp_id
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)      AS rows_frame
+FROM employees
+WHERE dept_id = 1
+ORDER BY salary DESC, emp_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name |  salary   | default_range | rows_frame
+------------+-----------+---------------+------------
+ Vikram     | 220000.00 |     220000.00 |  220000.00
+ Priya      | 150000.00 |     520000.00 |  370000.00
+ Rahul      | 150000.00 |     520000.00 |  520000.00
+ Arjun      | 110000.00 |     630000.00 |  630000.00
+ Divya      |  90000.00 |     720000.00 |  720000.00
+(5 rows)</code></pre>
+  <p>With the default <code>RANGE</code>, Priya and Rahul are peers (same salary), so both include both of them:
+  520000 each. <code>ROWS</code> with a unique ordering gives the true row-by-row running total. Rule of thumb:
+  for running totals, write <code>ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code> and order by a unique
+  key. PostgreSQL also has <code>GROUPS</code> mode (counts groups of peers). MySQL supports <code>ROWS</code>
+  and <code>RANGE</code>.</p>
+
+  <h4>Running totals and moving averages</h4>
+  <p>Employees in hire order: the cumulative payroll and a 3-row moving average.</p>
+  <pre data-title="Running total and moving average"><code class="language-sql">SELECT first_name, hire_date, salary,
+       SUM(salary) OVER (ORDER BY hire_date, emp_id
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+       ROUND(AVG(salary) OVER (ORDER BY hire_date, emp_id
+                         ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 2)      AS moving_avg_3
+FROM employees
+ORDER BY hire_date, emp_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name | hire_date  |  salary   | running_total | moving_avg_3
+------------+------------+-----------+---------------+--------------
+ Meera      | 2015-04-01 | 300000.00 |     300000.00 |    300000.00
+ Vikram     | 2016-07-15 | 220000.00 |     520000.00 |    260000.00
+ Ananya     | 2017-02-20 | 150000.00 |     670000.00 |    223333.33
+ Sunita     | 2018-06-11 | 120000.00 |     790000.00 |    163333.33
+ Priya      | 2019-01-07 | 150000.00 |     940000.00 |    140000.00
+ Rahul      | 2020-03-02 | 150000.00 |    1090000.00 |    140000.00
+ Karan      | 2021-05-24 | 160000.00 |    1250000.00 |    153333.33
+ Arjun      | 2022-08-16 | 110000.00 |    1360000.00 |    140000.00
+ Neha       | 2023-09-04 |  75000.00 |    1435000.00 |    115000.00
+ Farhan     | 2023-11-20 |  65000.00 |    1500000.00 |     83333.33
+ Divya      | 2024-01-08 |  90000.00 |    1590000.00 |     76666.67
+ Isha       | 2024-07-01 |  55000.00 |    1645000.00 |     70000.00
+(12 rows)</code></pre>
+  <p>The first two rows average over fewer rows because the frame is cut off at the start of the partition. The
+  last running total, 1,645,000, equals the payroll. Add <code>PARTITION BY dept_id</code> and the running total
+  restarts for each department. The same pattern gives "running total per customer" and "year-to-date sales".</p>
+
+  <h4>Percent of total</h4>
+  <p>A window aggregate without <code>ORDER BY</code> reads the whole partition, so each row can be divided by
+  its group's total:</p>
+  <pre data-title="Share of the department payroll"><code class="language-sql">SELECT first_name, salary,
+       ROUND(100 * salary / SUM(salary) OVER (PARTITION BY dept_id), 1) AS pct_of_dept
+FROM employees
+WHERE dept_id = 3
+ORDER BY salary DESC;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name |  salary   | pct_of_dept
+------------+-----------+-------------
+ Sunita     | 120000.00 |        50.0
+ Farhan     |  65000.00 |        27.1
+ Isha       |  55000.00 |        22.9
+(3 rows)</code></pre>
+
+  <h4>LAG and LEAD</h4>
+  <p><code>LAG(expr, offset, default)</code> returns the value from <code>offset</code> rows <em>before</em> the
+  current row (default offset 1); <code>LEAD</code> looks <em>after</em>. When no such row exists you get NULL, or
+  the <code>default</code> you provide. They ignore frames and need an <code>ORDER BY</code>.</p>
+  <pre data-title="Who was hired just before and after"><code class="language-sql">SELECT first_name, hire_date,
+       LAG(first_name)             OVER w AS hired_before,
+       LEAD(first_name, 1, 'nobody') OVER w AS hired_after
+FROM employees
+WHERE emp_id &lt;= 5
+WINDOW w AS (ORDER BY hire_date)
+ORDER BY hire_date;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name | hire_date  | hired_before | hired_after
+------------+------------+--------------+-------------
+ Meera      | 2015-04-01 | (null)       | Vikram
+ Vikram     | 2016-07-15 | Meera        | Ananya
+ Ananya     | 2017-02-20 | Vikram       | Sunita
+ Sunita     | 2018-06-11 | Ananya       | Priya
+ Priya      | 2019-01-07 | Sunita       | nobody
+(5 rows)</code></pre>
+  <p>Typical uses: the change from the previous month (<code>revenue - LAG(revenue) OVER (ORDER BY
+  month)</code>, see <a href="#m3-classic-islands">month-over-month growth</a>), days since the previous login,
+  and comparing a row with the next event. Note the <code>WHERE</code> ran first: the window only saw five
+  employees.</p>
+
+  <h4>FIRST_VALUE, LAST_VALUE and NTH_VALUE</h4>
+  <p><code>FIRST_VALUE(expr)</code> returns the value from the first row of the frame, <code>LAST_VALUE</code>
+  from the last row, <code>NTH_VALUE(expr, n)</code> from the n-th. Here is the famous gotcha, in HR (the highest
+  salary first):</p>
+  <pre data-title="The LAST_VALUE trap"><code class="language-sql">SELECT first_name, salary,
+       FIRST_VALUE(first_name) OVER (ORDER BY salary DESC) AS top_earner,
+       LAST_VALUE(first_name)  OVER (ORDER BY salary DESC) AS last_wrong,
+       LAST_VALUE(first_name)  OVER (ORDER BY salary DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lowest_paid
+FROM employees
+WHERE dept_id = 3
+ORDER BY salary DESC;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name |  salary   | top_earner | last_wrong | lowest_paid
+------------+-----------+------------+------------+-------------
+ Sunita     | 120000.00 | Sunita     | Sunita     | Isha
+ Farhan     |  65000.00 | Sunita     | Farhan     | Isha
+ Isha       |  55000.00 | Sunita     | Isha       | Isha
+(3 rows)</code></pre>
+  <p>The default frame ends at the <em>current row</em>, so "the last row of the frame" is simply the current
+  row (<code>last_wrong</code>). To see the real last row, extend the frame to
+  <code>UNBOUNDED FOLLOWING</code>. <code>FIRST_VALUE</code> works with the default frame because the frame
+  always starts at the first row. Alternatively, flip the ordering and use <code>FIRST_VALUE</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: spell out the frame when it matters</p>
+    <p>Running totals: <code>ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code> with a unique order key.
+    <code>LAST_VALUE</code> and <code>NTH_VALUE</code>: <code>… AND UNBOUNDED FOLLOWING</code>. Relying on the
+    default hides the peer behaviour from the next reader.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a running total ordered by a non-unique column</p>
+    <p>Ordering a running total by <code>order_date</code> when several orders share a date gives the same total
+    for all of them (the default <code>RANGE</code> frame, peers included) or a random split inside the day with
+    <code>ROWS</code>. Add a tie-breaker such as the id.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>ROWS</code> frames with <code>n PRECEDING</code> near the start just use fewer rows; no error,
+      no padding.</li>
+      <li><code>RANGE</code> with an offset (<code>RANGE BETWEEN 7 PRECEDING AND CURRENT ROW</code>) needs one
+      numeric or date ordering column and means "values within 7 of the current value".</li>
+      <li><code>LAG</code>/<code>LEAD</code> with <code>PARTITION BY</code> do not cross partitions; the first row
+      of each partition gets NULL.</li>
+      <li>Window frames need an <code>ORDER BY</code> for <code>ROWS</code> to be meaningful.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Likely: "running total per customer", "month-over-month change", "7-day moving average", "difference
+    between ROWS and RANGE", and "why does LAST_VALUE return the current row?" The last two are the questions that
+    separate memorised answers from understanding.</p>
+  </div>
+</article>

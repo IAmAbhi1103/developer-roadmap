@@ -1,0 +1,693 @@
+<article class="topic" id="m5-springboottest">
+  <h3>@SpringBootTest: full integration tests, profiles, test data and context caching</h3>
+  <p class="tldr">@SpringBootTest starts the whole application context so you can test real flows end to end through the layers; keep these tests few, share one context between them, and give each test its own clean data.</p>
+
+  <h4>What it does</h4>
+  <p><code>@SpringBootTest</code> searches upwards for your <code>@SpringBootApplication</code> class and starts the <strong>full application context</strong>: all beans, security, JPA, Flyway, everything. Use it to prove the parts work together: controller to service to repository to database, with real security and real transactions. It is slower (seconds to start), so you write fewer of these.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th><code>webEnvironment</code></th><th>What happens</th><th>Call the app with</th></tr></thead>
+    <tbody>
+      <tr><td><code>MOCK</code> (default)</td><td>Full context, but a <em>mock</em> servlet environment; no port is opened</td><td><code>MockMvc</code> with <code>@AutoConfigureMockMvc</code></td></tr>
+      <tr><td><code>RANDOM_PORT</code></td><td>Real embedded server on a random free port</td><td><code>@LocalServerPort</code> + an HTTP client (<code>RestClient</code>, <code>TestRestTemplate</code>, <code>WebTestClient</code>)</td></tr>
+      <tr><td><code>DEFINED_PORT</code></td><td>Real server on the configured port (can clash)</td><td>Rarely used</td></tr>
+      <tr><td><code>NONE</code></td><td>Context without any web environment</td><td>Test services or batch jobs directly</td></tr>
+    </tbody>
+  </table></div>
+  <p>Prefer <code>MOCK</code> + MockMvc for most API flows: it is faster, runs in the same thread, and works with <code>@Transactional</code> rollback. Choose <code>RANDOM_PORT</code> when you need the real servlet container, real HTTP (filters at container level, cookies, serialisation over the wire) or to simulate a client.</p>
+
+  <h4>An integration test through MockMvc</h4>
+  <pre data-title="JobFlowIT.java"><code class="language-java">@SpringBootTest
+@AutoConfigureMockMvc
+@ActiveProfiles("test")
+@Import(TestcontainersConfig.class)             // real PostgreSQL, see next article
+class JobFlowIT {
+
+    @Autowired MockMvc mvc;
+
+    @Test
+    void recruiterPostsJob_candidateApplies() throws Exception {
+        register("asha@example.com", "S3cret#2026", "RECRUITER");
+        register("ravi@example.com", "S3cret#2026", "CANDIDATE");
+        String recruiterToken = login("asha@example.com", "S3cret#2026");
+        String candidateToken = login("ravi@example.com", "S3cret#2026");
+
+        String jobBody = mvc.perform(post("/api/jobs")
+                        .header("Authorization", "Bearer " + recruiterToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"title":"Java Developer","description":"Spring Boot"}"""))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        int jobId = JsonPath.read(jobBody, "$.id");
+
+        mvc.perform(post("/api/jobs/{id}/applications", jobId)
+                        .header("Authorization", "Bearer " + candidateToken))
+                .andExpect(status().isCreated());
+
+        // the candidate may not edit the job
+        mvc.perform(put("/api/jobs/{id}", jobId)
+                        .header("Authorization", "Bearer " + candidateToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"title":"Hacked","description":"x"}"""))
+                .andExpect(status().isForbidden());
+    }
+
+    private void register(String email, String password, String role) throws Exception {
+        mvc.perform(post("/api/auth/register")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"name":"Test","email":"%s","password":"%s","role":"%s"}"""
+                                .formatted(email, password, role)))
+                .andExpect(status().isCreated());
+    }
+
+    private String login(String email, String password) throws Exception {
+        String body = mvc.perform(post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"%s","password":"%s"}""".formatted(email, password)))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        return JsonPath.read(body, "$.accessToken");
+    }
+}</code></pre>
+  <p>This one test exercises registration, BCrypt, JWT, role rules, ownership and the database, using the real security chain instead of mocks. That is its value: the wiring that unit tests cannot see.</p>
+
+  <h4>Calling a real server</h4>
+  <pre data-title="RANDOM_PORT with RestClient"><code class="language-java">@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@Import(TestcontainersConfig.class)
+class HealthIT {
+
+    @LocalServerPort int port;
+
+    @Test
+    void healthEndpoint_isUp() {
+        RestClient client = RestClient.create("http://localhost:" + port);
+
+        String body = client.get().uri("/actuator/health")
+                .retrieve().body(String.class);
+
+        assertThat(body).contains("UP");
+    }
+}</code></pre>
+  <p><code>RestClient</code> (Spring 6.1+) works the same in Boot 3 and 4. <code>TestRestTemplate</code> and <code>WebTestClient</code> also work with a random port, but how they are provided (extra dependencies or annotations) differs between Boot lines, so check your version's documentation; the idea is identical. Remember that a test method annotated <code>@Transactional</code> does <em>not</em> roll back the server's work with <code>RANDOM_PORT</code>: the server handles the request in another thread and its own transaction.</p>
+
+  <h4>Profiles and test configuration</h4>
+  <ul>
+    <li><code>@ActiveProfiles("test")</code> activates the <code>test</code> profile, so <code>src/test/resources/application-test.yml</code> overrides the main settings: a short JWT secret for tests, lower BCrypt cost, a fixed clock, disabled mail sending. Files in <code>src/test/resources</code> shadow those of the same name in <code>src/main/resources</code>.</li>
+    <li><code>@TestPropertySource(properties = "app.jwt.access-ttl-minutes=1")</code> or <code>@SpringBootTest(properties = "...")</code> set single properties for one class.</li>
+    <li><code>@TestConfiguration</code> adds or replaces beans for tests only, for example a fixed <code>Clock</code>. A static nested <code>@TestConfiguration</code> class is picked up automatically; a top-level one must be imported with <code>@Import</code>. (A normal <code>@Configuration</code> in <code>src/test</code> would be found by component scanning of every test, which is usually not what you want.)</li>
+  </ul>
+  <pre data-title="Replacing the Clock for one test class"><code class="language-java">@SpringBootTest
+@Import(FixedClockConfig.class)
+class DeadlineIT { ... }
+
+@TestConfiguration
+class FixedClockConfig {
+    @Bean
+    @Primary
+    Clock clock() {
+        return Clock.fixed(Instant.parse("2026-11-10T10:00:00Z"), ZoneOffset.UTC);
+    }
+}</code></pre>
+
+  <h4>Test data: @Sql, and cleaning up</h4>
+  <pre data-title="@Sql"><code class="language-java">@Test
+@Sql("/sql/jobs.sql")                                   // run before the test method
+@Sql(scripts = "/sql/cleanup.sql",
+     executionPhase = Sql.ExecutionPhase.AFTER_TEST_METHOD)
+void listJobs_returnsSeededJobs() throws Exception { ... }</code></pre>
+  <pre data-title="src/test/resources/sql/jobs.sql"><code class="language-sql">insert into app_user (id, name, email, password_hash, role, enabled, locked)
+values (1, 'Asha', 'asha@example.com', '{bcrypt}$2a$10$...', 'RECRUITER', true, false);
+insert into job (id, title, description, posted_by_id)
+values (10, 'Java Developer', 'Spring Boot', 1);</code></pre>
+  <p>Three ways to keep tests independent in integration tests: (1) <code>@Transactional</code> on the test class with MockMvc (same thread, rolled back after each test), (2) <code>@Sql</code> cleanup scripts or <code>repository.deleteAll()</code> in <code>@AfterEach</code>, (3) unique data per test (random emails), so no cleanup is needed and tests can even run in parallel.</p>
+
+  <h4>Context caching</h4>
+  <p>Starting a Spring context takes seconds. The test framework therefore <strong>caches</strong> contexts and reuses one for all test classes with the same configuration. The cache key includes the configuration classes, active profiles, properties, <code>@MockitoBean</code> definitions, <code>@TestConfiguration</code> imports, and <code>webEnvironment</code>. Any difference creates and caches another context, and every cached context keeps its beans and connection pool alive.</p>
+  <pre class="out" data-title="Symptom in the log"><code class="language-plaintext">Started JobFlowIT in 4.1 seconds
+Started ApplicationFlowIT in 3.8 seconds     (different mocks: new context)
+Started AuthIT in 3.9 seconds                (another property: new context)</code></pre>
+  <ul>
+    <li>Use one shared base class for integration tests with the same annotations, so most of them share a context.</li>
+    <li>Avoid scattering <code>@MockitoBean</code> and <code>@TestPropertySource</code> across many classes; each variant costs one more startup.</li>
+    <li><code>@DirtiesContext</code> marks the context as dirty and discards it after the test or class. It is a last resort: it throws away the cache and makes the suite slow. Reset state explicitly instead.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Use <code>@SpringBootTest</code> for flows across layers; use slices and unit tests for everything else.</li>
+      <li>Integration tests need a real database of the production type (Testcontainers), not H2.</li>
+      <li>Each test creates the data it needs and must not rely on another test.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>Unable to find a @SpringBootConfiguration</code>: the test class is in a package that is not under your application class. Move it or give <code>classes = ...</code>.</li>
+      <li><code>ApplicationContext failure threshold exceeded</code> / <code>Failed to load ApplicationContext</code>: the real cause is in the first "Caused by" lines, often a missing property or bean in the test profile.</li>
+      <li><code>@Transactional</code> + <code>RANDOM_PORT</code>: no rollback of the server side (see above).</li>
+      <li>Port conflicts with <code>DEFINED_PORT</code>; prefer <code>RANDOM_PORT</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Using <code>@SpringBootTest</code> for a test that only needs one service and two mocks. Use a plain unit test.</li>
+      <li>Sharing mutable data between tests, then seeing tests pass alone and fail together.</li>
+      <li>A different set of <code>@MockitoBean</code> in every class, giving ten contexts and a ten-minute build.</li>
+      <li>Reaching for <code>@DirtiesContext</code> to clean the database.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"@SpringBootTest vs slice tests?" Full context vs one layer; mention speed and when you need each. "MOCK vs RANDOM_PORT?" No server, MockMvc vs real server and HTTP client. "Why are my tests slow?" Too many contexts: different mocks/properties break the cache; <code>@DirtiesContext</code>; Testcontainers started per class. Good answer: base class, shared container, fewer integration tests.</p>
+  </div>
+</article>
+
+<article class="topic" id="m5-testcontainers">
+  <h3>Testcontainers: tests against a real PostgreSQL in Docker</h3>
+  <p class="tldr">Testcontainers starts a throwaway Docker container (PostgreSQL, Redis, Kafka) for your tests; with @ServiceConnection Spring Boot wires it in automatically, and a shared configuration or base class starts it once for the whole suite.</p>
+
+  <h4>Why</h4>
+  <p>H2 is not PostgreSQL, and a database installed on your laptop differs from your colleague's and from CI. <strong>Testcontainers</strong> is a Java library that starts a <em>real</em> database in a Docker container, from an exact image tag (<code>postgres:16-alpine</code>), for the duration of the tests, and removes it afterwards. Every developer and every CI run gets the same database, with your real Flyway migrations, real SQL features and real locking. You trade a few seconds of startup for tests that mean something.</p>
+  <p><strong>Requirement:</strong> Docker must be running. On Windows start <strong>Docker Desktop</strong> (with the WSL 2 backend) before running the tests; on Linux the Docker daemon. Without it you get <code>IllegalStateException: Could not find a valid Docker environment</code>. CI runners such as GitHub-hosted Ubuntu already have Docker.</p>
+
+  <h4>Dependencies</h4>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-testcontainers&lt;/artifactId&gt;
+    &lt;scope&gt;test&lt;/scope&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.testcontainers&lt;/groupId&gt;
+    &lt;artifactId&gt;junit-jupiter&lt;/artifactId&gt;
+    &lt;scope&gt;test&lt;/scope&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.testcontainers&lt;/groupId&gt;
+    &lt;artifactId&gt;postgresql&lt;/artifactId&gt;
+    &lt;scope&gt;test&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+  <p>Spring Boot's dependency management supplies the versions. Your normal PostgreSQL JDBC driver must be on the classpath too.</p>
+  <div class="co co-version">
+    <p class="co-t">Versions</p>
+    <p>Testcontainers 2.x (used by newer Boot lines) renamed its modules with a <code>testcontainers-</code> prefix (for example <code>testcontainers-postgresql</code>, <code>testcontainers-junit-jupiter</code>) and moved <code>PostgreSQLContainer</code> to the package <code>org.testcontainers.postgresql</code> without the generic type parameter. The ideas and the Spring annotations stay the same. Use the artifact names and imports that match the Testcontainers version your Boot version manages; the code below uses the 1.x style.</p>
+  </div>
+
+  <h4>Way 1: @Testcontainers, @Container and @ServiceConnection</h4>
+  <pre data-title="Container in the test class"><code class="language-java">import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+
+@SpringBootTest
+@Testcontainers
+class JobRepositoryIT {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer&lt;?&gt; postgres = new PostgreSQLContainer&lt;&gt;("postgres:16-alpine");
+
+    @Autowired JobRepository jobRepository;
+
+    @Test
+    void connectsToRealPostgres() {
+        assertThat(postgres.isRunning()).isTrue();
+        assertThat(jobRepository.count()).isZero();     // Flyway ran on a clean database
+    }
+}</code></pre>
+  <ul>
+    <li><code>@Testcontainers</code> adds the JUnit extension that manages containers.</li>
+    <li><code>@Container</code> on a <code>static</code> field: started once before the first test of the class and stopped after the last. On a non-static field: a new container per test method (slow).</li>
+    <li><code>@ServiceConnection</code> (Spring Boot 3.1+) tells Boot to create the connection details from the container (JDBC URL, user, password) and use them instead of <code>spring.datasource.*</code>. No manual property mapping.</li>
+  </ul>
+
+  <h4>Way 2: @DynamicPropertySource (before 3.1, or when @ServiceConnection does not fit)</h4>
+  <pre data-title="Manual wiring"><code class="language-java">@DynamicPropertySource
+static void dbProperties(DynamicPropertyRegistry registry) {
+    registry.add("spring.datasource.url", postgres::getJdbcUrl);
+    registry.add("spring.datasource.username", postgres::getUsername);
+    registry.add("spring.datasource.password", postgres::getPassword);
+}</code></pre>
+  <p>The values are suppliers because the container's mapped port is known only after it starts. This also works for containers that <code>@ServiceConnection</code> does not support.</p>
+
+  <h4>A reusable setup for the whole suite</h4>
+  <p>Starting one PostgreSQL per test class wastes time (about 2 to 5 seconds each) and gives each class its own Spring context. Share one container. The cleanest way in modern Boot is a test configuration that defines the container as a bean:</p>
+  <pre data-title="TestcontainersConfig.java"><code class="language-java">@TestConfiguration(proxyBeanMethods = false)
+public class TestcontainersConfig {
+
+    @Bean
+    @ServiceConnection
+    PostgreSQLContainer&lt;?&gt; postgres() {
+        return new PostgreSQLContainer&lt;&gt;(DockerImageName.parse("postgres:16-alpine"));
+    }
+}</code></pre>
+  <pre data-title="AbstractIntegrationTest.java: one base class for all integration tests"><code class="language-java">@SpringBootTest
+@AutoConfigureMockMvc
+@ActiveProfiles("test")
+@Import(TestcontainersConfig.class)
+public abstract class AbstractIntegrationTest {
+
+    @Autowired protected MockMvc mvc;
+}
+
+class JobFlowIT extends AbstractIntegrationTest { ... }
+class ApplicationFlowIT extends AbstractIntegrationTest { ... }</code></pre>
+  <p>All subclasses have identical annotations, so Spring caches <strong>one context</strong>, which holds <strong>one container</strong> for the entire test run. Flyway runs its migrations once on startup. Isolate tests by unique data or cleanup.</p>
+  <p>The older, widely seen alternative is the <strong>singleton container</strong> pattern, which does not need the Spring bean approach:</p>
+  <pre data-title="Singleton container with @DynamicPropertySource"><code class="language-java">public abstract class AbstractPgTest {
+
+    static final PostgreSQLContainer&lt;?&gt; POSTGRES =
+            new PostgreSQLContainer&lt;&gt;("postgres:16-alpine");
+
+    static { POSTGRES.start(); }                 // started once per JVM, no @Container
+
+    @DynamicPropertySource
+    static void props(DynamicPropertyRegistry r) {
+        r.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        r.add("spring.datasource.username", POSTGRES::getUsername);
+        r.add("spring.datasource.password", POSTGRES::getPassword);
+    }
+}</code></pre>
+  <p>Testcontainers starts a helper container (called Ryuk) that removes your containers when the JVM exits, even if the test run crashes, so you do not stop the singleton yourself.</p>
+
+  <h4>Container reuse, other containers, dev time</h4>
+  <ul>
+    <li><strong>Reuse between runs</strong> (local development only): call <code>.withReuse(true)</code> on the container and set <code>testcontainers.reuse.enable=true</code> in <code>~/.testcontainers.properties</code>. The container then stays running after the tests and the next <code>mvn test</code> starts in a second. Data persists, so such tests must clean up after themselves. Do not enable it in CI.</li>
+    <li><strong>Other services</strong>: the same pattern works for Redis (<code>new GenericContainer&lt;&gt;("redis:7").withExposedPorts(6379)</code> with <code>@ServiceConnection(name = "redis")</code>), Kafka (<code>KafkaContainer</code>), RabbitMQ, MongoDB, Elasticsearch, and a mock HTTP server. See <a href="#m7">module 7</a> for messaging.</li>
+    <li><strong>Dev-time Testcontainers</strong> (Boot 3.1+): a class in <code>src/test</code> with <code>SpringApplication.from(Application::main).with(TestcontainersConfig.class).run(args)</code> starts your real application with a containerised database, no local PostgreSQL install needed. Combined with <code>@RestartScope</code> it survives DevTools restarts. It reuses the same configuration class as your tests.</li>
+  </ul>
+
+  <h4>Speed tips</h4>
+  <ul>
+    <li>One container per suite (above); pin a small image (<code>postgres:16-alpine</code>) so CI caches it.</li>
+    <li>Use a tmpfs for the data directory only if tests are I/O heavy: <code>.withTmpFs(Map.of("/var/lib/postgresql/data", "rw"))</code>.</li>
+    <li>Keep the number of distinct Spring contexts low (<a href="#m5-springboottest">context caching</a>).</li>
+    <li>Use <code>@DataJpaTest</code> with <code>Replace.NONE</code> for query tests: it starts less than the full application but shares the same container class.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>IllegalStateException: Could not find a valid Docker environment</code>: Docker is not running or not reachable. Start Docker Desktop; check <code>docker ps</code>.</li>
+      <li><code>ContainerLaunchException: Container startup failed</code>: image could not be pulled (no network, proxy), or the database crashed on start. Read the container logs printed above the exception.</li>
+      <li><code>Connection refused</code> to <code>localhost:5432</code>: the test connects to a fixed port instead of the container's mapped port. Always read the port from the container (<code>getJdbcUrl()</code>).</li>
+      <li>Tests pass locally and fail in CI: CI has no Docker (for example Docker-in-Docker not enabled) or lacks permissions.</li>
+      <li>Flyway fails with "Found non-empty schema" or checksum errors when a reused container holds old data.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>A non-static <code>@Container</code> field: a fresh database for every test method.</li>
+      <li>Using the <code>latest</code> image tag: a surprise upgrade breaks CI. Pin the major version to match production.</li>
+      <li>Hard-coding <code>jdbc:postgresql://localhost:5432/...</code> in <code>application-test.yml</code>, which overrides the container wiring.</li>
+      <li>Forgetting that <code>@DataJpaTest</code> replaces the database unless <code>Replace.NONE</code> is set.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you test repositories against a real database?" Testcontainers with <code>@ServiceConnection</code>; Docker required; one shared container per suite; Flyway migrations run for real. "Why not H2?" Behaviour and SQL dialect differ. "What is <code>@ServiceConnection</code>?" Boot 3.1+ feature that derives connection details from the container, replacing <code>@DynamicPropertySource</code> boilerplate.</p>
+  </div>
+</article>
+
+<article class="topic" id="m5-coverage-maven">
+  <h3>Coverage with JaCoCo, Surefire vs Failsafe, and tests in CI</h3>
+  <p class="tldr">JaCoCo measures which lines and branches your tests execute; read the HTML report to find untested code, aim for sensible targets, never treat the percentage as proof of quality, and run unit tests with mvn test and integration tests (*IT) with mvn verify.</p>
+
+  <h4>What coverage tells you</h4>
+  <p><strong>Code coverage</strong> is the share of your code that ran while the tests ran. <strong>JaCoCo</strong> is the standard Java tool: it attaches an agent to the test JVM and records executed instructions.</p>
+  <dl class="terms">
+    <dt>Line coverage</dt><dd>Percentage of source lines executed at least once.</dd>
+    <dt>Branch coverage</dt><dd>Percentage of decision outcomes taken: for <code>if (a &amp;&amp; b)</code> both the true and false path of each condition. More honest than line coverage, because one line can hide several paths.</dd>
+    <dt>Other counters</dt><dd>Instruction, method, class and cyclomatic complexity.</dd>
+  </dl>
+  <pre data-title="One line, two branches"><code class="language-java">return job.isOpen() ? apply(job) : reject(job);   // a test with an open job gives 100% line,
+                                                  // but only 50% branch coverage</code></pre>
+
+  <h4>Setting up the JaCoCo Maven plugin</h4>
+  <pre data-title="pom.xml (build/plugins)"><code class="language-xml">&lt;plugin&gt;
+    &lt;groupId&gt;org.jacoco&lt;/groupId&gt;
+    &lt;artifactId&gt;jacoco-maven-plugin&lt;/artifactId&gt;
+    &lt;version&gt;0.8.12&lt;/version&gt;
+    &lt;executions&gt;
+        &lt;execution&gt;
+            &lt;id&gt;prepare-agent&lt;/id&gt;
+            &lt;goals&gt;&lt;goal&gt;prepare-agent&lt;/goal&gt;&lt;/goals&gt;
+        &lt;/execution&gt;
+        &lt;execution&gt;
+            &lt;id&gt;report&lt;/id&gt;
+            &lt;phase&gt;verify&lt;/phase&gt;
+            &lt;goals&gt;&lt;goal&gt;report&lt;/goal&gt;&lt;/goals&gt;
+        &lt;/execution&gt;
+    &lt;/executions&gt;
+&lt;/plugin&gt;</code></pre>
+  <p><code>prepare-agent</code> adds the JaCoCo agent to the JVM arguments of the test runs (Surefire and Failsafe). <code>report</code> turns the recorded data into HTML after the tests. Use the latest 0.8.x release that supports your JDK; an old JaCoCo fails on classes compiled by a newer Java ("Unsupported class file major version").</p>
+  <pre data-title="Generate and open the report"><code class="language-shell">$ mvn clean verify
+...
+[INFO] Loading execution data file target/jacoco.exec
+[INFO] Analyzed bundle 'jobs' with 48 classes
+$ start target/site/jacoco/index.html          # Windows (macOS: open, Linux: xdg-open)</code></pre>
+  <h4>Reading the report</h4>
+  <p>The first page lists packages with bars for instruction and branch coverage, plus missed/total counts. Click a package, then a class, then a method: the source view colours each line <strong>green</strong> (fully covered), <strong>yellow</strong> (some branches missed, with a diamond marker) and <strong>red</strong> (never executed). Start with red lines in service classes that hold business rules; ignore generated code, DTOs and the <code>main</code> method. The right questions are "which rules are untested?" and "which branches did I forget (404, 403, validation, empty list)?", not "how do I reach 100%?".</p>
+  <p>Exclude classes that add noise (configuration, generated mappers, entities with only getters) in the plugin <code>&lt;configuration&gt;&lt;excludes&gt;</code>. To fail the build under a threshold add a <code>check</code> goal:</p>
+  <pre data-title="Enforce a minimum"><code class="language-xml">&lt;execution&gt;
+    &lt;id&gt;check&lt;/id&gt;
+    &lt;phase&gt;verify&lt;/phase&gt;
+    &lt;goals&gt;&lt;goal&gt;check&lt;/goal&gt;&lt;/goals&gt;
+    &lt;configuration&gt;
+        &lt;rules&gt;
+            &lt;rule&gt;
+                &lt;element&gt;BUNDLE&lt;/element&gt;
+                &lt;limits&gt;
+                    &lt;limit&gt;
+                        &lt;counter&gt;LINE&lt;/counter&gt;
+                        &lt;value&gt;COVEREDRATIO&lt;/value&gt;
+                        &lt;minimum&gt;0.70&lt;/minimum&gt;
+                    &lt;/limit&gt;
+                &lt;/limits&gt;
+            &lt;/rule&gt;
+        &lt;/rules&gt;
+    &lt;/configuration&gt;
+&lt;/execution&gt;</code></pre>
+
+  <h4>Sensible targets, and why coverage is not quality</h4>
+  <ul>
+    <li>Many teams ask for roughly 70 to 80 percent line coverage on new code and watch the trend; 100 percent is rarely worth the cost. Services and domain logic deserve more than configuration or DTOs.</li>
+    <li>A test with no assertions gives coverage and no protection. <code>service.update(...)</code> called without checking anything is "covered".</li>
+    <li>Coverage tells you what is <em>definitely untested</em>; it cannot tell you what is well tested. Review assertions in pull requests, not just the percentage.</li>
+    <li>Mutation testing (PIT) goes further by changing your code and checking that tests fail; use it to learn, not necessarily in every build.</li>
+  </ul>
+
+  <h4>Surefire vs Failsafe</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Maven Surefire</th><th>Maven Failsafe</th></tr></thead>
+    <tbody>
+      <tr><td>Purpose</td><td>Unit and slice tests</td><td>Integration tests</td></tr>
+      <tr><td>Default name patterns</td><td><code>*Test</code>, <code>Test*</code>, <code>*Tests</code>, <code>*TestCase</code></td><td><code>*IT</code>, <code>IT*</code>, <code>*ITCase</code></td></tr>
+      <tr><td>Phase</td><td><code>test</code> (<code>mvn test</code>)</td><td><code>integration-test</code> and <code>verify</code> (<code>mvn verify</code>)</td></tr>
+      <tr><td>On test failure</td><td>Build stops immediately</td><td>Runs the <code>post-integration-test</code> phase first (cleanup), then fails in <code>verify</code></td></tr>
+      <tr><td>Setup</td><td>Included by default</td><td>Add the plugin (Spring Boot's parent configures its version)</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="pom.xml: enable Failsafe"><code class="language-xml">&lt;plugin&gt;
+    &lt;groupId&gt;org.apache.maven.plugins&lt;/groupId&gt;
+    &lt;artifactId&gt;maven-failsafe-plugin&lt;/artifactId&gt;
+    &lt;executions&gt;
+        &lt;execution&gt;
+            &lt;goals&gt;
+                &lt;goal&gt;integration-test&lt;/goal&gt;
+                &lt;goal&gt;verify&lt;/goal&gt;
+            &lt;/goals&gt;
+        &lt;/execution&gt;
+    &lt;/executions&gt;
+&lt;/plugin&gt;</code></pre>
+  <pre data-title="Common Maven commands"><code class="language-shell">$ mvn test                              # unit + slice tests (Surefire), fast
+$ mvn verify                            # all tests, including *IT, plus JaCoCo report
+$ mvn test -Dtest=JobServiceTest        # one class
+$ mvn test -Dtest=JobServiceTest#update_byOwner_changesFields   # one method
+$ mvn verify -DskipITs                  # skip Failsafe tests
+$ mvn test -Dgroups=fast                # JUnit @Tag("fast") only</code></pre>
+  <p>A common layout: name pure unit and slice tests <code>*Test</code> and Docker-based ones <code>*IT</code>. Developers run <code>mvn test</code> constantly (no Docker needed, seconds); CI runs <code>mvn verify</code> (everything). If your whole project uses only Surefire and you name Testcontainers tests <code>*Test</code>, that also works; the split is about speed and feedback. To meet the goal "Project 2 passes all its tests with <code>mvn test</code>", either keep all tests under Surefire naming, or decide that the full check is <code>mvn verify</code> and say so in the README.</p>
+
+  <h4>Running tests in CI</h4>
+  <pre data-title=".github/workflows/ci.yml (fragment)"><code class="language-yaml">name: ci
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest          # Docker is preinstalled, Testcontainers works
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+      - run: mvn -B verify          # unit, slice, integration tests + coverage
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports
+          path: |
+            target/site/jacoco
+            target/surefire-reports</code></pre>
+  <p>Make the pipeline required on pull requests so that red tests block the merge. Details of GitHub Actions are in <a href="07-devops.html#m4">DevOps · Module 4</a>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Chasing a percentage with tests that have no assertions.</li>
+      <li>Naming an integration test <code>MyFlowTest</code> and wondering why it runs on every <code>mvn test</code> (or naming it <code>MyFlowIT</code> and wondering why <code>mvn test</code> skips it).</li>
+      <li>Checking JaCoCo only on unit tests and concluding that controllers are "untested" when integration tests cover them: aggregate both runs (<code>verify</code>).</li>
+      <li>A JaCoCo version too old for your Java version.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What coverage is enough?" There is no number; useful targets are around 70 to 80 percent on business code, with branch coverage and good assertions. "Line vs branch coverage?" One line can have several branches. "Surefire vs Failsafe?" Unit vs integration, <code>test</code> vs <code>verify</code> phases, <code>*Test</code> vs <code>*IT</code> names.</p>
+  </div>
+</article>
+
+<article class="topic" id="m5-good-tests">
+  <h3>Good tests: FIRST, test data builders and avoiding flaky tests</h3>
+  <p class="tldr">A good test is fast, independent, repeatable, self-validating and written at the right time; it checks behaviour not implementation, builds its data with readable helpers, and never depends on time, order or luck.</p>
+
+  <h4>The FIRST principles</h4>
+  <dl class="terms">
+    <dt><strong>F</strong>ast</dt><dd>Unit tests run in milliseconds, the whole unit suite in seconds. Slow tests are not run, so they do not protect you.</dd>
+    <dt><strong>I</strong>ndependent</dt><dd>No test depends on another or on their order. Each creates its own data and cleans up. You can run one test alone or all in parallel.</dd>
+    <dt><strong>R</strong>epeatable</dt><dd>Same result in every environment and on every run: no dependence on the clock, random numbers, network, the machine's time zone or leftover files.</dd>
+    <dt><strong>S</strong>elf-validating</dt><dd>The test says pass or fail by itself, through assertions. No reading console output to decide.</dd>
+    <dt><strong>T</strong>imely</dt><dd>Written together with the code (or before it, TDD), when you still remember the rules. Not "after the release".</dd>
+  </dl>
+
+  <h4>Test behaviour, not implementation</h4>
+  <p>A test should fail when <em>behaviour</em> breaks and keep passing when you refactor. Tests that mirror the code line by line (verify that private helper A called B twice) break on every refactoring and teach nothing. Ask: "what would a caller notice?" Test the public result, the stored state, the response, and the side effects that matter.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: tests how, not what</p><pre><code class="language-java">verify(jobRepository).findById(7L);
+verify(jobRepository).save(job);
+verify(mapper).toResponse(job);
+verifyNoMoreInteractions(jobRepository, mapper);</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: tests the outcome</p><pre><code class="language-java">JobResponse r = service.close(7L, owner);
+assertThat(r.open()).isFalse();
+assertThat(job.getClosedAt()).isNotNull();</code></pre></div>
+  </div>
+
+  <h4>Test data builders</h4>
+  <p>Creating a <code>Job</code> needs a user, a title and more fields; repeating a ten-line set-up in every test hides what matters. A <strong>test data builder</strong> creates a valid object with defaults and lets the test override only what it cares about.</p>
+  <pre data-title="src/test/java/.../TestData.java"><code class="language-java">public final class TestData {
+
+    private TestData() {}
+
+    public static User user(Long id, String email, Role role) {
+        User u = new User("Test " + email, email, "{bcrypt}hash", role);
+        ReflectionTestUtils.setField(u, "id", id);
+        return u;
+    }
+
+    public static User newUser(String email, Role role) {      // no id: for persist
+        return new User("Test " + email, email, "{bcrypt}hash", role);
+    }
+
+    public static Job job(Long id, String title, User owner) {
+        Job j = new Job(title, "Description of " + title, owner);
+        ReflectionTestUtils.setField(j, "id", id);
+        return j;
+    }
+
+    public static Job newJob(String title, User owner) {
+        return new Job(title, "Description of " + title, owner);
+    }
+}
+
+// A builder with fluent overrides, when objects have many fields:
+public class JobBuilder {
+    private String title = "Java Developer";
+    private boolean open = true;
+    private User owner = TestData.newUser("owner@example.com", Role.RECRUITER);
+
+    public static JobBuilder aJob() { return new JobBuilder(); }
+    public JobBuilder withTitle(String t) { this.title = t; return this; }
+    public JobBuilder closed() { this.open = false; return this; }
+    public Job build() {
+        Job j = new Job(title, "Some description", owner);
+        if (!open) j.close();
+        return j;
+    }
+}
+// usage: Job closed = aJob().withTitle("QA").closed().build();</code></pre>
+  <p>Test data should be minimal and meaningful: names like <code>asha@example.com</code> help readers; magic numbers do not. Avoid giant shared fixtures loaded for all tests (changing one row breaks twenty tests).</p>
+
+  <h4>Flaky tests</h4>
+  <p>A <strong>flaky test</strong> sometimes passes and sometimes fails with no code change. It destroys trust: people re-run the pipeline "until green" and real failures get ignored. Typical causes and fixes:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Cause</th><th>Example</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>Time and dates</td><td><code>LocalDate.now()</code>; a test fails at midnight or on month end</td><td>Inject <code>Clock</code>; use a fixed instant</td></tr>
+      <tr><td>Randomness</td><td>Random emails that sometimes collide</td><td>Seeded random or UUIDs; assert on properties, not values</td></tr>
+      <tr><td>Test order and shared state</td><td>One test leaves a row that another counts</td><td>Own data per test, cleanup, rollback</td></tr>
+      <tr><td>Unordered results</td><td>Asserting list order from a query with no <code>ORDER BY</code></td><td>Add ordering or <code>containsExactlyInAnyOrder</code></td></tr>
+      <tr><td>Async and threads</td><td><code>Thread.sleep(500)</code> then assert</td><td>Awaitility: <code>await().atMost(5, SECONDS).untilAsserted(...)</code></td></tr>
+      <tr><td>External systems</td><td>Calling a real payment or mail API</td><td>Mock, WireMock/MockWebServer, or a container</td></tr>
+      <tr><td>Environment</td><td>Fixed ports, time zone, locale, file paths, Windows vs Linux newline</td><td>Random ports, explicit time zone and locale, <code>Path</code> APIs</td></tr>
+      <tr><td>Resources</td><td>Docker not ready, CI under load, timeouts too tight</td><td>Wait strategies, generous timeouts, retry only the infrastructure step</td></tr>
+    </tbody>
+  </table></div>
+  <p>Never "fix" a flaky test by adding a retry or <code>@Disabled</code> without finding the cause. Reproduce it by running the test in a loop, read the failure, fix the cause.</p>
+
+  <h4>Habits of strong teams</h4>
+  <ul>
+    <li>Test the unhappy paths: not found, validation failure, duplicate, forbidden, empty list, boundary values (0, 1, max).</li>
+    <li>When you fix a bug, first write a test that fails because of it (regression test).</li>
+    <li>Keep tests readable: a new teammate should understand a test without opening the production code. Prefer clear duplication over clever shared helpers that hide the scenario.</li>
+    <li>Treat test code like production code: review it, refactor it, delete obsolete tests.</li>
+    <li>Do not assert on log output or private methods. Do not test third-party libraries.</li>
+  </ul>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>A typical Spring Boot pull request contains: unit tests for new service logic, a <code>@WebMvcTest</code> for a new endpoint (success plus 400/401/403/404), a repository test for any new query, and the existing integration flows still green. Reviewers reject changes that lower coverage on business code or that add <code>Thread.sleep</code>.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What makes a good unit test?" FIRST, one behaviour, Arrange-Act-Assert, descriptive name, no logic, no real I/O. "What is a flaky test and how do you handle it?" Name causes (time, order, async, shared state) and fixes (Clock, isolation, Awaitility), and say you never ignore it. "TDD in one minute?" Red (failing test), green (smallest code), refactor.</p>
+  </div>
+</article>
+
+<article class="topic recap" id="m5-interview">
+  <h3>Interview questions — Testing</h3>
+  <details class="qa">
+    <summary>Explain the testing pyramid and what you test at each level in a Spring Boot app.</summary>
+    <div class="qa-a">
+      <p>Many fast unit tests at the base (services with Mockito), fewer slice tests (<code>@WebMvcTest</code> for controllers, <code>@DataJpaTest</code> for repositories), a few <code>@SpringBootTest</code> integration flows with a real database, and very few end-to-end tests. Each check goes to the lowest level that can prove it, because upper levels are slower and fail for more reasons.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>What is the difference between @Mock, @InjectMocks, @MockBean/@MockitoBean and @Spy?</summary>
+    <div class="qa-a">
+      <p><code>@Mock</code> creates a Mockito fake (plain unit tests with <code>MockitoExtension</code>). <code>@InjectMocks</code> creates the real object under test and injects those fakes. <code>@MockitoBean</code> (earlier <code>@MockBean</code>) puts a Mockito mock into the Spring context, replacing the bean, for slice and integration tests. <code>@Spy</code> wraps a real object so that only the stubbed methods are faked.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>What is UnnecessaryStubbingException?</summary>
+    <div class="qa-a">
+      <p>With <code>MockitoExtension</code> stubs are strict: a <code>when(...)</code> that the test never triggers fails the test. It points to dead set-up or a wrong assumption about what the code calls. Remove the stub, or use <code>lenient()</code> for shared set-up in <code>@BeforeEach</code>.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Why can't you write when(mock.voidMethod()) and what do you use instead?</summary>
+    <div class="qa-a">
+      <p>A void method has no value to pass to <code>when</code>, so it does not compile. Use the action-first forms <code>doThrow(...).when(mock).voidMethod()</code> or <code>doNothing()</code>. The same style, <code>doReturn(x).when(spy).method()</code>, is needed with spies so the real method is not called while stubbing.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>What is the rule for argument matchers?</summary>
+    <div class="qa-a">
+      <p>If any argument of a call uses a matcher (<code>any()</code>, <code>anyString()</code>), all arguments must use matchers; wrap literals in <code>eq()</code>. Mixing them throws <code>InvalidUseOfMatchersException</code>.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>When do you use verify, and when does it hurt?</summary>
+    <div class="qa-a">
+      <p>Use <code>verify</code> for side effects that are the point of the behaviour: an e-mail was sent, a save happened, nothing was deleted. Over-verifying every interaction (or <code>verifyNoMoreInteractions</code> everywhere) couples tests to the implementation, so refactoring breaks them. When a result is returned, assert the result instead.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>What does @WebMvcTest load, and how do you test a secured endpoint?</summary>
+    <div class="qa-a">
+      <p>Only the web layer: controllers, advice, filters, converters and security auto-configuration; services need <code>@MockitoBean</code>. Import your <code>SecurityConfig</code>. With <code>spring-security-test</code> use <code>@WithMockUser(roles = ...)</code> or <code>.with(jwt().authorities(...))</code>, add <code>csrf()</code> when CSRF is enabled, and test both 401 (no auth) and 403 (wrong role).</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>How do you test validation errors and error responses for a POST endpoint?</summary>
+    <div class="qa-a">
+      <p>Post invalid JSON with <code>MockMvc</code> (content type JSON), expect <code>status().isBadRequest()</code>, assert the ProblemDetail fields with <code>jsonPath</code>, and <code>verifyNoInteractions(service)</code> to show the service was never reached. Likewise, make the mocked service throw <code>ResourceNotFoundException</code> and expect 404.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>What does @DataJpaTest do and why not use H2 for it?</summary>
+    <div class="qa-a">
+      <p>It starts only JPA: entities, repositories, <code>TestEntityManager</code>, a transaction rolled back after each test. By default it swaps your database for an embedded one. H2 differs from PostgreSQL in SQL dialect, functions, case rules, locking and migrations, so tests can pass while production fails. Use Testcontainers with <code>@AutoConfigureTestDatabase(replace = NONE)</code>. Call <code>flush()</code> and <code>clear()</code> so SQL really runs.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>@SpringBootTest MOCK vs RANDOM_PORT?</summary>
+    <div class="qa-a">
+      <p>MOCK (default) loads the full context with a mock servlet environment and no port; you call it with <code>MockMvc</code>, in the same thread, so <code>@Transactional</code> rollback works. RANDOM_PORT starts a real embedded server on a free port, injected with <code>@LocalServerPort</code>, and you use an HTTP client; the server handles requests on its own threads and transactions.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Why is my Spring test suite slow, and what is context caching?</summary>
+    <div class="qa-a">
+      <p>Spring caches each distinct application context and reuses it across test classes. Different <code>@MockitoBean</code> sets, properties, profiles or <code>@DirtiesContext</code> create new contexts (seconds each), and starting a Testcontainers database per class adds more. Fix with one shared base class, a shared container, fewer integration tests and no <code>@DirtiesContext</code>.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>How does Testcontainers work with Spring Boot, and what does @ServiceConnection do?</summary>
+    <div class="qa-a">
+      <p>Testcontainers starts a real PostgreSQL in Docker for the tests. A static <code>@Container</code> field (or a container bean in a <code>@TestConfiguration</code>) annotated with <code>@ServiceConnection</code> (Boot 3.1+) makes Boot derive the datasource URL, user and password from the container; before that you used <code>@DynamicPropertySource</code>. Docker must be running, and a shared container keeps the suite fast.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Line coverage vs branch coverage, and is 100% coverage the goal?</summary>
+    <div class="qa-a">
+      <p>Line coverage counts executed lines; branch coverage counts the outcomes of decisions (both sides of an <code>if</code>), so it is stricter. 100 percent is not the goal: coverage shows what is untested, not whether tests assert anything. Use it to find missing scenarios, set a modest threshold on business code, and review assertion quality.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>What is a flaky test and how do you fix one?</summary>
+    <div class="qa-a">
+      <p>One that passes and fails without code changes. Causes: time (<code>now()</code>), randomness, test order or shared data, unordered results, <code>Thread.sleep</code> with async code, external services, environment differences. Fix the cause: inject a <code>Clock</code>, isolate data, <code>containsExactlyInAnyOrder</code> or <code>ORDER BY</code>, Awaitility, mocks or containers. Do not just retry or disable it.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m5-cheatsheet">
+  <h3>Cheat sheet — Testing</h3>
+  <ul class="cheat">
+    <li><b>Pyramid</b> unit (many, ms) then slice then integration then end-to-end (few).</li>
+    <li><b>AAA</b> Arrange, Act, Assert (= Given, When, Then); one behaviour per test.</li>
+    <li><b>Naming</b> <code>method_condition_expected</code> or <code>shouldXWhenY</code>; test tree mirrors main.</li>
+    <li><b>Starter</b> <code>spring-boot-starter-test</code>: JUnit 5, Mockito, AssertJ, Spring Test, JsonPath; add <code>spring-security-test</code>.</li>
+    <li><b>JUnit</b> <code>@Test</code>, <code>@BeforeEach</code>, <code>@AfterEach</code>, static <code>@BeforeAll</code>, <code>@Nested</code>, <code>@DisplayName</code>, <code>@Disabled</code>, <code>@Tag</code>.</li>
+    <li><b>Parameterized</b> <code>@ParameterizedTest</code> with <code>@ValueSource</code>, <code>@CsvSource</code>, <code>@MethodSource</code>, <code>@EnumSource</code>.</li>
+    <li><b>Mockito setup</b> <code>@ExtendWith(MockitoExtension.class)</code>, <code>@Mock</code>, <code>@InjectMocks</code>, <code>@Spy</code>, <code>@Captor</code>.</li>
+    <li><b>Stubbing</b> <code>when(x).thenReturn/thenThrow/thenAnswer</code>; void or spy: <code>doThrow/doNothing/doReturn(...).when(m)</code>.</li>
+    <li><b>Matchers</b> <code>any()</code>, <code>eq()</code>; all-or-none rule.</li>
+    <li><b>Verify</b> <code>verify(m)</code>, <code>times(n)</code>, <code>never()</code>, <code>verifyNoInteractions</code>; use sparingly.</li>
+    <li><b>Strict stubs</b> unused stub gives <code>UnnecessaryStubbingException</code>; <code>lenient()</code> as exception.</li>
+    <li><b>Do not mock</b> the SUT, value objects, collections; prefer a <code>Clock</code> to static mocks.</li>
+    <li><b>AssertJ</b> <code>assertThat</code>, <code>extracting</code>, <code>containsExactly</code>, <code>hasSize</code>, <code>assertThatThrownBy</code>, <code>SoftAssertions</code>.</li>
+    <li><b>@WebMvcTest</b> controller + advice + security only; <code>MockMvc</code>, <code>@MockitoBean</code> for services, <code>@Import</code> your config.</li>
+    <li><b>MockMvc</b> <code>perform(post(...).contentType(JSON).content(...))</code>, <code>status()</code>, <code>jsonPath()</code>, <code>andDo(print())</code>.</li>
+    <li><b>Security tests</b> <code>@WithMockUser</code>, <code>jwt()</code>, <code>csrf()</code>; always test 401 and 403.</li>
+    <li><b>@MockitoBean</b> replaces <code>@MockBean</code> (Boot 3.4+, only one in Boot 4).</li>
+    <li><b>@DataJpaTest</b> JPA slice, rollback per test, <code>TestEntityManager</code>, <code>flush()</code> + <code>clear()</code>, <code>Replace.NONE</code> for real DB.</li>
+    <li><b>@SpringBootTest</b> full context; <code>MOCK</code> + MockMvc or <code>RANDOM_PORT</code> + client; few of them.</li>
+    <li><b>Test config</b> <code>@ActiveProfiles("test")</code>, <code>application-test.yml</code>, <code>@TestConfiguration</code>, <code>@Sql</code>, avoid <code>@DirtiesContext</code>.</li>
+    <li><b>Context cache</b> same config gives same context; vary mocks or properties and you pay a new startup.</li>
+    <li><b>Testcontainers</b> Docker running; static <code>@Container</code> + <code>@ServiceConnection</code>; shared container via config/base class.</li>
+    <li><b>Surefire / Failsafe</b> <code>*Test</code> with <code>mvn test</code>; <code>*IT</code> with <code>mvn verify</code>.</li>
+    <li><b>JaCoCo</b> <code>prepare-agent</code> + <code>report</code>; HTML in <code>target/site/jacoco</code>; branch coverage is stricter; coverage is not quality.</li>
+    <li><b>FIRST</b> Fast, Independent, Repeatable, Self-validating, Timely; fix flaky tests at the cause.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m5-practice">
+  <h3>Practice — Testing</h3>
+  <ol class="steps">
+    <li><strong>Warm-up unit tests.</strong> Write <code>SalaryRangeTest</code> or a similar pure-Java test with JUnit 5 and AssertJ: a normal case, a boundary, and a <code>@ParameterizedTest</code> with <code>@CsvSource</code> for invalid input. Done when <code>mvn test -Dtest=SalaryRangeTest</code> is green and each test name states the expected result.</li>
+    <li><strong>Unit-test the services of Project 2.</strong> Write <code>JobServiceTest</code> and <code>ApplicationServiceTest</code> with Mockito: create, update by owner, update by another recruiter (forbidden), admin override, not found, duplicate application, apply to a closed job. Use <code>ArgumentCaptor</code> once and <code>verify(..., never())</code> once. Done when every branch of the services' public methods is covered and no test starts Spring.</li>
+    <li><strong>Break it on purpose.</strong> Add an unused stub and a mixed-matcher call, read the two Mockito exceptions, and fix them. Done when you can explain both messages.</li>
+    <li><strong>MockMvc tests for controllers.</strong> For <code>JobController</code> and <code>AuthController</code> write <code>@WebMvcTest</code> tests: 200 and 201 responses, 400 for invalid JSON, 404 via a mocked <code>ResourceNotFoundException</code>, 401 without token, 403 for a CANDIDATE posting a job. Done when each endpoint has a success test and at least two failure tests, and <code>$.password</code> never appears in any response.</li>
+    <li><strong>Repository tests.</strong> Write a <code>@DataJpaTest</code> for every custom query (for example jobs by recruiter, search by title ignoring case, applications by job). Use <code>flush()</code> and <code>clear()</code>. Done when a deliberately broken query (wrong field) makes a test fail.</li>
+    <li><strong>One Testcontainers integration test.</strong> Add <code>TestcontainersConfig</code> and <code>AbstractIntegrationTest</code> with PostgreSQL and your Flyway migrations. Write <code>JobFlowIT</code>: register a recruiter and a candidate, log in, post a job, apply, and check that the candidate cannot edit the job and the other recruiter gets 403. Done when it passes with Docker Desktop running and your Flyway migrations are applied on startup.</li>
+    <li><strong>Switch repository tests to PostgreSQL.</strong> Run the <code>@DataJpaTest</code> tests with <code>Replace.NONE</code> and the shared container. Add a native query using a PostgreSQL feature (such as <code>ilike</code>) and show it would fail on H2. Done when all repository tests run against the container.</li>
+    <li><strong>Measure coverage.</strong> Add JaCoCo and run <code>mvn clean verify</code>. Open <code>target/site/jacoco/index.html</code>, find the three least-covered service methods, and add tests for the missed branches. Done when business packages are above 70 percent line coverage, with a short note on one thing the percentage cannot tell you.</li>
+    <li><strong>Make the suite green and fast.</strong> Check the log for how many Spring contexts start; reduce them with a common base class. Split names into <code>*Test</code> and <code>*IT</code>, enable Failsafe, and run both <code>mvn test</code> and <code>mvn verify</code>. Done when Project 2 passes all its tests with <code>mvn test</code> (and <code>mvn verify</code> if you keep ITs separate) with no <code>@Disabled</code> and no sleeps.</li>
+    <li><strong>CI.</strong> Add the GitHub Actions workflow from this module and push a deliberately failing test to a branch. Done when the pull request shows a red check and turns green after the fix (<a href="07-devops.html#m4">DevOps · Module 4</a>).</li>
+  </ol>
+</article>

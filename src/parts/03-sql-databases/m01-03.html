@@ -1,0 +1,539 @@
+<article class="topic" id="m1-order-limit">
+  <h3>ORDER BY, LIMIT, OFFSET and pagination</h3>
+  <p class="tldr"><code>ORDER BY</code> is the only way to get rows in a guaranteed order. <code>LIMIT</code> and
+  <code>OFFSET</code> (or the standard <code>FETCH FIRST</code>) cut the result down to one page, and a page is
+  only stable when the sort includes a unique tie-breaker column.</p>
+
+  <h4>Sorting with ORDER BY</h4>
+  <p>A table is a set of rows with no order. If you do not write <code>ORDER BY</code>, the database returns
+  rows in whatever order is cheapest at that moment, and that order can change after an update, a new index or
+  a different query plan. <code>ORDER BY</code> goes at the end of the query (before <code>LIMIT</code>) and
+  sorts ascending (<code>ASC</code>, the default) or descending (<code>DESC</code>). With several columns, the
+  database sorts by the first one and uses the next only to break ties. Each column has its own direction:</p>
+  <pre data-title="Department first, highest salary first inside each department"><code class="language-sql">SELECT dept_id, first_name, salary
+FROM employees
+ORDER BY dept_id, salary DESC;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id | first_name |  salary
+---------+------------+-----------
+       1 | Vikram     | 220000.00
+       1 | Priya      | 150000.00
+       1 | Rahul      | 150000.00
+       1 | Arjun      | 110000.00
+       1 | Divya      |  90000.00
+       2 | Karan      | 160000.00
+       2 | Ananya     | 150000.00
+       2 | Neha       |  75000.00
+       3 | Sunita     | 120000.00
+       3 | Farhan     |  65000.00
+       3 | Isha       |  55000.00
+  (null) | Meera      | 300000.00
+(12 rows)</code></pre>
+  <p>You can sort by a column that is not in the select list, by an expression (<code>ORDER BY salary * 12</code>),
+  or by an alias from the select list (<code>ORDER BY annual_salary</code>). Text sorts by the database's
+  <strong>collation</strong>, which decides whether <code>'apple'</code> comes before <code>'Banana'</code>; to
+  ignore case, sort by <code>LOWER(name)</code>. To sort in a custom order (for example
+  <code>PLACED</code>, <code>SHIPPED</code>, <code>DELIVERED</code>) use a <code>CASE</code> expression, see
+  <a href="#m2-case-when">CASE expressions</a>.</p>
+
+  <h4>Where do NULLs go?</h4>
+  <p>PostgreSQL treats NULL as larger than every value. So <code>ASC</code> puts NULLs last and
+  <code>DESC</code> puts them first (the output above shows the CEO's NULL department at the end). You can say
+  what you want with <code>NULLS FIRST</code> or <code>NULLS LAST</code>:</p>
+  <pre data-title="Customers with and without a phone"><code class="language-sql">SELECT name, phone FROM customers ORDER BY phone;               -- NULLs last
+SELECT name, phone FROM customers ORDER BY phone NULLS FIRST;</code></pre>
+  <pre class="out" data-title="First query, then second query (ties by customer_id)"><code class="language-plaintext">     name     |   phone
+--------------+------------
+ Aarav Shah   | 9876500001
+ Kabir Singh  | 9876500003
+ Ishita Joshi | 9876500004
+ Sara Khan    | 9876500006
+ Diya Kapoor  | (null)
+ Rohan Das    | (null)
+ Tanvi Desai  | (null)
+(7 rows)
+
+     name     |   phone
+--------------+------------
+ Diya Kapoor  | (null)
+ Rohan Das    | (null)
+ Tanvi Desai  | (null)
+ Aarav Shah   | 9876500001
+ Kabir Singh  | 9876500003
+ Ishita Joshi | 9876500004
+ Sara Khan    | 9876500006
+(7 rows)</code></pre>
+  <p>MySQL does the opposite: it treats NULL as the smallest value, so <code>ASC</code> puts NULLs first, and it
+  has no <code>NULLS FIRST/LAST</code> syntax. The usual workaround sorts on <code>phone IS NULL</code> first
+  (which is 0 for real values and 1 for NULL): <code>ORDER BY phone IS NULL, phone</code> puts NULLs last.</p>
+
+  <h4>LIMIT, OFFSET and FETCH FIRST</h4>
+  <p><code>LIMIT n</code> returns at most <code>n</code> rows. Together with <code>ORDER BY</code> it answers
+  "top N" questions. <code>OFFSET m</code> skips the first <code>m</code> rows.</p>
+  <pre data-title="The three highest salaries"><code class="language-sql">SELECT first_name, salary
+FROM employees
+ORDER BY salary DESC
+LIMIT 3;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name |  salary
+------------+-----------
+ Meera      | 300000.00
+ Vikram     | 220000.00
+ Karan      | 160000.00
+(3 rows)</code></pre>
+  <p>The SQL standard spells the same thing <code>FETCH FIRST n ROWS ONLY</code>. PostgreSQL supports both, MySQL
+  only <code>LIMIT</code>. The standard form can also keep ties (PostgreSQL 13 and later). Three employees share
+  the salary 150000, so asking for the top 5 with ties returns 6 rows:</p>
+  <pre data-title="FETCH FIRST ... WITH TIES"><code class="language-sql">SELECT first_name, salary
+FROM employees
+ORDER BY salary DESC
+FETCH FIRST 5 ROWS WITH TIES;</code></pre>
+  <pre class="out" data-title="Output (rows with equal salary may appear in any order)"><code class="language-plaintext"> first_name |  salary
+------------+-----------
+ Meera      | 300000.00
+ Vikram     | 220000.00
+ Karan      | 160000.00
+ Ananya     | 150000.00
+ Priya      | 150000.00
+ Rahul      | 150000.00
+(6 rows)</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Need</th><th>PostgreSQL</th><th>MySQL</th><th>Other databases</th></tr></thead>
+    <tbody>
+      <tr><td>First 10 rows</td><td><code>LIMIT 10</code> or <code>FETCH FIRST 10 ROWS ONLY</code></td>
+      <td><code>LIMIT 10</code></td><td>SQL Server <code>TOP 10</code>; Oracle 12c+ <code>FETCH FIRST</code></td></tr>
+      <tr><td>Skip 20, take 10</td><td><code>LIMIT 10 OFFSET 20</code></td>
+      <td><code>LIMIT 10 OFFSET 20</code> or <code>LIMIT 20, 10</code></td>
+      <td>SQL Server <code>OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY</code></td></tr>
+      <tr><td>Include ties</td><td><code>FETCH FIRST n ROWS WITH TIES</code> (13+)</td><td>not available</td>
+      <td>Oracle and SQL Server have it</td></tr>
+    </tbody>
+  </table></div>
+  <p>Careful with the MySQL short form: <code>LIMIT 20, 10</code> means offset 20, count 10 (the offset comes
+  first). Prefer <code>LIMIT 10 OFFSET 20</code>, which reads the same in both databases.</p>
+
+  <h4>Pagination</h4>
+  <p>A web page that shows 4 employees at a time asks for page 1, 2, 3 and so on. The formula is
+  <code>OFFSET = (page - 1) * page_size</code>. Spring Data's <code>PageRequest.of(page, size)</code> counts
+  pages from 0, so for it the offset is <code>page * size</code>. Page 2 of size 4:</p>
+  <pre data-title="Page 2, four rows per page"><code class="language-sql">SELECT emp_id, first_name
+FROM employees
+ORDER BY emp_id
+LIMIT 4 OFFSET 4;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> emp_id | first_name
+--------+------------
+      5 | Priya
+      6 | Rahul
+      7 | Arjun
+      8 | Divya
+(4 rows)</code></pre>
+  <p>The page controls usually also need the total number of rows, which takes a second query,
+  <code>SELECT COUNT(*) FROM employees</code>. Spring Data's <code>Page</code> type runs both for you.</p>
+  <p>Paging only works when the sort is <strong>deterministic</strong>. If you sort by <code>salary</code>,
+  three employees tie at 150000, and the database may return those three in a different order for page 1 than
+  for page 2. A row can then appear on both pages, or on neither. The fix is a tie-breaker: add a unique
+  column last, as in <code>ORDER BY salary DESC, emp_id</code>.</p>
+
+  <h4>Why large OFFSETs are slow, and keyset pagination</h4>
+  <p><code>OFFSET 100000</code> does not jump to row 100,001. The database reads and throws away the first
+  100,000 rows, so later pages get slower and slower. <strong>Keyset pagination</strong> (also called the seek
+  method) remembers the last key of the previous page and asks for the rows after it. An index on the key
+  makes every page equally fast:</p>
+  <pre data-title="Keyset pagination: the page after emp_id 8"><code class="language-sql">SELECT emp_id, first_name
+FROM employees
+WHERE emp_id > 8          -- last emp_id seen on the previous page
+ORDER BY emp_id
+LIMIT 4;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> emp_id | first_name
+--------+------------
+      9 | Karan
+     10 | Neha
+     11 | Farhan
+     12 | Isha
+(4 rows)</code></pre>
+  <p>The trade-off: you can go to the next or previous page, but not jump to "page 57", and the sort key must
+  be unique (or you must compare two columns together). Infinite-scroll feeds and APIs with large tables use
+  it; admin screens with page numbers usually use <code>OFFSET</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: LIMIT and OFFSET need ORDER BY</p>
+    <p>Without <code>ORDER BY</code>, "the first 3 rows" means any 3 rows. Always sort first, and make the sort
+    unique when you page through results.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: LIMIT without ORDER BY</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: "top 3 salaries" returns any 3 rows</p><pre><code class="language-sql">SELECT first_name, salary FROM employees LIMIT 3;</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: sort, then cut</p><pre><code class="language-sql">SELECT first_name, salary
+FROM employees
+ORDER BY salary DESC, emp_id
+LIMIT 3;</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and errors</p>
+    <ul>
+      <li><code>LIMIT 0</code> returns no rows but still returns the column names, which is handy for checking a
+      query's shape. An <code>OFFSET</code> larger than the row count returns an empty result, not an error.</li>
+      <li>Negative values fail: <code>ERROR:  LIMIT must not be negative</code>. In PostgreSQL,
+      <code>LIMIT ALL</code> and <code>LIMIT NULL</code> mean "no limit"; MySQL does not accept them.</li>
+      <li>With <code>SELECT DISTINCT</code>, the <code>ORDER BY</code> columns must appear in the select list
+      (see <a href="#m1-distinct">DISTINCT and DISTINCT ON</a>).</li>
+      <li>Ordering by position (<code>ORDER BY 2</code>) is legal but fragile; use the name or alias.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Every list endpoint in a REST API should be paginated; an unbounded <code>SELECT</code> on a growing table
+    is a production incident waiting to happen. Spring Data JPA turns a <code>Pageable</code> into exactly the
+    <code>ORDER BY … LIMIT … OFFSET …</code> you see here (see
+    <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>).</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Is the order of rows guaranteed without <code>ORDER BY</code>?</b> No. Not even "by primary key".</li>
+      <li><b>How do you implement pagination?</b> <code>ORDER BY</code> a unique key,
+      <code>LIMIT size OFFSET (page - 1) * size</code>; mention that big offsets are slow and keyset pagination
+      (<code>WHERE id &gt; last_id</code>) fixes that.</li>
+      <li><b>Where do NULLs sort?</b> PostgreSQL: as the largest value (last in <code>ASC</code>); MySQL: as the
+      smallest. <code>NULLS FIRST/LAST</code> is PostgreSQL only.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-distinct">
+  <h3>DISTINCT and DISTINCT ON</h3>
+  <p class="tldr"><code>DISTINCT</code> removes duplicate rows from a result. It compares the whole row, not one
+  column. <code>DISTINCT ON</code> (PostgreSQL only) keeps one row per group, chosen by <code>ORDER BY</code>.</p>
+
+  <h4>Removing duplicates</h4>
+  <p>Many rows share the same value in some columns: several customers live in Mumbai, many employees work in
+  the same department. <code>SELECT DISTINCT</code> returns each different row once:</p>
+  <pre data-title="Which cities do we have customers in?"><code class="language-sql">SELECT DISTINCT city
+FROM customers
+ORDER BY city;</code></pre>
+  <pre class="out" data-title="Output (7 customers, 6 cities)"><code class="language-plaintext">   city
+-----------
+ Ahmedabad
+ Bengaluru
+ Delhi
+ Kolkata
+ Mumbai
+ Pune
+(6 rows)</code></pre>
+  <p>Internally the database sorts or hashes the result to find duplicates, so <code>DISTINCT</code> costs time
+  on big results. Use it when duplicates are expected and unwanted, not as a reflex.</p>
+
+  <h4>DISTINCT works on the whole row</h4>
+  <p>With several columns, two rows are duplicates only if <strong>all</strong> selected columns are equal.
+  Customer 1 has one <code>DELIVERED</code> and one <code>SHIPPED</code> order, so both pairs stay:</p>
+  <pre data-title="Distinct pairs"><code class="language-sql">SELECT DISTINCT customer_id, status
+FROM orders
+ORDER BY customer_id, status;</code></pre>
+  <pre class="out" data-title="Output (10 orders become 9 pairs)"><code class="language-plaintext"> customer_id |  status
+-------------+-----------
+           1 | DELIVERED
+           1 | SHIPPED
+           2 | DELIVERED
+           2 | PLACED
+           3 | CANCELLED
+           3 | DELIVERED
+           4 | DELIVERED
+           5 | PLACED
+           5 | SHIPPED
+(9 rows)</code></pre>
+  <p><code>DISTINCT</code> is not a function. <code>SELECT DISTINCT(city), name FROM customers</code> does not
+  mean "distinct city"; the parentheses are just grouping, and the whole row <code>(city, name)</code> is
+  compared. To count distinct values use <code>COUNT(DISTINCT city)</code> (see
+  <a href="#m2-aggregates">Aggregate functions</a>).</p>
+
+  <h4>NULL in DISTINCT</h4>
+  <p>Two NULLs are not equal in a comparison, but <code>DISTINCT</code> treats them as the same value, so all
+  NULLs collapse into one row. The CEO has no department, so a list of departments that appear among employees
+  contains a NULL:</p>
+  <pre data-title="NULL is kept once"><code class="language-sql">SELECT DISTINCT dept_id FROM employees ORDER BY dept_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id
+---------
+       1
+       2
+       3
+  (null)
+(4 rows)</code></pre>
+
+  <h4>DISTINCT ON: one row per group (PostgreSQL)</h4>
+  <p>A very common task: "for each department, the highest paid employee" or "for each customer, the latest
+  order". PostgreSQL has a shortcut: <code>DISTINCT ON (columns)</code> keeps only the <em>first</em> row of
+  each group, and "first" is decided by <code>ORDER BY</code>.</p>
+  <pre data-title="Latest order of each customer"><code class="language-sql">SELECT DISTINCT ON (customer_id)
+       customer_id, order_id, order_date
+FROM orders
+ORDER BY customer_id, order_date DESC;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> customer_id | order_id | order_date
+-------------+----------+------------
+           1 |        7 | 2026-03-21
+           2 |        9 | 2026-04-03
+           3 |        6 | 2026-03-08
+           4 |        5 | 2026-02-27
+           5 |       10 | 2026-04-10
+(5 rows)</code></pre>
+  <p>Read it as: sort by customer, newest order first; then keep the first row for each customer. Another
+  example, the best-paid person in each department (the NULL department forms its own group):</p>
+  <pre data-title="Top earner per department"><code class="language-sql">SELECT DISTINCT ON (dept_id)
+       dept_id, first_name, salary
+FROM employees
+ORDER BY dept_id, salary DESC;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id | first_name |  salary
+---------+------------+-----------
+       1 | Vikram     | 220000.00
+       2 | Karan      | 160000.00
+       3 | Sunita     | 120000.00
+  (null) | Meera      | 300000.00
+(4 rows)</code></pre>
+  <p><code>DISTINCT ON</code> is not standard SQL and MySQL does not have it. The portable way is a window
+  function, <code>ROW_NUMBER() OVER (PARTITION BY … ORDER BY …)</code>, covered in
+  <a href="#m3-window-ranking">Ranking functions</a>. It also handles "top 3 per group", which
+  <code>DISTINCT ON</code> cannot.</p>
+
+  <h4>DISTINCT versus GROUP BY</h4>
+  <p><code>SELECT DISTINCT city FROM customers</code> and <code>SELECT city FROM customers GROUP BY city</code>
+  return the same rows. Use <code>DISTINCT</code> when you only want unique values, and <code>GROUP BY</code>
+  when you also compute something per group, such as a count (see <a href="#m2-group-by">GROUP BY</a>).</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: ORDER BY must start with the DISTINCT ON columns</p>
+    <p>The <code>ORDER BY</code> list has to begin with the same expressions as <code>DISTINCT ON</code>.
+    Otherwise PostgreSQL stops with <code>ERROR:  SELECT DISTINCT ON expressions must match initial ORDER BY
+    expressions</code>. And without any <code>ORDER BY</code> the surviving row of each group is arbitrary.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: DISTINCT as a bandage for a join bug</p>
+    <p>A query returns the same employee three times, and someone adds <code>DISTINCT</code> to "fix" it. The
+    real problem is usually a join that multiplies rows (for example joining employees to
+    <code>employee_projects</code> and showing only employee columns). <code>DISTINCT</code> hides the symptom,
+    costs time, and can still hide real duplicates you wanted to see. Find out why rows multiply (see
+    <a href="#m2-self-cross-multi-joins">join cardinality</a>).</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>SELECT DISTINCT first_name FROM employees ORDER BY emp_id</code> fails in PostgreSQL:
+      <code>ERROR:  for SELECT DISTINCT, ORDER BY expressions must appear in select list</code>. After removing
+      duplicates there is no single <code>emp_id</code> per row to sort by.</li>
+      <li><code>DISTINCT</code> applies to the whole select list, so adding one more column (such as
+      <code>emp_id</code>) can make every row unique and "stop working".</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Does <code>DISTINCT</code> apply to one column or all?</b> All selected columns together.</li>
+      <li><b>How are NULLs treated?</b> As equal to each other: they collapse into one row.</li>
+      <li><b>How do you get the latest row per group?</b> <code>DISTINCT ON</code> in PostgreSQL, or
+      <code>ROW_NUMBER()</code> in any database.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-null-logic">
+  <h3>NULL and three-valued logic</h3>
+  <p class="tldr">NULL means "unknown or missing", not zero and not an empty string. Any comparison with NULL
+  gives UNKNOWN, <code>WHERE</code> keeps only rows that are TRUE, so <code>= NULL</code> never matches: use
+  <code>IS NULL</code>, <code>COALESCE</code> and <code>IS DISTINCT FROM</code> instead.</p>
+
+  <h4>What NULL is</h4>
+  <p><strong>NULL</strong> marks a value that is missing or unknown. Meera, the CEO, has
+  <code>manager_id = NULL</code>: she has no manager. Three customers have <code>phone = NULL</code>: we do not
+  know their number. NULL is not <code>0</code> (a salary of zero is a known value), and it is not
+  <code>''</code> (an empty string is a known, empty text). Because "unknown" can be anything, SQL cannot say
+  whether NULL equals something. This leads to <strong>three-valued logic</strong>: a condition is
+  <code>TRUE</code>, <code>FALSE</code> or <code>UNKNOWN</code>.</p>
+
+  <h4>Comparisons with NULL are UNKNOWN</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Expression</th><th>Result</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>NULL = NULL</code></td><td>NULL</td><td>Is one unknown equal to another? Unknown.</td></tr>
+      <tr><td><code>5 &gt; NULL</code>, <code>NULL &lt;&gt; 1</code></td><td>NULL</td><td>Any comparison with an unknown is unknown.</td></tr>
+      <tr><td><code>NULL IS NULL</code></td><td>TRUE</td><td>This is the correct test.</td></tr>
+      <tr><td><code>TRUE AND NULL</code></td><td>NULL</td><td>It depends on the unknown.</td></tr>
+      <tr><td><code>FALSE AND NULL</code></td><td>FALSE</td><td>False whatever the unknown is.</td></tr>
+      <tr><td><code>TRUE OR NULL</code></td><td>TRUE</td><td>True whatever the unknown is.</td></tr>
+      <tr><td><code>FALSE OR NULL</code></td><td>NULL</td><td>It depends on the unknown.</td></tr>
+      <tr><td><code>NOT NULL</code></td><td>NULL</td><td>The opposite of unknown is unknown.</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="See it yourself"><code class="language-sql">SELECT NULL = NULL AS eq, NULL IS NULL AS is_null, NULL &lt;&gt; 1 AS ne, 5 &gt; NULL AS gt;</code></pre>
+  <pre class="out" data-title="Output (NULL shown with \pset null)"><code class="language-plaintext">   eq   | is_null |   ne   |   gt
+--------+---------+--------+--------
+ (null) | t       | (null) | (null)
+(1 row)</code></pre>
+  <p>The key rule for queries: <strong><code>WHERE</code> keeps a row only when the condition is TRUE.</strong>
+  FALSE and UNKNOWN rows are both dropped. So a row whose condition is UNKNOWN silently disappears.</p>
+
+  <h4>IS NULL and IS NOT NULL</h4>
+  <pre data-title="The wrong test and the right test"><code class="language-sql">SELECT first_name, dept_id FROM employees WHERE dept_id = NULL;
+
+SELECT first_name, dept_id, manager_id FROM employees WHERE dept_id IS NULL;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name | dept_id
+------------+---------
+(0 rows)
+
+ first_name | dept_id | manager_id
+------------+---------+------------
+ Meera      | (null)  | (null)
+(1 row)</code></pre>
+  <p>The first query is valid SQL and returns nothing, with no error. That is what makes it dangerous.</p>
+
+  <h4>The silent loss with &lt;&gt;</h4>
+  <p>The same effect hides rows in "not equal" filters. Five employees work in Engineering (dept 1), so you
+  expect seven others. <code>dept_id &lt;&gt; 1</code> is UNKNOWN for the CEO, so she is dropped:</p>
+  <pre data-title="NULL rows vanish from not-equal filters"><code class="language-sql">SELECT first_name FROM employees WHERE dept_id &lt;&gt; 1 ORDER BY emp_id;            -- 6 rows
+SELECT first_name FROM employees WHERE dept_id IS DISTINCT FROM 1 ORDER BY emp_id; -- 7 rows</code></pre>
+  <pre class="out" data-title="First query: 6 rows. Second query: 7 rows (Meera is the extra one)"><code class="language-plaintext"> first_name
+------------
+ Ananya
+ Sunita
+ Karan
+ Neha
+ Farhan
+ Isha
+(6 rows)
+
+ first_name
+------------
+ Meera
+ Ananya
+ Sunita
+ Karan
+ Neha
+ Farhan
+ Isha
+(7 rows)</code></pre>
+  <p><code>a IS DISTINCT FROM b</code> is a NULL-safe "not equal": it is TRUE when the values differ, treats two
+  NULLs as equal, and never returns UNKNOWN. <code>a IS NOT DISTINCT FROM b</code> is the NULL-safe "equal".
+  MySQL's NULL-safe equals operator is <code>&lt;=&gt;</code>.</p>
+
+  <h4>COALESCE and NULLIF</h4>
+  <p><code>COALESCE(a, b, c, …)</code> returns the first argument that is not NULL. It replaces NULL with a
+  default for display or calculation. It works in every database; MySQL also has <code>IFNULL(a, b)</code> and
+  Oracle has <code>NVL</code>.</p>
+  <pre data-title="COALESCE"><code class="language-sql">SELECT name, COALESCE(phone, 'no phone') AS phone
+FROM customers
+ORDER BY customer_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">     name     |   phone
+--------------+------------
+ Aarav Shah   | 9876500001
+ Diya Kapoor  | no phone
+ Kabir Singh  | 9876500003
+ Ishita Joshi | 9876500004
+ Rohan Das    | no phone
+ Sara Khan    | 9876500006
+ Tanvi Desai  | no phone
+(7 rows)</code></pre>
+  <p><code>NULLIF(a, b)</code> does the reverse: it returns NULL when <code>a</code> equals <code>b</code>,
+  otherwise <code>a</code>. Its classic use is avoiding division by zero, because dividing by NULL gives NULL
+  instead of an error:</p>
+  <pre data-title="NULLIF avoids division by zero"><code class="language-sql">SELECT 100 / 0;                -- ERROR:  division by zero
+SELECT 100 / NULLIF(0, 0);     -- NULL (shown as an empty or (null) cell)</code></pre>
+  <p>In a real query it looks like <code>total / NULLIF(order_count, 0)</code>. Another use is turning empty
+  strings from a form into NULL: <code>NULLIF(TRIM(phone), '')</code>.</p>
+
+  <h4>NULL in arithmetic, text and aggregates</h4>
+  <ul>
+    <li><strong>Arithmetic and text:</strong> any operation with NULL gives NULL. <code>salary + NULL</code> is
+    NULL, and so is <code>'Mr ' || NULL</code> in PostgreSQL. Wrap nullable parts in <code>COALESCE</code>.</li>
+    <li><strong>Aggregates skip NULLs</strong> (except <code>COUNT(*)</code>). The CEO has no department and no
+    manager:</li>
+  </ul>
+  <pre data-title="COUNT(*) counts rows, COUNT(column) counts non-NULL values"><code class="language-sql">SELECT COUNT(*) AS total, COUNT(dept_id) AS with_dept, COUNT(manager_id) AS with_manager
+FROM employees;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> total | with_dept | with_manager
+-------+-----------+--------------
+    12 |        11 |           11
+(1 row)</code></pre>
+  <p><code>AVG</code>, <code>SUM</code>, <code>MIN</code> and <code>MAX</code> also ignore NULLs; more in
+  <a href="#m2-aggregates">Aggregate functions</a>.</p>
+
+  <h4>NULL in IN and NOT IN: the classic trap</h4>
+  <p><code>x IN (1, 2, NULL)</code> is TRUE when <code>x</code> is 1 or 2, and otherwise UNKNOWN (not FALSE),
+  because <code>x = NULL</code> is unknown. The danger is <code>NOT IN</code>: it is a chain of
+  <code>&lt;&gt;</code> tests joined by <code>AND</code>, and one UNKNOWN makes the whole chain never TRUE.</p>
+  <pre data-title="NULL inside an IN list"><code class="language-sql">SELECT 2 IN (1, 2, NULL) AS a, 3 IN (1, 2, NULL) AS b, 3 NOT IN (1, 2, NULL) AS c;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> a |   b    |   c
+---+--------+--------
+ t | (null) | (null)
+(1 row)</code></pre>
+  <p>This bites in real queries. "Which departments have no employees?" The subquery below returns the
+  <code>dept_id</code> of every employee, including the CEO's NULL:</p>
+  <pre data-title="NOT IN with a NULL in the subquery"><code class="language-sql">SELECT name
+FROM departments
+WHERE dept_id NOT IN (SELECT dept_id FROM employees);</code></pre>
+  <pre class="out" data-title="Output: Marketing is missing!"><code class="language-plaintext"> name
+------
+(0 rows)</code></pre>
+  <p>Marketing has no employees, but for it the test is <code>4 NOT IN (1, 2, 3, NULL)</code>, which is
+  UNKNOWN. Two fixes: filter the NULLs out of the subquery, or (better) use <code>NOT EXISTS</code>, which
+  does not have this problem (see <a href="#m2-correlated-exists">EXISTS and anti-joins</a>).</p>
+  <pre data-title="Fix: remove NULLs from the subquery"><code class="language-sql">SELECT name
+FROM departments
+WHERE dept_id NOT IN (SELECT dept_id FROM employees WHERE dept_id IS NOT NULL);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">   name
+-----------
+ Marketing
+(1 row)</code></pre>
+
+  <h4>NULL in constraints, sorting and grouping</h4>
+  <ul>
+    <li><strong><code>UNIQUE</code></strong> allows many NULLs in PostgreSQL and MySQL, because NULLs are not
+    equal to each other. (PostgreSQL 15 adds <code>UNIQUE NULLS NOT DISTINCT</code> if you want only one.)</li>
+    <li><strong><code>CHECK</code></strong> passes when the condition is TRUE <em>or UNKNOWN</em>. Only FALSE
+    rejects the row. <code>CHECK (price &gt; 0)</code> does not stop a NULL price; add
+    <code>NOT NULL</code>.</li>
+    <li><strong>Primary keys</strong> are never NULL. <strong>Foreign keys</strong> may be NULL, which means "no
+    related row".</li>
+    <li><strong><code>ORDER BY</code>, <code>DISTINCT</code>, <code>GROUP BY</code>, <code>UNION</code></strong>
+    treat all NULLs as one group, even though <code>NULL = NULL</code> is unknown.</li>
+  </ul>
+
+  <h4>NULL in Java</h4>
+  <p>JDBC can lose the difference between NULL and zero. <code>rs.getInt("manager_id")</code> returns
+  <code>0</code> for a NULL, and employee 0 does not exist. Use <code>rs.getObject("manager_id",
+  Integer.class)</code> (returns <code>null</code>) or call <code>rs.wasNull()</code> right after
+  <code>getInt</code>. In JPA, map nullable columns to wrapper types (<code>Integer</code>, <code>Long</code>),
+  not <code>int</code> or <code>long</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: test NULL only with IS NULL, IS NOT NULL or IS DISTINCT FROM</p>
+    <p><code>= NULL</code> and <code>&lt;&gt; NULL</code> never return TRUE. Remember also that a comparison
+    such as <code>&lt;&gt; 1</code> drops NULL rows.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: = NULL and NOT IN with a nullable subquery</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: always zero rows</p><pre><code class="language-sql">SELECT * FROM customers WHERE phone = NULL;
+SELECT * FROM departments
+WHERE dept_id NOT IN (SELECT dept_id FROM employees);</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right</p><pre><code class="language-sql">SELECT * FROM customers WHERE phone IS NULL;
+SELECT * FROM departments d
+WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.dept_id);</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: fewer NULLs, on purpose</p>
+    <p>Make a column <code>NOT NULL</code> unless "unknown" is a real state of the data. Use a
+    <code>DEFAULT</code> for the rest (<code>stock INT NOT NULL DEFAULT 0</code>). Do not store an empty string
+    to mean "none", and do not store 0 or <code>'N/A'</code> to mean "unknown": they poison averages and
+    comparisons. (Oracle treats <code>''</code> as NULL; PostgreSQL and MySQL do not.)</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Why does <code>WHERE col = NULL</code> return nothing?</b> The comparison is UNKNOWN, and
+      <code>WHERE</code> keeps only TRUE rows. Use <code>IS NULL</code>.</li>
+      <li><b>What is the difference between <code>COUNT(*)</code> and <code>COUNT(col)</code>?</b>
+      <code>COUNT(*)</code> counts rows; <code>COUNT(col)</code> counts rows where <code>col</code> is not NULL.</li>
+      <li><b>What does <code>NOT IN</code> return if the list contains a NULL?</b> No rows. Explain the
+      <code>AND</code> chain of <code>&lt;&gt;</code> and prefer <code>NOT EXISTS</code>.</li>
+      <li><b>NULL vs empty string vs 0?</b> Three different things: unknown, known-empty, known-zero.</li>
+    </ul>
+  </div>
+</article>

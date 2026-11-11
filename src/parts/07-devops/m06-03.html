@@ -1,0 +1,648 @@
+<article class="topic" id="m6-kubernetes-concepts">
+  <h3>Kubernetes basics: why, architecture and the main objects</h3>
+  <p class="tldr">Kubernetes runs and manages many containers across many machines: you declare the state you
+  want (three copies of this image, exposed on this port), and the control plane keeps reality equal to it by
+  scheduling, restarting, scaling and rolling out updates.</p>
+
+  <h4>The problem it solves</h4>
+  <p>Docker Compose runs containers on <em>one</em> machine. Real systems need more: place containers on whichever
+  machine has room, replace a container that crashed, start more copies when load rises, update without downtime,
+  and survive the loss of a whole machine. Doing that by hand with scripts does not scale. <strong>Kubernetes</strong>
+  (also written K8s) is an open-source <strong>container orchestrator</strong>, originally from Google, that does
+  these jobs. Its core ideas:</p>
+  <ul>
+    <li><strong>Scheduling:</strong> it chooses a node with enough CPU and memory for each container.</li>
+    <li><strong>Self-healing:</strong> failed containers are restarted; containers that fail health checks are
+    replaced; work moves away from a dead node.</li>
+    <li><strong>Scaling:</strong> change the number of replicas by hand or automatically by load (the Horizontal
+    Pod Autoscaler).</li>
+    <li><strong>Rolling updates and rollback:</strong> new versions replace old ones gradually; one command
+    returns to the previous version.</li>
+    <li><strong>Service discovery and load balancing:</strong> stable names and addresses for changing
+    containers.</li>
+  </ul>
+  <p>The model is <strong>declarative</strong>: you write YAML describing the desired state and submit it. A
+  controller compares the actual state with the desired state in a loop and fixes any difference. You do not say
+  "start a container"; you say "there should be three".</p>
+
+  <h4>Architecture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  U["kubectl / CI"] --> API
+  subgraph CP["Control plane"]
+    API["API server"]
+    ETCD[("etcd: cluster state")]
+    SCH["Scheduler"]
+    CM["Controller manager"]
+    API --- ETCD
+    SCH --> API
+    CM --> API
+  end
+  subgraph W1["Worker node 1"]
+    K1["kubelet"]
+    P1["Pods"]
+    K1 --> P1
+  end
+  subgraph W2["Worker node 2"]
+    K2["kubelet"]
+    P2["Pods"]
+    K2 --> P2
+  end
+  K1 --> API
+  K2 --> API
+</pre>
+    <figcaption>A cluster: a control plane that decides, and worker nodes that run the pods</figcaption>
+  </figure>
+  <dl class="terms">
+    <dt>Control plane</dt><dd>The brain. The <strong>API server</strong> is the front door for every command;
+    <strong>etcd</strong> stores the cluster state; the <strong>scheduler</strong> assigns new pods to nodes; the
+    <strong>controller manager</strong> runs the loops that match actual state to desired state.</dd>
+    <dt>Node</dt><dd>A worker machine (a VM or physical server) that runs pods.</dd>
+    <dt>kubelet</dt><dd>The agent on each node. It talks to the API server, starts the containers for pods
+    assigned to the node, and runs the health probes.</dd>
+    <dt>Container runtime</dt><dd>The software that actually runs containers on a node (containerd, for
+    example). kube-proxy handles Service networking on each node.</dd>
+  </dl>
+
+  <h4>The main objects</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Object</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Pod</strong></td><td>The smallest unit: one or more containers sharing a network address and storage. Pods are temporary; you rarely create them directly.</td></tr>
+      <tr><td><strong>ReplicaSet</strong></td><td>Keeps a stated number of identical pods running. Created and managed by a Deployment.</td></tr>
+      <tr><td><strong>Deployment</strong></td><td>Declares an app: image, replicas, update strategy. Manages ReplicaSets so updates are rolling and reversible.</td></tr>
+      <tr><td><strong>Service</strong></td><td>A stable name and virtual IP in front of a changing set of pods, chosen by labels. Load-balances between them.</td></tr>
+      <tr><td><strong>Ingress</strong></td><td>HTTP(S) routing from outside by host and path to Services; needs an ingress controller (for example Nginx).</td></tr>
+      <tr><td><strong>ConfigMap</strong></td><td>Non-secret configuration (environment values, files).</td></tr>
+      <tr><td><strong>Secret</strong></td><td>Sensitive values (passwords, tokens). Stored base64-encoded, which is not encryption; restrict access and consider encryption at rest and external secret stores.</td></tr>
+      <tr><td><strong>Namespace</strong></td><td>A named partition of the cluster (dev, staging, shop) for organising and limiting resources.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Others you will meet: <strong>StatefulSet</strong> (pods with stable identity and disks, for databases),
+  <strong>Job</strong> and <strong>CronJob</strong> (run to completion, scheduled), <strong>PersistentVolumeClaim</strong>
+  (a request for storage), <strong>HorizontalPodAutoscaler</strong> and <strong>DaemonSet</strong> (one pod per
+  node).</p>
+
+  <h4>Labels and selectors: how objects find each other</h4>
+  <p>Objects carry <strong>labels</strong>, simple key/value tags such as <code>app: shop-api</code>. A
+  Deployment's <code>selector</code> says which pods it owns; a Service's <code>selector</code> says which pods it
+  sends traffic to. If the labels do not match, the Service has no backends: the most common beginner problem.</p>
+
+  <h4>Service types</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Reachable from</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><strong>ClusterIP</strong> (default)</td><td>Inside the cluster only</td><td>Backends, databases, anything behind an Ingress</td></tr>
+      <tr><td><strong>NodePort</strong></td><td>Each node's IP on a high port (30000–32767)</td><td>Quick tests, local clusters</td></tr>
+      <tr><td><strong>LoadBalancer</strong></td><td>A cloud load balancer with a public address</td><td>Exposing one service on a cloud cluster</td></tr>
+    </tbody>
+  </table></div>
+  <p>On a cloud cluster, one Ingress with a single load balancer usually fronts many Services, which is cheaper
+  than a LoadBalancer Service per app.</p>
+
+  <h4>Request path</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  U[User] --> I["Ingress (api.example.com)"]
+  I --> S["Service shop-api (ClusterIP)"]
+  S --> P1["Pod 1"]
+  S --> P2["Pod 2"]
+  P1 --> D[("PostgreSQL")]
+  P2 --> D
+</pre>
+    <figcaption>Ingress routes by host, the Service balances over matching pods</figcaption>
+  </figure>
+
+  <h4>Where Kubernetes fits</h4>
+  <p>Kubernetes shines with many services, several teams and the need for automated scaling and updates. It
+  brings real complexity: networking, storage, security, upgrades and YAML. For one Spring Boot app, a single
+  server with Compose, or a PaaS, is simpler and cheaper. Learn Kubernetes to read and operate it, because many
+  companies run it; do not use it to run your first project.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Running a database as a plain Deployment with no persistent storage plan. Use managed databases, or
+      StatefulSets with care.</li>
+      <li>Believing a Secret is encrypted. It is only base64 by default.</li>
+      <li>Using the <code>latest</code> image tag, so a pod restart can pull a different version.</li>
+      <li>Setting no resource requests or limits; one greedy pod starves the others.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain Pod, Deployment and Service."</p>
+    <ul>
+      <li>Pod: the unit that runs containers, temporary. Deployment: declares replicas and image, handles rolling
+      updates and rollback through ReplicaSets. Service: stable address and load balancing across matching pods
+      by labels.</li>
+      <li>Add the control loop idea: desired state versus actual state.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-kubernetes-deploy">
+  <h3>Deploying Spring Boot to Kubernetes: YAML, probes, kubectl and local clusters</h3>
+  <p class="tldr">A Deployment (image, replicas, resources, probes pointing at Actuator's liveness and readiness
+  URLs) plus a Service gives you a self-healing, rolling-updating Spring Boot app; apply it with
+  <code>kubectl apply -f</code> and manage it with <code>get</code>, <code>describe</code>, <code>logs</code>
+  and <code>rollout</code>.</p>
+
+  <h4>The complete manifest</h4>
+  <p>A <strong>manifest</strong> is a YAML file describing objects; <code>---</code> separates several in one
+  file. This one creates a namespace, configuration, a Deployment with two replicas, and a Service. The names
+  and image are examples.</p>
+  <pre data-title="k8s/shop-api.yaml"><code class="language-yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shop-config
+  namespace: shop
+data:
+  SPRING_PROFILES_ACTIVE: "prod"
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop-api
+  namespace: shop
+  labels:
+    app: shop-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: shop-api                  # which pods this Deployment owns
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                    # at most one extra pod during an update
+      maxUnavailable: 0              # never go below the desired count
+  template:
+    metadata:
+      labels:
+        app: shop-api                # must match the selector above
+    spec:
+      terminationGracePeriodSeconds: 40
+      imagePullSecrets:
+        - name: ghcr-pull            # only needed for a private registry
+      containers:
+        - name: api
+          image: ghcr.io/asha/shop-api:sha-3f9c2ab   # always a specific tag
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: shop-config
+            - secretRef:
+                name: shop-secrets   # DB password, JWT secret (created with kubectl)
+          resources:
+            requests:                # what the scheduler reserves
+              cpu: "250m"
+              memory: "512Mi"
+            limits:                  # the hard ceiling
+              memory: "768Mi"
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 30     # up to 150 seconds to start
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop-api
+  namespace: shop
+spec:
+  type: ClusterIP
+  selector:
+    app: shop-api                    # sends traffic to pods with this label
+  ports:
+    - port: 80                       # the Service's port
+      targetPort: 8080               # the container's port</code></pre>
+  <p>Create the sensitive objects from the command line, not from files in Git:</p>
+  <pre data-title="Secrets"><code class="language-shell">$ kubectl create secret generic shop-secrets -n shop \
+    --from-literal=SPRING_DATASOURCE_URL='jdbc:postgresql://db.example.internal:5432/shop' \
+    --from-literal=SPRING_DATASOURCE_USERNAME='shop_app' \
+    --from-literal=SPRING_DATASOURCE_PASSWORD='change-me' \
+    --from-literal=JWT_SECRET='change-me-too'
+
+$ kubectl create secret docker-registry ghcr-pull -n shop \
+    --docker-server=ghcr.io --docker-username=asha --docker-password="$GHCR_TOKEN"</code></pre>
+
+  <h4>The pieces explained</h4>
+  <dl class="terms">
+    <dt>replicas: 2</dt><dd>Run two identical pods. If one dies, the ReplicaSet creates another.</dd>
+    <dt>selector and labels</dt><dd><code>matchLabels</code> must equal the pod template's labels. The Service
+    selects the same label.</dd>
+    <dt>RollingUpdate</dt><dd>With <code>maxSurge: 1</code> and <code>maxUnavailable: 0</code>, Kubernetes starts
+    one new pod, waits until it is Ready, then stops an old one. This is zero-downtime when readiness is
+    correct.</dd>
+    <dt>envFrom</dt><dd>Turns every key in a ConfigMap or Secret into an environment variable. Spring Boot reads
+    <code>SPRING_DATASOURCE_URL</code> by relaxed binding, as in the earlier modules.</dd>
+    <dt>requests and limits</dt><dd><strong>Requests</strong> are what the scheduler reserves for the pod;
+    <strong>limits</strong> are the ceiling. Exceeding the memory limit gets the container killed
+    (<code>OOMKilled</code>). CPU over its limit is only throttled. Set the JVM heap below the memory limit
+    (<code>MaxRAMPercentage=75</code>).</dd>
+    <dt>terminationGracePeriodSeconds</dt><dd>How long Kubernetes waits after SIGTERM before killing. Match it to
+    <code>spring.lifecycle.timeout-per-shutdown-phase</code> with <code>server.shutdown=graceful</code>.</dd>
+  </dl>
+
+  <h4>Probes mapped to Actuator</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Probe</th><th>Failing means</th><th>Spring Boot URL</th></tr></thead>
+    <tbody>
+      <tr><td><strong>startupProbe</strong></td><td>Still starting; the other probes wait. If it never passes, the container is restarted.</td><td><code>/actuator/health/liveness</code></td></tr>
+      <tr><td><strong>readinessProbe</strong></td><td>Not ready; removed from the Service endpoints, not restarted</td><td><code>/actuator/health/readiness</code></td></tr>
+      <tr><td><strong>livenessProbe</strong></td><td>Broken; the container is restarted</td><td><code>/actuator/health/liveness</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Spring Boot turns on these probe endpoints automatically when it detects it runs in Kubernetes; if you
+  deploy elsewhere, set <code>management.endpoint.health.probes.enabled=true</code>. The startup probe protects a
+  slow-starting JVM from being killed by the liveness probe. If you moved Actuator to its own port
+  (<code>management.server.port=8081</code>), point the probes at that port. The reasons for keeping the database
+  out of liveness are in <a href="#m6-health-checks">Health checks</a>.</p>
+
+  <h4>An Ingress for HTTP from outside</h4>
+  <pre data-title="k8s/ingress.yaml (needs an ingress controller installed in the cluster)"><code class="language-yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop-api
+  namespace: shop
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: shop-api
+                port:
+                  number: 80</code></pre>
+  <p>TLS certificates in Kubernetes are commonly handled by cert-manager, which obtains Let's Encrypt
+  certificates for Ingress hosts, the cluster version of certbot.</p>
+
+  <h4>kubectl essentials</h4>
+  <p><code>kubectl</code> is the command-line client for the API server.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>kubectl apply -f file.yaml</code></td><td>Create or update objects to match the file</td></tr>
+      <tr><td><code>kubectl get pods -n shop</code></td><td>List pods (also <code>deploy</code>, <code>svc</code>, <code>ing</code>, <code>all</code>)</td></tr>
+      <tr><td><code>kubectl describe pod NAME -n shop</code></td><td>Details and the Events at the bottom (why it fails)</td></tr>
+      <tr><td><code>kubectl logs -f NAME -n shop</code></td><td>Follow a pod's logs (<code>--previous</code> for the crashed container)</td></tr>
+      <tr><td><code>kubectl exec -it NAME -n shop -- sh</code></td><td>Open a shell inside a container</td></tr>
+      <tr><td><code>kubectl rollout status deploy/shop-api -n shop</code></td><td>Wait for an update to finish</td></tr>
+      <tr><td><code>kubectl rollout undo deploy/shop-api -n shop</code></td><td>Roll back to the previous revision</td></tr>
+      <tr><td><code>kubectl scale deploy/shop-api --replicas=4 -n shop</code></td><td>Change the replica count</td></tr>
+      <tr><td><code>kubectl port-forward svc/shop-api 8080:80 -n shop</code></td><td>Reach a Service from your laptop for testing</td></tr>
+      <tr><td><code>kubectl delete -f file.yaml</code></td><td>Delete what the file describes</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="A typical session"><code class="language-shell">$ kubectl apply -f k8s/shop-api.yaml
+namespace/shop created
+configmap/shop-config created
+deployment.apps/shop-api created
+service/shop-api created
+
+$ kubectl get pods -n shop
+NAME                        READY   STATUS    RESTARTS   AGE
+shop-api-6d9c7b8f5d-4kq2x   1/1     Running   0          48s
+shop-api-6d9c7b8f5d-v7m9p   1/1     Running   0          48s
+
+$ kubectl port-forward svc/shop-api 8080:80 -n shop
+$ curl localhost:8080/actuator/health
+
+# release a new version
+$ kubectl set image deploy/shop-api api=ghcr.io/asha/shop-api:sha-9b1d4e7 -n shop
+$ kubectl rollout status deploy/shop-api -n shop
+$ kubectl rollout undo deploy/shop-api -n shop          # if something is wrong
+$ kubectl rollout history deploy/shop-api -n shop</code></pre>
+  <p>In a pipeline, the deploy step runs <code>kubectl set image</code> or <code>kubectl apply</code> with the new
+  SHA tag (or a GitOps tool such as Argo CD does it from Git), exactly like the SSH deploy in
+  <a href="#m4-cd">Module 4</a>.</p>
+
+  <h4>Reading failures</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Status</th><th>Meaning</th><th>Look at</th></tr></thead>
+    <tbody>
+      <tr><td><code>ImagePullBackOff</code></td><td>Cannot pull the image: wrong name or tag, private registry without credentials</td><td><code>describe pod</code> Events; <code>imagePullSecrets</code></td></tr>
+      <tr><td><code>CrashLoopBackOff</code></td><td>The container starts and exits repeatedly</td><td><code>logs --previous</code>, as in <a href="#m6-crash-walkthrough">the crash walkthrough</a></td></tr>
+      <tr><td><code>Pending</code></td><td>No node has enough free CPU or memory, or a volume is unavailable</td><td><code>describe pod</code>: scheduling events</td></tr>
+      <tr><td><code>OOMKilled</code> (last state)</td><td>Memory limit exceeded</td><td>Raise the limit, lower the heap</td></tr>
+      <tr><td>Running but <code>0/1</code> Ready</td><td>Readiness probe failing</td><td>Probe URL, port, startup time</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Where to run a cluster</h4>
+  <ul>
+    <li><strong>Local learning:</strong> <strong>minikube</strong> (<code>minikube start</code>), <strong>kind</strong>
+    (Kubernetes in Docker: <code>kind create cluster</code>; load a local image with
+    <code>kind load docker-image NAME:TAG</code>), or the <strong>Kubernetes option in Docker Desktop</strong>.</li>
+    <li><strong>Managed in the cloud:</strong> <strong>EKS</strong> (AWS), <strong>GKE</strong> (Google) and
+    <strong>AKS</strong> (Azure) run the control plane for you; you pay for it and for the worker nodes. Learn
+    locally first; a managed cluster left running is a surprise cost.</li>
+    <li><strong>Helm:</strong> a package manager for Kubernetes. A <em>chart</em> is a templated bundle of
+    manifests, installed with <code>helm install</code> and configured through a values file.</li>
+  </ul>
+
+  <h4>Docker Compose vs Kubernetes</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Docker Compose</th><th>Kubernetes</th></tr></thead>
+    <tbody>
+      <tr><td>Machines</td><td>One host</td><td>A cluster of nodes</td></tr>
+      <tr><td>Self-healing and scheduling</td><td>Restart policy only</td><td>Full: reschedules on other nodes</td></tr>
+      <tr><td>Rolling updates</td><td>Recreate (brief downtime)</td><td>Built in, with rollback</td></tr>
+      <tr><td>Scaling</td><td>Manual, single host</td><td>Manual or automatic</td></tr>
+      <tr><td>Learning cost</td><td>Low</td><td>High</td></tr>
+      <tr><td>Best for</td><td>Local development, small single-server apps</td><td>Many services, teams, high availability</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every container gets probes, requests and a pinned image tag</p>
+    <p>Without readiness probes, rolling updates can send traffic to a pod that is still starting. Without
+    requests and limits, scheduling and memory behaviour are unpredictable. Without a pinned tag, you cannot say
+    what is running.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Selector and template labels that do not match (the apply is rejected), or a Service selector that
+      matches nothing (no endpoints; check with <code>kubectl get endpoints</code>).</li>
+      <li>Liveness probe with a short delay on a slow JVM: pods are killed while starting. Use a startup probe.</li>
+      <li>Memory limit equal to the heap size: the JVM also needs non-heap memory, so it gets OOMKilled.</li>
+      <li>Committing Secrets with real values to Git.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you deploy a Spring Boot app on Kubernetes and do a zero-downtime release?"</p>
+    <ul>
+      <li>Image with a SHA tag; Deployment with replicas, resources and probes on Actuator readiness and
+      liveness; Service and Ingress; rolling update with <code>maxUnavailable: 0</code> and graceful shutdown;
+      <code>kubectl rollout status</code> and <code>rollout undo</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-terraform">
+  <h3>Terraform basics: infrastructure as code</h3>
+  <p class="tldr">Terraform lets you describe cloud resources in code, preview the changes with
+  <code>terraform plan</code>, create them with <code>apply</code>, and remove them with <code>destroy</code>,
+  keeping a state file that records what exists, so environments are repeatable and reviewable like source
+  code.</p>
+
+  <h4>Why infrastructure as code</h4>
+  <p>Clicking in the console is fine for learning, but it cannot be reviewed, repeated or undone cleanly. If your
+  production server was clicked together by hand, nobody can say exactly how, and a second copy for testing is
+  guesswork. <strong>Infrastructure as code (IaC)</strong> keeps the description of servers, networks and
+  databases in text files in Git. You get history, code review, repeatable environments, and a one-command
+  cleanup (a real help against surprise bills, see <a href="#m5-billing-alerts">Module 5</a>).</p>
+  <p><strong>Terraform</strong> (by HashiCorp; a community fork named OpenTofu also exists) is the most widely
+  used IaC tool. It is <em>declarative</em>: you state the desired end result, and Terraform works out what to
+  create, change or delete. It works with any platform that has a provider.</p>
+
+  <h4>Core concepts</h4>
+  <dl class="terms">
+    <dt>Provider</dt><dd>A plugin that talks to a platform's API: <code>aws</code>, <code>google</code>,
+    <code>azurerm</code>, <code>kubernetes</code>, <code>github</code>. Downloaded by <code>terraform init</code>.</dd>
+    <dt>Resource</dt><dd>A thing to create: <code>aws_instance</code>, <code>aws_security_group</code>,
+    <code>aws_s3_bucket</code>. Written as <code>resource "type" "local_name" { ... }</code>.</dd>
+    <dt>Data source</dt><dd>Read-only information looked up from outside, such as the latest Ubuntu AMI.</dd>
+    <dt>Variable</dt><dd>An input (region, instance type) so code can be reused. Set with defaults,
+    <code>-var</code>, or a <code>.tfvars</code> file.</dd>
+    <dt>Output</dt><dd>A value printed after apply (the server's public IP).</dd>
+    <dt>State</dt><dd>A file (<code>terraform.tfstate</code>) mapping your code to the real resources. Terraform
+    compares code, state and reality to produce a plan.</dd>
+    <dt>Module</dt><dd>A reusable folder of Terraform code, called with inputs.</dd>
+  </dl>
+
+  <h4>A tiny example: an EC2 instance, a security group and an Elastic IP</h4>
+  <p>This creates the web server from the Module 5 runbook. Put it in a folder as <code>main.tf</code>. It uses
+  the default VPC of the region. Pin the provider version range you have tested; the range below is only a
+  starting point.</p>
+  <pre data-title="main.tf"><code class="language-plaintext">terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.region
+}
+
+variable "region" {
+  type    = string
+  default = "ap-south-1"
+}
+
+variable "instance_type" {
+  type    = string
+  default = "t3.micro"            # check the current free-tier rules before choosing
+}
+
+variable "my_ip_cidr" {
+  type        = string
+  description = "Your public IP with /32, for SSH, for example 203.0.113.7/32"
+}
+
+variable "public_key_path" {
+  type    = string
+  default = "~/.ssh/shop-key.pub"
+}
+
+# Latest Ubuntu 24.04 image published by Canonical
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+  }
+}
+
+resource "aws_key_pair" "shop" {
+  key_name   = "shop-key"
+  public_key = file(pathexpand(var.public_key_path))
+}
+
+resource "aws_security_group" "web" {
+  name        = "shop-web-sg"
+  description = "SSH from my IP; HTTP and HTTPS from anywhere"
+
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip_cidr]
+  }
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    description = "HTTPS"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_instance" "web" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  key_name               = aws_key_pair.shop.key_name
+  vpc_security_group_ids = [aws_security_group.web.id]
+
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp3"
+  }
+
+  tags = {
+    Name    = "shop-api"
+    project = "shop"
+  }
+}
+
+resource "aws_eip" "web" {
+  domain = "vpc"
+}
+
+resource "aws_eip_association" "web" {
+  instance_id   = aws_instance.web.id
+  allocation_id = aws_eip.web.id
+}
+
+output "public_ip" {
+  value = aws_eip.web.public_ip
+}
+
+output "ssh_command" {
+  value = "ssh -i shop-key.pem ubuntu@${aws_eip.web.public_ip}"
+}</code></pre>
+  <p>Notice the references like <code>aws_key_pair.shop.key_name</code> and
+  <code>aws_security_group.web.id</code>. Terraform builds a <strong>dependency graph</strong> from them: it
+  creates the key pair and security group first, then the instance, then the address, automatically and in
+  parallel where possible.</p>
+
+  <h4>The workflow</h4>
+  <pre data-title="Terminal"><code class="language-shell">$ terraform init                  # download the provider; run once per folder
+$ terraform fmt                   # format the code
+$ terraform validate              # check syntax
+$ terraform plan -var="my_ip_cidr=203.0.113.7/32"
+  # + aws_instance.web will be created
+  # + aws_security_group.web will be created
+  ...
+Plan: 5 to add, 0 to change, 0 to destroy.
+
+$ terraform apply -var="my_ip_cidr=203.0.113.7/32"     # shows the plan, asks "yes"
+Apply complete! Resources: 5 added, 0 changed, 0 destroyed.
+Outputs:
+public_ip = "203.0.113.25"
+
+$ terraform output public_ip
+$ terraform destroy -var="my_ip_cidr=203.0.113.7/32"   # delete everything it created</code></pre>
+  <p>In a plan, <code>+</code> means create, <code>~</code> means change in place, <code>-</code> means destroy,
+  and <code>-/+</code> means replace (destroy and create). <strong>Always read the plan.</strong> A replaced
+  database or server in the plan is a data-loss warning. Terraform authenticates the way the AWS CLI does: your
+  profile, environment variables or Identity Center login; never write keys into <code>.tf</code> files.</p>
+
+  <h4>State, and remote state</h4>
+  <p>The state file records what Terraform created, including resource IDs and sometimes secrets. Rules:</p>
+  <ul>
+    <li>Never commit <code>terraform.tfstate</code> or the <code>.terraform/</code> folder to Git. Do commit
+    <code>.terraform.lock.hcl</code> (it pins provider versions) and your <code>.tf</code> files.</li>
+    <li>On a team, store state <strong>remotely</strong> so everyone shares one truth, with locking so two people
+    do not apply at once. A common AWS choice is an S3 bucket, with versioning and encryption. Locking was
+    traditionally done with a DynamoDB table; newer Terraform versions can lock in S3 itself, so check the
+    current documentation.</li>
+  </ul>
+  <pre data-title="backend.tf"><code class="language-plaintext">terraform {
+  backend "s3" {
+    bucket  = "shop-terraform-state-asha"
+    key     = "prod/terraform.tfstate"
+    region  = "ap-south-1"
+    encrypt = true
+  }
+}</code></pre>
+  <p>Changes made outside Terraform (someone edits a security group in the console) cause <strong>drift</strong>;
+  the next plan shows the difference. Treat the code as the source of truth and avoid manual edits.</p>
+
+  <h4>Terraform vs the alternatives</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Approach</th><th>Strength</th><th>Weakness</th></tr></thead>
+    <tbody>
+      <tr><td>Console clicking</td><td>Fastest for learning and one-offs</td><td>Not repeatable, not reviewable, easy to forget resources</td></tr>
+      <tr><td>Terraform / OpenTofu</td><td>Multi-cloud, huge ecosystem, clear plan/apply</td><td>State to manage; its own language (HCL)</td></tr>
+      <tr><td>CloudFormation</td><td>AWS-native, no state file to look after, deep AWS integration</td><td>AWS only; verbose JSON/YAML templates</td></tr>
+      <tr><td>AWS CDK / Pulumi</td><td>Use a real programming language (Java, TypeScript, Python)</td><td>More power also means more ways to complicate things</td></tr>
+      <tr><td>Ansible</td><td>Configures what runs <em>inside</em> servers (packages, files)</td><td>Different job: configuration management, not provisioning</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Running <code>apply</code> without reading the plan.</li>
+      <li>Committing state files or <code>.tfvars</code> that hold secrets.</li>
+      <li>Editing resources by hand in the console after Terraform created them.</li>
+      <li>Forgetting <code>terraform destroy</code> after a lab and paying for it.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Importing existing resources into state is possible (<code>terraform import</code>, or import
+      blocks in newer versions) when you adopt IaC for something already created.</li>
+      <li>Changing an immutable property (such as an instance's AMI) usually replaces the resource.</li>
+      <li>Provider and Terraform versions change; keep them pinned and upgrade deliberately.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is Terraform and what is the state file?"</p>
+    <ul>
+      <li>A declarative IaC tool: providers, resources, variables, outputs; <code>init</code>, <code>plan</code>,
+      <code>apply</code>, <code>destroy</code>. State maps code to real resources; store it remotely with locking,
+      and never in Git.</li>
+      <li>Compare with CloudFormation (AWS-only, managed state) and with Ansible (configuration).</li>
+    </ul>
+  </div>
+</article>

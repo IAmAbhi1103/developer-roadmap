@@ -1,0 +1,629 @@
+<article class="topic" id="m3-rate-limiter">
+  <h3>Design a rate limiter (token bucket)</h3>
+  <p class="tldr">A rate limiter decides per client whether a request is allowed; the token bucket gives each client a bucket that refills at a steady rate and spends one token per request, which allows short bursts while enforcing a long-run average, and it needs a lock per bucket to be thread safe.</p>
+
+  <h4>Requirements and assumptions</h4>
+  <ul>
+    <li><code>allow(key)</code> returns true if the client (user id, API key or IP) may proceed, false if it must be rejected (an API would answer HTTP 429 Too Many Requests).</li>
+    <li>Limit example: 100 requests per minute per user, with bursts up to 20.</li>
+    <li>Constant-time check; thousands of threads; many keys.</li>
+    <li>Algorithms must be swappable: token bucket, fixed window, sliding window.</li>
+    <li>Assumptions: single JVM first (distributed version at the end), limits are the same for all keys (per-key rules are an extension), time comes from an injectable clock.</li>
+  </ul>
+
+  <h4>The algorithms compared</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Algorithm</th><th>Idea</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody>
+      <tr><td>Token bucket</td><td>Tokens refill steadily up to capacity; each request takes one</td><td>Allows bursts; O(1); tiny state</td><td>Burst can be large if capacity is big</td></tr>
+      <tr><td>Leaky bucket</td><td>Requests queue and leave at a fixed rate</td><td>Very smooth output</td><td>Bursts are delayed or dropped</td></tr>
+      <tr><td>Fixed window counter</td><td>Count per minute; reset at minute boundary</td><td>Simplest</td><td>Boundary spike: up to 2x limit around a reset</td></tr>
+      <tr><td>Sliding window log</td><td>Keep timestamps of recent requests</td><td>Exact</td><td>Memory grows with the limit</td></tr>
+      <tr><td>Sliding window counter</td><td>Weighted blend of the current and previous window counts</td><td>Cheap and smooth</td><td>Approximate</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>How the token bucket works</h4>
+  <p>The bucket holds up to <code>capacity</code> tokens and refills at <code>refillPerSecond</code>. You do not need a timer thread. On each call compute how many tokens have accrued since the last call: <code>elapsed × rate</code>, add them, cap at capacity, then try to take one. This is <strong>lazy refill</strong>.</p>
+  <figure class="fig">
+<pre class="diagram">
+ capacity = 3, refill = 1 token per second
+
+ t=0s   [###]  3 tokens   request -> allowed (2 left)
+ t=0s   [##.]             request -> allowed (1 left)
+ t=0s   [#..]             request -> allowed (0 left)
+ t=0s   [...]             request -> REJECTED
+ t=2s   [##.]  2 tokens refilled while idle
+</pre>
+    <figcaption>Tokens accrue with time; a request needs one token</figcaption>
+  </figure>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class RateLimiter {
+    &lt;&lt;interface&gt;&gt;
+    +allow(String key) boolean
+  }
+  class TokenBucketLimiter {
+    -Map~String, TokenBucket~ buckets
+  }
+  class SlidingWindowLogLimiter
+  class TokenBucket {
+    -double tokens
+    -long lastRefillNanos
+    +tryConsume() boolean
+  }
+  RateLimiter &lt;|.. TokenBucketLimiter
+  RateLimiter &lt;|.. SlidingWindowLogLimiter
+  TokenBucketLimiter "1" *-- "many" TokenBucket
+</pre>
+    <figcaption>The limiter interface is the Strategy; one bucket per key</figcaption>
+  </figure>
+
+  <h4>Key design decisions</h4>
+  <ul>
+    <li><strong>Interface <code>RateLimiter</code></strong> (Strategy, <a href="#m2">Module 2</a>): callers (a servlet filter or Spring interceptor) never know which algorithm runs.</li>
+    <li><strong>One <code>TokenBucket</code> per key</strong> held in a <code>ConcurrentHashMap</code> with <code>computeIfAbsent</code>, which creates the bucket atomically.</li>
+    <li><strong>Lock per bucket</strong>, not a global lock: different users never wait for each other.</li>
+    <li><strong>Monotonic clock:</strong> use <code>System.nanoTime()</code> (via a supplier) for elapsed time. Wall-clock time can jump backwards.</li>
+    <li><strong>Doubles for tokens</strong> allow fractional refill (0.5 token after half a second at 1 per second).</li>
+  </ul>
+
+  <h4>Core code</h4>
+  <pre data-title="TokenBucket.java"><code class="language-java">import java.util.function.LongSupplier;
+
+interface RateLimiter {
+    boolean allow(String key);
+}
+
+class TokenBucket {
+    private final long capacity;
+    private final double refillPerNano;
+    private final LongSupplier nanoClock;
+    private double tokens;
+    private long lastRefill;
+
+    TokenBucket(long capacity, double refillPerSecond, LongSupplier nanoClock) {
+        this.capacity = capacity;
+        this.refillPerNano = refillPerSecond / 1_000_000_000.0;
+        this.nanoClock = nanoClock;
+        this.tokens = capacity;                         // start full
+        this.lastRefill = nanoClock.getAsLong();
+    }
+
+    synchronized boolean tryConsume() {
+        refill();
+        if (tokens &gt;= 1) {
+            tokens -= 1;
+            return true;
+        }
+        return false;
+    }
+
+    private void refill() {
+        long now = nanoClock.getAsLong();
+        double added = (now - lastRefill) * refillPerNano;
+        tokens = Math.min(capacity, tokens + added);    // never exceed capacity
+        lastRefill = now;
+    }
+}</code></pre>
+  <pre data-title="Limiters.java"><code class="language-java">import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.LongSupplier;
+
+class TokenBucketLimiter implements RateLimiter {
+    private final Map&lt;String, TokenBucket&gt; buckets = new ConcurrentHashMap&lt;&gt;();
+    private final long capacity;
+    private final double refillPerSecond;
+    private final LongSupplier clock;
+
+    TokenBucketLimiter(long capacity, double refillPerSecond, LongSupplier clock) {
+        this.capacity = capacity;
+        this.refillPerSecond = refillPerSecond;
+        this.clock = clock;
+    }
+
+    public boolean allow(String key) {
+        return buckets
+                .computeIfAbsent(key, k -&gt; new TokenBucket(capacity, refillPerSecond, clock))
+                .tryConsume();
+    }
+}
+
+/** Alternative: exact sliding window using a log of timestamps. */
+class SlidingWindowLogLimiter implements RateLimiter {
+    private final Map&lt;String, Deque&lt;Long&gt;&gt; logs = new ConcurrentHashMap&lt;&gt;();
+    private final int limit;
+    private final long windowNanos;
+    private final LongSupplier clock;
+
+    SlidingWindowLogLimiter(int limit, long windowMillis, LongSupplier clock) {
+        this.limit = limit;
+        this.windowNanos = windowMillis * 1_000_000L;
+        this.clock = clock;
+    }
+
+    public boolean allow(String key) {
+        Deque&lt;Long&gt; log = logs.computeIfAbsent(key, k -&gt; new ArrayDeque&lt;&gt;());
+        synchronized (log) {
+            long now = clock.getAsLong();
+            while (!log.isEmpty() &amp;&amp; now - log.peekFirst() &gt;= windowNanos) {
+                log.pollFirst();                         // drop requests outside the window
+            }
+            if (log.size() &gt;= limit) return false;
+            log.addLast(now);
+            return true;
+        }
+    }
+}</code></pre>
+  <pre data-title="RateLimiterDemo.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class RateLimiterDemo {
+    public static void main(String[] args) {
+        AtomicLong now = new AtomicLong();               // fake clock in nanoseconds
+        RateLimiter limiter = new TokenBucketLimiter(3, 1.0, now::get);
+
+        List&lt;Boolean&gt; first = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 4; i++) first.add(limiter.allow("user-1"));
+        System.out.println(first);
+
+        now.addAndGet(2_000_000_000L);                   // two seconds pass
+        List&lt;Boolean&gt; second = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 3; i++) second.add(limiter.allow("user-1"));
+        System.out.println(second);
+        System.out.println(limiter.allow("user-2"));      // other users have their own bucket
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[true, true, true, false]
+[true, true, false]
+true</code></pre>
+
+  <h4>Concurrency</h4>
+  <ul>
+    <li>Refill and consume must be one step: <code>tryConsume</code> is synchronized, so two threads cannot both spend the last token.</li>
+    <li><code>computeIfAbsent</code> on <code>ConcurrentHashMap</code> creates exactly one bucket per key even under races.</li>
+    <li>Lock-free option: keep <code>(tokens, lastRefill)</code> in an immutable object inside an <code>AtomicReference</code> and loop with <code>compareAndSet</code>. Good to mention, rarely required.</li>
+  </ul>
+  <div class="co co-exc">
+    <p class="co-t">Fixed window boundary problem</p>
+    <p>With a limit of 100 per minute, a client can send 100 requests at 10:00:59 and 100 more at 10:01:00: 200 requests in two seconds, all allowed. Sliding windows and token buckets avoid this.</p>
+  </div>
+
+  <h4>Edge cases</h4>
+  <ul>
+    <li>Long idle period: tokens are capped at capacity, so an idle client does not bank unlimited credit.</li>
+    <li>Clock going backwards: <code>nanoTime</code> does not; with wall-clock time guard against negative elapsed values.</li>
+    <li>Memory: millions of keys create millions of buckets. Evict idle ones (a bucket full for a while can be dropped and recreated full) with a scheduled cleanup or a bounded cache (<a href="#m3-lru-cache">like the LRU cache</a>).</li>
+    <li>Cost-based requests: <code>tryConsume(n)</code> for expensive calls.</li>
+    <li>What to return: the HTTP layer sends 429 and a <code>Retry-After</code> header; the limiter can expose "seconds until next token".</li>
+  </ul>
+
+  <h4>Distributed rate limiting</h4>
+  <p>Several app servers need one shared count, usually in Redis. A check-then-update must be atomic, so people use a Lua script (Redis runs a script without interleaving other commands) or simple <code>INCR</code> plus <code>EXPIRE</code> for a fixed window. Trade-offs: an extra network hop per request, the limiter itself can become a bottleneck or point of failure (decide: fail open or fail closed), and strict global accuracy costs latency. Many teams accept small errors by letting each node keep a local bucket and sync periodically, or put the limit in an API gateway. This leads into the HLD module.</p>
+
+  <h4>Extensions interviewers ask</h4>
+  <ul>
+    <li><strong>Different limits per user tier or per endpoint:</strong> a rule lookup <code>(key, route) -&gt; config</code>; build the bucket from the rule.</li>
+    <li><strong>Multiple limits together</strong> (10 per second and 1000 per hour): a composite limiter that must satisfy all.</li>
+    <li><strong>Metrics:</strong> count rejected requests per key.</li>
+    <li><strong>Queue instead of reject:</strong> leaky bucket with a bounded queue.</li>
+    <li><strong>Dynamic config reload:</strong> volatile reference to the rule table.</li>
+  </ul>
+  <div class="co co-interview">
+    <p class="co-t">How to present this in 45 minutes</p>
+    <ol>
+      <li>5 min: key, limit, burst, single node or distributed, reject or queue.</li>
+      <li>5 min: compare the five algorithms in one table; pick token bucket and say why.</li>
+      <li>20 min: code <code>TokenBucket</code> with lazy refill, the limiter map, the demo with a fake clock.</li>
+      <li>10 min: thread safety, memory cleanup of idle keys.</li>
+      <li>5 min: distributed version with Redis and Lua, fail-open or fail-closed.</li>
+    </ol>
+  </div>
+</article>
+
+<article class="topic" id="m3-food-delivery-order-flow">
+  <h3>Design a food delivery order flow (Observer for status updates)</h3>
+  <p class="tldr">An order moves through a fixed set of statuses (placed, accepted, preparing, ready, picked up, delivered or cancelled); validate each transition with a table, and notify the customer, restaurant, delivery dispatcher and analytics through the Observer pattern so the order class does not know who is listening.</p>
+
+  <h4>Requirements and assumptions</h4>
+  <ul>
+    <li>A customer places an order from one restaurant with items and quantities.</li>
+    <li>Status flow: PLACED, ACCEPTED, PREPARING, READY, PICKED_UP, DELIVERED. Cancellation is allowed before PICKED_UP.</li>
+    <li>Different parties react to each change: the customer gets a notification, the restaurant sees new orders, a delivery partner is assigned when food is READY, analytics records everything.</li>
+    <li>Invalid transitions (DELIVERED to PREPARING) are rejected.</li>
+    <li>Assumptions: money in paise; payment, maps and routing are out of scope; notifications are printed to the console; observers run synchronously in the core code (asynchronous delivery is discussed below).</li>
+  </ul>
+
+  <h4>The state diagram</h4>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> PLACED
+  PLACED --> ACCEPTED
+  PLACED --> CANCELLED
+  ACCEPTED --> PREPARING
+  ACCEPTED --> CANCELLED
+  PREPARING --> READY
+  PREPARING --> CANCELLED
+  READY --> PICKED_UP
+  READY --> CANCELLED
+  PICKED_UP --> DELIVERED
+  DELIVERED --> [*]
+  CANCELLED --> [*]
+</pre>
+    <figcaption>Legal order status transitions</figcaption>
+  </figure>
+
+  <h4>Entities</h4>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class Order {
+    -String id
+    -OrderStatus status
+    -List~OrderItem~ items
+    -List~OrderObserver~ observers
+    +subscribe(OrderObserver o) void
+    +moveTo(OrderStatus next) void
+    +total() long
+  }
+  class OrderStatus {
+    &lt;&lt;enumeration&gt;&gt;
+    PLACED
+    ACCEPTED
+    PREPARING
+    READY
+    PICKED_UP
+    DELIVERED
+    CANCELLED
+    +canMoveTo(OrderStatus t) boolean
+  }
+  class OrderObserver {
+    &lt;&lt;interface&gt;&gt;
+    +onStatusChanged(Order o, OrderStatus from, OrderStatus to) void
+  }
+  class CustomerNotifier
+  class RestaurantNotifier
+  class DeliveryDispatcher
+  Order --> OrderStatus
+  Order "1" o-- "many" OrderObserver
+  OrderObserver &lt;|.. CustomerNotifier
+  OrderObserver &lt;|.. RestaurantNotifier
+  OrderObserver &lt;|.. DeliveryDispatcher
+</pre>
+    <figcaption>Order is the subject; the notifiers are observers</figcaption>
+  </figure>
+
+  <h4>Key design decisions</h4>
+  <ul>
+    <li><strong>Observer</strong> (<a href="#m2">Module 2</a>): when the status changes, the order loops over its observers. Adding SMS, email, a loyalty-points service or analytics means a new observer class and one <code>subscribe</code> call; <code>Order</code> never changes (open/closed, <a href="#m1">Module 1</a>).</li>
+    <li><strong>Transition table inside the enum</strong> instead of <code>if</code> chains: the legal moves are data, easy to read and test. If each status also had different behaviour, you would use the State pattern as in the <a href="#m3-vending-machine">vending machine</a>. Here statuses carry no behaviour, only rules, so an enum plus table is lighter.</li>
+    <li><strong>Notify outside the lock</strong> and isolate observers: one failing observer must not stop the others or roll back the order.</li>
+    <li><strong>Snapshot of observers</strong> (<code>CopyOnWriteArrayList</code>) so subscribing during a notification does not throw <code>ConcurrentModificationException</code>.</li>
+    <li>Delivery partner assignment is a Strategy (<code>nearest</code>, <code>least busy</code>) used inside <code>DeliveryDispatcher</code>.</li>
+  </ul>
+
+  <h4>Core code: status rules and the order</h4>
+  <pre data-title="OrderModel.java"><code class="language-java">import java.util.EnumMap;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+enum OrderStatus {
+    PLACED, ACCEPTED, PREPARING, READY, PICKED_UP, DELIVERED, CANCELLED;
+
+    private static final Map&lt;OrderStatus, Set&lt;OrderStatus&gt;&gt; NEXT = new EnumMap&lt;&gt;(OrderStatus.class);
+    static {
+        NEXT.put(PLACED, EnumSet.of(ACCEPTED, CANCELLED));
+        NEXT.put(ACCEPTED, EnumSet.of(PREPARING, CANCELLED));
+        NEXT.put(PREPARING, EnumSet.of(READY, CANCELLED));
+        NEXT.put(READY, EnumSet.of(PICKED_UP, CANCELLED));
+        NEXT.put(PICKED_UP, EnumSet.of(DELIVERED));
+        NEXT.put(DELIVERED, EnumSet.noneOf(OrderStatus.class));
+        NEXT.put(CANCELLED, EnumSet.noneOf(OrderStatus.class));
+    }
+
+    boolean canMoveTo(OrderStatus target) { return NEXT.get(this).contains(target); }
+}
+
+record OrderItem(String name, int quantity, long pricePaise) { }
+
+interface OrderObserver {
+    void onStatusChanged(Order order, OrderStatus from, OrderStatus to);
+}
+
+class Order {
+    private final String id, customerId, restaurantId;
+    private final List&lt;OrderItem&gt; items;
+    private OrderStatus status = OrderStatus.PLACED;
+    private final List&lt;OrderObserver&gt; observers = new CopyOnWriteArrayList&lt;&gt;();
+
+    Order(String id, String customerId, String restaurantId, List&lt;OrderItem&gt; items) {
+        if (items.isEmpty()) throw new IllegalArgumentException("Order has no items");
+        this.id = id;
+        this.customerId = customerId;
+        this.restaurantId = restaurantId;
+        this.items = List.copyOf(items);
+    }
+
+    String id() { return id; }
+    String customerId() { return customerId; }
+    String restaurantId() { return restaurantId; }
+    synchronized OrderStatus status() { return status; }
+
+    long total() {
+        return items.stream().mapToLong(i -&gt; i.pricePaise() * i.quantity()).sum();
+    }
+
+    void subscribe(OrderObserver o) { observers.add(o); }
+
+    void moveTo(OrderStatus next) {
+        OrderStatus old;
+        synchronized (this) {                                  // validate and change atomically
+            if (!status.canMoveTo(next)) {
+                throw new IllegalStateException("Illegal move " + status + " -&gt; " + next);
+            }
+            old = status;
+            status = next;
+        }
+        for (OrderObserver o : observers) {                    // notify outside the lock
+            try {
+                o.onStatusChanged(this, old, next);
+            } catch (RuntimeException e) {
+                System.err.println("Observer failed: " + e.getMessage());   // isolate failures
+            }
+        }
+    }
+}</code></pre>
+
+  <h4>Core code: observers and a demo</h4>
+  <pre data-title="OrderObservers.java"><code class="language-java">class CustomerNotifier implements OrderObserver {
+    public void onStatusChanged(Order o, OrderStatus from, OrderStatus to) {
+        System.out.println("Customer " + o.customerId() + ": order " + o.id() + " is " + to);
+    }
+}
+
+class RestaurantNotifier implements OrderObserver {
+    public void onStatusChanged(Order o, OrderStatus from, OrderStatus to) {
+        if (to == OrderStatus.PLACED || to == OrderStatus.CANCELLED) {
+            System.out.println("Restaurant " + o.restaurantId() + ": order " + o.id() + " " + to);
+        }
+    }
+}
+
+class DeliveryDispatcher implements OrderObserver {
+    public void onStatusChanged(Order o, OrderStatus from, OrderStatus to) {
+        if (to == OrderStatus.READY) {
+            System.out.println("Dispatcher: finding a delivery partner for " + o.id());
+        }
+    }
+}</code></pre>
+  <pre data-title="FoodDeliveryDemo.java"><code class="language-java">import java.util.List;
+
+public class FoodDeliveryDemo {
+    public static void main(String[] args) {
+        Order order = new Order("O1", "C1", "R1",
+                List.of(new OrderItem("Biryani", 2, 25_000), new OrderItem("Raita", 1, 4_000)));
+        order.subscribe(new CustomerNotifier());
+        order.subscribe(new DeliveryDispatcher());
+
+        order.moveTo(OrderStatus.ACCEPTED);
+        order.moveTo(OrderStatus.PREPARING);
+        order.moveTo(OrderStatus.READY);
+        order.moveTo(OrderStatus.PICKED_UP);
+        order.moveTo(OrderStatus.DELIVERED);
+        System.out.println("Total: " + order.total());
+        try {
+            order.moveTo(OrderStatus.PREPARING);
+        } catch (IllegalStateException e) {
+            System.out.println("Error: " + e.getMessage());
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Customer C1: order O1 is ACCEPTED
+Customer C1: order O1 is PREPARING
+Customer C1: order O1 is READY
+Dispatcher: finding a delivery partner for O1
+Customer C1: order O1 is PICKED_UP
+Customer C1: order O1 is DELIVERED
+Total: 54000
+Error: Illegal move DELIVERED -&gt; PREPARING</code></pre>
+
+  <h4>Concurrency</h4>
+  <ul>
+    <li>The restaurant presses "accepted" while the customer presses "cancel" at the same instant. Both call <code>moveTo</code>. The synchronized block validates and changes the status as one step, so one wins and the other gets <code>IllegalStateException</code> (or a valid transition from the new state). Nobody sees a half-updated order.</li>
+    <li>With a database: <code>UPDATE orders SET status = 'ACCEPTED' WHERE id = ? AND status = 'PLACED'</code> and check that one row changed. That is the same compare-and-set idea (<a href="#m3-concurrency-in-lld">Concurrency in LLD</a>).</li>
+    <li>Notifying outside the lock means two quick updates might notify out of order. If order matters to observers, include a sequence number or deliver through a single-threaded queue per order.</li>
+  </ul>
+
+  <h4>Edge cases</h4>
+  <ul>
+    <li>Illegal transition or a repeated one: rejected with a clear message.</li>
+    <li>Cancel after pickup: not allowed by the table; real systems add a "refund request" flow instead.</li>
+    <li>An observer throws (SMS provider down): logged, others still run; consider retries.</li>
+    <li>Restaurant never accepts: a timeout job moves PLACED to CANCELLED after N minutes.</li>
+    <li>Observers that are slow: do not call a slow network API inside the loop; hand the event to a queue.</li>
+    <li>Memory: unsubscribe observers of finished orders, or let the order go out of scope.</li>
+  </ul>
+
+  <h4>Extensions interviewers ask</h4>
+  <ul>
+    <li><strong>Asynchronous notifications:</strong> publish an event to an executor or a message broker (Kafka, RabbitMQ). Observers become consumers. This is the same Observer idea scaled across services (<a href="04-spring-boot.html#m7">Spring Boot · Module 7</a>).</li>
+    <li><strong>Delivery partner assignment:</strong> a Strategy (nearest, least loaded, rating), plus a partner state (available, busy).</li>
+    <li><strong>Order undo or edit:</strong> allow item edits only in PLACED.</li>
+    <li><strong>Payment:</strong> add PAYMENT_PENDING before PLACED, and a refund observer on CANCELLED.</li>
+    <li><strong>Different order types</strong> (pickup, dine-in): different transition tables chosen by a factory.</li>
+    <li><strong>Live tracking:</strong> a location stream from the partner app, separate from status.</li>
+  </ul>
+  <div class="co co-interview">
+    <p class="co-t">How to present this in 45 minutes</p>
+    <ol>
+      <li>5 min: statuses, who needs to know what, cancellation rules.</li>
+      <li>7 min: draw the state diagram, then Order plus observers.</li>
+      <li>20 min: code the enum with the transition table, <code>Order.moveTo</code>, two observers.</li>
+      <li>8 min: run the demo; discuss the race of accept vs cancel and failing observers.</li>
+      <li>5 min: async events and partner assignment Strategy.</li>
+    </ol>
+  </div>
+</article>
+
+<article class="topic recap" id="m3-interview">
+  <h3>Interview questions — LLD interview problems</h3>
+
+  <details class="qa">
+    <summary>How do you start an LLD interview question?</summary>
+    <div class="qa-a">
+      <p>I do not start with code. First I ask clarifying questions about users, main use cases, variations, limits and whether thread safety or persistence is needed. I write the agreed scope and my assumptions down. Next I list entities and the public methods, draw a class diagram, and only then write code, model first and main flow second. I keep talking so the interviewer can follow my reasoning.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you find the classes in a problem?</summary>
+    <div class="qa-a">
+      <p>I underline nouns in the requirements, keep those that have their own data and behaviour or identity, and turn plain attributes into fields. Fixed sets of values become enums. Verbs become methods on the class that owns the data needed. I look for things that vary (pricing, split rules, selection rules) and put them behind an interface. I also ask what changes together and what changes separately, which shows where one class should become two (for example Book and BookCopy, Seat and ShowSeat).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When do you use a design pattern in an LLD answer, and when not?</summary>
+    <div class="qa-a">
+      <p>Only when I can name the variation or the problem it solves: Strategy for pricing or split rules, State for a machine whose behaviour depends on its mode, Observer when many parties react to one change, Factory when object creation depends on a type. Using a pattern with nothing varying (Singleton for everything, a Factory for one class) is a negative sign. I say "no pattern needed here" when that is true, as in tic-tac-toe.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain the double-booking problem and how you prevent it.</summary>
+    <div class="qa-a">
+      <p>It is a check-then-act race: two requests both see a seat as free and both book it. The fix is to make the check and the write one atomic step. In memory I use a lock around the critical section (one lock per show so multi-seat booking is all-or-nothing). In a real system with several servers the database decides: a unique constraint on (show, seat), a conditional update such as <code>WHERE status = 'AVAILABLE'</code>, <code>SELECT ... FOR UPDATE</code> for high contention, or an optimistic version column. For checkout I add a HELD state with expiry.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why not keep a database transaction open while the user pays?</summary>
+    <div class="qa-a">
+      <p>Payment takes seconds or minutes. An open transaction holds locks and a connection, so other users queue up and the pool runs dry. Instead I use a short transaction to mark the seats HELD with an expiry time, release the lock, take the payment, then another short transaction to confirm. If the user leaves, the hold expires.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why is a per-show lock a good choice for BookMyShow?</summary>
+    <div class="qa-a">
+      <p>A booking changes several seats at once, and it must succeed for all or none. One lock per show makes that trivial and avoids deadlocks that per-seat locks cause when two users lock seats in opposite order. Different shows use different locks, so they do not slow each other. The lock is held only while flipping seat states, never during payment. If one show becomes extremely hot, I would go to per-seat locks in sorted order or to database-level conditional updates.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Implement an LRU cache with O(1) operations. Which structures and why?</summary>
+    <div class="qa-a">
+      <p>A <code>HashMap</code> from key to node gives O(1) lookup. A doubly linked list ordered by recency gives O(1) move-to-front and O(1) removal of the tail, because a node knows its neighbours. <code>get</code> moves the node to the front; <code>put</code> inserts at the front and, if over capacity, removes the tail node and its map entry (the node stores its key for that). Sentinel head and tail nodes avoid null checks. In Java, <code>LinkedHashMap</code> with <code>accessOrder = true</code> and <code>removeEldestEntry</code> does the same.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Is a ConcurrentHashMap enough to make an LRU cache thread safe?</summary>
+    <div class="qa-a">
+      <p>No. Each map operation is safe, but the cache must update the map and the recency list together, and even <code>get</code> writes (it reorders). Those compound steps need one lock, so the simple answer is <code>synchronized</code> methods. For more throughput: segment the cache into several independent LRUs by key hash, or use a library such as Caffeine that buffers recency updates.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Compare the token bucket and the fixed window rate limiter.</summary>
+    <div class="qa-a">
+      <p>A fixed window counts requests per time slot and resets at the boundary. It is simple but allows up to double the limit across a boundary (100 at 10:00:59 and 100 at 10:01:00). A token bucket refills continuously, allows a bounded burst equal to capacity, and enforces the average rate over time, with O(1) time and memory per key. Refill is computed lazily from timestamps, no timer thread. Both need atomic updates per key.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you make a rate limiter work across many servers?</summary>
+    <div class="qa-a">
+      <p>Keep the counters or buckets in a shared store such as Redis and make each check atomic, for example with a Lua script, because separate GET and SET calls would race. Costs: an extra network call per request and a new failure point, so decide whether the limiter fails open or closed. Alternatives are enforcing at the API gateway or using local buckets with periodic sync when small inaccuracy is acceptable.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does the State pattern help the vending machine, compared with a switch statement?</summary>
+    <div class="qa-a">
+      <p>With a switch, every method (insert, select, cancel) contains a branch per state, so adding OutOfService means editing all of them and it is easy to miss one. With State, each state class implements what each action means in that state, and the machine delegates. A new state is a new class. Invalid actions fall back to default methods that throw. The cost is more classes, which is worth it when states and actions both multiply.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you schedule an elevator? Explain the idea behind your algorithm.</summary>
+    <div class="qa-a">
+      <p>Each elevator keeps its direction and two sorted sets of stops, one above and one below. It moves toward the next stop in its direction, serves everything on the way, and reverses when no stops remain in that direction (LOOK, a variant of SCAN from disk scheduling). This avoids zig-zagging and starvation. A dispatcher Strategy assigns a hall call to the best elevator, for example the idle one or the one moving toward the caller that is nearest. Each elevator's state changes under its own lock.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does Splitwise simplify debts?</summary>
+    <div class="qa-a">
+      <p>Compute each person's net balance (owed to them minus what they owe); the sum is zero. Put creditors and debtors into two priority queues. Repeatedly take the largest debtor and the largest creditor, transfer the smaller of the two amounts, and push back whatever remains. Each transfer clears at least one person, so there are at most N-1 transfers. The true minimum number of transfers is NP-hard in general, so the greedy method is the practical answer.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why store money as a long of paise and not a double?</summary>
+    <div class="qa-a">
+      <p>Binary floating point cannot represent values like 0.1 exactly, so sums drift and equality checks fail. A <code>long</code> of the smallest unit (paise) is exact and fast. When dividing, decide where the leftover paise go (for example the first participants get one extra), so the parts always add up to the total. <code>BigDecimal</code> is the alternative when you need fractional units or currencies with different scales.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>The interviewer says "make it thread safe" at the end. What do you do?</summary>
+    <div class="qa-a">
+      <p>I name the shared mutable state and the compound operations on it (check-then-act, read-modify-write). For each I choose the smallest tool: an atomic or <code>putIfAbsent</code> for a single value, a lock per object (per show, per bucket, per account) for multi-step updates, never a global lock if objects are independent. I keep slow work (payment, network) outside the lock, lock in a fixed order if two locks are needed, and mention the database constraint as the real guard for multiple servers.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m3-cheatsheet">
+  <h3>Cheat sheet — LLD interview problems</h3>
+  <ul class="cheat">
+    <li><b>Method</b> requirements, entities, class diagram, core code, edge cases, extensions.</li>
+    <li><b>Time plan</b> 5-8 clarify, 5 API, 8-10 diagram, 20-25 code, 5 edge/concurrency, 5 extensions.</li>
+    <li><b>Clarify</b> actors, use cases, variations, limits, threads, persistence, failure behaviour.</li>
+    <li><b>Entity test</b> own data and behaviour or identity; else it is a field; fixed values are enums.</li>
+    <li><b>Money</b> long paise or BigDecimal, never double; decide where rounding leftovers go.</li>
+    <li><b>Double booking</b> check-then-act race; fix with atomic check and write.</li>
+    <li><b>In-memory fixes</b> synchronized, ReentrantLock (finally unlock), putIfAbsent, per-show lock, sorted multi-lock order.</li>
+    <li><b>Database fixes</b> unique constraint, conditional UPDATE, SELECT FOR UPDATE, version column.</li>
+    <li><b>Seat hold</b> AVAILABLE, HELD with expiry, BOOKED; lazy expiry; no lock during payment.</li>
+    <li><b>Distributed lock</b> Redis SET NX PX with token; caveats: expiry during pauses, failover; use fencing tokens.</li>
+    <li><b>Parking lot</b> enum types, Spot with atomic claim, PricingStrategy, ticket map, injected Clock.</li>
+    <li><b>Tic-tac-toe</b> Board vs Game; row, column, diagonal counters give O(1) win check.</li>
+    <li><b>Library</b> Book vs BookCopy, Loan as link entity, FineStrategy, limits per member.</li>
+    <li><b>Vending machine</b> State pattern, default methods throw, machine holds data, states hold transitions.</li>
+    <li><b>Elevator</b> two TreeSets per elevator, LOOK sweep, selector Strategy, step() simulates time.</li>
+    <li><b>LRU</b> HashMap plus doubly linked list with sentinels; node stores key; get also writes, so lock it.</li>
+    <li><b>LinkedHashMap LRU</b> accessOrder true plus removeEldestEntry.</li>
+    <li><b>Splitwise</b> SplitStrategy (equal, exact, percent), pairwise sheet with netting, greedy min cash flow with two heaps.</li>
+    <li><b>BookMyShow</b> Seat vs ShowSeat, per-show lock, hold, pay, confirm, release.</li>
+    <li><b>Rate limiter</b> token bucket with lazy refill, lock per bucket, nanoTime, 429 and Retry-After.</li>
+    <li><b>Fixed window flaw</b> boundary spike up to double the limit.</li>
+    <li><b>Food delivery</b> transition table in the enum, Observer for notifications, notify outside the lock, isolate failures.</li>
+    <li><b>Patterns seen</b> Strategy (pricing, fines, split, selector, limiter), State, Observer, Facade, Command for undo.</li>
+    <li><b>Mistakes</b> jumping to code, god class, pattern overuse, silent coding, ignoring concurrency.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m3-practice">
+  <h3>Practice — LLD interview problems</h3>
+  <ol class="steps">
+    <li><strong>Warm-up: shopping cart.</strong> Rebuild the cart from <a href="#m3-lld-method">the LLD method article</a> from memory, then add a coupon-code rule and a combined rule. Done when adding a rule needs no change to <code>Cart</code> and you have a test for each rule.</li>
+    <li><strong>Race it.</strong> Write the broken <code>Seat.book</code> from <a href="#m3-concurrency-in-lld">the concurrency article</a>, run it with 200 threads on one seat in a loop and count winners. Then fix it with <code>synchronized</code> and with <code>putIfAbsent</code>. Done when the count is always exactly 1.</li>
+    <li><strong>Parking lot.</strong> Implement it with the Strategy for pricing. Add EV spots and a "nearest free spot" allocation policy. Done when a unit test with a fake <code>Clock</code> checks the fee for 59 minutes, 61 minutes and 5 hours.</li>
+    <li><strong>Tic-tac-toe, then Snake and Ladder.</strong> Code both with an injected dice. Add undo to tic-tac-toe using a stack of moves. Done when a scripted game ends in a win, a draw and an invalid move.</li>
+    <li><strong>Library and vending machine.</strong> Code the library with reservations (a waiting queue notified on return) and the vending machine with an <code>OutOfServiceState</code>. Done when every invalid action throws a clear exception.</li>
+    <li><strong>Elevator.</strong> Run three elevators with random requests from several threads and a scheduler calling <code>stepAll()</code> every 100 ms. Print the stops. Done when no request waits longer than two full sweeps.</li>
+    <li><strong>LRU cache.</strong> Write the hand-made version, the <code>LinkedHashMap</code> version, then add a TTL. Done when the same test suite passes on both and a 16-thread stress test never throws.</li>
+    <li><strong>Splitwise.</strong> Add all three split types, history and <code>simplify</code>. Done when the sum of all net balances is zero in every test and a group of 5 people with 8 expenses needs at most 4 transfers.</li>
+    <li><strong>BookMyShow in 60 minutes.</strong> Set a timer and code the hold, pay, confirm flow. Then write the SQL conditional update and unique constraint for the same flow. Done when 100 threads fighting for 10 seats produce exactly 10 bookings and no seat is booked twice.</li>
+    <li><strong>Rate limiter and food delivery.</strong> Build the token bucket with a fake clock and a sliding window alternative, then the order flow with an asynchronous observer using an executor. Done when both pass tests, including a failing observer that does not stop the others.</li>
+  </ol>
+</article>

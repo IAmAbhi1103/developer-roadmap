@@ -1,0 +1,626 @@
+<div class="mintro">
+  <p>A React app on its own only shows data you typed into it. A real full-stack app talks to a backend:
+  the browser loads your React files, then your JavaScript calls a Spring Boot REST API, which reads
+  and writes PostgreSQL. This module is the glue between <a href="#m5">Module 5</a> and the Spring Boot
+  work in <a href="04-spring-boot.html#m4">Spring Boot · Module 4</a>. Most real-world bugs for a new
+  full-stack developer live here: a CORS error, a 401 on every request, a token that disappears on
+  refresh, a validation message that never shows up.</p>
+  <p>You will build the whole path: an API client with the JWT attached, the CORS configuration on both
+  sides, login and protected routes, forms that show backend errors, environment variables per
+  environment, and a production build. Then you will put it all into one small project.</p>
+  <ul>
+    <li>Draw the request path from browser to database and back.</li>
+    <li>Call your API with a configured Axios instance or a small <code>fetch</code> wrapper.</li>
+    <li>Explain CORS and preflight, read a CORS error, and fix it in Spring Boot or with the Vite
+    proxy.</li>
+    <li>Implement JWT login with an <code>AuthContext</code>, restore the session on reload and handle
+    expired tokens (401).</li>
+    <li>Build protected and role-based routes, and explain why the backend must still check roles.</li>
+    <li>Show loading, error, empty and paginated data, and map Spring's field errors onto form
+    fields.</li>
+    <li>Use environment variables, build for production and deploy the static files.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m6-architecture">
+  <h3>The full-stack architecture and the request cycle</h3>
+  <p class="tldr">The browser downloads static React files once, then your JavaScript sends JSON requests
+  to the Spring Boot API, which talks to PostgreSQL; the React app and the API are two separate
+  programs, often on two different origins.</p>
+
+  <h4>The pieces</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  U["Browser"] -->|"1. GET page"| H["Static host (Vite build, Nginx, Vercel)"]
+  H -->|"HTML, JS, CSS"| U
+  U -->|"2. fetch/Axios + JWT"| A["Spring Boot API"]
+  A -->|"3. JPA / SQL"| D[("PostgreSQL")]
+  D --> A
+  A -->|"JSON"| U
+</pre>
+    <figcaption>Two programs: static React files for the UI, and the Spring Boot API for data</figcaption>
+  </figure>
+
+  <ol class="steps">
+    <li><strong>The page load.</strong> The user opens <code>https://crm.example.com</code>. A static
+    host (Nginx, Vercel, Netlify, S3 + CDN) returns <code>index.html</code> and the JS and CSS files
+    that <code>npm run build</code> produced. No Java runs here.</li>
+    <li><strong>React starts.</strong> The JavaScript runs in the browser, renders the first screen,
+    and the router shows the page for the URL.</li>
+    <li><strong>API call.</strong> A component (or a query) calls
+    <code>https://api.example.com/api/employees</code> with <code>fetch</code> or Axios, adding
+    <code>Authorization: Bearer &lt;jwt&gt;</code>.</li>
+    <li><strong>Spring Boot.</strong> Security filters check the token, the controller calls the
+    service, the repository runs SQL on PostgreSQL, and the result is serialised to JSON by Jackson.</li>
+    <li><strong>Response.</strong> The browser receives JSON, your code calls <code>setState</code> (or
+    the query cache updates) and React re-renders.</li>
+  </ol>
+
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant B as Browser (React)
+  participant S as Spring Boot API
+  participant DB as PostgreSQL
+  B->>S: GET /api/employees?page=0 (Authorization: Bearer ...)
+  S->>S: Verify JWT, check role
+  S->>DB: SELECT ... LIMIT 10
+  DB-->>S: rows
+  S-->>B: 200 OK, JSON page
+  B->>B: setState, React re-renders
+</pre>
+    <figcaption>One authenticated request, end to end</figcaption>
+  </figure>
+
+  <h4>Two origins, two deployments</h4>
+  <p>In development you run two servers: Vite on <code>http://localhost:5173</code> and Spring Boot on
+  <code>http://localhost:8080</code>. These are <strong>different origins</strong> (different ports), and
+  browsers apply the same-origin policy to scripts that call other origins. That is why CORS (next
+  article) is the first thing that goes wrong. In production you choose between three layouts:</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Layout</th><th>How</th><th>CORS needed?</th></tr></thead>
+    <tbody>
+      <tr><td>Separate hosts</td><td>UI on Vercel/Netlify/S3, API on its own domain or cloud server</td><td>Yes</td></tr>
+      <tr><td>Reverse proxy, one domain</td><td>Nginx serves <code>/</code> from <code>dist/</code> and forwards <code>/api</code> to Spring Boot</td><td>No (same origin)</td></tr>
+      <tr><td>Bundled in the JAR</td><td>Copy <code>dist/</code> into Spring Boot's <code>static</code> folder</td><td>No, but UI and API deploy together</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The contract between the two sides</h4>
+  <p>The frontend and backend agree on a contract: URLs, methods, JSON field names, status codes and
+  the error format. Keep a short list of it (or an OpenAPI document from springdoc) and let the Java
+  <code>record</code> DTOs drive the JavaScript object shapes. Typical mapping:</p>
+
+<pre data-title="Java DTO (backend)"><code class="language-java">public record EmployeeResponse(Long id, String name, String email,
+                               String department, BigDecimal salary, LocalDate joinedOn) {}</code></pre>
+
+<pre data-title="The JSON the browser receives"><code class="language-json">{
+  "id": 7,
+  "name": "Asha Rao",
+  "email": "asha@corp.in",
+  "department": "ENGINEERING",
+  "salary": 85000.00,
+  "joinedOn": "2024-06-03"
+}</code></pre>
+
+  <div class="co co-note">
+    <p class="co-t">Things that trip people up in the JSON contract</p>
+    <ul>
+      <li>Dates arrive as strings (<code>"2024-06-03"</code>). Convert with <code>new Date(...)</code>
+      only when you need date maths or formatting.</li>
+      <li><code>Long</code> ids above 2<sup>53</sup> lose precision in JavaScript numbers. Normal
+      auto-increment ids are fine; send very large ids as strings.</li>
+      <li><code>BigDecimal</code> becomes a JSON number; use integer paise or a string for money you
+      calculate with.</li>
+      <li>Spring's default pagination response (<code>Page</code>) has <code>content</code>,
+      <code>totalElements</code>, <code>totalPages</code>, <code>number</code> and <code>size</code>
+      fields, plus flags such as <code>first</code> and <code>last</code>; the exact shape depends on
+      your Spring Data version and whether you wrap it in your own DTO. Check the real response in the
+      Network tab.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Prefix all API routes with <code>/api</code> so a proxy or Nginx can tell them apart from
+      frontend routes.</li>
+      <li>The frontend stores the API base URL in one place (an environment variable), never repeated
+      in components.</li>
+      <li>All API calls go through one module (<code>src/lib/apiClient.js</code>). Components do not
+      call <code>fetch</code> with full URLs.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Walk me through what happens when a user opens the page and clicks Login"</p>
+    <ul>
+      <li>Static files load from the host; React boots in the browser (SPA).</li>
+      <li>The login form POSTs credentials as JSON to the API (a cross-origin request, so CORS applies).</li>
+      <li>Spring Security authenticates, returns a JWT; the app stores it and attaches it to later
+      requests.</li>
+      <li>Each API response is JSON that updates React state; the backend remains the authority for
+      security and validation.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-axios-fetch">
+  <h3>Calling your API: an Axios instance or a fetch wrapper</h3>
+  <p class="tldr">Create one configured HTTP client (base URL from an env variable, JSON headers, a
+  request interceptor that adds the JWT, a response interceptor that handles 401) and use it everywhere;
+  Axios gives this almost for free, and a 40-line <code>fetch</code> wrapper does the same.</p>
+
+  <h4>Why a single client</h4>
+  <p>Without one, every component repeats the base URL, the headers, the token, the
+  <code>res.ok</code> check and the error parsing. One mistake or change then needs fifty edits. A
+  central client makes four things happen automatically: the right base URL, the
+  <code>Authorization</code> header, a consistent error shape, and one place to react to "401, token
+  expired".</p>
+
+  <h4>Axios</h4>
+  <p><strong>Axios</strong> is a popular HTTP client library. Install it with
+  <code>npm install axios</code>. Compared with <code>fetch</code>, it parses JSON for you, throws on
+  4xx and 5xx responses, supports timeouts, and has <strong>interceptors</strong>: functions that run on
+  every request or response.</p>
+
+<pre data-title="src/lib/axios.js"><code class="language-javascript">import axios from 'axios';
+import { tokenStore } from './tokenStore.js';
+
+export const api = axios.create({
+  baseURL: import.meta.env.VITE_API_URL,       // e.g. http://localhost:8080/api
+  timeout: 10_000,                              // fail after 10 s instead of hanging
+  headers: { 'Content-Type': 'application/json' },
+});
+
+// Request interceptor: runs before every request
+api.interceptors.request.use((config) =&gt; {
+  const token = tokenStore.get();
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// Response interceptor: runs for every response
+api.interceptors.response.use(
+  (response) =&gt; response,                      // 2xx: pass through
+  (error) =&gt; {
+    if (error.response?.status === 401 &amp;&amp; !error.config.url.includes('/auth/')) {
+      tokenStore.clear();                       // token invalid or expired
+      window.dispatchEvent(new Event('auth:logout'));   // AuthContext listens for this
+    }
+    return Promise.reject(error);               // let the caller handle other errors
+  },
+);</code></pre>
+
+<pre data-title="src/features/employees/employeeApi.js"><code class="language-javascript">import { api } from '../../lib/axios.js';
+
+export const employeeApi = {
+  list: (params) =&gt; api.get('/employees', { params }).then((r) =&gt; r.data),
+  get: (id) =&gt; api.get(`/employees/${id}`).then((r) =&gt; r.data),
+  create: (body) =&gt; api.post('/employees', body).then((r) =&gt; r.data),
+  update: (id, body) =&gt; api.put(`/employees/${id}`, body).then((r) =&gt; r.data),
+  remove: (id) =&gt; api.delete(`/employees/${id}`),
+};
+
+// employeeApi.list({ page: 0, size: 10, sort: 'name,asc' })
+// -&gt; GET /api/employees?page=0&amp;size=10&amp;sort=name%2Casc</code></pre>
+
+  <h4>Telling error kinds apart</h4>
+  <p>An Axios error has different fields depending on what failed. This distinction decides what you
+  show the user.</p>
+
+<pre data-title="src/lib/errors.js"><code class="language-javascript">export function describeError(error) {
+  if (error.response) {
+    // The server answered with 4xx or 5xx
+    const { status, data } = error.response;
+    if (status === 401) return 'Your session has expired. Please log in again.';
+    if (status === 403) return 'You do not have permission to do this.';
+    if (status === 404) return 'Not found.';
+    if (status &gt;= 500) return 'Server error. Please try again later.';
+    return data?.detail ?? data?.message ?? `Request failed (${status}).`;
+  }
+  if (error.request) {
+    // The request was sent but no response arrived: server down, offline, or CORS blocked
+    return 'Cannot reach the server. Check your connection.';
+  }
+  return error.message;                          // something broke before sending
+}</code></pre>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Kind</th><th>Axios sign</th><th>Typical cause</th><th>UI</th></tr></thead>
+    <tbody>
+      <tr><td>Network error</td><td><code>error.response</code> is undefined; code <code>ERR_NETWORK</code></td><td>API down, offline, CORS block, wrong URL</td><td>"Cannot reach server", retry button</td></tr>
+      <tr><td>Timeout</td><td>code <code>ECONNABORTED</code></td><td>Slow server</td><td>Retry message</td></tr>
+      <tr><td>4xx</td><td><code>error.response.status</code> 400/401/403/404/409/422</td><td>Your request is wrong or not allowed</td><td>Field errors, login redirect, "not found"</td></tr>
+      <tr><td>5xx</td><td>status 500+</td><td>Bug or outage in the backend</td><td>Generic error, log it</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The same with fetch</h4>
+  <p><code>fetch</code> needs no library. The cost is that you write the wrapper yourself: it does not
+  throw on HTTP errors, does not parse JSON automatically, has no built-in timeout, and has no
+  interceptors. This wrapper adds all of them (this is the <code>apiClient</code> idea from
+  <a href="#m4">Module 4</a>, grown up).</p>
+
+<pre data-title="src/lib/apiClient.js"><code class="language-javascript">import { tokenStore } from './tokenStore.js';
+
+const BASE_URL = import.meta.env.VITE_API_URL;
+
+export class ApiError extends Error {
+  constructor(status, body) {
+    super(body?.detail ?? body?.message ?? `HTTP ${status}`);
+    this.status = status;
+    this.body = body;            // keep the whole Spring ProblemDetail for field errors
+  }
+}
+
+async function request(path, { method = 'GET', body, params, signal } = {}) {
+  const url = new URL(BASE_URL + path, window.location.origin);
+  if (params) Object.entries(params).forEach(([k, v]) =&gt; url.searchParams.set(k, v));
+
+  const headers = { Accept: 'application/json' };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  const token = tokenStore.get();
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const timeout = AbortSignal.timeout(10_000);   // built-in timeout signal
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  });
+
+  if (res.status === 204) return null;           // No Content (typical for DELETE)
+  const data = await res.json().catch(() =&gt; null);
+
+  if (!res.ok) {
+    if (res.status === 401 &amp;&amp; !path.startsWith('/auth/')) {
+      tokenStore.clear();
+      window.dispatchEvent(new Event('auth:logout'));
+    }
+    throw new ApiError(res.status, data);
+  }
+  return data;
+}
+
+export const apiClient = {
+  get: (path, opts) =&gt; request(path, opts),
+  post: (path, body, opts) =&gt; request(path, { ...opts, method: 'POST', body }),
+  put: (path, body, opts) =&gt; request(path, { ...opts, method: 'PUT', body }),
+  delete: (path, opts) =&gt; request(path, { ...opts, method: 'DELETE' }),
+};</code></pre>
+
+  <p>Both versions expect a tiny token helper, shown here with an in-memory store. The
+  <a href="#m6-jwt-flow">JWT article</a> explains where the token should live.</p>
+
+<pre data-title="src/lib/tokenStore.js"><code class="language-javascript">let accessToken = null;               // lives in memory only
+
+export const tokenStore = {
+  get: () =&gt; accessToken,
+  set: (token) =&gt; { accessToken = token; },
+  clear: () =&gt; { accessToken = null; },
+};</code></pre>
+
+  <h4>Axios vs fetch</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Axios</th><th>fetch</th></tr></thead>
+    <tbody>
+      <tr><td>Installation</td><td><code>npm install axios</code> (adds bundle size)</td><td>Built into browsers and Node 18+</td></tr>
+      <tr><td>JSON body and response</td><td>Automatic</td><td>Manual <code>JSON.stringify</code> and <code>res.json()</code></td></tr>
+      <tr><td>4xx / 5xx</td><td>Rejects the promise</td><td>Resolves; you check <code>res.ok</code></td></tr>
+      <tr><td>Timeout</td><td><code>timeout</code> option</td><td><code>AbortSignal.timeout(ms)</code></td></tr>
+      <tr><td>Interceptors</td><td>Built in</td><td>Write a wrapper</td></tr>
+      <tr><td>Query params</td><td><code>params</code> option</td><td><code>URLSearchParams</code> manually</td></tr>
+      <tr><td>Upload / download progress</td><td>Supported</td><td>Upload progress not available in the standard API</td></tr>
+      <tr><td>Cancel a request</td><td><code>signal</code> (AbortController) is supported</td><td><code>signal</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-conv">
+    <p class="co-t">Which one should you pick?</p>
+    <p>Either is fine; consistency matters more. Many Spring Boot teams use Axios because interceptors
+    make JWT handling short. If you use TanStack Query, both work as the <code>queryFn</code>. Do not mix
+    them in the same project. The rest of this module uses Axios (<code>api</code>) in most examples and
+    shows the <code>fetch</code> equivalent where it differs.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Hard-coding <code>http://localhost:8080</code> in components; it breaks in staging and
+      production.</li>
+      <li>Treating <code>fetch</code> 404/500 as success because the promise resolved.</li>
+      <li>Redirecting to login on <em>every</em> 401, including the 401 of a wrong password on the
+      login request, which clears the error message. Skip the interceptor for auth endpoints.</li>
+      <li>Logging the Authorization header or token to the console or an error tracker.</li>
+      <li>Sending <code>Content-Type: application/json</code> with a <code>FormData</code> body; leave
+      the header off and let the browser set the multipart boundary.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Axios vs fetch? What are interceptors?"</p>
+    <ul>
+      <li>Both use promises. Axios adds automatic JSON, rejection on non-2xx, timeouts and interceptors;
+      <code>fetch</code> is native and needs a wrapper for the same behaviour.</li>
+      <li>Interceptors are hooks on every request/response: add the bearer token on the way out; handle
+      401 (logout or refresh) on the way back.</li>
+      <li>Keep one configured client so base URL, auth and error handling live in one place.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-cors-spring">
+  <h3>CORS end to end: why the browser blocks your request and how to fix it</h3>
+  <p class="tldr">CORS is a browser rule: a page may read a response from another origin only if that
+  server's headers allow it; fix it by allowing your frontend's origin in Spring Boot (or avoid it in
+  development with the Vite proxy), and remember CORS does not protect your API.</p>
+
+  <h4>The error you will meet first</h4>
+  <p>You call <code>http://localhost:8080/api/employees</code> from a React app on
+  <code>http://localhost:5173</code>. The API works in Postman, but the browser Console shows:</p>
+
+<pre class="out" data-title="Browser Console"><code class="language-plaintext">Access to XMLHttpRequest at 'http://localhost:8080/api/employees' from origin
+'http://localhost:5173' has been blocked by CORS policy: No
+'Access-Control-Allow-Origin' header is present on the requested resource.</code></pre>
+
+  <p>Postman works because CORS is enforced by <strong>browsers</strong>, not by servers. Your Spring
+  Boot code probably ran fine and returned data; the browser then refused to hand the response to your
+  JavaScript.</p>
+
+  <h4>What an origin is</h4>
+  <p>An <strong>origin</strong> is the combination of <strong>scheme + host + port</strong>. Two URLs
+  are the same origin only if all three match.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>URL compared with <code>http://localhost:5173</code></th><th>Same origin?</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>http://localhost:5173/employees</code></td><td>Yes</td><td>Only the path differs</td></tr>
+      <tr><td><code>http://localhost:8080/api</code></td><td>No</td><td>Different port</td></tr>
+      <tr><td><code>https://localhost:5173</code></td><td>No</td><td>Different scheme</td></tr>
+      <tr><td><code>http://127.0.0.1:5173</code></td><td>No</td><td>Different host name</td></tr>
+      <tr><td><code>https://api.crm.in</code> vs <code>https://app.crm.in</code></td><td>No</td><td>Different host (subdomain)</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The <strong>same-origin policy</strong> stops a script on one origin from reading data from
+  another, so that a malicious page you visit cannot read your bank's pages using your logged-in
+  session. <strong>CORS (Cross-Origin Resource Sharing)</strong> is the controlled loophole: the
+  <em>server</em> tells the browser, using response headers, which other origins may read its
+  responses.</p>
+
+  <h4>Simple requests and preflight</h4>
+  <p>For some requests the browser just sends them with an <code>Origin</code> header and checks the
+  response headers. For others, it first sends an <strong>OPTIONS "preflight" request</strong> to ask
+  permission. A request needs preflight when it is not "simple": a method other than GET, HEAD or POST;
+  or a <code>Content-Type</code> such as <code>application/json</code>; or a custom header such as
+  <code>Authorization</code>. A JSON POST with a JWT therefore always triggers a preflight.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant B as Browser (localhost:5173)
+  participant S as Spring Boot (localhost:8080)
+  B->>S: OPTIONS /api/employees (Origin, Access-Control-Request-Method, -Headers)
+  S-->>B: 200 + Access-Control-Allow-Origin, -Methods, -Headers, Max-Age
+  Note over B: Allowed, so send the real request
+  B->>S: POST /api/employees (Authorization, JSON)
+  S-->>B: 201 + Access-Control-Allow-Origin
+  Note over B: JavaScript may now read the response
+</pre>
+    <figcaption>Preflight: the browser asks first, then sends the real request</figcaption>
+  </figure>
+
+<pre data-title="The preflight, as raw HTTP"><code class="language-http">OPTIONS /api/employees HTTP/1.1
+Host: localhost:8080
+Origin: http://localhost:5173
+Access-Control-Request-Method: POST
+Access-Control-Request-Headers: authorization,content-type
+
+HTTP/1.1 200
+Access-Control-Allow-Origin: http://localhost:5173
+Access-Control-Allow-Methods: GET,POST,PUT,DELETE,OPTIONS
+Access-Control-Allow-Headers: authorization,content-type
+Access-Control-Allow-Credentials: true
+Access-Control-Max-Age: 3600</code></pre>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Header</th><th>Direction</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>Origin</code></td><td>Request</td><td>Which origin the calling page is on (set by the browser; you cannot change it)</td></tr>
+      <tr><td><code>Access-Control-Allow-Origin</code></td><td>Response</td><td>The allowed origin (or <code>*</code> for any, which cannot be combined with credentials)</td></tr>
+      <tr><td><code>Access-Control-Allow-Methods</code></td><td>Response to preflight</td><td>Allowed HTTP methods</td></tr>
+      <tr><td><code>Access-Control-Allow-Headers</code></td><td>Response to preflight</td><td>Allowed request headers (<code>Authorization</code>, <code>Content-Type</code>)</td></tr>
+      <tr><td><code>Access-Control-Allow-Credentials</code></td><td>Response</td><td><code>true</code> lets cookies and HTTP auth be sent</td></tr>
+      <tr><td><code>Access-Control-Max-Age</code></td><td>Response to preflight</td><td>Seconds the browser may cache the preflight result</td></tr>
+      <tr><td><code>Access-Control-Expose-Headers</code></td><td>Response</td><td>Extra response headers JavaScript may read (such as <code>Location</code>)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The fix in Spring Boot</h4>
+  <p>Option 1, <strong>without Spring Security</strong>: register CORS mappings in a
+  <code>WebMvcConfigurer</code>.</p>
+
+<pre data-title="WebConfig.java"><code class="language-java">import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.servlet.config.annotation.CorsRegistry;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+
+@Configuration
+public class WebConfig implements WebMvcConfigurer {
+
+    private final String[] allowedOrigins;
+
+    public WebConfig(@Value("${app.cors.allowed-origins}") String[] allowedOrigins) {
+        this.allowedOrigins = allowedOrigins;
+    }
+
+    @Override
+    public void addCorsMappings(CorsRegistry registry) {
+        registry.addMapping("/api/**")
+                .allowedOrigins(allowedOrigins)
+                .allowedMethods("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+                .allowedHeaders("Authorization", "Content-Type")
+                .exposedHeaders("Location")
+                .maxAge(3600);
+    }
+}</code></pre>
+
+<pre data-title="application.properties and application-prod.properties"><code class="language-properties"># application.properties (development)
+app.cors.allowed-origins=http://localhost:5173
+
+# application-prod.properties (override per environment)
+app.cors.allowed-origins=https://crm.example.com</code></pre>
+
+  <p>Option 2, <strong>with Spring Security</strong> (the case for any JWT API). The Security filter
+  chain runs <em>before</em> Spring MVC, so a preflight request with no <code>Authorization</code>
+  header would be rejected with 401 before MVC's CORS mapping is ever consulted. You must configure CORS
+  in the security chain, using a <code>CorsConfigurationSource</code> bean.</p>
+
+<pre data-title="SecurityConfig.java (CORS part)"><code class="language-java">import java.util.List;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+@Configuration
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .cors(Customizer.withDefaults())          // uses the CorsConfigurationSource bean
+            .csrf(csrf -&gt; csrf.disable())             // OK for a stateless Bearer-token API
+            .authorizeHttpRequests(auth -&gt; auth
+                .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()   // preflight
+                .requestMatchers("/api/auth/**").permitAll()
+                .anyRequest().authenticated());
+        // ... JWT filter, session policy STATELESS, etc. (see the Spring Boot page)
+        return http.build();
+    }
+
+    @Bean
+    CorsConfigurationSource corsConfigurationSource(
+            @Value("${app.cors.allowed-origins}") List&lt;String&gt; origins) {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowedOrigins(origins);
+        config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        config.setAllowedHeaders(List.of("Authorization", "Content-Type"));
+        config.setExposedHeaders(List.of("Location"));
+        config.setAllowCredentials(true);            // needed only for cookie-based auth
+        config.setMaxAge(3600L);
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/api/**", config);
+        return source;
+    }
+}</code></pre>
+
+  <p>Rules of thumb for the Java side:</p>
+  <ul>
+    <li>List the exact origins (scheme + host + port, no trailing slash). The origin
+    <code>http://localhost:5173/</code> with a trailing slash never matches.</li>
+    <li><code>allowedOrigins("*")</code> together with <code>allowCredentials(true)</code> is rejected
+    by Spring (and by browsers). With credentials you must name origins explicitly, or use
+    <code>allowedOriginPatterns</code>.</li>
+    <li>Read origins from properties, so development, staging and production differ without code
+    changes.</li>
+    <li>If Spring Security is present and you only added <code>addCorsMappings</code>, preflights fail
+    with 401/403. Always use <code>.cors(...)</code> in the security chain.</li>
+    <li>A controller-level <code>@CrossOrigin(origins = "...")</code> exists for quick tests, but a
+    central configuration is cleaner.</li>
+  </ul>
+
+  <h4>The Vite dev proxy: avoiding CORS in development</h4>
+  <p>Instead of allowing another origin, make the browser think the API is on the same origin. Vite's
+  dev server can forward requests: the browser calls <code>http://localhost:5173/api/...</code>
+  (same origin, so no CORS), and Vite passes them on to Spring Boot on port 8080 server-to-server,
+  where CORS does not apply.</p>
+
+<pre data-title="vite.config.js"><code class="language-javascript">import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8080',
+        changeOrigin: true,        // sets the Host header to the target
+      },
+    },
+  },
+});</code></pre>
+
+<pre data-title=".env.development"><code class="language-ini"># With the proxy, use a relative base URL
+VITE_API_URL=/api</code></pre>
+
+  <p>The proxy works only with <code>npm run dev</code>; <code>npm run build</code> output has no
+  proxy. In production use Nginx to proxy <code>/api</code> the same way (see <a
+  href="#m6-deploy">deployment</a>), or set the full API URL and configure CORS properly. Many teams
+  do both: proxy in development, CORS or Nginx in production.</p>
+
+  <h4>Reading a CORS problem in DevTools</h4>
+  <ol class="steps">
+    <li>Open the Network tab. Find the failed request; a preflight shows as a separate
+    <code>OPTIONS</code> line.</li>
+    <li>If the <code>OPTIONS</code> response is 401/403/404, the server rejected the preflight (Spring
+    Security not configured for CORS, or the path is not permitted).</li>
+    <li>If it is 200 but the Console still complains, compare the response headers with the message:
+    "origin not allowed" means a wrong or missing <code>Allow-Origin</code>; "header not allowed" means
+    <code>Allow-Headers</code> misses <code>Authorization</code> or <code>Content-Type</code>; "method
+    not allowed" means <code>Allow-Methods</code> misses PUT or DELETE.</li>
+    <li>Test the API without the browser (Postman, curl). If it works there, the problem is CORS, not
+    your controller.</li>
+  </ol>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A 500 error from the controller can also look like a CORS error: error responses created
+      before the CORS filter applies may lack the headers, and the browser reports only "CORS". Check
+      the server log and the Network tab response.</li>
+      <li>A wrong URL or the server not running also gives "Failed to fetch" / <code>ERR_NETWORK</code>,
+      with no HTTP status. Do not assume CORS every time.</li>
+      <li>Cookies across origins need <code>withCredentials: true</code> (Axios) or
+      <code>credentials: 'include'</code> (fetch) on the client <em>and</em>
+      <code>Allow-Credentials: true</code> plus an explicit origin on the server, and
+      <code>SameSite</code>/<code>Secure</code> cookie settings that allow cross-site use.</li>
+      <li>Multiple CORS configurations (a <code>@CrossOrigin</code>, a gateway, and Nginx all adding
+      headers) can produce duplicate <code>Access-Control-Allow-Origin</code> values, which browsers
+      reject. Configure CORS in exactly one layer.</li>
+    </ul>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">CORS is not security for your API</p>
+    <p>CORS only tells <em>browsers</em> what scripts may read. curl, Postman, scripts and other
+    servers ignore it completely, so anyone can still call your API. Real protection is authentication,
+    authorisation and validation on the server (<a href="04-spring-boot.html#m4">Spring Security</a>).
+    Allow your real frontend origins only, and never reflect any origin back automatically.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is CORS? What is a preflight? How did you fix it?"</p>
+    <ul>
+      <li>Origin = scheme + host + port. Browsers block scripts from reading cross-origin responses
+      unless the server sends <code>Access-Control-Allow-Origin</code> (same-origin policy plus CORS).</li>
+      <li>Non-simple requests (JSON, <code>Authorization</code>, PUT/DELETE) trigger an
+      <code>OPTIONS</code> preflight asking for allowed methods and headers.</li>
+      <li>Spring fix: <code>CorsConfigurationSource</code> bean plus <code>.cors()</code> in the
+      security chain (or <code>addCorsMappings</code> without Security); origins from properties.</li>
+      <li>In dev, the Vite proxy removes the need. CORS is browser-only and is not an API security
+      mechanism.</li>
+    </ul>
+  </div>
+</article>

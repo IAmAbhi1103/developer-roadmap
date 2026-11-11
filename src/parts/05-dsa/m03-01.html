@@ -1,0 +1,639 @@
+<div class="mintro">
+  <p>Stage 3 (months 7–9) is where problems stop being "one clever loop" and become <strong>search and modelling</strong> problems. You learn to try every choice and undo it (<strong>backtracking</strong>), to take the best local choice and prove that it is safe (<strong>greedy</strong>), to model things and their connections and walk through them (<strong>graphs</strong>), and to remember the answers of repeated subproblems (<strong>dynamic programming</strong>). The module ends with <strong>tries</strong>, a tree built for fast prefix search. Product companies and startups ask these topics in almost every coding round, and service companies use them for their harder rounds.</p>
+  <p>Everything here builds on Stages 1 and 2: recursion and the call stack, <code>ArrayDeque</code> and <code>PriorityQueue</code>, sorting with comparators, and trees (a tree is simply a connected graph without cycles). The same ideas appear in everyday backend work: Gradle runs tasks in an order computed from a dependency graph, Spring Boot refuses to start (by default) when beans depend on each other in a cycle, map apps compute shortest routes, and "people you may know" is a walk over a friendship graph. The first half of this module covers backtracking, greedy and graphs (targets: about 12 backtracking, 10 greedy, 15 graph-basics and 15 graph-algorithm problems). The second half covers dynamic programming and tries.</p>
+  <ul>
+    <li>Write the backtracking template from memory and adapt it to subsets, permutations, combinations, N-Queens and grid word search — with pruning and duplicate handling.</li>
+    <li>Decide whether a greedy rule is correct, justify it with an exchange argument, and recognise when greedy fails and dynamic programming is needed.</li>
+    <li>Model a problem as a graph, pick a representation, and use BFS and DFS for reachability, connected components, shortest paths in unweighted graphs, cycle detection and bipartite checks.</li>
+    <li>Apply topological sort, Dijkstra, Bellman-Ford, Floyd-Warshall, 0-1 BFS, union-find, Kruskal and Prim — and choose the right one from the problem statement.</li>
+    <li>Solve dynamic programming problems and use tries for prefix and word problems (second half of the module).</li>
+    <li>State and justify the time and space complexity of every solution in an interview.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m3-backtracking-basics">
+  <h3>Backtracking: choose, explore, un-choose</h3>
+  <p class="tldr">Backtracking builds a solution one choice at a time, explores each choice with recursion and undoes it before trying the next one — a depth-first walk over the tree of all possible choices that cuts off branches which cannot lead to an answer.</p>
+
+  <p>Think of walking through a maze. At every junction you pick a corridor. If it ends in a wall, you walk back to the last junction and try the next corridor. You never need a map of the whole maze; you only remember the path you are standing on. <strong>Backtracking</strong> is exactly this idea written as recursion: make a choice, recurse, and when the recursion returns, undo the choice so that the next choice starts from a clean state.</p>
+  <p>You use backtracking when a problem asks for <em>all</em> arrangements ("return all subsets", "list every permutation", "all valid boards"), or for <em>any one</em> arrangement that satisfies hard rules ("solve this sudoku", "does this word exist in the grid?"). The number of possible answers grows exponentially, so the input in these problems is always small — and that small input size is itself a strong hint.</p>
+
+  <h4>Key terms</h4>
+  <dl class="terms">
+    <dt>State (partial solution)</dt>
+    <dd>What you have built so far — for example the list <code>[1, 3]</code> while generating subsets, or the queens already placed in the first three rows.</dd>
+    <dt>Choice</dt>
+    <dd>One option you can add to the current state — the next number, the next letter, the column for the next queen.</dd>
+    <dt>Constraint</dt>
+    <dd>A rule every valid state must obey — "no two queens attack each other", "the sum must not exceed the target".</dd>
+    <dt>Goal (base case)</dt>
+    <dd>The test that says the state is a complete answer — the path has k elements, every row has a queen, every letter of the word matched.</dd>
+    <dt>State-space tree</dt>
+    <dd>The tree of all states. The root is the empty state, each edge is one choice and each node is a partial solution. Backtracking is a depth-first traversal of this tree. The tree is never stored in memory; it exists only as the pattern of recursive calls.</dd>
+    <dt>Pruning</dt>
+    <dd>Skipping a whole subtree because you can already tell it contains no valid answer. Pruning is what makes backtracking much faster than blind brute force.</dd>
+  </dl>
+
+  <h4>The state-space tree</h4>
+  <p>Here is the tree for "all subsets of <code>[1, 2, 3]</code>" when each level loops over the numbers to the right of the last number used. Every node is one subset. The <code>#</code> numbers show the order in which depth-first search visits the nodes: it goes as deep as it can (<code>[1]</code> → <code>[1,2]</code> → <code>[1,2,3]</code>), then backs up one level and tries the next choice (<code>[1,3]</code>), and so on.</p>
+  <figure class="fig">
+<pre class="diagram">
+                           #1 [ ]
+            ┌─────────────────┼─────────────────┐
+         #2 [1]            #6 [2]            #8 [3]
+      ┌─────┴──────┐          │
+  #3 [1,2]     #5 [1,3]   #7 [2,3]
+      │
+ #4 [1,2,3]
+</pre>
+    <figcaption>State-space tree for the subsets of [1, 2, 3]: 8 nodes, one per subset, visited depth-first</figcaption>
+  </figure>
+
+  <h4>The template</h4>
+  <p>Every backtracking solution has the same skeleton. Learn it once; every problem in this section only fills in the blanks: what the state is, what the choices are, when the state is complete, and which choices are invalid.</p>
+<pre data-title="The shape of every backtracking solution"><code class="language-java">// pseudo-Java: the skeleton, not a runnable program
+void backtrack(State state) {
+    if (isComplete(state)) {               // 1. goal reached: record a COPY of the state
+        record(state);
+        return;                            //    (skip the return if longer answers also count)
+    }
+    for (Choice c : choicesFrom(state)) {
+        if (!isValid(state, c)) continue;  // 2. prune: skip choices that break a rule
+        apply(state, c);                   // 3. choose
+        backtrack(state);                  // 4. explore
+        undo(state, c);                    // 5. un-choose: restore exactly what apply changed
+    }
+}</code></pre>
+  <p>Here is the same skeleton as real Java, generating all subsets. One <code>path</code> list is shared by every recursive call. That is memory-efficient, and it is exactly why the undo step and the copy at record time are mandatory.</p>
+<pre data-title="Subsets.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class Subsets {
+    public static List&lt;List&lt;Integer>> subsets(int[] nums) {
+        List&lt;List&lt;Integer>> result = new ArrayList&lt;>();
+        backtrack(nums, 0, new ArrayList&lt;>(), result);
+        return result;
+    }
+
+    private static void backtrack(int[] nums, int start, List&lt;Integer> path,
+                                  List&lt;List&lt;Integer>> result) {
+        result.add(new ArrayList&lt;>(path));        // every node is an answer: record a copy
+        for (int i = start; i &lt; nums.length; i++) {
+            path.add(nums[i]);                    // choose
+            backtrack(nums, i + 1, path, result); // explore: only numbers to the right
+            path.remove(path.size() - 1);         // un-choose (remove by INDEX)
+        }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(subsets(new int[]{1, 2, 3}));
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">[[], [1], [1, 2], [1, 2, 3], [1, 3], [2], [2, 3], [3]]</code></pre>
+  <p>The output order matches the <code>#</code> numbers in the tree above. That is a good self-check: if you can predict the output order of your backtracking code, you understand it.</p>
+
+  <h4>Two ways to branch</h4>
+  <p>The same problem can often be drawn as two different trees. Both are correct; pick the one that makes the goal check simplest.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Style</th><th>Each level decides</th><th>Answers are recorded</th><th>Typical problems</th></tr></thead>
+    <tbody>
+      <tr><td>Include / exclude</td><td>"Is element <code>i</code> in or out?" — always 2 branches</td><td>At the leaves, when <code>i == n</code></td><td>Subsets, target-sum, partition problems</td></tr>
+      <tr><td>Loop over candidates</td><td>"Which element comes next?" — many branches</td><td>At every node, or when the size or goal is reached</td><td>Subsets, combinations, combination sum, permutations, N-Queens</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Pruning: cut branches early</h4>
+  <p>Without pruning, backtracking is just brute force. With good pruning, it explores only a small part of the tree. The four pruning tricks you will use again and again:</p>
+  <ul>
+    <li><strong>Constraint check before recursing.</strong> N-Queens checks the column and both diagonals before placing a queen, so it never builds an invalid board.</li>
+    <li><strong>Bound check on sorted input.</strong> In combination sum, once <code>candidates[i] &gt; remaining</code>, every later candidate is bigger too, so you <code>break</code> out of the loop instead of trying them.</li>
+    <li><strong>Feasibility check.</strong> When choosing k items, stop the loop if fewer items remain than you still need.</li>
+    <li><strong>Duplicate skip.</strong> Sort the input, then skip a value equal to the previous one at the same level (next section).</li>
+  </ul>
+<pre data-title="Bound pruning (fragment)"><code class="language-java">Arrays.sort(candidates);
+for (int i = start; i &lt; candidates.length; i++) {
+    if (candidates[i] > remaining) break;   // sorted: every later candidate is bigger too
+    // ... choose, explore, un-choose
+}</code></pre>
+
+  <h4>Handling duplicates</h4>
+  <p>When the input contains repeated values, two different branches can build the same answer. With <code>[1, 2, 2]</code>, picking "1 and the first 2" and "1 and the second 2" both give <code>[1, 2]</code>. The fix has two parts: <strong>sort</strong> the input so equal values sit next to each other, and at each level <strong>use only the first value of a run of equal values</strong>.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Problem type</th><th>Skip rule (after sorting)</th><th>What it means</th></tr></thead>
+    <tbody>
+      <tr><td>Subsets II, Combination Sum II</td><td><code>if (i &gt; start &amp;&amp; nums[i] == nums[i - 1]) continue;</code></td><td>At this level, try each distinct value only once</td></tr>
+      <tr><td>Permutations II</td><td><code>if (i &gt; 0 &amp;&amp; nums[i] == nums[i - 1] &amp;&amp; !used[i - 1]) continue;</code></td><td>Equal values are always used in left-to-right order</td></tr>
+    </tbody>
+  </table></div>
+  <p>The detailed reasoning for each rule is in <a href="#m3-subsets">Subsets II</a> and <a href="#m3-permutations">Permutations II</a>.</p>
+
+  <h4>Complexity of backtracking</h4>
+  <p>Time = (number of nodes in the state-space tree) × (work per node). The work per node is often O(n), because recording an answer copies the path. Space is the recursion depth plus the path — usually O(n) — not counting the output, which can be huge on its own (2<sup>20</sup> subsets is more than a million lists).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Problem</th><th>Number of answers</th><th>Time</th><th>Extra space</th></tr></thead>
+    <tbody>
+      <tr><td>All subsets of n items</td><td>2<sup>n</sup></td><td>O(n · 2<sup>n</sup>)</td><td>O(n)</td></tr>
+      <tr><td>All permutations of n items</td><td>n!</td><td>O(n · n!)</td><td>O(n)</td></tr>
+      <tr><td>Combinations, choose k of n</td><td>C(n, k)</td><td>O(k · C(n, k))</td><td>O(k)</td></tr>
+      <tr><td>N-Queens</td><td>at most n! placements tried</td><td>O(n!)</td><td>O(n)</td></tr>
+      <tr><td>Word search (m × n grid, word length L)</td><td>—</td><td>O(m · n · 3<sup>L</sup>)</td><td>O(L)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Use the input limits to check yourself. An exponential search fits a typical time limit only when the tree stays around 10<sup>6</sup>–10<sup>7</sup> nodes: n ≤ 10 for n! (10! = 3,628,800) and n ≤ 20 for 2<sup>n</sup> (2<sup>20</sup> = 1,048,576). If n is 1,000 or more, it is not a backtracking problem — look for greedy, dynamic programming or a graph algorithm.</p>
+
+  <h4>How to recognise a backtracking problem</h4>
+  <ul>
+    <li>The output is a list of all arrangements: "return all…", "generate all…", "list every possible…".</li>
+    <li>The input is tiny: n ≤ 20 (often ≤ 10), a 9 × 9 board, a short word.</li>
+    <li>You must place things under constraints: queens on a board, digits in a sudoku, letters along a path in a grid.</li>
+    <li>"Count the ways" with tiny n can be backtracking; if n is large or the same subproblem repeats, it is dynamic programming (second half of this module).</li>
+  </ul>
+
+  <h4>How to think</h4>
+  <ol class="steps">
+    <li>Write down what one partial solution looks like: a list, a <code>StringBuilder</code>, a board.</li>
+    <li>List the choices at each step and the order in which you will try them.</li>
+    <li>Write the goal check: when is the state a complete answer? Record a copy there.</li>
+    <li>Write the constraint checks and prune as early as possible.</li>
+    <li>Check that the undo step restores exactly what the choose step changed.</li>
+    <li>If the input can contain duplicates, sort it and add the skip rule.</li>
+    <li>Estimate the size of the tree (2<sup>n</sup>, n!, …) and compare it with the input limits.</li>
+  </ol>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: undo exactly what you changed, in reverse order</p>
+    <p>If the choose step adds to the path, sets <code>used[i] = true</code> and marks a board cell, then the un-choose step must restore the cell, set <code>used[i] = false</code> and remove from the path. Anything you forget to undo leaks into the sibling branches and silently produces wrong answers.</p>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: record a copy, never the live path</p>
+    <p>The path object is shared and keeps changing. Store a snapshot of it.</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: stores a reference to the one shared list</p><pre><code class="language-java">result.add(path);
+// after the search: [[], [], [], [], [], [], [], []]
+// every entry is the same list, and it is empty after the last undo</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: stores a snapshot of the path at this moment</p><pre><code class="language-java">result.add(new ArrayList&lt;>(path));
+// [[], [1], [1, 2], [1, 2, 3], [1, 3], [2], [2, 3], [3]]</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: path.remove(nums[i]) on a List&lt;Integer&gt;</p>
+    <p><code>List</code> has two <code>remove</code> methods: <code>remove(int index)</code> and <code>remove(Object o)</code>. With an <code>int</code> argument Java picks <code>remove(int index)</code>, so the code removes the element at <em>position</em> <code>nums[i]</code> — the wrong element, or an <code>IndexOutOfBoundsException</code>.</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: removes by position nums[i]</p><pre><code class="language-java">path.add(nums[i]);
+backtrack(nums, i + 1, path, result);
+path.remove(nums[i]);           // int argument → remove(int index)!</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: removes the last element</p><pre><code class="language-java">path.add(nums[i]);
+backtrack(nums, i + 1, path, result);
+path.remove(path.size() - 1);   // the element we just added</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-version">
+    <p class="co-t">Java 21+: removeLast()</p>
+    <p>Java 21 added sequenced collections, so <code>List</code> now has <code>removeLast()</code>, <code>getLast()</code> and friends. <code>path.removeLast()</code> reads nicely, but use <code>path.remove(path.size() - 1)</code> if your online judge or project still runs Java 17.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions professionals follow</p>
+    <ul>
+      <li>Name the helper <code>backtrack</code> or <code>dfs</code>, and keep the public method as a thin wrapper that creates the result list.</li>
+      <li>Pass a <code>start</code> index when order does not matter (subsets, combinations) and a <code>boolean[] used</code> when it does (permutations).</li>
+      <li>Build strings in a <code>StringBuilder</code> and undo with <code>sb.setLength(oldLength)</code> or <code>sb.deleteCharAt(sb.length() - 1)</code>.</li>
+      <li>Return <code>boolean</code> when one solution is enough (sudoku, word search) so that the first success stops the whole search.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and runtime errors</p>
+    <ul>
+      <li>An empty input still has one subset — the empty set — so <code>subsets([])</code> returns <code>[[]]</code>, not <code>[]</code>.</li>
+      <li>The recursion depth is at most the length of one answer, so a <code>StackOverflowError</code> almost always means a missing base case or a recursion that does not move forward — for example recursing with the same index when an element may be reused and the target never shrinks (a zero-valued candidate in combination sum would loop forever).</li>
+      <li>The output can be exponential. If you only need a count, do not build the lists — count at the leaves instead.</li>
+    </ul>
+  </div>
+
+  <h4>Backtracking compared with its neighbours</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Brute force</th><th>Backtracking</th><th>Dynamic programming</th></tr></thead>
+    <tbody>
+      <tr><td>Idea</td><td>Generate every candidate, then filter</td><td>Build candidates step by step, abandon invalid ones early</td><td>Solve each distinct subproblem once and reuse the answer</td></tr>
+      <tr><td>Prunes?</td><td>No</td><td>Yes</td><td>Not needed — repeated work is cached</td></tr>
+      <tr><td>Typical output</td><td>All answers</td><td>All answers, or one valid answer</td><td>One number: a count, minimum or maximum</td></tr>
+      <tr><td>Typical time</td><td>Exponential</td><td>Exponential, but far smaller in practice</td><td>Polynomial: O(n²), O(n · W), …</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>A common opener is "What is the difference between recursion, DFS and backtracking?" A strong answer: recursion is the tool; DFS is a traversal order; backtracking is a search strategy that runs DFS over an implicit tree of partial solutions, keeps one shared state, undoes each change after exploring it, and prunes branches that cannot succeed. Then give the complexity in terms of the tree — for subsets, O(n · 2<sup>n</sup>) because there are 2<sup>n</sup> subsets and copying each costs O(n). Mention pruning and duplicate handling before the interviewer asks; it shows you have solved these problems for real.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-subsets">
+  <h3>Subsets I and II</h3>
+  <p class="tldr">Each element is either in or out of a subset, so n elements give 2<sup>n</sup> subsets; generate them with the loop-from-start template, the include/exclude recursion or a bitmask, and when the input has duplicates, sort it and skip a repeated value at the same level.</p>
+
+  <p>The set of all subsets of a set is called its <strong>power set</strong>. Generating it is the "hello world" of backtracking, and the duplicate-handling trick you learn here is reused in combinations and combination sum. Interviewers like it because it has three clean solutions and a natural follow-up (duplicates).</p>
+
+  <h4>Problem 1 — Subsets (LeetCode 78)</h4>
+  <p>Given an array of <em>distinct</em> integers, return all possible subsets in any order, without duplicate subsets. For <code>[1, 2, 3]</code> the answer has 2<sup>3</sup> = 8 subsets.</p>
+
+  <h5>Approach A: loop from start (backtracking)</h5>
+  <p>This is the <code>Subsets</code> class from <a href="#m3-backtracking-basics">the template</a>. Every call records the current path, then tries each number to the right of the last one used. Because a number is only ever followed by numbers to its right, <code>[2, 1]</code> can never appear next to <code>[1, 2]</code> — order is fixed, so there are no duplicates.</p>
+  <p><strong>Dry run</strong> for <code>[1, 2, 3]</code>:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Call</th><th>Path on entry</th><th>Recorded</th><th>Loop tries</th></tr></thead>
+    <tbody>
+      <tr><td><code>backtrack(start=0)</code></td><td><code>[]</code></td><td><code>[]</code></td><td>1, 2, 3</td></tr>
+      <tr><td><code>backtrack(start=1)</code></td><td><code>[1]</code></td><td><code>[1]</code></td><td>2, 3</td></tr>
+      <tr><td><code>backtrack(start=2)</code></td><td><code>[1, 2]</code></td><td><code>[1, 2]</code></td><td>3</td></tr>
+      <tr><td><code>backtrack(start=3)</code></td><td><code>[1, 2, 3]</code></td><td><code>[1, 2, 3]</code></td><td>nothing — loop is empty</td></tr>
+      <tr><td><code>backtrack(start=3)</code></td><td><code>[1, 3]</code></td><td><code>[1, 3]</code></td><td>nothing</td></tr>
+      <tr><td><code>backtrack(start=2)</code></td><td><code>[2]</code></td><td><code>[2]</code></td><td>3</td></tr>
+      <tr><td><code>backtrack(start=3)</code></td><td><code>[2, 3]</code></td><td><code>[2, 3]</code></td><td>nothing</td></tr>
+      <tr><td><code>backtrack(start=3)</code></td><td><code>[3]</code></td><td><code>[3]</code></td><td>nothing</td></tr>
+    </tbody>
+  </table></div>
+  <p>Notice there is no explicit base case: when <code>start == nums.length</code> the loop simply does not run, and the call returns.</p>
+
+  <h5>Approach B: include / exclude</h5>
+  <p>Walk through the elements in order and make a yes/no decision for each. The tree is a full binary tree of depth n, and its 2<sup>n</sup> leaves are exactly the subsets.</p>
+  <figure class="fig">
+<pre class="diagram">
+                           [ ]
+              ┌── take 1 ───┴── skip 1 ───┐
+             [1]                         [ ]
+       ┌──────┴──────┐             ┌──────┴──────┐
+     [1,2]          [1]           [2]           [ ]
+</pre>
+    <figcaption>Include/exclude tree for [1, 2]: the left branch at each level takes the element, the right branch skips it; the 4 leaves are the 4 subsets</figcaption>
+  </figure>
+<pre data-title="SubsetsIncludeExclude.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class SubsetsIncludeExclude {
+    public static List&lt;List&lt;Integer>> subsets(int[] nums) {
+        List&lt;List&lt;Integer>> result = new ArrayList&lt;>();
+        dfs(nums, 0, new ArrayList&lt;>(), result);
+        return result;
+    }
+
+    private static void dfs(int[] nums, int i, List&lt;Integer> path,
+                            List&lt;List&lt;Integer>> result) {
+        if (i == nums.length) {                // decided in/out for every element
+            result.add(new ArrayList&lt;>(path));
+            return;
+        }
+        path.add(nums[i]);                     // branch 1: include nums[i]
+        dfs(nums, i + 1, path, result);
+        path.remove(path.size() - 1);
+        dfs(nums, i + 1, path, result);        // branch 2: exclude nums[i]
+    }
+
+    public static void main(String[] args) {
+        System.out.println(subsets(new int[]{1, 2, 3}));
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">[[1, 2, 3], [1, 2], [1, 3], [1], [2, 3], [2], [3], []]</code></pre>
+
+  <h5>Approach C: bitmask (no recursion)</h5>
+  <p>Number the elements 0 to n − 1. Every integer <code>mask</code> from 0 to 2<sup>n</sup> − 1 describes one subset: if bit <code>b</code> of <code>mask</code> is 1, element <code>b</code> is in. For n = 3, the mask <code>101</code> (5) means "elements 0 and 2" → <code>[1, 3]</code>.</p>
+<pre data-title="SubsetsBitmask.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class SubsetsBitmask {
+    public static List&lt;List&lt;Integer>> subsets(int[] nums) {
+        int n = nums.length;
+        List&lt;List&lt;Integer>> result = new ArrayList&lt;>();
+        for (int mask = 0; mask &lt; (1 &lt;&lt; n); mask++) {        // 2^n masks: 000 .. 111
+            List&lt;Integer> subset = new ArrayList&lt;>();
+            for (int b = 0; b &lt; n; b++) {
+                if ((mask &amp; (1 &lt;&lt; b)) != 0) subset.add(nums[b]); // bit b set → take nums[b]
+            }
+            result.add(subset);
+        }
+        return result;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(subsets(new int[]{1, 2, 3}));
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">[[], [1], [2], [1, 2], [3], [1, 3], [2, 3], [1, 2, 3]]</code></pre>
+  <p><code>1 &lt;&lt; n</code> overflows an <code>int</code> once n reaches 31, but that never matters in practice: 2<sup>31</sup> subsets would not fit in memory anyway.</p>
+
+  <h5>Approach D: iterative cascading</h5>
+  <p>Start with only the empty subset. For each new number, copy every subset you already have and add the number to the copy. After processing all numbers the list has doubled n times.</p>
+<pre data-title="Iterative cascading"><code class="language-java">static List&lt;List&lt;Integer>> subsetsIterative(int[] nums) {
+    List&lt;List&lt;Integer>> result = new ArrayList&lt;>();
+    result.add(new ArrayList&lt;>());                 // start with the empty subset
+    for (int x : nums) {
+        int size = result.size();                  // only extend subsets that existed before x
+        for (int j = 0; j &lt; size; j++) {
+            List&lt;Integer> next = new ArrayList&lt;>(result.get(j));
+            next.add(x);
+            result.add(next);
+        }
+    }
+    return result;                                 // [[], [1], [2], [1, 2], [3], [1, 3], ...]
+}</code></pre>
+  <p><strong>Complexity (all four approaches):</strong> O(n · 2<sup>n</sup>) time — 2<sup>n</sup> subsets, each copied or built in O(n) — and O(n) extra space for the recursion and the path, not counting the output.</p>
+
+  <h4>Problem 2 — Subsets II (LeetCode 90)</h4>
+  <p>Now the input may contain duplicates, but the answer must not contain duplicate subsets. For <code>[1, 2, 2]</code> the answer is <code>[], [1], [1,2], [1,2,2], [2], [2,2]</code> — six subsets, not eight.</p>
+  <p><strong>Idea.</strong> Sort the array so equal values are adjacent. At one level of the tree (one run of the <code>for</code> loop), choosing the first 2 or the second 2 leads to identical subtrees, so try only the first one. The code is the Approach A template plus one line.</p>
+<pre data-title="SubsetsWithDup.java"><code class="language-java">import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+public class SubsetsWithDup {
+    public static List&lt;List&lt;Integer>> subsetsWithDup(int[] nums) {
+        int[] sorted = nums.clone();
+        Arrays.sort(sorted);                         // equal values become neighbours
+        List&lt;List&lt;Integer>> result = new ArrayList&lt;>();
+        backtrack(sorted, 0, new ArrayList&lt;>(), result);
+        return result;
+    }
+
+    private static void backtrack(int[] nums, int start, List&lt;Integer> path,
+                                  List&lt;List&lt;Integer>> result) {
+        result.add(new ArrayList&lt;>(path));
+        for (int i = start; i &lt; nums.length; i++) {
+            if (i > start &amp;&amp; nums[i] == nums[i - 1]) continue; // same value, same level: skip
+            path.add(nums[i]);
+            backtrack(nums, i + 1, path, result);
+            path.remove(path.size() - 1);
+        }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(subsetsWithDup(new int[]{2, 1, 2}));
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">[[], [1], [1, 2], [1, 2, 2], [2], [2, 2]]</code></pre>
+  <figure class="fig">
+<pre class="diagram">
+                             [ ]
+            ┌─────────────────┼─────────────────┐
+           [1]               [2]            [2] skip
+      ┌─────┴──────┐          │
+    [1,2]     [1,2] skip    [2,2]
+      │
+   [1,2,2]
+</pre>
+    <figcaption>Subsets II on sorted [1, 2, 2]: the second 2 is skipped whenever it is not the first choice of its level</figcaption>
+  </figure>
+
+  <h5>Why i &gt; start and not i &gt; 0</h5>
+  <p>The skip must only stop you from picking the same value <em>twice as alternatives at the same level</em>. When <code>i == start</code>, <code>nums[i]</code> is the first candidate of this level. Even if it equals <code>nums[i - 1]</code>, that earlier copy was chosen by the <em>parent</em> level — it is already in the path — so taking this copy builds a bigger subset such as <code>[2, 2]</code>, which you need. With <code>i &gt; 0</code> you would wrongly throw that away.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: i &gt; 0 loses [1, 2, 2] and [2, 2]</p><pre><code class="language-java">if (i > 0 &amp;&amp; nums[i] == nums[i - 1]) continue;
+// [1, 2, 2] → [[], [1], [1, 2], [2]]</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: only skip alternatives at the same level</p><pre><code class="language-java">if (i > start &amp;&amp; nums[i] == nums[i - 1]) continue;
+// [1, 2, 2] → [[], [1], [1, 2], [1, 2, 2], [2], [2, 2]]</code></pre></div>
+  </div>
+
+  <p><strong>Complexity:</strong> O(n · 2<sup>n</sup>) time in the worst case (all values distinct) plus O(n log n) for sorting, which is negligible; O(n) extra space.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: forgetting to sort before the skip rule</p>
+    <p>The skip compares a value only with its left neighbour, so it works only when equal values are adjacent. With unsorted <code>[2, 1, 2]</code>, the two 2s are not neighbours, nothing is skipped, and <code>[1, 2]</code> and <code>[2, 1]</code>-style duplicates appear (as <code>[2, 1]</code> and <code>[1, 2]</code>). Sort first, every time.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: removing duplicates with a Set&lt;List&lt;Integer&gt;&gt;</p>
+    <p>Adding every subset to a <code>HashSet</code> "works" only if each list is sorted, and it still generates every duplicate before throwing it away — slower and more memory-hungry. Interviewers treat it as a weak answer. Prevent duplicates instead of filtering them.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Empty input → <code>[[]]</code>: one subset, the empty set.</li>
+      <li>All values equal, e.g. <code>[2, 2, 2]</code> → n + 1 subsets: <code>[], [2], [2,2], [2,2,2]</code>.</li>
+      <li>Negative numbers and zero need no special handling — the algorithm never looks at the values except to compare neighbours.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: the include/exclude version of Subsets II</p>
+    <p>If you prefer the include/exclude style, handle duplicates when <em>excluding</em>: after the include branch, skip past every copy of <code>nums[i]</code> (<code>while (i + 1 &lt; n &amp;&amp; nums[i + 1] == nums[i]) i++;</code>) and then recurse with <code>i + 1</code>. "If you skip a value, skip all its copies" — otherwise the excluded copy comes back as a duplicate.</p>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real-project usage</p>
+    <p>Generating every combination of a few feature flags for a test matrix, or trying every subset of a handful of coupons to find the best price, is the same algorithm. The 2<sup>n</sup> growth is why such features cap n at a small number.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Expect "generate the power set", then "now the input has duplicates". A strong answer names two approaches (backtracking and bitmask), explains O(n · 2<sup>n</sup>), then handles duplicates with sort + <code>i &gt; start</code> and explains why <code>i &gt; 0</code> is wrong. If asked for subsets of size exactly k, record only when <code>path.size() == k</code> — that is <a href="#m3-combinations">combinations</a>.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-permutations">
+  <h3>Permutations I and II</h3>
+  <p class="tldr">A permutation uses every element exactly once in some order; at each position try every element not used yet (tracked in a boolean used[] array), and when the input has duplicates, sort it and skip a value whose equal left neighbour is not currently in use.</p>
+
+  <p>Permutations differ from subsets in two ways. <strong>Order matters</strong> — <code>[1, 2]</code> and <code>[2, 1]</code> are different answers — so every level loops over <em>all</em> elements, not just the ones to the right. And <strong>every element is used</strong>, so an answer is complete only when the path has n elements. The number of permutations of n distinct elements is n! (n factorial): n choices for the first position, n − 1 for the second, and so on.</p>
+
+  <figure class="fig">
+<pre class="diagram">
+                                   [ ]
+            ┌───────────────────────┼───────────────────────┐
+           [1]                     [2]                     [3]
+       ┌────┴────┐             ┌────┴────┐             ┌────┴────┐
+     [1,2]     [1,3]         [2,1]     [2,3]         [3,1]     [3,2]
+       │         │             │         │             │         │
+    [1,2,3]   [1,3,2]       [2,1,3]   [2,3,1]       [3,1,2]   [3,2,1]
+</pre>
+    <figcaption>Permutation tree for [1, 2, 3]: 3 choices, then 2, then 1 — the 3! = 6 leaves are the answers</figcaption>
+  </figure>
+
+  <h4>Problem 1 — Permutations (LeetCode 46)</h4>
+  <p>Given an array of distinct integers, return all permutations in any order.</p>
+<pre data-title="Permutations.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class Permutations {
+    public static List&lt;List&lt;Integer>> permute(int[] nums) {
+        List&lt;List&lt;Integer>> result = new ArrayList&lt;>();
+        backtrack(nums, new boolean[nums.length], new ArrayList&lt;>(), result);
+        return result;
+    }
+
+    private static void backtrack(int[] nums, boolean[] used, List&lt;Integer> path,
+                                  List&lt;List&lt;Integer>> result) {
+        if (path.size() == nums.length) {          // every position is filled
+            result.add(new ArrayList&lt;>(path));
+            return;
+        }
+        for (int i = 0; i &lt; nums.length; i++) {    // order matters: always start from 0
+            if (used[i]) continue;                 // each element at most once
+            used[i] = true;                        // choose (two changes...)
+            path.add(nums[i]);
+            backtrack(nums, used, path, result);   // explore
+            path.remove(path.size() - 1);          // un-choose (...two undos)
+            used[i] = false;
+        }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(permute(new int[]{1, 2, 3}));
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">[[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1]]</code></pre>
+  <p><strong>Dry run</strong> (first two answers):</p>
+  <ol>
+    <li>Level 0 picks 1 (<code>used = [T, F, F]</code>, path <code>[1]</code>).</li>
+    <li>Level 1 skips index 0 (used), picks 2 → path <code>[1, 2]</code>.</li>
+    <li>Level 2 skips 1 and 2, picks 3 → path <code>[1, 2, 3]</code>, size 3 → record.</li>
+    <li>Undo 3. Level 2 has no more choices; return. Undo 2 at level 1.</li>
+    <li>Level 1 picks 3 → <code>[1, 3]</code>; level 2 finds only 2 unused → <code>[1, 3, 2]</code> → record.</li>
+  </ol>
+  <p><strong>Complexity:</strong> O(n · n!) time — n! leaves, each copied in O(n); the internal nodes add at most a constant factor (the tree has fewer than e · n! nodes). Extra space O(n) for <code>used</code>, the path and the recursion.</p>
+
+  <h5>Alternative: swapping in place</h5>
+  <p>Instead of a <code>used</code> array, keep the array itself as the state. Positions <code>[0, k)</code> are fixed; to fill position <code>k</code>, swap each remaining element into it, recurse, and swap back.</p>
+<pre data-title="PermutationsBySwap.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class PermutationsBySwap {
+    public static List&lt;List&lt;Integer>> permute(int[] nums) {
+        List&lt;List&lt;Integer>> result = new ArrayList&lt;>();
+        permute(nums.clone(), 0, result);
+        return result;
+    }
+
+    // positions [0, k) are fixed; try every remaining element at position k
+    private static void permute(int[] a, int k, List&lt;List&lt;Integer>> result) {
+        if (k == a.length) {
+            List&lt;Integer> perm = new ArrayList&lt;>();
+            for (int x : a) perm.add(x);
+            result.add(perm);
+            return;
+        }
+        for (int i = k; i &lt; a.length; i++) {
+            swap(a, k, i);                 // choose: bring a[i] to position k
+            permute(a, k + 1, result);     // explore
+            swap(a, k, i);                 // un-choose: put it back
+        }
+    }
+
+    private static void swap(int[] a, int i, int j) {
+        int t = a[i];
+        a[i] = a[j];
+        a[j] = t;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(permute(new int[]{1, 2, 3}));
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">[[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 2, 1], [3, 1, 2]]</code></pre>
+  <p>Same complexity, no extra array — but notice the order is <em>not</em> lexicographic (<code>[3, 2, 1]</code> comes before <code>[3, 1, 2]</code>), because swapping disturbs the order of the remaining elements. If the output must be sorted, use the <code>used[]</code> version on sorted input.</p>
+
+  <h4>Problem 2 — Permutations II (LeetCode 47)</h4>
+  <p>The input may contain duplicates; return only the unique permutations. For <code>[1, 1, 2]</code> there are 3!/2! = 3: <code>[1,1,2], [1,2,1], [2,1,1]</code>. In general the count is n! divided by the factorial of each value's count.</p>
+  <p><strong>Idea.</strong> Label the two 1s as <code>1a</code> and <code>1b</code>. The arrangements <code>1a 1b 2</code> and <code>1b 1a 2</code> look identical. To generate each arrangement once, insist that equal values are always used in their left-to-right order: <code>1b</code> may be placed only if <code>1a</code> is already in the path. After sorting, that is exactly the rule "skip <code>nums[i]</code> if it equals <code>nums[i - 1]</code> and <code>nums[i - 1]</code> is not in use".</p>
+<pre data-title="PermutationsWithDup.java"><code class="language-java">import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+public class PermutationsWithDup {
+    public static List&lt;List&lt;Integer>> permuteUnique(int[] nums) {
+        int[] a = nums.clone();
+        Arrays.sort(a);                                   // equal values side by side
+        List&lt;List&lt;Integer>> result = new ArrayList&lt;>();
+        backtrack(a, new boolean[a.length], new ArrayList&lt;>(), result);
+        return result;
+    }
+
+    private static void backtrack(int[] a, boolean[] used, List&lt;Integer> path,
+                                  List&lt;List&lt;Integer>> result) {
+        if (path.size() == a.length) {
+            result.add(new ArrayList&lt;>(path));
+            return;
+        }
+        for (int i = 0; i &lt; a.length; i++) {
+            if (used[i]) continue;
+            // equal twin on the left is NOT in use → placing a[i] here would repeat
+            // the branch where a[i - 1] was placed at this position
+            if (i > 0 &amp;&amp; a[i] == a[i - 1] &amp;&amp; !used[i - 1]) continue;
+            used[i] = true;
+            path.add(a[i]);
+            backtrack(a, used, path, result);
+            path.remove(path.size() - 1);
+            used[i] = false;
+        }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(permuteUnique(new int[]{1, 2, 1}));
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">[[1, 1, 2], [1, 2, 1], [2, 1, 1]]</code></pre>
+  <p><strong>Dry run</strong> on sorted <code>[1a, 1b, 2]</code>:</p>
+  <ul>
+    <li>Level 0 picks <code>1a</code>. Level 1: <code>1b</code> equals <code>1a</code>, but <code>1a</code> is in use → allowed → <code>[1, 1]</code>, then <code>2</code> → record <code>[1, 1, 2]</code>. Level 1 then picks <code>2</code>, and level 2 places <code>1b</code> (allowed, <code>1a</code> in use) → record <code>[1, 2, 1]</code>.</li>
+    <li>Level 0 tries <code>1b</code>: equal to <code>1a</code> and <code>1a</code> is <em>not</em> in use → skip. This one line removes the whole duplicate subtree.</li>
+    <li>Level 0 picks <code>2</code>. Level 1 places <code>1a</code>; level 2 places <code>1b</code> → record <code>[2, 1, 1]</code>. Level 1 then tries <code>1b</code> with <code>1a</code> unused → skip.</li>
+  </ul>
+  <p><strong>Complexity:</strong> O(n · n!) in the worst case (all distinct), O(n) extra space.</p>
+
+  <div class="co co-note">
+    <p class="co-t">Note: !used[i - 1] versus used[i - 1]</p>
+    <p>You will see solutions online that use <code>used[i - 1]</code> without the <code>!</code>. That variant forces equal values to be used right-to-left instead and also produces each unique permutation once — but it discovers the duplicates much deeper in the tree, so it does far more work. Use <code>!used[i - 1]</code>: it prunes at the highest possible level.</p>
+  </div>
+
+  <h4>Subsets vs combinations vs permutations</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Subsets</th><th>Combinations (size k)</th><th>Permutations</th></tr></thead>
+    <tbody>
+      <tr><td>Order matters?</td><td>No</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Loop starts at</td><td><code>start</code></td><td><code>start</code></td><td><code>0</code>, skipping used elements</td></tr>
+      <tr><td>Record when</td><td>At every node</td><td><code>path.size() == k</code></td><td><code>path.size() == n</code></td></tr>
+      <tr><td>Count</td><td>2<sup>n</sup></td><td>C(n, k)</td><td>n!</td></tr>
+      <tr><td>Duplicate rule</td><td><code>i &gt; start</code> and equal</td><td><code>i &gt; start</code> and equal</td><td><code>i &gt; 0</code>, equal and <code>!used[i - 1]</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: checking "used" with path.contains()</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: O(n) per check, and breaks with duplicates</p><pre><code class="language-java">for (int i = 0; i &lt; nums.length; i++) {
+    if (path.contains(nums[i])) continue;  // [1, 1, 2]: the second 1 is never placed
+    // ...
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: track positions, not values</p><pre><code class="language-java">for (int i = 0; i &lt; nums.length; i++) {
+    if (used[i]) continue;                 // O(1), works with repeated values
+    // ...
+}</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: undoing only half of the choice</p>
+    <p>The choose step made two changes (<code>used[i] = true</code> and <code>path.add</code>). Forgetting <code>used[i] = false</code> leaves the element marked forever, so after the first answer almost nothing else is generated. Write the undo lines immediately after you write the choose lines, in reverse order.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A single element → one permutation: <code>[[x]]</code>.</li>
+      <li>All elements equal → exactly one unique permutation; the skip rule cuts every other branch at level 0.</li>
+      <li>Inputs are tiny on purpose: 10! is already 3.6 million answers, each a list of 10 numbers.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: you only need the next arrangement?</p>
+    <p>If a problem asks for the next permutation in lexicographic order (LeetCode 31, Next Permutation), do not generate all n! of them. The next-permutation algorithm finds it in O(n): from the right, find the first index whose value is smaller than its right neighbour, swap it with the smallest larger value to its right, then reverse the suffix.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Print all permutations of a string" is a classic warm-up in service-company rounds; Permutations II is the usual follow-up at product companies. Strong points: explain <code>used[]</code> versus swapping, give O(n · n!), handle duplicates with sort + <code>!used[i - 1]</code> and explain it with the 1a/1b labels. For the swap version, duplicates can be handled with a small <code>Set</code> of values already placed at position <code>k</code> in the current call.</p>
+  </div>
+</article>

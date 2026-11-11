@@ -1,0 +1,311 @@
+<article class="topic" id="m3-indexing">
+  <h3>Indexing theory: primary, secondary, clustered, dense, sparse and hash</h3>
+  <p class="tldr">An index is a separate sorted (or hashed) structure that maps search-key values to
+  row locations, turning a full scan into a few page reads at the cost of extra storage and slower
+  writes.</p>
+
+  <h4>The problem an index solves</h4>
+  <p>Data is stored on disk in fixed-size <strong>blocks</strong> (pages). The cost of a query is
+  mostly the number of blocks it reads. Without an index, finding one student by roll number means
+  reading every block (a <strong>full table scan</strong>). Say a table has 1,000,000 rows and 100
+  rows fit in a block: that is 10,000 block reads. An <strong>index</strong> is like the index at
+  the back of a book: a small, sorted list of (search key, pointer) entries, so you jump straight to
+  the right page.</p>
+
+  <h4>Classification of indexes</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Definition</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Primary index</td><td>Index on the field the data file is sorted by, and which is a
+      unique key. Usually sparse.</td><td>Student file sorted by <code>roll_no</code></td></tr>
+      <tr><td>Clustering index</td><td>Index on the sorting field when it is not unique</td>
+      <td>File sorted by <code>dept_id</code></td></tr>
+      <tr><td>Secondary index</td><td>Index on a field the file is <em>not</em> sorted by. Must be
+      dense. Can be on a unique or non-unique field.</td><td>Index on <code>email</code> or
+      <code>name</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Textbook "primary index" means "index on the ordering key". In everyday SQL talk, "primary key
+  index" is just the index that backs the primary key. Interviewers usually mean the textbook
+  version when asking "primary vs secondary index".</p>
+
+  <h4>Clustered vs non-clustered</h4>
+  <p>This is the most-asked pair in practice.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Clustered index</th><th>Non-clustered index</th></tr></thead>
+    <tbody>
+      <tr><td>Data storage</td><td>Table rows are stored <em>in the order of</em> the index (the
+      leaves hold the rows)</td><td>Separate structure; leaves hold key plus a pointer to the
+      row</td></tr>
+      <tr><td>How many per table</td><td>One (rows can be sorted one way only)</td>
+      <td>Many</td></tr>
+      <tr><td>Range queries on the key</td><td>Very fast (rows are adjacent)</td>
+      <td>Slower: an extra lookup per row</td></tr>
+      <tr><td>Insert cost</td><td>Can cause page splits and row movement</td>
+      <td>Update every index</td></tr>
+      <tr><td>Typical example</td><td>Primary key in InnoDB and SQL Server</td>
+      <td>Index on <code>email</code></td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><strong>MySQL InnoDB</strong>: the primary key is always the clustered index. A secondary
+    index stores the primary-key value as its pointer, so a lookup goes secondary index → primary key
+    → row. A long primary key therefore makes every secondary index bigger.</li>
+    <li><strong>PostgreSQL</strong>: tables are heaps (unordered); all indexes are non-clustered
+    and point to a physical tuple location. The <code>CLUSTER</code> command rewrites a table once in
+    index order but does not keep it that way.</li>
+    <li><strong>SQL Server</strong>: you choose; the clustered index is the table.</li>
+  </ul>
+
+  <h4>Dense vs sparse</h4>
+  <ul>
+    <li><strong>Dense index</strong>: one entry for <em>every</em> search-key value (every row).
+    Works on unsorted files, so secondary indexes are always dense. Fast, but large.</li>
+    <li><strong>Sparse index</strong>: one entry per <em>block</em> (the first key of each block).
+    Works only when the data file is sorted by the key. Smaller; you find the right block, then
+    search inside it.</li>
+  </ul>
+  <p>Numbers for 1,000,000 rows, 100 rows per block, 500 index entries per index block:</p>
+  <pre data-title="cost comparison"><code class="language-plaintext">No index           : up to 10,000 block reads (scan)
+Sparse index       : 10,000 entries -> 20 index blocks
+                     binary search 20 blocks (about 5 reads) + 1 data block = about 6 reads
+Dense index        : 1,000,000 entries -> 2,000 index blocks
+                     binary search (about 11 reads) + 1 data block = about 12 reads
+B+ tree (multilevel): 3 levels deep -> about 3 index reads + 1 data read</code></pre>
+  <p>A <strong>multilevel index</strong> builds an index on the index until the top fits in one block;
+  that idea, made dynamic, is the B+ tree (next article).</p>
+
+  <h4>Other index kinds</h4>
+  <ul>
+    <li><strong>Composite (multi-column) index</strong>: on (a, b, c). It helps queries that filter
+    on a, or a and b, or a, b and c — the <strong>leftmost prefix</strong> rule — but not on b alone.</li>
+    <li><strong>Unique index</strong>: also enforces uniqueness (primary and unique constraints create
+    one).</li>
+    <li><strong>Covering index</strong>: contains every column the query needs, so the table is never
+    touched (an "index-only scan").</li>
+    <li><strong>Hash index</strong>: stores <code>hash(key)</code> → bucket. Finds an exact match in
+    about one step. It cannot do ranges (<code>&gt;</code>, <code>BETWEEN</code>), ordering or prefix
+    matches, because hashing destroys order.</li>
+    <li><strong>Bitmap index</strong>: a bit-vector per value; good for low-cardinality columns in
+    analytics (Oracle). <strong>Full-text</strong>, <strong>spatial</strong> and
+    <strong>partial</strong> indexes exist for special needs.</li>
+  </ul>
+
+  <h4>When indexes hurt</h4>
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Indexes help when</p><ul>
+      <li>Columns appear in <code>WHERE</code>, <code>JOIN ON</code>, <code>ORDER BY</code>,
+      <code>GROUP BY</code></li>
+      <li>The column is selective (few rows match)</li>
+      <li>Tables are large and read-heavy</li></ul></div>
+    <div class="pc-con"><p class="pc-t">Indexes hurt when</p><ul>
+      <li>Writes dominate: every insert, update and delete must update each index</li>
+      <li>The table is tiny (a scan is as cheap)</li>
+      <li>The column has very low selectivity (a boolean flag: half the table matches)</li>
+      <li>You index everything: wasted storage and a confused optimizer</li></ul></div>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: writing queries that cannot use the index</p>
+    <ul>
+      <li>A function on the column: <code>WHERE UPPER(name) = 'ASHA'</code> (use a functional index or
+      store normalized data).</li>
+      <li>A leading wildcard: <code>LIKE '%sha'</code>.</li>
+      <li>An implicit type conversion, such as comparing a number column to a string.</li>
+      <li>Skipping the leftmost column of a composite index.</li>
+    </ul>
+  </div>
+  <p>Use <code>EXPLAIN</code> to see whether the optimizer picks the index. Practical index design is
+  in <a href="03-sql-databases.html#m5">SQL · Module 5</a>.</p>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is an index and what does it cost?" Faster reads; slower writes and more storage.
+    "Clustered vs non-clustered?" Rows ordered by index vs separate pointers; one vs many.
+    "Dense vs sparse?" Entry per row vs entry per block. "Why can't a hash index do range
+    queries?" Hash order is unrelated to key order.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-btree">
+  <h3>B-tree vs B+ tree and why databases use B+ trees</h3>
+  <p class="tldr">A B+ tree is a balanced, wide, shallow search tree whose internal nodes only route
+  searches and whose linked leaves hold all entries, so any lookup takes a few page reads and range
+  scans are sequential.</p>
+
+  <h4>Why a binary tree is wrong for disks</h4>
+  <p>A binary search tree over 1,000,000 keys is about 20 levels deep; each level would be a separate
+  disk read. Disks read whole pages (often 8 KB or 16 KB), so a tree should make each node as big as a
+  page and hold hundreds of keys. That gives a tree with a very large <strong>fan-out</strong> (number
+  of children), so very few levels.</p>
+
+  <h4>B-tree</h4>
+  <p>A <strong>B-tree</strong> of order m is a self-balancing tree where:</p>
+  <ul>
+    <li>Every node has at most m children and (except the root) at least ⌈m/2⌉ children.</li>
+    <li>All leaves are at the same depth.</li>
+    <li>A node with k children holds k−1 keys in sorted order.</li>
+    <li>Keys <em>and their data pointers</em> are stored in <strong>all</strong> nodes, internal ones
+    too, so a search can finish at an internal node.</li>
+  </ul>
+
+  <h4>B+ tree</h4>
+  <p>A <strong>B+ tree</strong> is a B-tree variant:</p>
+  <ul>
+    <li><strong>Internal nodes</strong> hold only keys (signposts) and child pointers; no data.</li>
+    <li><strong>Leaf nodes</strong> hold all the keys with their records (or record pointers).
+    Every key appears in a leaf; some keys are also copied into internal nodes as routing values.</li>
+    <li>Leaves are <strong>linked</strong> in a list in key order.</li>
+    <li>All leaves are at the same depth, so every lookup costs the same number of page reads.</li>
+  </ul>
+  <figure class="fig">
+  <pre class="diagram">
+                     ┌──────────────┐
+          root       │   30  │  60  │
+                     └──┬───────┬───┘
+              ┌─────────┘   │    └──────────┐
+              ▼             ▼               ▼
+        ┌──────────┐  ┌──────────┐    ┌──────────┐
+ leaves │ 10 20    │─▶│ 30 40 50 │───▶│ 60 70 80 │
+        └──────────┘  └──────────┘    └──────────┘
+         keys &lt; 30     30 to 59        60 and up
+  </pre>
+  <figcaption>A B+ tree: internal nodes route, linked leaves hold every key</figcaption>
+  </figure>
+  <p>Search for 50: at the root, 50 is at least 30 and below 60, so go to the middle child, then find
+  50 in that leaf. Range <code>BETWEEN 20 AND 60</code>: find 20 in the first leaf, then follow the
+  leaf links to the right until you pass 60; no need to climb back up.</p>
+
+  <h4>Insert and split</h4>
+  <p>Suppose a leaf holds at most 3 keys. Insert 10, 20, 30: one leaf <code>[10 20 30]</code> (also the
+  root). Insert 40: the leaf is full, so it <strong>splits</strong> into <code>[10 20]</code> and
+  <code>[30 40]</code>, and the key 30 is <em>copied up</em> into a new root <code>[30]</code>. If a
+  parent overflows, it splits too, and the middle key is <em>moved up</em>; splits can reach the root,
+  which is the only way the tree grows taller — so it always stays balanced. Delete is the reverse:
+  if a node falls below half full, it borrows from a sibling or merges with one.</p>
+
+  <h4>Why databases use B+ trees</h4>
+  <ol class="steps">
+    <li><strong>Higher fan-out, shallower tree.</strong> Internal nodes carry no data, so more keys fit
+    in a page. With 8 KB pages and about 16 bytes per (key, pointer), a node has roughly 500 children;
+    a root with 500 children gives 250,000 leaf pages at level 3, each holding about 500 entries — roughly
+    125 million entries in three levels (an estimate, not an exact figure). So finding one row takes about 3–4 page reads. The top levels stay cached in
+    memory.</li>
+    <li><strong>Predictable cost.</strong> Every search ends at a leaf at the same depth.</li>
+    <li><strong>Fast range scans and ordering.</strong> Leaves are linked, so
+    <code>BETWEEN</code>, <code>ORDER BY</code> and "next 20 rows" are sequential reads.</li>
+    <li><strong>Full scans of the index</strong> read only the leaf list.</li>
+    <li><strong>Efficient updates.</strong> Inserts and deletes cost O(log n) page changes, with
+    occasional splits.</li>
+  </ol>
+
+  <h4>B-tree vs B+ tree</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Feature</th><th>B-tree</th><th>B+ tree</th></tr></thead>
+    <tbody>
+      <tr><td>Data / record pointers</td><td>In every node</td><td>Only in leaves</td></tr>
+      <tr><td>Keys repeated</td><td>No: each key appears once</td><td>Yes: routing keys repeat in
+      leaves</td></tr>
+      <tr><td>Leaf nodes linked</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Fan-out</td><td>Lower</td><td>Higher</td></tr>
+      <tr><td>Search cost</td><td>Varies; can stop early</td><td>Always to a leaf</td></tr>
+      <tr><td>Range query</td><td>Needs tree traversal</td><td>Easy via leaf links</td></tr>
+      <tr><td>Used by</td><td>Some file systems</td><td>Most RDBMS indexes</td></tr>
+    </tbody>
+  </table></div>
+  <p>Complexity: search, insert and delete are all <strong>O(log<sub>m</sub> n)</strong> page
+  accesses, where m is the fan-out. In SQL databases, "B-tree index" in the docs almost always means a
+  B+ tree implementation (PostgreSQL calls its default index type "btree"; InnoDB uses B+ trees).</p>
+
+  <h4>B+ tree vs hash index</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Need</th><th>B+ tree</th><th>Hash</th></tr></thead>
+    <tbody>
+      <tr><td>Equality (<code>=</code>)</td><td>O(log n)</td><td>O(1) average</td></tr>
+      <tr><td>Range, <code>ORDER BY</code></td><td>Supported</td><td>Not supported</td></tr>
+      <tr><td>Prefix search</td><td>Supported</td><td>No</td></tr>
+      <tr><td>Default choice</td><td>Yes</td><td>Special cases</td></tr>
+    </tbody>
+  </table></div>
+  <p>For LSM trees (used by Cassandra and RocksDB for write-heavy loads) and other storage engines see
+  <a href="03-sql-databases.html#m5">SQL · Module 5</a>.</p>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Why B+ tree and not a binary tree or hash?" Disk pages, high fan-out, few reads, ranges.
+    "B tree vs B+ tree?" Data only in leaves, linked leaves. "What is the complexity of a lookup?"
+    O(log n) with a huge base, effectively 3–4 reads.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-sql-vs-nosql">
+  <h3>SQL vs NoSQL quick revision and the CAP theorem</h3>
+  <p class="tldr">SQL databases give structured tables, joins and strong ACID guarantees; NoSQL
+  databases trade some of that for flexible schemas and easy horizontal scaling; CAP says a
+  partitioned distributed system must choose between consistency and availability.</p>
+
+  <h4>The comparison</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>SQL (relational)</th><th>NoSQL</th></tr></thead>
+    <tbody>
+      <tr><td>Data model</td><td>Tables, rows, columns</td><td>Document, key-value, wide-column,
+      graph</td></tr>
+      <tr><td>Schema</td><td>Fixed, defined up front</td><td>Flexible or schema-less</td></tr>
+      <tr><td>Query language</td><td>SQL (standard)</td><td>Database-specific APIs or query
+      languages</td></tr>
+      <tr><td>Relationships and joins</td><td>First-class, with foreign keys</td>
+      <td>Usually embedded or handled in the application</td></tr>
+      <tr><td>Transactions</td><td>Full ACID multi-row, multi-table</td><td>Varies: often
+      single-document or key; some support multi-document</td></tr>
+      <tr><td>Scaling</td><td>Mostly vertical; read replicas; sharding is harder</td>
+      <td>Designed for horizontal scaling (sharding built in)</td></tr>
+      <tr><td>Consistency model</td><td>Strong</td><td>Tunable; often eventual</td></tr>
+      <tr><td>Best for</td><td>Orders, payments, anything with strong relations</td>
+      <td>Catalogues, sessions, events, feeds, caches, graphs</td></tr>
+      <tr><td>Examples</td><td>PostgreSQL, MySQL, Oracle</td>
+      <td>MongoDB, Redis, Cassandra, Neo4j</td></tr>
+    </tbody>
+  </table></div>
+  <p>The lines are blurring: PostgreSQL stores JSON, MongoDB offers multi-document transactions, and
+  many "NewSQL" systems scale SQL horizontally. "SQL vs NoSQL" is a trade-off per workload, not a war.</p>
+
+  <h4>The four NoSQL families</h4>
+  <ul>
+    <li><strong>Key-value</strong> (Redis, DynamoDB): value by key; fastest, simplest.</li>
+    <li><strong>Document</strong> (MongoDB): JSON documents; nested data in one read.</li>
+    <li><strong>Wide-column</strong> (Cassandra, HBase): rows with flexible columns grouped in
+    families; huge write volume.</li>
+    <li><strong>Graph</strong> (Neo4j): nodes and edges; relationship-heavy queries such as "friends
+    of friends".</li>
+  </ul>
+
+  <h4>ACID vs BASE</h4>
+  <p>Many NoSQL systems follow <strong>BASE</strong>: <em>Basically Available</em> (the system answers,
+  even during partial failures), <em>Soft state</em> (state may change over time without input, as
+  replicas sync) and <em>Eventual consistency</em> (if writes stop, all replicas converge). ACID gives
+  correctness first; BASE gives availability and scale first.</p>
+
+  <h4>CAP theorem (one-liner)</h4>
+  <p>A distributed data store can provide at most two of: <strong>Consistency</strong> (every read sees
+  the latest write), <strong>Availability</strong> (every request gets a non-error answer) and
+  <strong>Partition tolerance</strong> (the system keeps working when the network splits). Network
+  partitions will happen, so in practice <strong>when a partition occurs you choose C or A</strong>.
+  A CP store (commonly said of MongoDB and HBase) refuses some requests to stay
+  consistent; an AP store (Cassandra, DynamoDB with eventual consistency) keeps answering and may
+  return stale data. When there is no partition you can have both; the PACELC extension adds the
+  latency-versus-consistency trade-off that exists even then.</p>
+
+  <div class="co co-note">
+    <p class="co-t">Go deeper</p>
+    <p>Document modelling, Redis structures and when to choose what are covered in
+    <a href="03-sql-databases.html#m6">SQL · Module 6</a>; replication, sharding and consistency
+    patterns in <a href="08-system-design.html#m6">System Design · Module 6</a>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Never say "NoSQL is faster" or "SQL doesn't scale". Say: pick SQL when data is structured,
+    relationships and transactions matter; pick a NoSQL type when the access pattern fits it (flexible
+    documents, key lookups, huge write volume) and you can live with weaker consistency or no joins.
+    For CAP, state "during a partition choose consistency or availability" with one example each.</p>
+  </div>
+</article>

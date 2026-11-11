@@ -1,0 +1,364 @@
+<article class="topic" id="m7-compose">
+  <h3>Running several services together with Docker Compose</h3>
+  <p class="tldr">Docker Compose describes all your containers (services, databases, broker, cache) in one compose.yaml; use healthchecks with depends_on conditions so services start in a working order, a shared network so they reach each other by service name, and environment variables for configuration.</p>
+
+  <h4>What and why</h4>
+  <p>A microservice system is many processes. Starting PostgreSQL, Kafka, Redis and three Spring Boot applications by hand with long <code>docker run</code> commands is slow and error-prone. <strong>Docker Compose</strong> lets you write the whole setup once in <code>compose.yaml</code> and start it with <code>docker compose up</code>. It is the standard tool for local development and for simple single-host deployments. (Docker basics, images and Dockerfiles: <a href="07-devops.html#m3">DevOps · Module 3</a>; Kubernetes replaces Compose for large production systems.)</p>
+  <p>Compose creates a private network for the project. Containers reach each other by <strong>service name</strong> as hostname: from <code>application-service</code>, the database is simply <code>jobs-db:5432</code> and Kafka is <code>kafka:9092</code>. <code>localhost</code> inside a container means that container itself, a very common mistake.</p>
+
+  <h4>A complete compose.yaml</h4>
+  <p>Two Spring Boot services (jobs and notifications), each with its own PostgreSQL (database per service), plus Kafka and Redis:</p>
+  <pre data-title="compose.yaml"><code class="language-yaml">name: jobs-platform
+
+services:
+  jobs-db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: jobs
+      POSTGRES_USER: jobs
+      POSTGRES_PASSWORD: ${JOBS_DB_PASSWORD:?set JOBS_DB_PASSWORD in .env}
+    volumes:
+      - jobs-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobs -d jobs"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+
+  notify-db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: notify
+      POSTGRES_USER: notify
+      POSTGRES_PASSWORD: ${NOTIFY_DB_PASSWORD:?set NOTIFY_DB_PASSWORD in .env}
+    volumes:
+      - notify-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notify -d notify"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+
+  kafka:
+    image: apache/kafka:3.9.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    networks: [backend]
+
+  jobs-service:
+    build: ./jobs-service                       # folder with its Dockerfile
+    ports:
+      - "8081:8080"                             # host:container
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:postgresql://jobs-db:5432/jobs
+      SPRING_DATASOURCE_USERNAME: jobs
+      SPRING_DATASOURCE_PASSWORD: ${JOBS_DB_PASSWORD}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MANAGEMENT_TRACING_SAMPLING_PROBABILITY: "1.0"
+    depends_on:
+      jobs-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      # needs curl inside the image; or use a tiny Java/wget check
+      test: ["CMD-SHELL", "curl -fs http://localhost:8080/actuator/health/readiness || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 40s
+    restart: unless-stopped
+    networks: [backend]
+
+  notification-service:
+    build: ./notification-service
+    ports:
+      - "8082:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:postgresql://notify-db:5432/notify
+      SPRING_DATASOURCE_USERNAME: notify
+      SPRING_DATASOURCE_PASSWORD: ${NOTIFY_DB_PASSWORD}
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_MAIL_HOST: mailpit
+      SPRING_MAIL_PORT: "1025"
+    depends_on:
+      notify-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [backend]
+
+  mailpit:
+    image: axllent/mailpit
+    ports:
+      - "8025:8025"                             # open the mail UI on the host
+    networks: [backend]
+
+volumes:
+  jobs-db-data:
+  notify-db-data:
+
+networks:
+  backend:</code></pre>
+
+  <h4>Reading the file</h4>
+  <ul>
+    <li><strong><code>depends_on</code> with <code>condition: service_healthy</code></strong> makes Compose wait until the dependency's healthcheck passes. A plain <code>depends_on: [kafka]</code> only waits until the container has <em>started</em>, which is not the same as "ready to accept connections", the usual reason for startup crashes.</li>
+    <li><strong>Healthchecks</strong> are commands that Docker runs repeatedly; the container becomes <code>healthy</code> after one succeeds. <code>start_period</code> gives slow starters (Spring Boot, Kafka) time before failures count. Your services can reuse the Actuator readiness endpoint (<a href="#m6-actuator">Actuator</a>); the image needs a tool such as <code>curl</code> to call it.</li>
+    <li><strong>Environment variables</strong> override <code>application.yml</code> via relaxed binding: <code>SPRING_DATASOURCE_URL</code> becomes <code>spring.datasource.url</code>, <code>SPRING_KAFKA_BOOTSTRAP_SERVERS</code> becomes <code>spring.kafka.bootstrap-servers</code>. Hostnames are service names (<code>jobs-db</code>, <code>kafka</code>, <code>redis</code>).</li>
+    <li><strong><code>${VAR}</code> and <code>.env</code>:</strong> Compose reads a <code>.env</code> file next to <code>compose.yaml</code> for substitutions. <code>${VAR:?message}</code> stops with an error if the variable is missing. Add <code>.env</code> to <code>.gitignore</code>; commit a <code>.env.example</code> instead.</li>
+    <li><strong><code>volumes</code></strong> (named volumes) keep database files when containers are recreated. <code>docker compose down -v</code> deletes them.</li>
+    <li><strong><code>networks</code>:</strong> by default all services share one network anyway; naming networks lets you separate, for example, a <code>frontend</code> network (gateway, UI) from a <code>backend</code> network (databases not reachable from outside).</li>
+    <li><strong><code>ports</code></strong> publish a container port to the host. Do not publish databases and Kafka in anything but local development; services on the network reach them without publishing.</li>
+    <li>Kafka needs an <strong>advertised listener</strong> that clients can reach: <code>kafka:9092</code> works for other containers. For an application running on your host (outside Docker), you would add a second listener on a host-visible address such as <code>localhost:9094</code>.</li>
+  </ul>
+
+  <h4>A Dockerfile for a Spring Boot service</h4>
+  <pre data-title="jobs-service/Dockerfile"><code class="language-dockerfile">FROM eclipse-temurin:21-jdk AS build
+WORKDIR /workspace
+COPY . .
+RUN ./mvnw -q -DskipTests package
+
+FROM eclipse-temurin:21-jre
+RUN useradd --system --create-home app
+USER app
+WORKDIR /app
+COPY --from=build /workspace/target/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]</code></pre>
+  <p>The multi-stage build keeps the build tools out of the final image, and the non-root user is a basic security measure. Spring Boot can also build an image without a Dockerfile (<code>./mvnw spring-boot:build-image</code>, using buildpacks).</p>
+
+  <h4>Everyday commands</h4>
+  <pre data-title="Shell session"><code class="language-shell">$ docker compose up -d --build        # build images and start everything in the background
+$ docker compose ps                   # status and health of each service
+$ docker compose logs -f jobs-service # follow one service's logs
+$ docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+      --bootstrap-server localhost:9092 --list
+$ docker compose stop notification-service   # simulate an outage: do events queue up?
+$ docker compose up -d notification-service  # bring it back: does it catch up?
+$ docker compose down                 # stop and remove containers (keeps volumes)
+$ docker compose down -v              # also delete volumes (all data!)</code></pre>
+  <p>The "stop a service and restart it" experiment is the best way to see the value of Kafka buffering and of timeouts and circuit breakers in the other services.</p>
+
+  <h4>Spring Boot's Docker Compose support for development</h4>
+  <p>While developing, you usually run the application from your IDE and only want the infrastructure (databases, Kafka, Redis) in Docker. Spring Boot 3.1+ can manage this for you. Add the dependency:</p>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-docker-compose&lt;/artifactId&gt;
+    &lt;scope&gt;runtime&lt;/scope&gt;
+    &lt;optional&gt;true&lt;/optional&gt;
+&lt;/dependency&gt;</code></pre>
+  <p>Put a <code>compose.yaml</code> with only the infrastructure services in the project root. When you start the application, Boot runs <code>docker compose up</code>, waits for the containers, and <strong>configures the connections automatically</strong> (datasource URL, Redis host, Kafka bootstrap server, the mapped random ports), so you write no connection properties for local development. On shutdown it stops the containers. You control it with <code>spring.docker.compose.lifecycle-management</code> (<code>start-and-stop</code>, <code>start-only</code>, <code>none</code>) and <code>spring.docker.compose.file</code>. The same idea with Testcontainers and <code>@ServiceConnection</code> is used for tests (<a href="#m5">module 5</a>). Keep the full multi-service file above for running the whole system.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li><code>localhost</code> in <code>SPRING_DATASOURCE_URL</code> inside a container: connection refused. Use the service name.</li>
+      <li>Plain <code>depends_on</code> and a race condition: the app starts before the database accepts connections (or before Kafka is ready) and exits.</li>
+      <li>Committing secrets in <code>compose.yaml</code> or <code>.env</code>.</li>
+      <li>Publishing database and broker ports on a server.</li>
+      <li>Forgetting that <code>docker compose down -v</code> deletes the data volume.</li>
+      <li>One shared database for all services: it works, but it breaks the main microservice rule.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip</p>
+    <p>Add Prometheus, Grafana and Zipkin (or Grafana's all-in-one <code>grafana/otel-lgtm</code> image) as extra Compose services, point your services at them with environment variables, and your laptop becomes a complete observability lab (<a href="07-devops.html#m6">DevOps · Module 6</a>).</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is Docker Compose for?" Define and run multi-container applications locally. "How do containers find each other?" Service-name DNS on the Compose network. "How do you make a service wait for the database?" Healthcheck plus <code>depends_on: condition: service_healthy</code>, and application-level retries. "Compose vs Kubernetes?" Single host and development versus orchestration, scaling and self-healing across a cluster.</p>
+  </div>
+</article>
+
+<article class="topic recap" id="m7-interview">
+  <h3>Interview questions — Microservices and messaging</h3>
+
+  <details class="qa">
+    <summary>Monolith vs modular monolith vs microservices: how do you choose?</summary>
+    <div class="qa-a">
+      <p>A monolith deploys as one unit and is simplest; a modular monolith is the same deployment with strict module boundaries; microservices are independently deployable services with their own data. Microservices give independent deployment and scaling for many teams, but cost network failures, distributed data, observability and DevOps effort. Start with a (modular) monolith, and extract services when there is a concrete need such as team independence or different scaling.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a distributed monolith?</summary>
+    <div class="qa-a">
+      <p>A system split into services that are still tightly coupled: they share a database, must be deployed together, or call each other in long synchronous chains. It has all the costs of microservices and none of the benefits. Avoid it with clear business boundaries, database per service, and asynchronous events between services.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you decide service boundaries, and what does "database per service" mean for queries and transactions?</summary>
+    <div class="qa-a">
+      <p>Use business capabilities and bounded contexts, with one team owning each service. Each service is the only owner of its data, so there are no cross-service joins: you use API composition or a local copy fed by events. Cross-service transactions become sagas with compensating actions and eventual consistency.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does an API gateway do, and what is a route in Spring Cloud Gateway?</summary>
+    <div class="qa-a">
+      <p>It is the single entry point that routes requests to services and handles authentication, rate limiting, CORS and similar cross-cutting concerns. A route has an id, a destination URI, predicates that decide whether it matches (Path, Method, Header...) and filters that modify the request or response (StripPrefix, RewritePath, RequestRateLimiter, CircuitBreaker). The gateway is reactive (WebFlux/Netty), so avoid blocking calls in it.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do services find each other, and how is configuration managed across environments?</summary>
+    <div class="qa-a">
+      <p>With client-side discovery (Eureka registry plus load balancing, <code>lb://service-name</code>) or, more commonly today, platform DNS such as Kubernetes Services or Compose service names. Configuration is kept outside the artifact: environment variables, ConfigMaps and Secrets, a Spring Cloud Config Server backed by Git, and a vault for secrets. The same image runs in every environment.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain the circuit breaker pattern and its states.</summary>
+    <div class="qa-a">
+      <p>It protects a caller from a failing dependency. In CLOSED state calls pass and failures are counted in a sliding window. When the failure (or slow-call) rate exceeds the threshold, it moves to OPEN and rejects calls immediately, so threads are not blocked and the dependency can recover. After a wait time it becomes HALF_OPEN and allows a few probe calls; success closes it, failure reopens it. Business errors should not count as failures.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you configure retries safely?</summary>
+    <div class="qa-a">
+      <p>Retry only idempotent operations and transient errors (timeouts, 503), never 4xx or validation errors. Use few attempts with exponential backoff and jitter, and keep the total time inside your own deadline. For non-idempotent calls like payments, pass an idempotency key. Put timeouts first, since a retry needs the earlier call to end.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why must every remote call have a timeout, and what is a cascading failure?</summary>
+    <div class="qa-a">
+      <p>Without a timeout, a slow dependency makes threads wait indefinitely; the thread pool fills, the service stops responding, and its callers start hanging too. That chain reaction is a cascading failure. Timeouts, bulkheads (limiting concurrency per dependency), circuit breakers and fallbacks contain the damage.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Kafka: what are topics, partitions, offsets and consumer groups?</summary>
+    <div class="qa-a">
+      <p>A topic is a named stream split into partitions; each partition is an ordered append-only log, and each record has an offset. Records with the same key go to the same partition, so order is guaranteed per key only. A consumer group shares a topic: each partition is read by one consumer in the group, so parallelism is limited by the partition count, while different groups each receive all records. Messages are retained for a set period, so consumers can replay.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Kafka vs RabbitMQ: when would you pick each?</summary>
+    <div class="qa-a">
+      <p>Kafka is a distributed log with high throughput, retention and replay, good for event streaming, many independent consumers and data pipelines. RabbitMQ is a broker with flexible routing (direct, topic, fanout exchanges), per-message acknowledgement and dead-letter exchanges, good for task queues and work distribution. RabbitMQ deletes a message after the ack; Kafka keeps it until retention ends.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What delivery guarantees exist, and how do you achieve effectively-once processing?</summary>
+    <div class="qa-a">
+      <p>At-most-once can lose messages, at-least-once can duplicate them, and true exactly-once is only achievable inside controlled boundaries. In practice you use at-least-once delivery (acks after processing, producer retries with idempotence) together with idempotent consumers that record processed event ids in the same transaction as their side effect, or use naturally idempotent operations.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the outbox pattern and what problem does it solve?</summary>
+    <div class="qa-a">
+      <p>It solves the dual-write problem: you cannot atomically update your database and publish to a broker. The service writes the event into an outbox table in the same database transaction as the business change. A relay (a polling job or change data capture such as Debezium) publishes outbox rows to the broker and marks them sent. Delivery is at-least-once, so consumers must be idempotent.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you handle a message that keeps failing in a Kafka listener?</summary>
+    <div class="qa-a">
+      <p>Configure a <code>DefaultErrorHandler</code> with a back-off (for example exponential, 4 attempts) and a <code>DeadLetterPublishingRecoverer</code> that sends the record to a dead-letter topic. Mark non-retryable exceptions (bad data) so they go straight to the DLT, wrap the deserializer in <code>ErrorHandlingDeserializer</code> to survive poison pills, and alert on the DLT and consumer lag. Alternatively use <code>@RetryableTopic</code> for non-blocking retries.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does distributed tracing work in a Spring Boot system?</summary>
+    <div class="qa-a">
+      <p>Each request gets a trace id; each operation is a span with its own id and a parent. The trace context travels to the next service in the W3C <code>traceparent</code> header (or message headers). Micrometer Tracing with an OpenTelemetry or Brave bridge creates spans for HTTP and messaging automatically, an exporter sends them to Zipkin, Jaeger or Tempo, and sampling controls the volume. The trace id is also added to the logs so you can jump from a trace to all log lines of the request.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How would you run a multi-service system locally, and how do containers wait for each other?</summary>
+    <div class="qa-a">
+      <p>Docker Compose: one <code>compose.yaml</code> with the services, databases, Kafka and Redis on a shared network where service names are hostnames. Each infrastructure container has a healthcheck, and application services use <code>depends_on</code> with <code>condition: service_healthy</code>. Configuration is passed through environment variables. For development, Boot's <code>spring-boot-docker-compose</code> module can start the infrastructure for you and configure connections.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m7-cheatsheet">
+  <h3>Cheat sheet — Microservices and messaging</h3>
+  <ul class="cheat">
+    <li><b>Modular monolith first</b> one deployable, strict module boundaries; extract services when team or scaling needs prove it</li>
+    <li><b>Distributed monolith</b> services that share a DB or must deploy together: worst of both worlds</li>
+    <li><b>Boundaries</b> business capabilities / bounded contexts; one owner, one database per service; no cross-service joins</li>
+    <li><b>Sync vs async</b> REST/gRPC when you need the answer now; events for facts that happened; keep call chains short</li>
+    <li><b>Sagas</b> local transactions + compensations instead of distributed ACID; eventual consistency</li>
+    <li><b>API gateway</b> routing, auth, rate limit, CORS; Spring Cloud Gateway = routes (id, uri, predicates, filters), reactive, no business logic</li>
+    <li><b>Gateway YAML</b> <code>predicates: - Path=/api/jobs/**</code>, <code>filters: - StripPrefix=1</code>, <code>uri: lb://job-service</code></li>
+    <li><b>Discovery</b> Eureka (client-side, <code>@EnableEurekaServer</code>, <code>@LoadBalanced</code>) or Kubernetes / Compose DNS by service name</li>
+    <li><b>Config</b> env vars, ConfigMaps/Secrets, Spring Cloud Config Server (<code>spring.config.import=configserver:</code>), Vault for secrets</li>
+    <li><b>Feign vs HTTP interfaces</b> <code>@FeignClient</code> (Spring Cloud) vs <code>@HttpExchange</code> (Spring native)</li>
+    <li><b>Timeouts first</b> connect + read timeouts on every call; nothing else works without them</li>
+    <li><b>Retry</b> idempotent + transient only; exponential backoff + jitter; 2 to 3 attempts</li>
+    <li><b>Circuit breaker</b> CLOSED, OPEN (fail fast), HALF_OPEN (probes); <code>@CircuitBreaker(name, fallbackMethod)</code>; ignore business exceptions</li>
+    <li><b>Bulkhead / rate limiter / time limiter</b> limit concurrency / calls per period / wait time per dependency</li>
+    <li><b>Resilience4j order</b> Retry, CircuitBreaker, RateLimiter, TimeLimiter, Bulkhead (outermost first); needs AOP starter; see <code>/actuator/circuitbreakers</code></li>
+    <li><b>Queue vs topic</b> one consumer gets each message vs every subscriber group gets it</li>
+    <li><b>Kafka</b> topic, partitions (ordering + parallelism unit), offset, key, consumer group, replication, retention, KRaft</li>
+    <li><b>Spring Kafka</b> <code>KafkaTemplate.send(topic, key, value)</code> (async), <code>@KafkaListener(topics, groupId)</code>, <code>ErrorHandlingDeserializer</code>, <code>spring.json.trusted.packages</code></li>
+    <li><b>Kafka errors</b> <code>DefaultErrorHandler</code> + back-off + <code>DeadLetterPublishingRecoverer</code> (<code>topic.DLT</code>); watch consumer lag</li>
+    <li><b>RabbitMQ</b> producer to exchange (direct/topic/fanout) to queues via bindings + routing key; ack/nack; DLX; <code>RabbitTemplate</code>, <code>@RabbitListener</code></li>
+    <li><b>Kafka vs RabbitMQ</b> log with replay and huge throughput vs smart routing and task queues</li>
+    <li><b>Delivery</b> at-most-once (loss), at-least-once (duplicates), exactly-once (only within boundaries); use at-least-once + idempotent consumer</li>
+    <li><b>Idempotent consumer</b> unique event id stored in the same transaction as the effect; or upsert / set semantics</li>
+    <li><b>Outbox</b> event row saved in the same DB transaction, relay or CDC publishes later; fixes the dual-write problem</li>
+    <li><b>Tracing</b> trace id + span id, W3C <code>traceparent</code>, Micrometer Tracing bridge (OTel/Brave) + exporter; <code>management.tracing.sampling.probability</code>; build clients from injected builders</li>
+    <li><b>Compose</b> <code>healthcheck</code> + <code>depends_on: condition: service_healthy</code>; service names as hosts; env vars override Spring properties; <code>down -v</code> deletes data</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m7-practice">
+  <h3>Practice — Microservices and messaging</h3>
+  <ol class="steps">
+    <li><strong>Draw the boundaries (easy).</strong> For the job portal, write down the services you would extract, what data each owns, and which calls are synchronous and which are events. Compare it with a modular-monolith package layout. Done when you can justify each boundary in one sentence and have no shared tables.</li>
+    <li><strong>Gateway (easy).</strong> Create a Spring Cloud Gateway project that routes <code>/api/jobs/**</code> and <code>/api/applications/**</code> to two local services, strips a prefix, adds a header and handles CORS. Done when the frontend calls only the gateway port and both routes work.</li>
+    <li><strong>HTTP client with timeouts (easy).</strong> In the application service, call the job service with an <code>@HttpExchange</code> client with a 2 s connect and 3 s read timeout. Done when stopping the job service makes the call fail fast with a clear exception, not a hang.</li>
+    <li><strong>Resilience4j (medium).</strong> Add a circuit breaker, retry (exponential backoff with jitter) and a fallback to that call; expose the breaker via Actuator. Done when you can watch it go CLOSED, OPEN and HALF_OPEN by stopping and restarting the dependency, and POST calls are not retried without a key.</li>
+    <li><strong>Kafka producer and consumer (medium).</strong> Publish <code>ApplicationSubmitted</code> (JSON, keyed by job id) from the application service and consume it in a notification service. Done when two instances of the consumer in one group split the partitions and a second group receives every event.</li>
+    <li><strong>Dead-letter topic (medium).</strong> Make the listener throw for a specific bad record, configure retries with back-off and a DLT. Done when the bad record lands in the DLT with the exception headers after the retries, and the good records behind it are still processed.</li>
+    <li><strong>Idempotency and outbox (hard).</strong> Replace direct publishing with an outbox table and a scheduled relay; add a processed-event table to the consumer. Done when killing the application between commit and publish does not lose the event, and replaying the same event twice sends only one email.</li>
+    <li><strong>RabbitMQ variant (medium).</strong> Re-implement the notification flow with a topic exchange, durable queue, DLX and <code>@RabbitListener</code>. Done when a rejected message appears in the dead-letter queue, and you can explain in two sentences when you would pick RabbitMQ over Kafka.</li>
+    <li><strong>Tracing (medium).</strong> Add Micrometer Tracing with OTLP or Zipkin export to the gateway and two services, enable Kafka observation, and show the trace id in the logs. Done when one browser request shows up as one trace with spans from the gateway, both services and the Kafka consumer.</li>
+    <li><strong>Project 4 (hard).</strong> Build either a URL shortener with analytics (a redirect service that serves from Redis and publishes a click event, plus an analytics service that consumes events and exposes statistics) or a food-delivery backend split into services (orders, payments, notifications) using Redis, Kafka or RabbitMQ. Run everything with one <code>compose.yaml</code> with healthchecks and <code>depends_on: condition: service_healthy</code>, add a README with an architecture diagram, and add timeouts, a circuit breaker and tracing. Done when <code>docker compose up</code> starts the whole system, a simulated outage of one service does not lose events, and you can walk an interviewer through the event flow.</li>
+  </ol>
+</article>

@@ -1,0 +1,530 @@
+<article class="topic" id="m5-tanstack-query">
+  <h3>TanStack Query for server data</h3>
+  <p class="tldr">TanStack Query manages server state for you: <code>useQuery</code> fetches and caches
+  data by a query key with loading and error states, and <code>useMutation</code> sends changes and
+  invalidates the cache so the UI refreshes.</p>
+
+  <span class="chip pri-good">Good to know</span>
+
+  <h4>Server state is different</h4>
+  <p>Data like "the list of employees" is not owned by your app. It lives on the server, can change
+  without you knowing, can be shared by many screens, and can be out of date the moment you receive it.
+  With <code>useEffect</code> you would have to build caching, deduplication, retries, background
+  refresh, loading flags and invalidation yourself. <strong>TanStack Query</strong> (formerly React
+  Query) does all of it. Install: <code>npm install @tanstack/react-query</code>. The current major
+  version is v5; the examples use its object-style API.</p>
+
+  <h4>Setup</h4>
+<pre data-title="src/main.jsx"><code class="language-jsx">import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 30_000,        // data counts as fresh for 30 s: no refetch in that window
+      retry: 1,                 // retry failed requests once
+    },
+  },
+});
+
+createRoot(document.getElementById('root')).render(
+  &lt;StrictMode&gt;
+    &lt;QueryClientProvider client={queryClient}&gt;
+      &lt;App /&gt;
+    &lt;/QueryClientProvider&gt;
+  &lt;/StrictMode&gt;,
+);</code></pre>
+
+  <h4>useQuery: reading data</h4>
+  <p>You give <code>useQuery</code> a <strong>query key</strong> (an array that identifies the data) and
+  a <strong>query function</strong> that returns a Promise (and throws on failure). The key is the cache
+  key: same key, same cached data, shared by all components.</p>
+
+<pre data-title="src/features/employees/employeeApi.js"><code class="language-javascript">export async function fetchEmployees(page = 0) {
+  const res = await fetch(`http://localhost:8080/api/employees?page=${page}&amp;size=10`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);   // a thrown error becomes `error`
+  return res.json();
+}</code></pre>
+
+<pre data-title="EmployeeListPage.jsx"><code class="language-jsx">import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { fetchEmployees } from './employeeApi.js';
+
+function EmployeeListPage() {
+  const [page, setPage] = useState(0);
+
+  const { data, isPending, isError, error, isFetching } = useQuery({
+    queryKey: ['employees', { page }],         // changes with page -&gt; new fetch, own cache entry
+    queryFn: () =&gt; fetchEmployees(page),
+    placeholderData: keepPreviousData,         // keep showing old page while the next loads
+  });
+
+  if (isPending) return &lt;p&gt;Loading…&lt;/p&gt;;
+  if (isError) return &lt;p role="alert"&gt;Error: {error.message}&lt;/p&gt;;
+
+  return (
+    &lt;&gt;
+      &lt;ul&gt;{data.content.map((e) =&gt; &lt;li key={e.id}&gt;{e.name}&lt;/li&gt;)}&lt;/ul&gt;
+      {isFetching &amp;&amp; &lt;small&gt;Updating…&lt;/small&gt;}
+      &lt;button disabled={page === 0} onClick={() =&gt; setPage((p) =&gt; p - 1)}&gt;Prev&lt;/button&gt;
+      &lt;button disabled={data.last} onClick={() =&gt; setPage((p) =&gt; p + 1)}&gt;Next&lt;/button&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+  <p>Compare this with the 30-line effect in <a href="#m5-fetching-data">fetching data</a>: no
+  loading state, no cleanup, no race conditions, and the result is cached. Key fields returned:</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Field / option</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>data</code></td><td>The last successful result (or <code>undefined</code>)</td></tr>
+      <tr><td><code>isPending</code></td><td>No data yet (first load)</td></tr>
+      <tr><td><code>isFetching</code></td><td>A request is running, including background refetches</td></tr>
+      <tr><td><code>isError</code> / <code>error</code></td><td>The query function threw</td></tr>
+      <tr><td><code>refetch()</code></td><td>Fetch again on demand</td></tr>
+      <tr><td><code>enabled: false</code></td><td>Do not run yet (e.g. wait until an id exists)</td></tr>
+      <tr><td><code>staleTime</code></td><td>How long data is fresh. Default 0: always considered stale</td></tr>
+      <tr><td><code>gcTime</code></td><td>How long unused cache stays in memory (default 5 minutes)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Fresh, stale and refetching</h4>
+  <p>Cached data is <strong>fresh</strong> for <code>staleTime</code>, then <strong>stale</strong>.
+  Showing stale data instantly while fetching a new copy in the background ("stale-while-revalidate")
+  is the default behaviour. A stale query is refetched when a component mounts, the window regains
+  focus, or the network reconnects. That is why your list refreshes when you come back to the tab. With
+  <code>staleTime: 0</code> (the default) this happens a lot; raise it for data that rarely changes.</p>
+
+  <h4>Query keys</h4>
+  <p>Keys are arrays, compared by value. Put everything the function depends on into the key, as you
+  would with an effect's dependencies: <code>['employee', id]</code>,
+  <code>['employees', { page, q }]</code>. The key structure is hierarchical, so invalidating
+  <code>['employees']</code> also matches <code>['employees', { page: 2 }]</code>.</p>
+
+  <h4>useMutation: changing data</h4>
+  <p>Writes (POST, PUT, DELETE) use <code>useMutation</code>. After a successful mutation you
+  <strong>invalidate</strong> the affected queries, which marks them stale and refetches the ones
+  on screen.</p>
+
+<pre data-title="AddEmployee.jsx"><code class="language-jsx">import { useMutation, useQueryClient } from '@tanstack/react-query';
+
+async function createEmployee(newEmployee) {
+  const res = await fetch('http://localhost:8080/api/employees', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(newEmployee),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+function AddEmployee() {
+  const queryClient = useQueryClient();
+
+  const mutation = useMutation({
+    mutationFn: createEmployee,
+    onSuccess: () =&gt; {
+      queryClient.invalidateQueries({ queryKey: ['employees'] });   // list refetches
+    },
+  });
+
+  return (
+    &lt;button
+      disabled={mutation.isPending}
+      onClick={() =&gt; mutation.mutate({ name: 'Meera Iyer', email: 'meera@corp.in' })}
+    &gt;
+      {mutation.isPending ? 'Saving…' : 'Add employee'}
+      {mutation.isError &amp;&amp; &lt;span role="alert"&gt; Failed: {mutation.error.message}&lt;/span&gt;}
+    &lt;/button&gt;
+  );
+}</code></pre>
+
+  <h4>Wrap it in custom hooks</h4>
+<pre data-title="src/features/employees/useEmployees.js"><code class="language-javascript">import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { createEmployee, fetchEmployee, fetchEmployees } from './employeeApi.js';
+
+export const employeeKeys = {
+  all: ['employees'],
+  list: (page) =&gt; ['employees', { page }],
+  detail: (id) =&gt; ['employee', id],
+};
+
+export function useEmployees(page) {
+  return useQuery({ queryKey: employeeKeys.list(page), queryFn: () =&gt; fetchEmployees(page) });
+}
+
+export function useEmployee(id) {
+  return useQuery({
+    queryKey: employeeKeys.detail(id),
+    queryFn: () =&gt; fetchEmployee(id),
+    enabled: Boolean(id),
+  });
+}
+
+export function useCreateEmployee() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: createEmployee,
+    onSuccess: () =&gt; qc.invalidateQueries({ queryKey: employeeKeys.all }),
+  });
+}</code></pre>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Hand-written useEffect</th><th>TanStack Query</th></tr></thead>
+    <tbody>
+      <tr><td>Loading / error state</td><td>You write it every time</td><td>Built in</td></tr>
+      <tr><td>Caching and sharing</td><td>None, or a custom context</td><td>Automatic by query key</td></tr>
+      <tr><td>Duplicate requests</td><td>One per component</td><td>Deduplicated</td></tr>
+      <tr><td>Race conditions</td><td>Your cleanup</td><td>Handled</td></tr>
+      <tr><td>Refetch on focus, retries</td><td>Manual</td><td>Configurable defaults</td></tr>
+      <tr><td>After a write</td><td>Manually reload</td><td><code>invalidateQueries</code></td></tr>
+      <tr><td>Optimistic updates</td><td>Hard</td><td>Supported through mutation callbacks</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>The query function must return a Promise and <strong>throw</strong> on HTTP errors. With
+      <code>fetch</code> check <code>res.ok</code>; Axios already throws for 4xx/5xx.</li>
+      <li>Everything the request depends on goes in the query key.</li>
+      <li>Do not copy <code>data</code> into <code>useState</code>; read it from the query.</li>
+      <li>Use queries for reads and mutations for writes.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>In v5, <code>isLoading</code> means "first fetch is running" (<code>isFetching &amp;&amp;
+      isPending</code>); <code>isPending</code> is "no data yet". In v4 the names were different
+      (<code>isLoading</code> meant "no data"). Check which version tutorials use.</li>
+      <li>The default retry is 3 attempts with backoff. A 401 or 404 that retries three times just
+      delays the error; set <code>retry: false</code> for those or handle them in one place.</li>
+      <li>Install the optional <code>@tanstack/react-query-devtools</code> to see the cache live.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>A common stack for a Spring Boot backend: Axios instance (<a href="#m6-axios-fetch">Module 6</a>)
+    as the <code>queryFn</code> transport, TanStack Query for all GET/POST/PUT/DELETE calls, React Router
+    for pages, Context only for auth and theme, and React Hook Form for forms.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Why TanStack Query instead of useEffect and Redux?"</p>
+    <ul>
+      <li>Server state is async, shared, cached and can go stale; it needs a cache layer, not just
+      <code>setState</code>.</li>
+      <li>The query key identifies cached data; <code>staleTime</code> controls freshness;
+      mutations plus <code>invalidateQueries</code> keep the UI in sync after writes.</li>
+      <li>It removes boilerplate and race conditions, and leaves Redux/Zustand for true client
+      state.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-devtools-errors">
+  <h3>React DevTools and common React errors</h3>
+  <p class="tldr">Use the React DevTools browser extension to inspect the component tree, props, state
+  and renders, and learn to read the handful of error messages you will see every week.</p>
+
+  <h4>React DevTools</h4>
+  <p>Install the <strong>React Developer Tools</strong> extension for Chrome, Edge or Firefox. Open
+  the browser DevTools; two new tabs appear:</p>
+  <ul>
+    <li><strong>Components</strong>: the component tree. Click a component to see its props, state,
+    hooks and context on the right. You can edit state and props live, jump to the DOM node, and search
+    by component name. Use it to answer "what value did this component really receive?".</li>
+    <li><strong>Profiler</strong>: record an interaction, then see which components rendered, how long
+    each took, and (with "Record why each component rendered" enabled in settings) why. Use it before
+    adding <code>memo</code>/<code>useMemo</code>. The "Highlight updates when components render"
+    option flashes every re-rendering component.</li>
+  </ul>
+  <p>Combine it with the other DevTools tabs you know from <a href="#m4">Module 4</a>: the
+  <strong>Network</strong> tab for requests and the <strong>Console</strong> for errors. TanStack Query
+  also has its own devtools panel.</p>
+
+  <h4>Common errors and warnings</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Message</th><th>Cause</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>Each child in a list should have a unique "key" prop</td><td>Array rendered without keys, or duplicate keys</td><td>Add <code>key={item.id}</code> on the outer element of <code>map</code></td></tr>
+      <tr><td>Too many re-renders. React limits the number of renders to prevent an infinite loop</td><td>A setter is called during render, e.g. <code>onClick={setCount(1)}</code></td><td>Pass a function: <code>onClick={() =&gt; setCount(1)}</code></td></tr>
+      <tr><td>Cannot update a component while rendering a different component</td><td>A child calls a parent's setter during its render</td><td>Move the call into an event handler or <code>useEffect</code></td></tr>
+      <tr><td>Objects are not valid as a React child</td><td>Rendering a plain object or Date: <code>{user}</code></td><td>Render a field: <code>{user.name}</code>, or format the date</td></tr>
+      <tr><td>Cannot read properties of undefined (reading 'name')</td><td>Using data before it loaded, or a wrong response shape</td><td>Loading branch first, optional chaining, check the Network tab</td></tr>
+      <tr><td>Invalid hook call</td><td>Hook called outside a component, in a condition, or two copies of React installed</td><td>Follow the rules of hooks; run <code>npm ls react</code></td></tr>
+      <tr><td>Rendered more hooks than during the previous render</td><td>A hook after a conditional return</td><td>Move all hooks above any return</td></tr>
+      <tr><td>A component is changing an uncontrolled input to be controlled</td><td>Input <code>value</code> started as <code>undefined</code></td><td>Initialise state to <code>''</code></td></tr>
+      <tr><td>Maximum update depth exceeded</td><td>An effect sets state and has a bad dependency array</td><td>Fix dependencies; derive instead of syncing</td></tr>
+      <tr><td>X is not a function / X is not defined</td><td>Wrong import (default vs named), typo, or lowercase component</td><td>Check the export style and the capitalisation</td></tr>
+      <tr><td>Warning: Invalid DOM property <code>class</code></td><td>HTML attribute in JSX</td><td>Use <code>className</code></td></tr>
+      <tr><td>Hydration failed (frameworks only)</td><td>Server and client HTML differ</td><td>Avoid <code>Date.now()</code> or <code>window</code> in the first render</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A debugging routine</h4>
+  <ol class="steps">
+    <li>Read the <strong>first</strong> error in the Console and click the file and line in the stack
+    trace; later errors are often a consequence.</li>
+    <li>In the Components tab, check the props and state of the failing component. Is the value what
+    you expected?</li>
+    <li>In the Network tab, check the request URL, status, response body and headers. Is it a 404, a 401,
+    a CORS failure, or the wrong JSON shape?</li>
+    <li>Add <code>console.log</code> or a <code>debugger</code> statement; remember StrictMode runs
+    renders twice in development, so logs appear doubled.</li>
+    <li>Reduce the problem: comment out parts until it works, then add them back.</li>
+  </ol>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: error boundaries</p>
+    <p>A rendering error in any component unmounts the whole tree and leaves a white page. An
+    <strong>error boundary</strong> catches errors in its children and shows a fallback. It must be a
+    class component, so most apps use the small <code>react-error-boundary</code> library:
+    <code>&lt;ErrorBoundary fallback={&lt;p&gt;Something broke&lt;/p&gt;}&gt;</code>. Boundaries do not
+    catch errors in event handlers or async code; handle those with <code>try/catch</code>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you debug a React app?"</p>
+    <ul>
+      <li>Console error and stack trace first; React DevTools Components for props/state; Profiler for
+      slow renders; Network tab for API problems.</li>
+      <li>Know the usual suspects: keys, too many re-renders, stale closures, undefined data before
+      loading, wrong hook order.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m5-interview">
+  <h3>Interview questions — React</h3>
+
+  <details class="qa">
+    <summary>What is React, and how is it different from a framework like Angular?</summary>
+    <div class="qa-a">
+      <p>React is a library for building UIs from components. It handles rendering and state only;
+      routing, forms, HTTP and global state come from separate libraries you choose. Angular is a full
+      framework with its own router, forms, HTTP client and dependency injection, written in
+      TypeScript. React is declarative: you describe the UI for the current state, and React updates
+      the DOM.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the virtual DOM and how does reconciliation work?</summary>
+    <div class="qa-a">
+      <p>Components return React elements, plain objects that describe the UI. After a state change
+      React renders again, diffs the new tree with the previous one and commits only the differences to
+      the real DOM. It assumes elements of different types produce different trees, and uses
+      <code>key</code> to match list items, which gives roughly O(n) comparison. Several updates are
+      batched into one render.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between props and state?</summary>
+    <div class="qa-a">
+      <p>Props are inputs from the parent and are read-only. State is data the component owns and
+      changes through a setter, which triggers a re-render. State persists across renders; props change
+      when the parent re-renders. Data flows down as props, and child-to-parent communication happens by
+      calling functions passed as props.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why must you not mutate state directly?</summary>
+    <div class="qa-a">
+      <p>React detects changes by comparing references. If you mutate an array or object and pass the
+      same reference to the setter, React sees no change and the UI is stale. Create a new value with
+      spread, <code>map</code> or <code>filter</code>. Immutability also keeps DevTools, memoisation
+      and time-travel debugging reliable.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>After <code>setCount(count + 1)</code> three times in a handler, count only goes up by 1.
+    Why, and how do you fix it?</summary>
+    <div class="qa-a">
+      <p>State is a snapshot: in that render <code>count</code> is a constant, so all three calls
+      schedule "count = old + 1". Use the functional form <code>setCount(c =&gt; c + 1)</code>; React
+      passes the latest pending value to each updater, and the result is +3 in one batched render.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain <code>useEffect</code> and its dependency array.</summary>
+    <div class="qa-a">
+      <p>It runs after the render is committed, to synchronise with an external system. No array: after
+      every render. <code>[]</code>: once after mount. <code>[a, b]</code>: when <code>a</code> or
+      <code>b</code> change. The returned cleanup runs before the next run and on unmount. List every
+      reactive value you use, or you get stale closures. Unstable object or function dependencies cause
+      extra runs or infinite loops.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you fetch data in a component and avoid race conditions?</summary>
+    <div class="qa-a">
+      <p>Fetch inside <code>useEffect</code> with the inputs (such as <code>id</code>) in the
+      dependency array. Keep loading, error and data state, and check <code>res.ok</code>. Return a
+      cleanup that aborts with <code>AbortController</code> or sets an <code>ignore</code> flag so an
+      older, slower response cannot overwrite a newer one. In real projects use TanStack Query.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why do I see my effect (and API call) run twice in development?</summary>
+    <div class="qa-a">
+      <p>StrictMode deliberately mounts, unmounts and mounts again in development to check that your
+      effect has correct cleanup. It does not happen in production. Fix the effect rather than removing
+      StrictMode.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why do lists need keys? Is the array index a good key?</summary>
+    <div class="qa-a">
+      <p>Keys let React match items between renders to reuse, move or remove the correct element and
+      keep its state. Use a stable unique id. Index keys break when the list is reordered, filtered or
+      has inserts or deletes, because state and DOM nodes attach to the wrong item. A random key per
+      render recreates every item.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Controlled vs uncontrolled components?</summary>
+    <div class="qa-a">
+      <p>A controlled input's value comes from state (<code>value</code> + <code>onChange</code>), so
+      React is the source of truth and you can validate or transform on each change. An uncontrolled
+      input keeps its value in the DOM; you read it with a ref or <code>FormData</code>. File inputs are
+      always uncontrolled; React Hook Form uses uncontrolled inputs for performance.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is prop drilling and how do you avoid it?</summary>
+    <div class="qa-a">
+      <p>Passing props through intermediate components that do not need them. Avoid it with
+      composition (pass <code>children</code> or JSX), with Context for rarely changing global values
+      like the user or theme, or with a state library. Context re-renders all consumers when the value
+      changes, so it is not for fast-changing data.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What are the rules of hooks, and why do they exist?</summary>
+    <div class="qa-a">
+      <p>Call hooks only at the top level (not in conditions, loops or nested functions) and only in
+      function components or custom hooks. React stores hook state in an ordered list per component, so
+      the calls must happen in the same order every render. Breaking the rule gives "Rendered more
+      hooks than during the previous render" or silently wrong state.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you use <code>useMemo</code>, <code>useCallback</code> and
+    <code>React.memo</code>?</summary>
+    <div class="qa-a">
+      <p><code>useMemo</code> caches an expensive computed value; <code>useCallback</code> caches a
+      function reference; <code>React.memo</code> skips re-rendering a component when its props are
+      shallow-equal. Together they help when a memoised child receives stable props, or a value is an
+      effect dependency. Measure with the Profiler first; unnecessary memoisation adds complexity
+      without benefit.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why TanStack Query instead of fetching in useEffect?</summary>
+    <div class="qa-a">
+      <p>Server data needs caching, deduplication, background refetching, retries, loading and error
+      states and invalidation after writes. TanStack Query provides these through query keys,
+      <code>staleTime</code>, <code>useQuery</code>, <code>useMutation</code> and
+      <code>invalidateQueries</code>, and removes race-condition boilerplate. Client-only state still
+      belongs in <code>useState</code> or Context.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m5-cheatsheet">
+  <h3>Cheat sheet — React</h3>
+  <ul class="cheat">
+    <li><b>Create project</b> <code>npm create vite@latest</code> → <code>npm install</code> →
+    <code>npm run dev</code> (port 5173); <code>npm run build</code> → <code>dist/</code></li>
+    <li><b>Component</b> function with a Capital name returning JSX; one root or a fragment
+    <code>&lt;&gt;…&lt;/&gt;</code></li>
+    <li><b>JSX attributes</b> <code>className</code>, <code>htmlFor</code>, camelCase events,
+    <code>style={{ }}</code>, comments <code>{/* */}</code></li>
+    <li><b>Props</b> read-only inputs; destructure with defaults; <code>children</code> for
+    composition</li>
+    <li><b>useState</b> <code>[value, setValue]</code>; state is a snapshot; use
+    <code>setX(x =&gt; …)</code> when depending on the old value</li>
+    <li><b>Immutable updates</b> add <code>[...a, x]</code>, remove <code>filter</code>, change
+    <code>map</code> + <code>{...o, k: v}</code></li>
+    <li><b>Events</b> <code>onClick={fn}</code> passes the function; <code>() =&gt; fn(id)</code> for
+    arguments; <code>e.preventDefault()</code> in submit</li>
+    <li><b>Conditional</b> early return, ternary, <code>cond &amp;&amp; &lt;X /&gt;</code>; never
+    <code>0 &amp;&amp;</code></li>
+    <li><b>Lists</b> <code>items.map(i =&gt; &lt;Row key={i.id} … /&gt;)</code>; stable unique keys,
+    not random, not index</li>
+    <li><b>useEffect</b> runs after render; no array = every render, <code>[]</code> = mount,
+    <code>[a]</code> = when a changes; return a cleanup</li>
+    <li><b>Fetch in effect</b> loading/error/data + <code>res.ok</code> + AbortController or ignore
+    flag</li>
+    <li><b>Not an effect</b> derived data → compute in render; user action → event handler; reset →
+    <code>key</code></li>
+    <li><b>useRef</b> DOM node or mutable value, no re-render; <b>useMemo</b> value cache;
+    <b>useCallback</b> function cache; <b>useReducer</b> complex state</li>
+    <li><b>Rules of hooks</b> top level only; only in components or custom hooks</li>
+    <li><b>Forms</b> controlled: <code>value</code> + <code>onChange</code>, one handler using
+    <code>name</code>; disable submit while sending; server validates too</li>
+    <li><b>React Hook Form + Zod</b> <code>register</code>, <code>handleSubmit</code>,
+    <code>zodResolver</code></li>
+    <li><b>Router</b> <code>BrowserRouter</code>, <code>Routes</code>, <code>Route</code>,
+    <code>Link</code>/<code>NavLink</code>, <code>useNavigate</code>, <code>useParams</code> (string),
+    <code>useSearchParams</code>, <code>Outlet</code>, <code>path="*"</code> for 404</li>
+    <li><b>Lift state up</b> closest common parent owns it; pass value + handler down</li>
+    <li><b>Context</b> <code>createContext</code> → Provider with memoised value →
+    <code>useContext</code> inside a <code>useXxx</code> hook; for rarely changing data</li>
+    <li><b>Custom hook</b> name starts with <code>use</code>; shares logic, not state</li>
+    <li><b>TanStack Query</b> <code>useQuery({queryKey, queryFn})</code>,
+    <code>useMutation</code> + <code>invalidateQueries</code>, <code>staleTime</code></li>
+    <li><b>Debug</b> Console first error, DevTools Components/Profiler, Network tab</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m5-practice">
+  <h3>Practice — React</h3>
+  <ol class="steps">
+    <li><strong>Counter and toggles.</strong> Create a Vite React project. Build a counter with +, −
+    and reset, using functional updates, and a button that shows/hides a panel. Done when clicking +
+    three times in one handler adds 3 and no console warnings appear.</li>
+    <li><strong>Todo list.</strong> Add, toggle and delete todos stored in state with immutable
+    updates, a filter (all/done/pending) derived during render, and ids as keys. Done when you can
+    delete the first item without any text in other rows moving.</li>
+    <li><strong>Form with validation.</strong> Build a registration form (name, email, password,
+    role select, terms checkbox) with controlled inputs, one <code>handleChange</code>, errors under
+    each field and a disabled button while "submitting" (use a fake 1-second promise). Rebuild it with
+    React Hook Form + Zod.</li>
+    <li><strong>Movie search or expense tracker.</strong> Pick one. Movie search: call a public movie
+    API from an effect with a debounced search box, loading/error/empty states, AbortController and
+    results as cards. Expense tracker: add/edit/delete expenses, totals by category derived in render,
+    persisted with a <code>useLocalStorage</code> hook. Done when a fast typist never sees stale
+    results.</li>
+    <li><strong>Add routing and Context.</strong> Extend that app with React Router: a list page, a
+    detail page (<code>/:id</code>), a 404 page, a shared layout with <code>NavLink</code>s, and filters
+    in search params. Add a <code>ThemeContext</code> (light/dark) and a favourites list in Context.</li>
+    <li><strong>Rebuild the Module 4 apps.</strong> Take your DOM and async apps from
+    <a href="#m4">Module 4</a> (for example the weather or GitHub-user search) and rebuild them in React
+    with routing. Compare how many lines handle "update the screen".</li>
+    <li><strong>Custom hooks.</strong> Write and use <code>useFetch</code>, <code>useDebounce</code>
+    and <code>useLocalStorage</code>. Open StrictMode's double effect in the Network tab and prove your
+    cleanup works.</li>
+    <li><strong>Switch to TanStack Query.</strong> Replace a hand-written fetch with
+    <code>useQuery</code>, add a create form with <code>useMutation</code> and
+    <code>invalidateQueries</code>. Done when the list updates after saving without a manual refetch.</li>
+    <li><strong>Break and debug on purpose.</strong> Trigger "Each child in a list should have a unique
+    key", "Too many re-renders", and "Objects are not valid as a React child". Find each in the
+    Console and fix it. Record a Profiler session and find one avoidable re-render.</li>
+  </ol>
+</article>

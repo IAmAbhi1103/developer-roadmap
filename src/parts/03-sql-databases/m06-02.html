@@ -1,0 +1,516 @@
+<article class="topic" id="m6-mongodb">
+  <h3>MongoDB basics: documents, collections and queries</h3>
+  <p class="tldr">MongoDB stores JSON-like documents (BSON) in collections without a fixed schema; you query them
+  with filter documents, update them with operators like <code>$set</code> and <code>$inc</code>, and analyse
+  them with the aggregation pipeline.</p>
+
+  <h4>The document model</h4>
+  <p>A relational row is flat: columns of simple values. A MongoDB <strong>document</strong> is a nested structure
+  of fields, arrays and sub-documents, stored as <strong>BSON</strong> (binary JSON, which adds types such as
+  dates, 64-bit integers, decimals and <code>ObjectId</code>). A <strong>collection</strong> groups documents,
+  roughly like a table, and a <strong>database</strong> groups collections. Documents in one collection need not
+  have the same fields.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Relational</th><th>MongoDB</th></tr></thead>
+    <tbody>
+      <tr><td>Database</td><td>Database</td></tr>
+      <tr><td>Table</td><td>Collection</td></tr>
+      <tr><td>Row</td><td>Document</td></tr>
+      <tr><td>Column</td><td>Field</td></tr>
+      <tr><td>Primary key</td><td><code>_id</code> (every document has one, unique)</td></tr>
+      <tr><td>Join</td><td>Embedding, <code>$lookup</code></td></tr>
+    </tbody>
+  </table></div>
+  <p><code>_id</code> is the primary key. If you do not supply one, the server generates an <code>ObjectId</code>:
+  a 12-byte value that includes a timestamp, so ids are roughly time-ordered and unique across servers. A single
+  document can be up to 16 MB.</p>
+
+  <h4>Run MongoDB and open mongosh</h4>
+<pre data-title="Docker"><code class="language-bash">$ docker run -d --name mongo -p 27017:27017 mongo:7
+$ docker exec -it mongo mongosh
+test&gt; use fooddb
+switched to db fooddb</code></pre>
+
+  <h4>Create</h4>
+<pre data-title="mongosh: insertOne and insertMany"><code class="language-javascript">db.restaurants.insertOne({
+  name: "Spice Hub",
+  city: "Pune",
+  cuisines: ["North Indian", "Chinese"],
+  rating: 4.3,
+  isOpen: true,
+  address: { line1: "12 MG Road", pincode: "411001" },
+  menu: [
+    { name: "Paneer Tikka", pricePaise: 22000 },
+    { name: "Butter Naan",  pricePaise: 4000 }
+  ]
+})
+
+db.restaurants.insertMany([
+  { name: "Dosa Point", city: "Pune",  cuisines: ["South Indian"], rating: 4.6, isOpen: true },
+  { name: "Biryani House", city: "Delhi", cuisines: ["Mughlai"], rating: 3.9, isOpen: false }
+])</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{ acknowledged: true,
+  insertedId: ObjectId('6731a0c2f1d2a4b5c6d7e8f9') }</code></pre>
+
+  <h4>Read: find, filters, projection, sort, limit</h4>
+<pre data-title="mongosh: find"><code class="language-javascript">db.restaurants.find({ city: "Pune" })                        // all Pune restaurants
+
+db.restaurants.find(
+  { city: "Pune", rating: { $gt: 4.0 } },                    // filter
+  { name: 1, rating: 1, _id: 0 }                             // projection: which fields to return
+).sort({ rating: -1 }).limit(5)                              // sort descending, top 5
+
+db.restaurants.findOne({ name: "Dosa Point" })
+db.restaurants.countDocuments({ isOpen: true })</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[ { name: 'Dosa Point', rating: 4.6 }, { name: 'Spice Hub', rating: 4.3 } ]</code></pre>
+  <p>The first argument is the <em>filter document</em>; <code>{ city: "Pune" }</code> means equality, like
+  <code>WHERE city = 'Pune'</code>. Several fields in one filter are combined with AND. The second argument is the
+  projection (<code>1</code> include, <code>0</code> exclude).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operator</th><th>Meaning</th><th>SQL equivalent</th></tr></thead>
+    <tbody>
+      <tr><td><code>$eq</code>, <code>$ne</code></td><td>Equal, not equal</td><td><code>=</code>, <code>&lt;&gt;</code></td></tr>
+      <tr><td><code>$gt</code>, <code>$gte</code>, <code>$lt</code>, <code>$lte</code></td><td>Comparisons</td>
+      <td><code>&gt;</code>, <code>&gt;=</code>, <code>&lt;</code>, <code>&lt;=</code></td></tr>
+      <tr><td><code>$in</code>, <code>$nin</code></td><td>Value in / not in a list</td><td><code>IN</code>, <code>NOT IN</code></td></tr>
+      <tr><td><code>$and</code>, <code>$or</code>, <code>$not</code></td><td>Logic</td><td><code>AND</code>, <code>OR</code>, <code>NOT</code></td></tr>
+      <tr><td><code>$exists</code></td><td>Field is present</td><td><code>IS NOT NULL</code> (roughly)</td></tr>
+      <tr><td><code>$regex</code></td><td>Pattern match</td><td><code>LIKE</code> / regex</td></tr>
+    </tbody>
+  </table></div>
+<pre data-title="mongosh: operators"><code class="language-javascript">db.restaurants.find({ city: { $in: ["Pune", "Mumbai"] }, isOpen: true })
+
+db.restaurants.find({
+  $or: [ { rating: { $gte: 4.5 } }, { cuisines: "Chinese" } ]    // array field: matches if any element equals
+})
+
+db.restaurants.find({ "address.pincode": "411001" })             // dot notation for nested fields
+db.restaurants.find({ "menu.pricePaise": { $lt: 10000 } })       // inside an array of sub-documents</code></pre>
+
+  <h4>Update and delete</h4>
+<pre data-title="mongosh: updateOne, deleteOne"><code class="language-javascript">db.restaurants.updateOne(
+  { name: "Spice Hub" },                                      // which document
+  {
+    $set:  { isOpen: false },                                 // set or add a field
+    $inc:  { reviewCount: 1 },                                // add to a number (creates it at 0 first)
+    $push: { cuisines: "Biryani" }                            // append to an array
+  }
+)
+db.restaurants.updateMany({ city: "Pune" }, { $set: { zone: "West" } })
+db.restaurants.updateOne({ name: "New Place" }, { $set: { city: "Pune" } }, { upsert: true })
+
+db.restaurants.deleteOne({ name: "Biryani House" })
+db.restaurants.deleteMany({ isOpen: false })</code></pre>
+  <p>Always use update operators. Passing a plain document (<code>updateOne(filter, {isOpen: false})</code>) is
+  rejected by <code>updateOne</code> (only <code>replaceOne</code> replaces whole documents). Single-document
+  operations are atomic, including updates of nested fields and arrays inside that document.</p>
+
+  <h4>Indexes</h4>
+<pre data-title="mongosh: indexes and explain"><code class="language-javascript">db.restaurants.createIndex({ city: 1, rating: -1 })            // compound index, same prefix rule as SQL
+db.restaurants.createIndex({ name: 1 }, { unique: true })
+db.restaurants.find({ city: "Pune" }).sort({ rating: -1 }).explain("executionStats")
+// winningPlan: IXSCAN (index scan) good;  COLLSCAN (collection scan) = full scan, bad on big collections</code></pre>
+  <p>MongoDB uses B-tree indexes with the same ideas as <a href="#m5-composite-indexes">Module 5</a>: compound
+  indexes follow the leftmost-prefix rule; indexes speed reads and cost writes. Without an index, a query scans
+  the whole collection.</p>
+
+  <h4>Aggregation pipeline basics</h4>
+  <p>The <strong>aggregation pipeline</strong> passes documents through stages, each transforming the stream:
+  the MongoDB equivalent of <code>WHERE</code>, <code>GROUP BY</code>, <code>ORDER BY</code> and joins.</p>
+<pre data-title="mongosh: average rating per city"><code class="language-javascript">db.restaurants.aggregate([
+  { $match:   { isOpen: true } },                                     // WHERE
+  { $group:   { _id: "$city",                                         // GROUP BY city
+                avgRating: { $avg: "$rating" },
+                count:     { $sum: 1 } } },
+  { $sort:    { avgRating: -1 } },                                    // ORDER BY
+  { $project: { _id: 0, city: "$_id", avgRating: 1, count: 1 } }      // choose and rename fields
+])</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[ { avgRating: 4.45, count: 2, city: 'Pune' } ]</code></pre>
+<pre data-title="$lookup: a left outer join with another collection"><code class="language-javascript">db.orders.aggregate([
+  { $match: { status: "DELIVERED" } },
+  { $lookup: { from: "restaurants",            // other collection
+               localField: "restaurantId",     // field in orders
+               foreignField: "_id",            // field in restaurants
+               as: "restaurant" } },           // result array
+  { $unwind: "$restaurant" }
+])</code></pre>
+  <p>Put <code>$match</code> and <code>$sort</code> early so they can use indexes and shrink the stream.
+  <code>$lookup</code> works but is not a replacement for relational joins; if you use it all the time, the data
+  may belong in a relational database.</p>
+
+  <h4>Embedding vs referencing</h4>
+  <p>The central design decision. <strong>Embed</strong> related data inside the document, or <strong>reference</strong>
+  it by storing the other document's <code>_id</code> (like a foreign key, without enforcement).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Embed when</th><th>Reference when</th></tr></thead>
+    <tbody>
+      <tr><td>Data is read together (menu with restaurant)</td><td>Data is used on its own, from many places</td></tr>
+      <tr><td>One-to-few; the child list is small and bounded</td><td>One-to-many with unbounded growth (orders of a user)</td></tr>
+      <tr><td>The child belongs to one parent and dies with it</td><td>Many-to-many, or shared between parents</td></tr>
+      <tr><td>You want atomic updates of parent and child together</td><td>The child changes often, or the document would approach 16 MB</td></tr>
+    </tbody>
+  </table></div>
+  <p>Rule of thumb: <em>model the data the way the application reads it</em>. A restaurant page needs the menu: embed
+  it. A user's order history grows forever: store orders in their own collection with <code>userId</code>.
+  Duplicating a little data (restaurant name inside an order, like the snapshot columns in
+  <a href="#m4-denormalization">Module 4</a>) is normal in document design.</p>
+
+  <h4>When MongoDB fits, and when not</h4>
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Good fit</p><ul>
+      <li>Content, catalogues and profiles with varying fields</li>
+      <li>Data read and written as whole documents</li>
+      <li>Rapidly evolving schemas in early products</li>
+      <li>Horizontal scaling through sharding for large volumes</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Poor fit</p><ul>
+      <li>Many relationships and frequent joins</li>
+      <li>Multi-record transactions as the main workload (money, inventory)</li>
+      <li>Ad-hoc reporting across entities</li>
+      <li>Teams that need schema enforcement everywhere (possible with JSON Schema validation, but optional)</li>
+    </ul></div>
+  </div>
+  <p>Spring Boot supports it with Spring Data MongoDB (<code>MongoRepository</code>, <code>@Document</code>). MongoDB
+  does support multi-document ACID transactions on replica sets, but if you need them everywhere, a relational
+  database is simpler. Official docs: <a href="https://www.mongodb.com/docs/">mongodb.com/docs</a>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: unbounded arrays inside a document</p>
+    <p>Pushing every order into <code>user.orders</code> makes the document grow without limit, slows each update
+    and eventually hits 16 MB. Embed only bounded data.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>No foreign keys: nothing stops a reference to a deleted document. Your code must clean up.</li>
+      <li>Types are per value: <code>rating: "4.3"</code> (string) and <code>rating: 4.3</code> (number) are
+      different, and a filter on one will not match the other.</li>
+      <li>A compound index must match the query's leading fields, as in SQL.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Document vs row?</b> Nested, schema-flexible BSON versus flat, fixed-column rows.</li>
+      <li><b>Embed or reference?</b> Embed for bounded data read together; reference for unbounded or shared data.</li>
+      <li><b>How do you do a join?</b> <code>$lookup</code> in an aggregation, or better, model so you do not need one.</li>
+      <li><b>When not MongoDB?</b> Heavy relationships, multi-record transactions and strict consistency as the
+      main need.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-cap">
+  <h3>CAP theorem, PACELC and eventual consistency</h3>
+  <p class="tldr">When the network splits a distributed database into parts that cannot talk to each other
+  (a partition), it must choose between answering with possibly stale data (availability) or refusing to answer
+  until it can be sure (consistency); you cannot have both during a partition.</p>
+
+  <h4>The three properties</h4>
+  <dl class="terms">
+    <dt>Consistency (C)</dt><dd>Every read sees the latest write, or an error. All clients see the same data
+    at the same time, as if there were a single copy. (This is not the ACID "consistency" about constraints.)</dd>
+    <dt>Availability (A)</dt><dd>Every request to a node that is working gets a non-error response, even if it
+    might not be the newest data.</dd>
+    <dt>Partition tolerance (P)</dt><dd>The system keeps working when the network drops or delays messages
+    between nodes.</dd>
+  </dl>
+
+  <h4>Why you must choose</h4>
+  <p>Imagine a balance stored on two servers, in Mumbai and Delhi, each with a copy. The link between them breaks
+  (a partition). A client changes the balance in Mumbai. Now a client reads from Delhi.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  W[Client writes 500] --&gt; M[(Node Mumbai: 500)]
+  M -. link broken .- D[(Node Delhi: old value 100)]
+  R[Client reads] --&gt; D
+</pre>
+  <figcaption>During a partition Delhi cannot know about the write in Mumbai</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Choose consistency (CP):</strong> Delhi refuses to answer (an error or a timeout) because it cannot
+    be sure its value is current. The system is consistent but not available at Delhi.</li>
+    <li><strong>Choose availability (AP):</strong> Delhi answers with its old value 100. The system is available but
+    returns stale data, and the two copies must be reconciled when the network heals.</li>
+  </ul>
+  <p>You cannot answer correctly <em>and</em> always answer. That is the CAP theorem: in the presence of a
+  partition, you pick C or A. Partitions are not optional in a real network (cables fail, packets are lost, nodes
+  pause), so "P" is a fact of life, and the actual decision is <strong>CP or AP</strong>. When there is no
+  partition, a system can be both consistent and available. A single-node database has no partition to worry
+  about.</p>
+
+  <h4>CP and AP systems</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>CP: consistency first</th><th>AP: availability first</th></tr></thead>
+    <tbody>
+      <tr><td>During a partition</td><td>Minority side stops serving (or reads and writes fail)</td><td>Every side
+      keeps serving; copies diverge</td></tr>
+      <tr><td>Typical examples</td><td>ZooKeeper, etcd, HBase, MongoDB with majority settings, relational databases
+      with synchronous replication</td><td>Cassandra, DynamoDB (default reads), CouchDB, DNS</td></tr>
+      <tr><td>Good for</td><td>Money, inventory counts, leader election, configuration</td><td>Shopping carts,
+      social feeds, likes, session data</td></tr>
+      <tr><td>Cost</td><td>Errors or higher latency when nodes are down</td><td>Stale reads, conflicts to resolve</td></tr>
+    </tbody>
+  </table></div>
+  <p>Most modern products are <em>tunable</em>: Cassandra and DynamoDB let you ask for stronger consistency per
+  query (at a cost in latency), and MongoDB lets you choose write and read concerns. Treat the CP/AP labels as
+  defaults and tendencies, not as fixed properties.</p>
+
+  <h4>Eventual consistency</h4>
+  <p><strong>Eventual consistency</strong> means: if no new writes arrive, all copies eventually become the same.
+  In between, reads may return older values. A like count that shows 1,204 on one phone and 1,206 on another for a
+  few seconds is fine. A bank balance that shows two different values is not. AP systems use eventual consistency,
+  and need a rule for conflicts: last write wins (by timestamp), version vectors, or application-level merging.
+  Read-your-writes problems (you post a comment and do not see it) are the usual user-visible symptom.</p>
+
+  <h4>PACELC in one paragraph</h4>
+  <p>CAP only talks about the rare case of a partition. <strong>PACELC</strong> extends it: if there is a
+  <em>P</em>artition, choose <em>A</em> or <em>C</em>; <em>E</em>lse (normal operation), choose between
+  <em>L</em>atency and <em>C</em>onsistency. Keeping replicas strictly in sync costs round trips, so even when
+  everything works, a system that waits for all copies is slower than one that answers from the nearest copy. So a
+  database is described by two choices, for example PA/EL (available during partitions and low latency otherwise,
+  Cassandra's default style) or PC/EC (consistent always, paying latency, as in many strongly consistent stores).
+  PACELC is a better way to talk about real trade-offs, but CAP is what interviewers ask first.</p>
+
+  <h4>ACID consistency vs CAP consistency</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>ACID "C"</th><th>CAP "C"</th></tr></thead>
+    <tbody>
+      <tr><td>Meaning</td><td>A transaction leaves the data valid: constraints and rules hold</td><td>All nodes
+      return the same, latest value (linearizability)</td></tr>
+      <tr><td>Scope</td><td>Rules inside one database</td><td>Agreement between replicas of the data</td></tr>
+      <tr><td>Question</td><td>Is the data valid?</td><td>Is the data up to date everywhere?</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: CAP applies to distributed systems during a partition</p>
+    <p>A single PostgreSQL server is not "CA"; it is simply not distributed. Don't say "pick any two of three":
+    P is not optional, so the choice is C or A when a partition happens.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: calling a database "CP" or "AP" without context</p>
+    <p>Behaviour depends on configuration (replication factor, read and write consistency, quorum). Say "by default,
+    and with these settings" in an interview.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Explain CAP simply.</b> In a network partition a distributed system must choose between consistency
+      (refuse or error) and availability (answer, possibly stale).</li>
+      <li><b>Give a CP and an AP example, and when you would use each.</b> CP for money and coordination (etcd,
+      relational with sync replication); AP for carts, feeds and likes (Cassandra, DynamoDB).</li>
+      <li><b>What is eventual consistency?</b> Copies converge when writes stop; reads can be stale meanwhile.</li>
+      <li><b>PACELC?</b> Else, when no partition, trade latency against consistency.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-replication-sharding">
+  <h3>Replication, partitioning and sharding</h3>
+  <p class="tldr">Replication copies the same data to several servers for availability and read capacity;
+  partitioning splits a big table into pieces, and sharding spreads those pieces across servers to scale writes
+  and storage, with the shard key as the critical design choice.</p>
+
+  <h4>Replication: primary and replicas</h4>
+  <p>In <strong>primary-replica</strong> replication (older name: master-slave) one server, the
+  <strong>primary</strong>, accepts all writes. It sends its changes (the write-ahead log in PostgreSQL, the binary
+  log in MySQL) to one or more <strong>replicas</strong>, which apply them and serve reads.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  App[Application] --&gt;|writes| P[(Primary)]
+  P --&gt;|change stream| R1[(Replica 1)]
+  P --&gt;|change stream| R2[(Replica 2)]
+  App --&gt;|reads| R1
+  App --&gt;|reads| R2
+</pre>
+  <figcaption>Writes go to the primary; reads can be spread over replicas</figcaption>
+  </figure>
+  <p>Why replicate:</p>
+  <ul>
+    <li><strong>High availability:</strong> if the primary dies, promote a replica (failover).</li>
+    <li><strong>Read scaling:</strong> reporting and read-heavy traffic go to replicas.</li>
+    <li><strong>Backups and analytics</strong> on a replica without disturbing production.</li>
+    <li><strong>Geography:</strong> a replica near the users.</li>
+  </ul>
+  <p>Replication does <em>not</em> scale writes (one primary) and is not a backup (a bad <code>DELETE</code>
+  replicates too).</p>
+
+  <h4>Synchronous vs asynchronous</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Asynchronous</th><th>Synchronous</th></tr></thead>
+    <tbody>
+      <tr><td>Commit returns when</td><td>The primary has written it</td><td>At least one replica also has it</td></tr>
+      <tr><td>Write latency</td><td>Low</td><td>Higher (network round trip)</td></tr>
+      <tr><td>Data loss if the primary dies</td><td>Possible: the last changes may not have reached a replica</td>
+      <td>None for acknowledged commits</td></tr>
+      <tr><td>If a replica is down</td><td>Primary continues</td><td>Writes may block (unless configured otherwise)</td></tr>
+      <tr><td>Common use</td><td>Most deployments</td><td>Critical data; often one synchronous replica plus
+      asynchronous others</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Replication lag and read-your-writes</h4>
+  <p>With asynchronous replication a replica is always a little behind: <strong>replication lag</strong>, usually
+  milliseconds but seconds or more under load. A user updates their profile (write to primary), the page reloads
+  and reads from a replica that has not received the change yet, and shows the old data. This breaks
+  <strong>read-your-writes</strong> consistency. Fixes:</p>
+  <ul>
+    <li>Read from the primary for a short time after a write by that user (for example 5 seconds), or for the
+    critical pages (checkout, order confirmation).</li>
+    <li>Route reads that must be fresh to the primary and tolerant reads (browse, search) to replicas.</li>
+    <li>Wait until the replica reaches the write's log position (supported by some systems).</li>
+  </ul>
+  <p>In Spring Boot you typically configure two data sources and a routing rule, or let a proxy/managed service
+  (such as an RDS or Cloud SQL reader endpoint) split the traffic. <code>@Transactional(readOnly = true)</code> is the
+  natural hook for choosing a replica.</p>
+
+  <h4>Failover</h4>
+  <p>If the primary fails, a replica is <strong>promoted</strong> to be the new primary and clients are pointed to
+  it. Tools such as Patroni (PostgreSQL) or managed cloud databases automate this. Risks: the promoted replica may
+  be missing the last few async commits; and <strong>split brain</strong>, when the old primary comes back and still
+  thinks it is the leader, so two servers accept writes. Good setups use a fencing/consensus mechanism to ensure only
+  one primary.</p>
+
+  <h4>Partitioning: splitting one big table</h4>
+  <p><strong>Partitioning</strong> divides a large table into smaller pieces on the same server, while queries
+  still treat it as one table. <strong>Vertical partitioning</strong> splits columns (rarely used big columns into
+  a side table, as in <a href="#m4-one-to-many-one-to-one">one-to-one splits</a>). <strong>Horizontal
+  partitioning</strong> splits rows by a rule. PostgreSQL has built-in <em>declarative partitioning</em> with three
+  methods:</p>
+<pre data-title="Range partitioning by month (the classic for time-based data)"><code class="language-sql">CREATE TABLE orders (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY,
+    user_id     BIGINT NOT NULL,
+    status      TEXT NOT NULL,
+    placed_at   TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (id, placed_at)               -- the key must include the partition column
+) PARTITION BY RANGE (placed_at);
+
+CREATE TABLE orders_2026_10 PARTITION OF orders
+    FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+CREATE TABLE orders_2026_11 PARTITION OF orders
+    FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+
+-- Only the November partition is scanned (partition pruning)
+EXPLAIN SELECT * FROM orders WHERE placed_at &gt;= '2026-11-05' AND placed_at &lt; '2026-11-10';
+
+-- Removing a month of old data is instant, no huge DELETE
+DROP TABLE orders_2026_10;</code></pre>
+<pre data-title="List and hash partitioning"><code class="language-sql">CREATE TABLE restaurants_by_region (id BIGINT, name TEXT, region TEXT NOT NULL)
+    PARTITION BY LIST (region);
+CREATE TABLE restaurants_west  PARTITION OF restaurants_by_region FOR VALUES IN ('Pune', 'Mumbai');
+CREATE TABLE restaurants_north PARTITION OF restaurants_by_region FOR VALUES IN ('Delhi', 'Noida');
+
+CREATE TABLE sessions (id BIGINT, user_id BIGINT NOT NULL) PARTITION BY HASH (user_id);
+CREATE TABLE sessions_p0 PARTITION OF sessions FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE sessions_p1 PARTITION OF sessions FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+-- ... p2 and p3</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Rule</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td>RANGE</td><td>Value ranges</td><td>Dates: fast pruning and cheap removal of old data</td></tr>
+      <tr><td>LIST</td><td>Explicit values</td><td>Region, tenant, country</td></tr>
+      <tr><td>HASH</td><td>Hash of a column modulo N</td><td>Even spread when there is no natural range</td></tr>
+    </tbody>
+  </table></div>
+  <p>Partitioning helps maintenance (drop old data, vacuum smaller pieces) and queries that filter on the partition
+  key. It does not help queries that don't, and it adds management work. Don't partition a table until it is
+  large (tens or hundreds of millions of rows).</p>
+
+  <h4>Sharding: splitting across servers</h4>
+  <p><strong>Sharding</strong> is horizontal partitioning where the pieces (shards) live on <em>different
+  servers</em>. When one machine can no longer handle the write load or the data volume, sharding spreads both.
+  Each row belongs to exactly one shard, chosen by the <strong>shard key</strong>.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  App[Application / router] --&gt;|user_id 1-1M| S1[(Shard 1)]
+  App --&gt;|user_id 1M-2M| S2[(Shard 2)]
+  App --&gt;|user_id 2M-3M| S3[(Shard 3)]
+</pre>
+  <figcaption>A router sends each request to the shard that owns the key</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Strategy</th><th>How</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Range</strong></td><td>Key ranges map to shards</td><td>Range queries stay on few shards</td>
+      <td>Hot spots: new ids or recent dates all hit the last shard</td></tr>
+      <tr><td><strong>Hash</strong></td><td><code>hash(key) mod N</code> picks the shard</td><td>Even spread</td>
+      <td>Range queries touch all shards; changing N moves most data</td></tr>
+      <tr><td><strong>Directory / lookup</strong></td><td>A table maps key to shard</td><td>Flexible placement</td>
+      <td>The directory is a bottleneck and extra hop</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Consistent hashing</strong> reduces data movement when you add or remove a shard: only a small part of
+  the keys move instead of almost all. It is covered in
+  <a href="08-system-design.html#m5">System Design · Module 5</a>.</p>
+  <h5>Choosing a shard key</h5>
+  <ul>
+    <li><strong>High cardinality</strong> with many distinct values, so data spreads out.</li>
+    <li><strong>Even access:</strong> avoid a key where one value gets most of the traffic (a celebrity user,
+    <code>country = 'IN'</code>, or <code>placed_at</code> with range sharding). That shard becomes a
+    <strong>hot spot</strong>.</li>
+    <li><strong>Matches the main query:</strong> if most queries include <code>user_id</code>, shard by it so each
+    query hits one shard.</li>
+    <li><strong>Stable:</strong> changing a row's key means moving it between servers.</li>
+  </ul>
+  <h5>What gets harder</h5>
+  <ul>
+    <li><strong>Cross-shard queries:</strong> a report over all users must ask every shard and merge the results
+    (scatter-gather).</li>
+    <li><strong>Joins and transactions across shards:</strong> expensive or unavailable; you need distributed
+    transactions or sagas, or you design so related rows share a shard key (all of a user's orders on the user's
+    shard).</li>
+    <li><strong>Resharding:</strong> adding shards and moving data while the system runs.</li>
+    <li><strong>Unique ids:</strong> sequences are per server, so use UUIDs or snowflake-style ids.</li>
+    <li><strong>Operations:</strong> backups, schema changes and monitoring multiply.</li>
+  </ul>
+  <p>Some databases shard for you (MongoDB sharded clusters, Cassandra, DynamoDB, Citus for PostgreSQL, Vitess for
+  MySQL); with plain PostgreSQL or MySQL you build routing in the application.</p>
+
+  <h4>Scale in order</h4>
+  <ol class="steps">
+    <li>Fix queries and add indexes (<a href="#m5-explain">Module 5</a>).</li>
+    <li>Add caching (<a href="#m6-caching-patterns">caching patterns</a>).</li>
+    <li>Scale the server up (more CPU, RAM, faster disks).</li>
+    <li>Add read replicas.</li>
+    <li>Partition huge tables.</li>
+    <li>Shard, as the last resort.</li>
+  </ol>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: a replica is not a backup</p>
+    <p>Replication copies mistakes instantly. Keep real backups with point-in-time recovery and test the restore.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: sharding too early</p>
+    <p>Many systems that think they need sharding actually need an index, a cache or a replica. Sharding makes
+    every later feature (joins, reports, transactions) harder. One well-tuned PostgreSQL server handles a very
+    large workload.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A unique constraint in a PostgreSQL partitioned table must include the partition key, so a global
+      unique <code>email</code> across partitions needs a different mechanism.</li>
+      <li>Replicas can apply changes in order but still lag behind each other, so two replicas may disagree briefly.</li>
+      <li>Long-running queries on a replica can be cancelled by replication conflicts (PostgreSQL "canceling
+      statement due to conflict with recovery").</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Replication vs sharding?</b> Replication copies the same data (availability, read scale); sharding splits
+      different data across servers (write and storage scale).</li>
+      <li><b>Sync vs async replication?</b> Sync waits for a replica (no loss, slower); async does not (fast, may
+      lose the last commits, lag).</li>
+      <li><b>How do you choose a shard key?</b> High cardinality, even load, matches the main query, rarely changes.</li>
+      <li><b>Range vs hash sharding?</b> Range keeps range queries local but creates hot spots; hash spreads evenly but
+      scatters ranges.</li>
+      <li><b>Partitioning vs sharding?</b> Same server versus many servers.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,499 @@
+<article class="topic" id="m2-ports-sockets">
+  <h3>Ports and sockets</h3>
+  <p class="tldr">An IP address finds the machine, a port number finds the process on it, and a socket
+  is one endpoint of a conversation, identified by IP address, port and protocol; a TCP connection
+  is identified by the full 4-tuple of both endpoints.</p>
+
+  <h4>Why ports exist</h4>
+  <p>One computer runs many network programs at once: a browser with twenty tabs, an SSH session,
+  a database, your Spring Boot app. The IP address gets a packet to the machine, but the OS must
+  decide which process receives it. The <strong>port number</strong> (16 bits, 0 to 65,535) solves
+  this. Ports belong to the transport layer: TCP and UDP each have their own separate set of 65,536
+  ports, so TCP port 53 and UDP port 53 are different things.</p>
+
+  <h4>Port ranges</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Range</th><th>Name</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>0 – 1023</td><td>Well-known (system) ports</td><td>Standard services; on Linux only
+      root can bind them</td></tr>
+      <tr><td>1024 – 49151</td><td>Registered ports</td><td>Registered with IANA for applications
+      (e.g. 3306, 5432, 8080)</td></tr>
+      <tr><td>49152 – 65535</td><td>Dynamic / ephemeral ports</td><td>Chosen by the OS for the
+      client side of a connection</td></tr>
+    </tbody>
+  </table></div>
+  <p>Linux by default hands out ephemeral ports from a different range (32768 to 60999 on most
+  kernels, configurable); the IANA range above is the standard answer.</p>
+
+  <h4>Ports you must know</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Port</th><th>Protocol</th><th>Service</th></tr></thead>
+    <tbody>
+      <tr><td>20 / 21</td><td>TCP</td><td>FTP data / control</td></tr>
+      <tr><td>22</td><td>TCP</td><td>SSH (and SFTP)</td></tr>
+      <tr><td>23</td><td>TCP</td><td>Telnet</td></tr>
+      <tr><td>25</td><td>TCP</td><td>SMTP (587 for mail submission)</td></tr>
+      <tr><td>53</td><td>UDP and TCP</td><td>DNS</td></tr>
+      <tr><td>67 / 68</td><td>UDP</td><td>DHCP server / client</td></tr>
+      <tr><td>80</td><td>TCP</td><td>HTTP</td></tr>
+      <tr><td>110 / 995</td><td>TCP</td><td>POP3 / POP3 over TLS</td></tr>
+      <tr><td>143 / 993</td><td>TCP</td><td>IMAP / IMAP over TLS</td></tr>
+      <tr><td>443</td><td>TCP (and UDP for HTTP/3)</td><td>HTTPS</td></tr>
+      <tr><td>3306</td><td>TCP</td><td>MySQL</td></tr>
+      <tr><td>5432</td><td>TCP</td><td>PostgreSQL</td></tr>
+      <tr><td>6379</td><td>TCP</td><td>Redis</td></tr>
+      <tr><td>8080</td><td>TCP</td><td>Alternative HTTP; Spring Boot's default <code>server.port</code>
+      </td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Sockets</h4>
+  <p>A <strong>socket</strong> is the programming interface to the network: an endpoint that your
+  program reads from and writes to, like a file. The OS identifies a socket by
+  <strong>IP address + port + protocol</strong>, e.g. <code>203.0.113.10:443</code> over TCP. A
+  server socket in the <strong>LISTEN</strong> state waits for connections. When a client connects,
+  the OS creates a new connected socket for that client; the listening socket keeps listening.</p>
+  <p>A TCP connection is identified by the <strong>4-tuple</strong>: (source IP, source port,
+  destination IP, destination port). That is why 10,000 browsers can all connect to port 443 on
+  your server at once: each connection has a different source IP or port, so the 4-tuples differ.
+  The server uses one port, not 10,000.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Client 198.51.100.5                          Server 203.0.113.10
+┌───────────────────┐                        ┌────────────────────┐
+│ Chrome tab 1      │ 198.51.100.5:50001 ───▶│                    │
+│ Chrome tab 2      │ 198.51.100.5:50002 ───▶│  :443  (listening) │
+└───────────────────┘                        └────────────────────┘
+  Two connections to the same server port, told apart by the client port
+</pre>
+    <figcaption>Same destination port, different 4-tuples: two separate connections</figcaption>
+  </figure>
+
+  <h4>Sockets in Java</h4>
+  <p>Java exposes this in <code>java.net</code>. A minimal echo server and client (TCP):</p>
+  <pre data-title="EchoServer.java"><code class="language-java">import java.io.*;
+import java.net.*;
+
+public class EchoServer {
+    public static void main(String[] args) throws IOException {
+        try (ServerSocket server = new ServerSocket(5000)) {   // bind + listen
+            System.out.println("Listening on 5000");
+            try (Socket client = server.accept();              // blocks until connect
+                 BufferedReader in = new BufferedReader(
+                         new InputStreamReader(client.getInputStream()));
+                 PrintWriter out = new PrintWriter(client.getOutputStream(), true)) {
+                String line = in.readLine();
+                out.println("echo: " + line);
+            }
+        }
+    }
+}</code></pre>
+  <pre data-title="EchoClient.java"><code class="language-java">import java.io.*;
+import java.net.*;
+
+public class EchoClient {
+    public static void main(String[] args) throws IOException {
+        try (Socket socket = new Socket("localhost", 5000);    // TCP handshake here
+             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+             BufferedReader in = new BufferedReader(
+                     new InputStreamReader(socket.getInputStream()))) {
+            out.println("hello");
+            System.out.println(in.readLine());
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Client output"><code class="language-plaintext">echo: hello</code></pre>
+  <p>The client never chooses its own port: the OS picks an ephemeral port. Spring Boot's embedded
+  Tomcat or Netty does the same <code>ServerSocket</code>-style listening, with a thread pool or
+  event loop on top.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Errors you will meet</p>
+    <ul>
+      <li><code>java.net.BindException: Address already in use</code>: another process (or an old
+      instance of your app) owns that port. Find it with <code>netstat -ano</code> (Windows) or
+      <code>ss -ltnp</code> (Linux), or change <code>server.port</code>.</li>
+      <li><code>java.net.ConnectException: Connection refused</code>: the host answered, but nothing
+      listens on that port (the OS sent a TCP RST).</li>
+      <li><code>java.net.SocketTimeoutException</code> / "connect timed out": no answer at all,
+      usually a firewall silently dropping packets or a wrong IP.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "a server uses one port per client"</p>
+    <p>All clients connect to the same listening port. The server distinguishes them by the client's
+    IP and port, and the OS creates one connected socket per client. The real limit is open file
+    descriptors and memory, not ports.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a socket? What is a port?"</p>
+    <ul>
+      <li>Port: 16-bit number that selects a process; socket: IP + port + protocol endpoint.</li>
+      <li>Connection = 4-tuple; many clients share one server port.</li>
+      <li>Give the ranges and 5–6 well-known ports (80, 443, 22, 53, 3306, 5432).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-tcp-connection">
+  <h3>TCP: handshake, teardown, sequence numbers and states</h3>
+  <p class="tldr">TCP is a connection-oriented, reliable, ordered byte-stream protocol; it opens a
+  connection with a three-way handshake (SYN, SYN-ACK, ACK), numbers every byte so the receiver can
+  acknowledge and reorder, and closes each direction separately with FIN and ACK.</p>
+
+  <h4>What TCP gives you</h4>
+  <p><strong>TCP</strong> (Transmission Control Protocol) runs on top of unreliable IP and builds a
+  dependable pipe for two programs. Its features:</p>
+  <ul>
+    <li><strong>Connection-oriented</strong>: a connection is set up before data moves and torn
+    down afterwards; both sides keep state.</li>
+    <li><strong>Reliable</strong>: every byte is acknowledged; lost data is retransmitted.</li>
+    <li><strong>Ordered</strong>: bytes reach the application in the order sent, even if packets
+    arrive jumbled.</li>
+    <li><strong>Byte stream</strong>: no message boundaries. Two 100-byte writes may arrive as one
+    200-byte read; applications must frame messages (HTTP uses headers and Content-Length).</li>
+    <li><strong>Flow control</strong>: the sender never overruns the receiver's buffer.</li>
+    <li><strong>Congestion control</strong>: the sender slows down when the network is overloaded.</li>
+    <li><strong>Full duplex</strong>: data flows both ways at once.</li>
+    <li><strong>Error detection</strong>: a checksum in every segment.</li>
+  </ul>
+
+  <h4>The TCP header</h4>
+  <p>The fixed header is 20 bytes. Fields you should know: source port and destination port
+  (16 bits each), <strong>sequence number</strong> (32 bits), <strong>acknowledgment number</strong>
+  (32 bits), header length, the <strong>flags</strong> (SYN, ACK, FIN, RST, PSH, URG), the
+  <strong>window size</strong> (16 bits), checksum, and urgent pointer. Options such as MSS, window
+  scaling and selective acknowledgments follow.</p>
+  <dl class="terms">
+    <dt>SYN</dt><dd>Synchronise: starts a connection and carries the initial sequence number.</dd>
+    <dt>ACK</dt><dd>The acknowledgment number field is valid; set on almost every segment after the
+    first.</dd>
+    <dt>FIN</dt><dd>The sender has finished sending data (graceful close).</dd>
+    <dt>RST</dt><dd>Reset: abort the connection immediately (for example, port closed).</dd>
+    <dt>PSH</dt><dd>Push the data to the application now, do not wait to fill a buffer.</dd>
+  </dl>
+
+  <h4>Sequence and acknowledgment numbers</h4>
+  <p>TCP numbers <em>bytes</em>, not segments. Each side picks a random <strong>initial sequence
+  number</strong> (ISN) in the handshake. The sequence number of a segment is the number of its
+  first data byte. The <strong>acknowledgment number</strong> is the next byte the receiver
+  expects: "I have everything before this." ACKs are <strong>cumulative</strong>.</p>
+  <p>Example: the client's data starts at sequence 1,000 and it sends 500 bytes (1,000 to 1,499).
+  The server acknowledges with ack = 1,500. If the next segment, bytes 1,500 to 1,999, is lost but
+  the one after it arrives, the server keeps answering ack = 1,500: duplicate ACKs that signal a
+  gap.</p>
+
+  <h4>The three-way handshake</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant S as Server (LISTEN)
+  C->>S: SYN seq=x
+  Note over C: SYN_SENT
+  S->>C: SYN-ACK seq=y ack=x+1
+  Note over S: SYN_RECEIVED
+  C->>S: ACK seq=x+1 ack=y+1
+  Note over C,S: ESTABLISHED, data can flow
+</pre>
+    <figcaption>TCP three-way handshake: both sides agree on starting sequence numbers</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><strong>SYN</strong>: the client sends a segment with SYN set and its ISN <em>x</em>.</li>
+    <li><strong>SYN-ACK</strong>: the server replies with SYN and ACK set, its own ISN <em>y</em>,
+    and ack = <em>x</em> + 1 (the SYN consumes one sequence number).</li>
+    <li><strong>ACK</strong>: the client acknowledges with ack = <em>y</em> + 1. The client may
+    already put data in this third segment.</li>
+  </ol>
+  <p><strong>Why three and not two?</strong> Each side must tell the other its starting number and
+  hear it acknowledged. That is four messages, but the server's ACK and SYN travel together, so
+  three. Two messages would not let the server know the client received its ISN, and old duplicate
+  SYNs from a previous connection could open a false connection. The handshake costs one
+  <strong>RTT</strong> before data flows, which is why far-away servers feel slow on first
+  connect and why keep-alive matters.</p>
+
+  <h4>The four-way teardown</h4>
+  <p>TCP is full duplex, so each direction is closed on its own: each side sends a FIN and gets an
+  ACK. Usually the ACK and the second FIN are separate messages, giving four steps.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client (active close)
+  participant S as Server
+  C->>S: FIN seq=u
+  Note over C: FIN_WAIT_1
+  S->>C: ACK ack=u+1
+  Note over C: FIN_WAIT_2
+  Note over S: CLOSE_WAIT, app finishes sending
+  S->>C: FIN seq=v
+  Note over S: LAST_ACK
+  C->>S: ACK ack=v+1
+  Note over C: TIME_WAIT then CLOSED
+  Note over S: CLOSED
+</pre>
+    <figcaption>TCP four-way teardown: each direction closes independently</figcaption>
+  </figure>
+  <p>After the first FIN, the other side may keep sending (a <strong>half-close</strong>) until it
+  is done. If the server has no more data, its ACK and FIN can be combined into one segment, which
+  makes it look like a three-step close.</p>
+
+  <h4>Connection states</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>State</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>LISTEN</td><td>Server waits for a SYN</td></tr>
+      <tr><td>SYN_SENT / SYN_RECEIVED</td><td>Handshake in progress (client / server)</td></tr>
+      <tr><td>ESTABLISHED</td><td>Open; data flows</td></tr>
+      <tr><td>FIN_WAIT_1, FIN_WAIT_2</td><td>This side sent FIN and waits for ACK / the peer's FIN</td></tr>
+      <tr><td>CLOSE_WAIT</td><td>Peer closed; our application has not closed yet</td></tr>
+      <tr><td>LAST_ACK</td><td>We sent our FIN and wait for the final ACK</td></tr>
+      <tr><td>TIME_WAIT</td><td>Active closer waits before fully closing</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>TIME_WAIT</h4>
+  <p>The side that closes first (the active closer) stays in <strong>TIME_WAIT</strong> for twice
+  the Maximum Segment Lifetime (2 × MSL; Linux uses a fixed 60 seconds). Two reasons: (1) the last
+  ACK might be lost, so if the peer resends its FIN the closer can ACK it again; (2) delayed
+  packets of the old connection must die out so they are not mistaken for data of a new connection
+  that reuses the same 4-tuple. A server making thousands of short outgoing connections can pile
+  up TIME_WAIT sockets and run out of ephemeral ports; the usual fix is connection pooling and
+  keep-alive, not deleting the wait.</p>
+
+  <h4>RST and SYN queues</h4>
+  <p>If a SYN arrives for a port with no listener, the OS answers with RST, and the client sees
+  "Connection refused". A server keeps half-open connections in a <strong>SYN queue</strong> and
+  completed ones in an <strong>accept queue</strong> until the application calls
+  <code>accept()</code>. When these overflow, new clients wait or time out. A flood of fake SYNs
+  that fills the queue is the SYN flood attack (see the security article).</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Simultaneous open (both sides send SYN) and simultaneous close are legal and rare.</li>
+      <li>Many CLOSE_WAIT sockets on a server mean your application is not closing its sockets: a
+      leak in your code, not a network problem.</li>
+      <li>A host crash leaves the peer thinking the connection is fine until it tries to send;
+      TCP keep-alive probes or application heartbeats detect dead peers.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain the TCP three-way handshake"</p>
+    <ul>
+      <li>SYN, SYN-ACK, ACK with sequence and ack numbers; ISNs exchanged; one RTT cost.</li>
+      <li>Why not two: confirm both directions, avoid stale connections.</li>
+      <li>Teardown is four steps because each direction closes separately; mention TIME_WAIT.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-tcp-reliability-control">
+  <h3>TCP reliability, flow control and congestion control</h3>
+  <p class="tldr">TCP detects loss by missing ACKs (timeout or three duplicate ACKs) and
+  retransmits; the receiver's advertised window limits how much the sender may have in flight (flow
+  control), and the sender's congestion window grows by slow start and AIMD and shrinks on loss
+  (congestion control).</p>
+
+  <h4>Retransmission</h4>
+  <p>The sender keeps every unacknowledged segment and starts a timer, the
+  <strong>RTO</strong> (retransmission timeout), calculated from measured RTTs. It resends a segment
+  in two cases:</p>
+  <ul>
+    <li><strong>Timeout</strong>: no ACK arrived before the RTO fired. This is the slow, heavy
+    signal.</li>
+    <li><strong>Fast retransmit</strong>: three duplicate ACKs for the same number arrive. Three
+    duplicates mean later segments got through while one is missing, so the sender resends at once
+    without waiting for the timer.</li>
+  </ul>
+  <p>Modern TCP also uses <strong>SACK</strong> (selective acknowledgment): the receiver tells
+  exactly which ranges it has, so the sender resends only the holes, not everything after the loss.
+  Because of cumulative ACKs and sequence numbers, duplicates are discarded and out-of-order
+  segments are held and reordered before delivery.</p>
+
+  <h4>Flow control and the sliding window</h4>
+  <p>A fast sender can overwhelm a slow receiver. In every ACK the receiver advertises its
+  <strong>receive window</strong> (<code>rwnd</code>): how many more bytes its buffer can hold. The
+  sender may have at most <code>rwnd</code> bytes sent but not yet acknowledged. This region is the
+  <strong>sliding window</strong>; it slides right as ACKs arrive.</p>
+  <figure class="fig">
+<pre class="diagram">
+ sent &amp; ACKed │      sent, not ACKed      │  can send now  │  cannot send yet
+ ──────────────┼───────────────────────────┼────────────────┼─────────────────
+   bytes 0-999 │  bytes 1000-1999 (in flight)│ 2000-2999    │ 3000 onwards
+               │◀──────── window (rwnd = 2000 bytes) ───────▶│
+               ▲ ack number: next byte expected
+</pre>
+    <figcaption>The window slides right each time new data is acknowledged</figcaption>
+  </figure>
+  <p>Worked example: receiver window 4,000 bytes, MSS 1,000. The sender sends segments 1 to 4
+  without waiting. The receiver ACKs segment 2 (ack = 2,001) and says window = 4,000 again, so the
+  window slides and segments 5 and 6 may go out. If the receiving application is slow and the
+  buffer fills, the receiver advertises <strong>window = 0</strong>; the sender stops and sends
+  small <strong>window probes</strong> until space opens. The window field is 16 bits (at most
+  65,535 bytes), so the <strong>window scale</strong> option, negotiated in the handshake, allows
+  much larger windows on fast long-distance links.</p>
+  <p>Compare with <strong>stop-and-wait</strong>, where only one segment is in flight: on a link
+  with a 100 ms RTT that is one segment per 100 ms. A sliding window keeps the pipe full.</p>
+
+  <h4>Congestion control</h4>
+  <p>Flow control protects the <em>receiver</em>; <strong>congestion control</strong> protects the
+  <em>network</em>. If every sender blasted at full speed, router queues would overflow, packets
+  would be dropped, retransmissions would add more load, and throughput would collapse. TCP infers
+  congestion from loss (and, in some variants, delay) and keeps a second limit, the
+  <strong>congestion window</strong> (<code>cwnd</code>). The sender may have
+  <code>min(cwnd, rwnd)</code> bytes in flight.</p>
+  <ol class="steps">
+    <li><strong>Slow start</strong>: begin with a small cwnd (modern stacks start with 10 segments)
+    and increase it by one segment per ACK, which doubles cwnd every RTT. Despite the name, growth
+    is exponential. It continues until cwnd reaches the <strong>slow-start threshold</strong>
+    (<code>ssthresh</code>) or a loss happens.</li>
+    <li><strong>Congestion avoidance</strong>: above ssthresh, grow by about one segment per RTT
+    (linear). This is the <em>additive increase</em>.</li>
+    <li><strong>On loss</strong>: set <code>ssthresh = cwnd / 2</code>. After a fast retransmit
+    (three dup ACKs), set cwnd to the new ssthresh and continue in avoidance (fast recovery). After
+    a timeout, which signals worse trouble, set cwnd back to 1 segment and slow-start again.</li>
+  </ol>
+  <p>Increase by one, cut by half on loss: <strong>AIMD</strong> (Additive Increase,
+  Multiplicative Decrease). It makes competing flows converge to a fair share. The cwnd graph looks
+  like a sawtooth.</p>
+  <figure class="fig">
+<pre class="diagram">
+cwnd
+ ▲
+ │            ssthresh        loss: cut to half
+ │           ·········        ╱╲        ╱╲
+ │          ╱         ╲      ╱  ╲      ╱  ╲   additive increase
+ │        ╱            ╲   ╱     ╲   ╱     ╲
+ │      ╱  slow start    ╲╱        ╲╱
+ │    ╱
+ └──────────────────────────────────────────▶ time (RTTs)
+</pre>
+    <figcaption>Slow start grows exponentially, then AIMD gives the sawtooth pattern</figcaption>
+  </figure>
+  <p>Numerical example (units of MSS, ssthresh = 8): RTT 1: cwnd 1, RTT 2: 2, RTT 3: 4, RTT 4: 8.
+  Now at ssthresh, RTT 5: 9, RTT 6: 10, RTT 7: 11. Three duplicate ACKs arrive at cwnd = 11:
+  ssthresh = 11 / 2 = 5 (rounded down), cwnd = 5 and growth continues linearly. Had it been a
+  timeout, cwnd would drop to 1 with ssthresh = 5, then slow-start up to 5.</p>
+  <p>Named algorithms: <strong>Tahoe</strong> and <strong>Reno</strong> are the classics (Reno adds
+  fast recovery), <strong>CUBIC</strong> is the default on Linux, and <strong>BBR</strong> (from
+  Google) estimates bandwidth and RTT rather than reacting to loss alone.</p>
+
+  <h4>Putting it together</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Mechanism</th><th>Protects</th><th>Controlled by</th><th>Signal</th></tr></thead>
+    <tbody>
+      <tr><td>Flow control</td><td>The receiver's buffer</td><td>Receiver (rwnd in each ACK)</td>
+      <td>Advertised window</td></tr>
+      <tr><td>Congestion control</td><td>The network</td><td>Sender (cwnd)</td>
+      <td>Packet loss, duplicate ACKs, RTT</td></tr>
+      <tr><td>Error control</td><td>Data integrity</td><td>Both</td>
+      <td>Checksum, ACKs, retransmission</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: mixing flow control with congestion control</p>
+    <p>Flow control is between the two end hosts (receiver says "slow down, my buffer is full").
+    Congestion control is about the routers in the middle (sender guesses "the network is full").
+    Interviewers ask for exactly this difference.</p>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>You rarely tune TCP, but you feel it. A new connection starts slow, so a cold HTTPS call to a
+    far region is slower than a warm one: reuse connections (HTTP keep-alive, JDBC and
+    <code>RestClient</code>/<code>WebClient</code> pools). Lossy mobile networks reduce TCP
+    throughput sharply, one reason HTTP/3 moved to QUIC.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How does TCP ensure reliability, and what is congestion control?"</p>
+    <ul>
+      <li>Sequence numbers, ACKs, checksum, retransmission (timeout and fast retransmit), ordering.</li>
+      <li>Flow control = receiver window; congestion control = cwnd, slow start, AIMD.</li>
+      <li>State the loss reactions: 3 duplicate ACKs → halve; timeout → back to 1.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-tcp-udp-quic">
+  <h3>UDP, TCP vs UDP and QUIC</h3>
+  <p class="tldr">UDP is a thin, connectionless, unreliable datagram service with an 8-byte header
+  and no handshake; choose TCP when every byte must arrive in order, UDP when speed or low latency
+  matter more, and QUIC when you want TCP-like reliability on top of UDP with faster setup.</p>
+
+  <h4>UDP</h4>
+  <p><strong>UDP</strong> (User Datagram Protocol) adds almost nothing to IP: source and destination
+  ports, a length and a checksum. That is the whole 8-byte header. Each <strong>datagram</strong> is
+  sent independently. There is no handshake, no connection state, no acknowledgment, no
+  retransmission, no ordering, no flow or congestion control. If a datagram is lost, UDP does not
+  know or care. Message boundaries are preserved: one send is one datagram, one receive.</p>
+  <p>That bareness is the point. UDP has no setup delay, no head-of-line blocking from a lost
+  packet, and the application decides what to do about loss. Typical uses:</p>
+  <ul>
+    <li><strong>DNS</strong> queries: one small question, one small answer.</li>
+    <li><strong>DHCP</strong>, NTP, SNMP: short exchanges.</li>
+    <li><strong>Live voice and video, online games</strong>: a late packet is useless; skipping it
+    is better than waiting for a resend.</li>
+    <li><strong>Streaming and telemetry</strong> where occasional loss is acceptable.</li>
+    <li><strong>QUIC / HTTP/3</strong>: reliability rebuilt in user space on top of UDP.</li>
+  </ul>
+  <p>The same sockets idea applies in Java: <code>DatagramSocket</code> and
+  <code>DatagramPacket</code> send and receive UDP datagrams without any connection.</p>
+
+  <h4>TCP vs UDP</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>TCP</th><th>UDP</th></tr></thead>
+    <tbody>
+      <tr><td>Connection</td><td>Connection-oriented (handshake)</td><td>Connectionless</td></tr>
+      <tr><td>Reliability</td><td>Guaranteed: ACKs, retransmission</td><td>Best effort, may lose
+      or duplicate</td></tr>
+      <tr><td>Ordering</td><td>In order</td><td>No ordering guarantee</td></tr>
+      <tr><td>Unit</td><td>Byte stream (no boundaries)</td><td>Datagrams (boundaries kept)</td></tr>
+      <tr><td>Header size</td><td>20 bytes or more</td><td>8 bytes</td></tr>
+      <tr><td>Flow and congestion control</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Speed and overhead</td><td>Slower, more overhead</td><td>Faster, light</td></tr>
+      <tr><td>Broadcast / multicast</td><td>No (one-to-one only)</td><td>Yes</td></tr>
+      <tr><td>Examples</td><td>HTTP/1.1, HTTP/2, HTTPS, SSH, SMTP, FTP, database connections</td>
+      <td>DNS, DHCP, VoIP, video calls, games, QUIC</td></tr>
+    </tbody>
+  </table></div>
+  <p>A good one-liner: <em>TCP is a phone call (set up, confirmed, ordered); UDP is posting
+  letters without tracking.</em> UDP is not "bad": it hands control to the application.</p>
+
+  <h4>QUIC and HTTP/3</h4>
+  <p><strong>QUIC</strong> is a transport protocol built on UDP, standardised in 2021 (RFC 9000),
+  and it carries <strong>HTTP/3</strong>. It implements in user space what TCP and TLS did in the
+  kernel: reliability, ordering, congestion control, and TLS 1.3 encryption built in. Benefits:
+  (1) <strong>faster setup</strong>, because the transport and TLS handshakes are combined (one
+  RTT for a new connection, and zero-RTT for a repeat one); (2) <strong>independent
+  streams</strong>, so a lost packet only stalls the stream it belongs to, not the whole
+  connection (fixes TCP's head-of-line blocking); (3) <strong>connection migration</strong>, since
+  a connection ID rather than the IP/port 4-tuple identifies it, so a phone switching from Wi-Fi to
+  mobile data keeps the session. It runs over UDP because new IP protocols would be dropped by
+  middleboxes, and because user-space code can evolve faster than OS kernels.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li>DNS normally uses UDP port 53 but switches to TCP for large responses and zone
+      transfers.</li>
+      <li>UDP can be reliable if the application adds its own ACKs and retries (QUIC, many game
+      protocols). "UDP is unreliable" means UDP itself does not provide it.</li>
+      <li>Some corporate firewalls block UDP 443, so HTTP/3 clients fall back to HTTP/2 over
+      TCP.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "TCP is always better because it is reliable"</p>
+    <p>For a video call, retransmitting a lost packet makes it arrive too late and adds delay for
+    the packets behind it. Choose by requirement: correctness → TCP, timeliness → UDP.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "TCP vs UDP — when would you use each?"</p>
+    <ul>
+      <li>Give 4–5 rows of the table: connection, reliability, ordering, header, speed.</li>
+      <li>Examples for each: web, email, file transfer → TCP; DNS, calls, games → UDP.</li>
+      <li>Bonus: mention QUIC as UDP-based with reliability and TLS built in.</li>
+    </ul>
+  </div>
+</article>

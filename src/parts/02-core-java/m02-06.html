@@ -1,0 +1,382 @@
+<article class="topic" id="m2-interfaces">
+  <h3>Interfaces: default, static and private methods</h3>
+  <p class="tldr">An interface is a pure contract: a list of methods a class promises to provide. A class can implement many interfaces, and since Java 8 an interface can also carry default, static and (Java 9) private methods with bodies.</p>
+
+  <p>An <strong>interface</strong> says <em>what</em> a type can do and nothing about <em>how</em>. A class that <code>implements</code> the interface signs the contract and must provide every abstract method. Interfaces are how Java gets "multiple inheritance of type": one class can implement many interfaces even though it can extend only one class. They are the backbone of <a href="#m2-abstraction">abstraction</a> in real projects: <code>List</code>, <code>Map</code>, <code>Comparable</code>, <code>Runnable</code> and every Spring Data repository are interfaces.</p>
+
+  <h4>Syntax and a first example</h4>
+  <pre data-title="PaymentDemo.java"><code class="language-java">interface PaymentMethod {
+    int MAX_RETRIES = 3;                          // implicitly public static final
+
+    boolean pay(long amountInPaise);              // implicitly public abstract
+
+    default String receipt(long amountInPaise) {  // default method: has a body
+        return "Paid Rs " + amountInPaise / 100.0 + " via " + name();
+    }
+
+    String name();
+
+    static PaymentMethod upi(String vpa) {        // static method: called on the interface
+        return new Upi(vpa);
+    }
+}
+
+class Upi implements PaymentMethod {
+    private final String vpa;
+    Upi(String vpa) { this.vpa = vpa; }
+
+    @Override public boolean pay(long amountInPaise) {   // must be public
+        System.out.println("Debiting " + amountInPaise + " paise from " + vpa);
+        return true;
+    }
+    @Override public String name() { return "UPI(" + vpa + ")"; }
+}
+
+public class PaymentDemo {
+    public static void main(String[] args) {
+        PaymentMethod m = PaymentMethod.upi("asha@bank");   // static call on the interface
+        if (m.pay(49900)) {
+            System.out.println(m.receipt(49900));           // inherited default method
+        }
+        System.out.println(PaymentMethod.MAX_RETRIES);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Debiting 49900 paise from asha@bank
+Paid Rs 499.0 via UPI(asha@bank)
+3</code></pre>
+
+  <h4>What can be inside an interface</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Member</th><th>Implicit modifiers</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Constant field</td><td><code>public static final</code></td><td>Must be initialised. No instance state at all.</td></tr>
+      <tr><td>Abstract method</td><td><code>public abstract</code></td><td>The contract. Implementations must be <code>public</code>.</td></tr>
+      <tr><td><code>default</code> method</td><td><code>public</code></td><td>Java 8. A body that implementers inherit and may override.</td></tr>
+      <tr><td><code>static</code> method</td><td><code>public</code></td><td>Java 8. Called as <code>Iface.m()</code>; not inherited by implementing classes.</td></tr>
+      <tr><td><code>private</code> (static) method</td><td><code>private</code></td><td>Java 9. Shares code between default methods; invisible outside.</td></tr>
+      <tr><td>Nested type</td><td><code>public static</code></td><td>Rare. A nested class or enum inside an interface.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Why default methods exist</h4>
+  <p>Before Java 8, adding a method to an interface broke every class that implemented it. When the Java team wanted <code>list.stream()</code>, <code>list.forEach(…)</code> and <code>map.getOrDefault(…)</code>, they could not touch thousands of implementations, including yours. A <strong>default method</strong> gave them a body to fall back on. So <code>Collection.stream()</code> and <code>Iterable.forEach()</code> are default methods. This is called <strong>interface evolution</strong>. Use default methods for the same reason: to add a method to a published interface without breaking implementers, or to give a convenient method built from the abstract ones, as <code>receipt()</code> does above.</p>
+
+  <h4>Static and private methods</h4>
+  <p>A <strong>static method</strong> belongs to the interface itself, so it is a natural home for factories and helpers: <code>List.of(…)</code>, <code>Comparator.comparing(…)</code>, <code>Map.entry(…)</code>. It is not inherited: you call <code>PaymentMethod.upi(…)</code>, never <code>m.upi(…)</code> or <code>Upi.upi(…)</code>. A <strong>private method</strong> (Java 9) lets two default methods share code without making that helper part of the public contract.</p>
+  <pre data-title="Logger.java"><code class="language-java">interface AuditLog {
+    void write(String line);
+
+    default void info(String msg)  { write(format("INFO", msg)); }
+    default void error(String msg) { write(format("ERROR", msg)); }
+
+    private String format(String level, String msg) {   // hidden helper, Java 9+
+        return "[" + level + "] " + msg;
+    }
+}</code></pre>
+
+  <h4>The diamond conflict with default methods</h4>
+  <p>If a class implements two interfaces that both offer a default method with the same signature, which one should it inherit? Java uses three resolution rules, in this order:</p>
+  <ol class="steps">
+    <li><strong>A class always wins.</strong> A method declared in the class or inherited from a superclass beats any interface default.</li>
+    <li><strong>The more specific interface wins.</strong> If interface <code>B extends A</code> and both define the default, <code>B</code>'s version is used.</li>
+    <li><strong>Otherwise, you must decide.</strong> The compiler reports an error and the class has to override the method. Inside it you can pick one with <code>InterfaceName.super.method()</code>.</li>
+  </ol>
+  <pre data-title="Diamond.java"><code class="language-java">interface Camera { default String start() { return "camera on"; } }
+interface Phone  { default String start() { return "phone on"; } }
+
+// Without the override: "types Camera and Phone are incompatible;
+// class CameraPhone inherits unrelated defaults for start()"
+class CameraPhone implements Camera, Phone {
+    @Override public String start() {
+        return Camera.super.start() + " + " + Phone.super.start();   // choose explicitly
+    }
+}
+
+public class Diamond {
+    public static void main(String[] args) {
+        System.out.println(new CameraPhone().start());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">camera on + phone on</code></pre>
+  <p>This is why Java allows multiple inheritance of <em>type</em> and <em>behaviour</em> from interfaces but not of <em>state</em>. Interfaces have no instance fields, so the classic "which copy of the field?" part of the diamond problem never appears (<a href="#m2-inheritance">inheritance</a>).</p>
+
+  <h4>Interfaces extending interfaces</h4>
+  <p>An interface can extend one or more interfaces: <code>interface Savings extends Account, Interest { … }</code>. A class that implements <code>Savings</code> must supply everything from all of them. Remember the vocabulary: a class <em>extends</em> a class, a class <em>implements</em> an interface, and an interface <em>extends</em> interfaces.</p>
+
+  <h4>Functional interfaces</h4>
+  <p>A <strong>functional interface</strong> has exactly one abstract method (default and static methods do not count, nor do abstract methods that repeat <code>Object</code> methods such as <code>equals</code>). It can be implemented with a lambda: <code>Runnable r = () -&gt; System.out.println("hi");</code>. Add <code>@FunctionalInterface</code> to make the compiler check the rule. Examples: <code>Runnable</code>, <code>Callable</code>, <code>Comparator</code>, <code>Comparable</code> and the <code>java.util.function</code> types such as <code>Function</code> and <code>Predicate</code>. Lambdas and these types get their own module: <a href="#m5">Module 5</a>.</p>
+
+  <h4>Marker interfaces</h4>
+  <p>A <strong>marker interface</strong> has no methods. Implementing it only tags the class, and some other code checks the tag. <code>java.io.Serializable</code> says "this object may be converted to bytes", <code>Cloneable</code> says "<code>Object.clone()</code> may copy me" (<a href="#m2-clone-copy">clone</a>), and <code>RandomAccess</code> says "indexed access is fast". Today annotations do the same job in most new code (<code>@Entity</code>, <code>@Service</code>), but the JDK keeps its markers.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules to remember</p>
+    <ul>
+      <li>Interface methods are <code>public</code>. Implementing one with weaker access (<code>void pay()</code> without <code>public</code>) is a compile error: "attempting to assign weaker access privileges".</li>
+      <li>Interface fields are constants. You cannot reassign <code>MAX_RETRIES</code>.</li>
+      <li>You cannot instantiate an interface with <code>new</code> (an anonymous class or a lambda is allowed), and interfaces have no constructors.</li>
+      <li>A default method cannot override <code>equals</code>, <code>hashCode</code> or <code>toString</code> of <code>Object</code>. The compiler rejects it, because a class always inherits those from <code>Object</code> and "the class wins".</li>
+      <li>An interface method cannot be <code>protected</code> or <code>final</code>.</li>
+      <li>A class that does not implement all abstract methods must be declared <code>abstract</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Static interface methods are not inherited</strong> by implementing classes or sub-interfaces. Only <code>Iface.method()</code> works.</li>
+      <li><strong>Same constant name in two interfaces</strong> makes an unqualified use ambiguous: write <code>A.X</code> or <code>B.X</code>.</li>
+      <li><strong>Empty and sealed interfaces.</strong> An interface with no methods is legal (a marker). A <code>sealed</code> interface limits who may implement it (<a href="#m2-sealed-classes">sealed classes</a>).</li>
+      <li><strong>Interface constants anti-pattern.</strong> Putting only constants in an interface and implementing it "to get the names" is considered bad design. Use a final class or an enum.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Name interfaces after a capability or a role: <code>Comparable</code>, <code>PaymentMethod</code>, <code>OrderRepository</code>. Do not prefix with <code>I</code> (<code>IPayment</code> is a C# habit).</li>
+      <li>When the implementation is single, name it plainly (<code>JpaOrderRepository</code>), or avoid the <code>Impl</code> suffix if a better name exists.</li>
+      <li>Keep interfaces small and focused. Many small contracts are easier to implement and to fake in tests than one large one.</li>
+      <li>Use default methods sparingly: convenience built from abstract methods, or evolution of an old interface. Do not build a class hierarchy out of them.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: forgetting public on the implementation</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: weaker access</p><pre><code class="language-java">class Upi implements PaymentMethod {
+    boolean pay(long p) { return true; }   // error: weaker access privileges
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right</p><pre><code class="language-java">class Upi implements PaymentMethod {
+    @Override public boolean pay(long p) { return true; }
+}</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In a real Spring Boot project</p>
+    <p>Controllers depend on service interfaces, services on repository interfaces, and Spring picks the implementation to inject. Spring Data repositories are interfaces with no implementing class that you write. Strategy-style code ("pick the right <code>PaymentMethod</code> for this request") is a map of interface implementations. Tests replace real implementations with Mockito mocks of the interface.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: interface questions</p>
+    <ul>
+      <li><b>Why default methods?</b> To add methods to existing interfaces without breaking implementers; this enabled the Streams API on old collections.</li>
+      <li><b>What if two interfaces have the same default method?</b> The class must override it; it may call <code>A.super.m()</code>. A class method beats any default.</li>
+      <li><b>Can an interface have a constructor or instance variable?</b> No. Fields are always <code>public static final</code>.</li>
+      <li><b>Can an interface have a <code>main</code> method?</b> Yes, as a static method; it can be run.</li>
+      <li><b>What is a functional interface? A marker interface?</b> One abstract method (lambda target) / no methods (a tag).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-abstract-vs-interface">
+  <h3>Abstract class vs interface: which to choose</h3>
+  <p class="tldr">Use an interface to describe a capability that unrelated classes can share; use an abstract class when closely related classes share state and code. When in doubt, start with an interface, and combine both with a skeleton class if you need shared code.</p>
+
+  <p>Since Java 8 the two look more alike, because both can hold method bodies. The real differences are about <strong>state</strong>, <strong>constructors</strong> and <strong>inheritance count</strong>. This table is the one to learn for interviews.</p>
+
+  <h4>The comparison</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Feature</th><th>Abstract class</th><th>Interface</th></tr></thead>
+    <tbody>
+      <tr><td>Keyword</td><td><code>abstract class</code>, subclass <code>extends</code></td><td><code>interface</code>, class <code>implements</code></td></tr>
+      <tr><td>How many can a class use?</td><td>One (single inheritance)</td><td>Any number</td></tr>
+      <tr><td>Instance fields (state)</td><td>Yes, any access level</td><td>No; only <code>public static final</code> constants</td></tr>
+      <tr><td>Constructors</td><td>Yes (called through <code>super(…)</code>)</td><td>No</td></tr>
+      <tr><td>Method bodies</td><td>Yes, any kind</td><td>Only <code>default</code>, <code>static</code>, <code>private</code></td></tr>
+      <tr><td>Method access</td><td>Any modifier, including <code>protected</code></td><td>Public (private helpers since Java 9)</td></tr>
+      <tr><td>Abstract methods</td><td>Must be marked <code>abstract</code></td><td>Implicit</td></tr>
+      <tr><td>Can be <code>final</code> members</td><td>Yes (<code>final</code> methods)</td><td>No</td></tr>
+      <tr><td>Can extend / implement</td><td>Extends one class, implements many interfaces</td><td>Extends many interfaces</td></tr>
+      <tr><td>Lambda target</td><td>No</td><td>Yes, if functional</td></tr>
+      <tr><td>Models</td><td>"is-a" with shared implementation</td><td>"can-do" capability or role</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>When to use which</h4>
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Choose an interface when</p><ul>
+      <li>Unrelated classes should share a capability (<code>Comparable</code>, <code>Serializable</code>, <code>Notifier</code>).</li>
+      <li>You want callers to depend on a contract, with many possible or future implementations.</li>
+      <li>A class already has a superclass (frameworks often force it) and still needs the new type.</li>
+      <li>You want lambdas or easy mocks in tests.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Choose an abstract class when</p><ul>
+      <li>Subclasses are closely related and share fields and real code (<code>Shape</code> keeps <code>name</code>).</li>
+      <li>You need a constructor, non-public members or <code>protected</code> helpers.</li>
+      <li>You want a Template Method with <code>final</code> steps (<a href="#m2-abstract-classes">abstract classes</a>).</li>
+      <li>You need to control how the state is initialised for all subclasses.</li>
+    </ul></div>
+  </div>
+
+  <h4>The best of both: interface plus skeleton class</h4>
+  <p>A common design is to publish an interface and also offer an abstract <strong>skeleton implementation</strong> that does the boring part. The JDK does this with <code>List</code> and <code>AbstractList</code>, <code>Map</code> and <code>AbstractMap</code>. Users who just need a list-like class extend the skeleton and write two methods. Users who already have a superclass implement the interface directly. Both stay compatible, because callers only see the interface.</p>
+  <pre data-title="SkeletonDemo.java"><code class="language-java">import java.util.AbstractList;
+
+interface Greeter { String greet(String name); }
+
+abstract class BaseGreeter implements Greeter {          // skeleton: shared code
+    protected abstract String salutation();
+    @Override public String greet(String name) { return salutation() + ", " + name + "!"; }
+}
+
+class HindiGreeter extends BaseGreeter {
+    @Override protected String salutation() { return "Namaste"; }
+}
+
+public class SkeletonDemo {
+    public static void main(String[] args) {
+        Greeter g = new HindiGreeter();                  // callers see only the interface
+        System.out.println(g.greet("Asha"));
+
+        // AbstractList needs only get(int) and size() for a read-only list
+        var squares = new AbstractList&lt;Integer&gt;() {
+            @Override public Integer get(int i) { return i * i; }
+            @Override public int size() { return 5; }
+        };
+        System.out.println(squares);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Namaste, Asha!
+[0, 1, 4, 9, 16]</code></pre>
+
+  <h4>Why not always use default methods in interfaces?</h4>
+  <p>Default methods cannot touch fields, cannot be <code>protected</code>, cannot be <code>final</code> and cannot be a stable base for subclass state. They are for convenience and evolution. If you find yourself wanting state in an interface, you want an abstract class, or better, composition (<a href="#m2-composition-over-inheritance">composition over inheritance</a>).</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Overlap and exceptions</p>
+    <ul>
+      <li>An abstract class with no state, no constructor logic and only abstract methods is just a worse interface. Convert it.</li>
+      <li>An interface with default methods can offer "mixin" behaviour (<code>Comparator.reversed()</code>), but still no state.</li>
+      <li>Both can have <code>static</code> methods and nested types.</li>
+      <li>If you must keep binary compatibility in a public library, adding an abstract method to either breaks implementers; adding a default method (or a concrete method in the class) does not.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Abstract class vs interface?"</p>
+    <ul>
+      <li>Lead with the decision rule: state and shared code in a family means abstract class; a capability across unrelated classes means interface.</li>
+      <li>Give three differences: multiple inheritance, instance state and constructors, access modifiers.</li>
+      <li>Mention Java 8 changes: default and static methods narrowed the gap, but interfaces still have no state.</li>
+      <li>Mention the skeleton pattern (<code>List</code> and <code>AbstractList</code>) to show depth.</li>
+      <li>Follow-up: "Why did Java add default methods?" Interface evolution, for <code>stream()</code> and <code>forEach()</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-final">
+  <h3>The final keyword; final vs finally vs finalize</h3>
+  <p class="tldr"><code>final</code> means "cannot be changed after this point": a final variable is assigned once, a final method cannot be overridden and a final class cannot be extended; it fixes the reference, not the contents of the object.</p>
+
+  <p>The word <code>final</code> appears in four places and means a slightly different "no more changes" in each. Learn the four, and the two look-alike words <code>finally</code> and <code>finalize</code>, which interviewers love to mix into one question.</p>
+
+  <h4>final variables</h4>
+  <p>A <code>final</code> variable can be assigned exactly once. After that, any assignment is a compile error: <code>cannot assign a value to final variable</code>.</p>
+  <ul>
+    <li><strong>Final local variable or parameter.</strong> <code>final int tax = 18;</code>. Many teams skip <code>final</code> on locals; it adds noise, though it is useful for a parameter you do not want reassigned.</li>
+    <li><strong>Final instance field.</strong> Must be assigned once, either at the declaration, in an instance initializer, or in <em>every</em> constructor. A final field with no initial value is a <strong>blank final</strong>; the compiler checks that each constructor assigns it exactly once ("variable might not have been initialized").</li>
+    <li><strong>Final static field.</strong> Assigned at declaration or in a <code>static</code> block. With a primitive or <code>String</code> constant value, it is a <strong>compile-time constant</strong> (<code>static final int MAX = 10;</code>), which the compiler copies into the code that uses it. Convention: <code>UPPER_SNAKE_CASE</code>.</li>
+  </ul>
+  <pre data-title="FinalDemo.java"><code class="language-java">import java.util.*;
+
+public class FinalDemo {
+    static final double GST_RATE = 0.18;           // constant
+    private final String orderId;                  // blank final
+    private final List&lt;String&gt; items = new ArrayList&lt;&gt;();
+
+    FinalDemo(String orderId) {
+        this.orderId = orderId;                    // assigned exactly once
+    }
+
+    public static void main(String[] args) {
+        FinalDemo d = new FinalDemo("OD-1");
+        d.items.add("Mouse");                      // OK: the list object is mutable
+        d.items.add("Keyboard");
+        System.out.println(d.items + " " + d.orderId);
+        // d.items = new ArrayList&lt;&gt;();            // error: cannot assign a value to final variable items
+
+        final int[] marks = {40, 50};
+        marks[0] = 99;                             // OK: contents of a final array can change
+        System.out.println(Arrays.toString(marks));
+        // marks = new int[3];                     // error
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[Mouse, Keyboard] OD-1
+[99, 50]</code></pre>
+  <div class="co co-exc">
+    <p class="co-t">final reference is not an immutable object</p>
+    <p><code>final</code> locks the <em>variable</em>, not the <em>object</em> it points to. A <code>final List</code> still lets you call <code>add</code>; a <code>final</code> array still lets you change its elements. To get an object that really cannot change, make its class immutable (<a href="#m2-immutability">immutability</a>), or use <code>List.of(…)</code> for an unmodifiable list. This is the most common <code>final</code> interview trap.</p>
+  </div>
+
+  <h4>Effectively final</h4>
+  <p>A local variable or parameter that is never reassigned after its first assignment is <strong>effectively final</strong>, even without the keyword. Lambdas and anonymous or local classes may use outer local variables only if they are final or effectively final. The reason: the lambda gets a <em>copy</em> of the value, and the variable may live on a thread's stack that is gone by the time the lambda runs. Allowing changes would give confusing results, so Java forbids them.</p>
+  <pre data-title="Effectively.java"><code class="language-java">int count = 0;
+Runnable r = () -&gt; System.out.println(count);   // OK only if count is never changed
+count++;   // error at the lambda: local variables referenced from a lambda expression
+           // must be final or effectively final
+
+// Fix when you need a changing value: use an object or array holder, or AtomicInteger
+var counter = new java.util.concurrent.atomic.AtomicInteger();
+Runnable ok = () -&gt; counter.incrementAndGet();</code></pre>
+
+  <h4>final methods</h4>
+  <p>A <code>final</code> method cannot be overridden. Use it when the method's behaviour is part of a class's safety or algorithm, such as the Template Method in <a href="#m2-abstract-classes">abstract classes</a>. <code>Object.getClass()</code>, <code>wait()</code> and <code>notify()</code> are final. A <code>private</code> method is effectively final already. Static methods can be marked final too, but it has little meaning, since they are hidden, not overridden.</p>
+
+  <h4>final classes</h4>
+  <p>A <code>final</code> class cannot be extended: <code>cannot inherit from final String</code>. The JDK uses it for security and immutability: <code>String</code>, <code>Integer</code> and all wrapper classes, <code>LocalDate</code>, <code>Math</code>. Records are implicitly final, and so are enums without constant bodies. For your own classes, making the class final is a good default for value-like types and utility classes, because inheritance is a strong coupling (<a href="#m2-composition-over-inheritance">composition</a>). A middle option is a <code>sealed</code> class, which allows only chosen subclasses (<a href="#m2-sealed-classes">sealed classes</a>). A frequent real-world catch: frameworks that create proxies by subclassing (Spring CGLIB proxies, Hibernate lazy entities) cannot proxy a final class or final method. Spring Boot projects written in Kotlin need the "allopen" plugin for this reason.</p>
+
+  <h4>final vs finally vs finalize</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Word</th><th>What it is</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>final</code></td><td>Modifier (keyword)</td><td>Variable assigned once; method not overridable; class not extendable</td></tr>
+      <tr><td><code>finally</code></td><td>Block after <code>try</code></td><td>Cleanup code that runs whether or not an exception happened (<a href="#m3">Module 3</a>)</td></tr>
+      <tr><td><code>finalize()</code></td><td>Method of <code>Object</code></td><td>Old hook the garbage collector called before freeing an object. <strong>Deprecated for removal</strong> since Java 18</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="FinallyDemo.java"><code class="language-java">static int test() {
+    try {
+        return 1;
+    } finally {
+        System.out.println("cleanup runs even after return");
+    }
+}
+// test() prints the message, then returns 1.
+// finally is skipped only if the JVM stops first (System.exit) or the thread is killed.</code></pre>
+  <p><code>finalize()</code> was unpredictable: nobody can say when (or if) it runs, it slowed down the garbage collector, and it could resurrect objects. Do not write it. Close resources with <code>try-with-resources</code> (<a href="#m3">Module 3</a>) and, for rare native-resource cases, use <code>java.lang.ref.Cleaner</code>. See <a href="#m7">Module 7</a> for the garbage collector.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>A final field must be definitely assigned by the end of every constructor, once and only once.</li>
+      <li>A final method cannot be overridden; a final class cannot be extended; <code>abstract final</code> is illegal.</li>
+      <li>A lambda or inner class may capture only final or effectively final locals.</li>
+      <li>The same value assigned in a loop to a <code>final</code> local is fine, if declared inside the loop: each iteration is a new variable.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions: where professionals use final</p>
+    <ul>
+      <li>On fields, by default. Make fields <code>private final</code> unless they must change. It makes classes simpler and thread-safe by construction.</li>
+      <li>On constants: <code>public static final</code>, upper snake case.</li>
+      <li>On utility and value classes. Not on every local variable, and not on classes meant to be extended.</li>
+      <li>Constructor injection in Spring uses <code>private final</code> fields; it makes the dependency required and unchangeable.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: thinking final means immutable</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong belief</p><pre><code class="language-java">private final List&lt;String&gt; roles;     // "nobody can change roles"
+public List&lt;String&gt; getRoles() { return roles; }   // caller can still add and remove</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: protect the contents too</p><pre><code class="language-java">private final List&lt;String&gt; roles;
+public List&lt;String&gt; getRoles() { return List.copyOf(roles); }  // unmodifiable copy</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: final questions</p>
+    <ul>
+      <li><b>Final vs finally vs finalize?</b> Keyword / cleanup block / deprecated GC hook. Say what each is in one line.</li>
+      <li><b>Can a final object's state change?</b> Yes. Only the reference is fixed.</li>
+      <li><b>Can we override a final method? Extend a final class?</b> No to both.</li>
+      <li><b>What is a blank final?</b> A final field without an initial value; each constructor must assign it once.</li>
+      <li><b>What does effectively final mean, and why for lambdas?</b> Never reassigned; lambdas capture copies of local values.</li>
+      <li><b>Why is String final?</b> Security, caching of hash codes, safe sharing in the string pool, thread safety.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,411 @@
+<article class="topic" id="m7-notification">
+  <h3>Design a notification system (push, SMS, email, in-app)</h3>
+  <p class="tldr">A notification system accepts "tell user X about Y" requests from many services and delivers
+  them over several channels; the design is a validation layer, per-channel queues with priorities, workers that
+  call external providers with retries and rate limits, and idempotency so nobody gets the same message twice.</p>
+
+  <h4>1. Requirements</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>Other services (orders, payments, marketing) send notifications through an API or by publishing events.</li>
+    <li>Channels: mobile push (FCM for Android, APNs for iOS), SMS, email and in-app (a bell icon list).</li>
+    <li>Templates with variables ("Your order {{orderId}} is out for delivery").</li>
+    <li>User preferences: opt in or out per channel and per category; quiet hours (do not disturb).</li>
+    <li>Scheduled and bulk (campaign) notifications.</li>
+    <li>Delivery status tracking (queued, sent, delivered, failed, opened) where the provider reports it.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> high availability and no loss for important messages (OTP, payment alerts);
+  <strong>at-least-once delivery</strong> with deduplication so users are not spammed; priority (an OTP must not
+  wait behind a marketing blast); soft real-time (OTP within seconds, marketing within minutes); scalable for
+  burst traffic; respect provider rate limits. <strong>Out of scope:</strong> building the SMS carrier network,
+  the content of marketing campaigns.</p>
+
+  <h4>2. Capacity estimates (assumptions)</h4>
+  <ul>
+    <li>10 million users, on average 5 notifications per user per day → 50 million per day → 50,000,000 ÷ 86,400
+    ≈ <strong>580 per second</strong> on average.</li>
+    <li>Burst: a marketing campaign pushes to all 10 million users within 10 minutes (600 seconds) → 10,000,000 ÷
+    600 ≈ <strong>16,700 per second</strong>. The system must be sized for this, not for the average.</li>
+    <li>Channel mix (assumed): 70% push, 20% email, 5% SMS, 5% in-app only. SMS is 2.5 million per day and costs
+    real money per message, so SMS is the channel to protect with limits.</li>
+    <li>Storage: a log row of about 300 bytes per notification → 50M × 300 B = 15 GB per day. Keep 90 days for
+    support: 90 × 15 GB = 1.35 TB. Older data goes to cheap storage or is deleted.</li>
+    <li>Queue sizing: at the 16,700/s burst with 1 KB messages, throughput is about 17 MB/s, which one small Kafka
+    cluster handles. Workers: if one worker can make 200 provider calls per second, the burst needs about 85
+    workers, which autoscaling can add.</li>
+  </ul>
+
+  <h4>3. API design</h4>
+  <pre data-title="API" class="out"><code class="language-http">POST /api/v1/notifications
+Idempotency-Key: 5d1c0d6e-...
+{"userId": 9912,
+ "type": "ORDER_SHIPPED",              // maps to a template + category
+ "channels": ["PUSH", "EMAIL"],        // optional: otherwise from preferences
+ "priority": "HIGH",
+ "data": {"orderId": "OD-7731", "eta": "Tomorrow"},
+ "sendAt": "2026-11-12T09:00:00+05:30"}   // optional
+
+202 Accepted
+{"notificationId": "n_01JC3...", "status": "QUEUED"}
+
+GET  /api/v1/users/9912/notifications?cursor=...&amp;limit=20   (in-app list)
+POST /api/v1/notifications/n_01JC3.../read
+PUT  /api/v1/users/9912/preferences
+     {"email": {"marketing": false}, "quietHours": {"from": "22:00", "to": "07:00"}}</code></pre>
+  <p>The API answers <code>202 Accepted</code> because delivery is asynchronous. The caller needs the idempotency
+  key so a retried request does not create a second notification
+  (<a href="#m6-idempotency">Idempotency</a>).</p>
+
+  <h4>4. Data model</h4>
+  <pre data-title="schema.sql"><code class="language-sql">CREATE TABLE notification (
+    id            VARCHAR(30) PRIMARY KEY,
+    user_id       BIGINT       NOT NULL,
+    type          VARCHAR(40)  NOT NULL,
+    channel       VARCHAR(10)  NOT NULL,        -- PUSH, SMS, EMAIL, INAPP
+    status        VARCHAR(12)  NOT NULL,        -- QUEUED, SENT, DELIVERED, FAILED
+    payload       JSONB        NOT NULL,
+    attempts      INT          NOT NULL DEFAULT 0,
+    created_at    TIMESTAMP    NOT NULL,
+    updated_at    TIMESTAMP    NOT NULL
+);
+CREATE INDEX idx_notif_user ON notification (user_id, created_at DESC);
+
+CREATE TABLE user_preference (
+    user_id BIGINT, channel VARCHAR(10), category VARCHAR(20), enabled BOOLEAN,
+    PRIMARY KEY (user_id, channel, category)
+);
+CREATE TABLE device_token (
+    user_id BIGINT, token VARCHAR(300), platform VARCHAR(10), updated_at TIMESTAMP,
+    PRIMARY KEY (user_id, token)
+);</code></pre>
+  <p>Preferences, templates and device tokens are small, relational and read-heavy: PostgreSQL or MySQL with a
+  Redis cache in front. The notification log is write-heavy and time-ordered, queried by user and time: a
+  wide-column store (Cassandra) or a partitioned SQL table works. Use SQL first and say when you would move.</p>
+
+  <h4>5. High-level architecture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  S[Calling services] --> API[Notification API]
+  API --> V[Validate, dedupe, preferences, template]
+  V --> Q1[[Push queue]]
+  V --> Q2[[SMS queue]]
+  V --> Q3[[Email queue]]
+  V --> DB[(Notification DB)]
+  Q1 --> W1[Push workers] --> FCM[FCM and APNs]
+  Q2 --> W2[SMS workers] --> SMS[SMS gateway]
+  Q3 --> W3[Email workers] --> ESP[Email provider]
+  FCM -.->|status callbacks| CB[Callback handler]
+  CB --> DB
+</pre>
+    <figcaption>One input path, separate queue and worker pool per channel, external providers at the end</figcaption>
+  </figure>
+  <p>Why <strong>one queue per channel</strong>? Each provider has different speed, cost, failure modes and rate
+  limits. If the email provider is slow, the backlog must not delay push or SMS. This is the bulkhead idea from
+  <a href="#m6-resilience">Resilience</a>. Within a channel, use separate queues (or topics) per priority: OTP and
+  payment alerts on a high-priority queue with dedicated workers, marketing on a low-priority queue that may
+  take hours.</p>
+  <p>Steps inside the validation stage: authenticate the caller → check the idempotency key → load the user's
+  preferences and quiet hours → pick channels → render the template (language, variables) → write a row as
+  QUEUED → publish to the channel queue. Use the outbox pattern
+  (<a href="#m6-outbox-cdc">Outbox</a>) so the row and the queue message cannot disagree.</p>
+
+  <h4>6. Deep dive A: reliable delivery, retries and duplicates</h4>
+  <ul>
+    <li><strong>At-least-once.</strong> A worker takes a message, calls the provider, and acks the queue only
+    after the call succeeds. If it crashes before acking, the message is redelivered. So duplicates are possible
+    (<a href="#m6-delivery-semantics">Delivery semantics</a>).</li>
+    <li><strong>Deduplication.</strong> Each notification has an id. Before sending, the worker sets
+    <code>SET sent:&lt;id&gt;:&lt;channel&gt; 1 NX EX 86400</code> in Redis (or a conditional update in the DB,
+    status QUEUED → SENT). If it already exists, skip. Pass the same id as the provider's idempotency or
+    collapse key when they support one (FCM has a <em>collapse key</em> so repeated messages replace each other).
+    The remaining window (crash after the provider accepted but before recording) gives a rare duplicate; accept
+    it and say so.</li>
+    <li><strong>Retries.</strong> Transient provider errors (timeouts, 5xx, 429) are retried with exponential
+    backoff and jitter (<a href="#m6-retries">Retries</a>), using delayed retry queues (retry after 10 s, 1 min,
+    10 min) instead of sleeping in the worker. After N attempts, move to a dead-letter queue and mark FAILED.
+    Permanent errors (invalid or unregistered device token, unsubscribed number) are never retried; delete the
+    bad token.</li>
+    <li><strong>Failover between providers.</strong> Keep two SMS or email providers; a circuit breaker switches
+    to the second when the first fails.</li>
+    <li><strong>Ordering</strong> is not guaranteed and rarely needed across notifications; for status updates on
+    one order, include a version or timestamp so a late "packed" does not overwrite "shipped".</li>
+  </ul>
+
+  <h4>7. Deep dive B: priority, rate limits and bursts</h4>
+  <ul>
+    <li><strong>Priority:</strong> separate queues and consumer groups. Do not use one queue with a priority field
+    on Kafka; consumers read in offset order. RabbitMQ and SQS-style systems have their own priority options, but
+    separate queues are simpler and predictable.</li>
+    <li><strong>Provider limits:</strong> providers throttle you. A token-bucket limiter per provider and per
+    sender (<a href="#m7-rate-limiter">Rate limiter</a>) in the workers keeps you under the limit; when the
+    bucket is empty, leave the message in the queue.</li>
+    <li><strong>Per-user limits:</strong> cap marketing to, say, 3 per day per user, and collapse bursts ("5
+    people liked your post" instead of 5 pushes). This protects users from spam, which is also a
+    non-functional requirement.</li>
+    <li><strong>Bulk campaigns:</strong> a campaign job reads the audience in pages, creates notifications in
+    batches and feeds the low-priority queue at a controlled rate, never all 10 million at once. Spread sends
+    over time zones.</li>
+    <li><strong>Scheduling:</strong> store <code>sendAt</code> and let a scheduler (a DB poller with an index,
+    or delayed messages) enqueue when due. Respect quiet hours by shifting non-urgent messages to the next
+    allowed time.</li>
+  </ul>
+
+  <h4>8. Deep dive C: channel details and tracking</h4>
+  <ul>
+    <li><strong>Push:</strong> the app registers a device token with the backend; the worker sends the token and
+    payload to FCM or APNs. Tokens expire or change; handle "unregistered" replies by deleting the token. Push is
+    best-effort: if the phone is offline, the provider holds the message for a limited time.</li>
+    <li><strong>SMS:</strong> costly and regulated (in India, sender id and template registration rules apply for
+    transactional and promotional SMS). Use for OTP and critical alerts; prefer push or email for marketing.
+    Watch for fraud: an attacker triggers OTP SMS to premium numbers (pumping), so rate limit OTP per number and
+    per IP.</li>
+    <li><strong>Email:</strong> use a provider (SES, SendGrid and similar); handle bounces and spam complaints via
+    webhooks and stop mailing bad addresses; include an unsubscribe link; set up SPF, DKIM and DMARC so mail is
+    not marked as spam.</li>
+    <li><strong>In-app:</strong> write to the notification table and push over the user's open WebSocket if any
+    (see <a href="#m7-chat">Chat</a>); the bell icon reads the list with cursor pagination and an unread count
+    kept in Redis.</li>
+    <li><strong>Tracking:</strong> providers send delivery and open events through webhooks. A callback service
+    updates the status. Treat webhooks as at-least-once too: updates must be idempotent and monotonic
+    (SENT → DELIVERED → OPENED, never backwards).</li>
+  </ul>
+
+  <h4>9. Bottlenecks, scaling and monitoring</h4>
+  <ul>
+    <li>Scale workers per queue by queue depth (autoscaling on lag). The database write of status rows can become
+    the bottleneck; batch updates and partition by time.</li>
+    <li>Cache preferences and templates in Redis with short TTLs; invalidate on change.</li>
+    <li>Queue brokers are replicated across zones; the API is stateless.</li>
+    <li>Metrics: queue lag per channel, send success rate, provider latency, DLQ size, delivered-to-sent ratio,
+    cost per channel. Alert on lag for high-priority queues and on a sudden drop in the success rate.</li>
+    <li>Security: validate the caller's identity and allowed types so one service cannot message all users; never
+    put secrets or full card numbers in payloads; mask OTPs in logs.</li>
+  </ul>
+
+  <h4>Follow-up questions</h4>
+  <ul>
+    <li>How do you guarantee an OTP is delivered within 10 seconds? (Dedicated high-priority queue and workers,
+    multiple SMS providers with failover, alert on latency.)</li>
+    <li>What if a user has 3 devices? (One token row per device; send to all active ones, or only the most
+    recent.)</li>
+    <li>How do you support user timezones and localisation? (Store locale and zone; render templates per locale.)</li>
+    <li>How would you avoid sending a "your order was delivered" push twice after a retry? (Idempotency key plus
+    dedupe set, monotonic status.)</li>
+    <li>How do you test without messaging real users? (A sandbox provider and a dry-run mode.)</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Say early: "async, one queue per channel and priority, at-least-once with dedupe".</li>
+      <li>Size for the campaign burst (16,700 per second), not the average (580).</li>
+      <li>Show you know channel details: device tokens, SMS cost and abuse, email bounces.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m7-chat">
+  <h3>Design a chat app (like WhatsApp)</h3>
+  <p class="tldr">A chat app keeps a WebSocket open from each online user to a gateway, routes each message to the
+  recipient's gateway through a session registry, stores messages durably so offline users catch up when they
+  return, and tracks sent, delivered and read states with acknowledgements.</p>
+
+  <h4>1. Requirements</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>One-to-one chat and small group chat (up to a few hundred members).</li>
+    <li>Send and receive text messages in real time; media as links to files (images, video, documents).</li>
+    <li>Message states: sent, delivered, read (the ticks).</li>
+    <li>Online / last-seen status.</li>
+    <li>Messages sent to offline users are delivered when they reconnect, and as push notifications.</li>
+    <li>Chat history synced on a new device (within limits).</li>
+  </ul>
+  <p><strong>Non-functional:</strong> low latency (well under a second when both are online), no message loss
+  (durability), per-conversation ordering, high availability, millions of concurrent connections, and security
+  (TLS everywhere; end-to-end encryption is a deep topic, mention it). <strong>Out of scope:</strong> voice and
+  video calls, stories, payments inside chat.</p>
+
+  <h4>2. Capacity estimates (assumptions)</h4>
+  <ul>
+    <li>50 million daily active users, 40 messages sent per user per day → 2 billion messages per day →
+    2,000,000,000 ÷ 86,400 ≈ <strong>23,000 per second</strong> on average; peak 3× ≈ 70,000 per second.</li>
+    <li>Message size ~100 bytes of text plus ~100 bytes of metadata = 200 B. Per day: 2 × 10<sup>9</sup> × 200 B =
+    400 GB; per year ≈ 146 TB; with 3× replication ≈ 440 TB. Media (images, videos) is far bigger and goes to
+    object storage and a CDN, not to the message store.</li>
+    <li>Concurrent connections: if 40% of daily users are online at once → 20 million WebSocket connections. A
+    tuned gateway server can hold on the order of 100,000 idle connections (approximate; depends on memory and
+    kernel tuning) → 20,000,000 ÷ 100,000 = <strong>200 gateway servers</strong>, plus headroom.</li>
+    <li>Presence heartbeats: every 30 seconds per connection → 20M ÷ 30 ≈ 670,000 tiny messages per second,
+    handled inside the gateways in memory; only status <em>changes</em> go to shared storage.</li>
+    <li>Bandwidth: 70,000 messages/s × 200 B = 14 MB/s of message payload. Small; connection count and fan-out
+    dominate, not bytes.</li>
+  </ul>
+
+  <h4>3. API design</h4>
+  <p>Chat uses a persistent <strong>WebSocket</strong> for real-time events, and normal REST for everything
+  else (login, history, media upload). HTTP polling would waste requests, and long polling holds a request
+  open and re-establishes it per message; WebSockets give a two-way channel with little overhead per
+  message.</p>
+  <pre data-title="WebSocket frames" class="out"><code class="language-json">// client -> server
+{"type": "send", "clientMsgId": "c-7f31", "chatId": "ch_88",
+ "text": "Reached office", "ts": 1762853392000}
+
+// server -> sender (ack: stored)
+{"type": "ack", "clientMsgId": "c-7f31", "msgId": "m_5501772", "seq": 412}
+
+// server -> recipient
+{"type": "message", "msgId": "m_5501772", "chatId": "ch_88", "from": 9912,
+ "seq": 412, "text": "Reached office", "ts": 1762853392100}
+
+// recipient -> server
+{"type": "delivered", "msgId": "m_5501772"}
+{"type": "read", "chatId": "ch_88", "upToSeq": 412}</code></pre>
+  <pre data-title="REST" class="out"><code class="language-http">GET  /api/v1/chats/ch_88/messages?afterSeq=400&amp;limit=50
+POST /api/v1/media           (returns an upload URL; message then carries the media id)
+GET  /api/v1/users/9912/presence</code></pre>
+  <p>The <code>clientMsgId</code> is an idempotency key generated by the client: if the app resends after a lost
+  ack, the server recognises the duplicate (<a href="#m6-idempotency">Idempotency</a>).</p>
+
+  <h4>4. Data model</h4>
+  <p>Access patterns: "append a message to a conversation" and "read the latest N messages of a conversation, or
+  all after sequence S". Writes are huge and append-only, with reads by chat id in order. That fits a
+  <strong>wide-column / partitioned store</strong> (Cassandra, HBase, DynamoDB) with the chat as the partition key
+  and the sequence as the sort key. A single SQL database would need sharding by chat id early.</p>
+  <pre data-title="message store (conceptual)" class="out"><code class="language-plaintext">messages
+  partition key : chat_id
+  clustering key: seq (ascending)
+  columns       : msg_id, sender_id, text, media_id, created_at
+
+user_inbox  (for offline delivery)
+  partition key : user_id
+  clustering key: msg_id
+  columns       : chat_id, seq
+
+chats       : chat_id, type (DIRECT, GROUP), member_ids, created_at
+users       : user_id, phone, name, avatar_url, last_seen
+receipts    : (chat_id, user_id) -> last_delivered_seq, last_read_seq</code></pre>
+  <p>Receipts use <strong>watermarks</strong> (the last sequence delivered or read per user per chat), not one
+  row per message, which keeps group receipts cheap: "read up to 412" marks everything before it.</p>
+
+  <h4>5. High-level architecture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A[Sender app] <-->|WebSocket| G1[Gateway 1]
+  B[Recipient app] <-->|WebSocket| G2[Gateway 2]
+  G1 --> MS[Message service]
+  MS --> ST[(Message store)]
+  MS --> SR[(Session registry in Redis)]
+  MS -->|route to gateway 2| G2
+  MS -->|if offline| PN[Push notification service]
+  MS --> K[[Kafka for receipts and sync]]
+  G1 -.-> P[(Presence in Redis)]
+</pre>
+    <figcaption>Gateways hold connections; the message service stores, looks up where the recipient is, and routes</figcaption>
+  </figure>
+  <p><strong>Send flow:</strong></p>
+  <ol class="steps">
+    <li>The sender's app sends the frame over its WebSocket to gateway 1.</li>
+    <li>Gateway 1 forwards it to the message service, which assigns the next <code>seq</code> for that chat and
+    writes the message to the store. Now it is durable.</li>
+    <li>The message service replies with an <code>ack</code> (the first tick: "sent").</li>
+    <li>It looks up each recipient in the session registry (<code>user_id → gateway id</code>, kept in Redis, with
+    a TTL refreshed by heartbeats).</li>
+    <li>If the recipient is online on gateway 2, the service forwards the message to gateway 2, which pushes it
+    down the socket. The recipient app sends <code>delivered</code> (second tick).</li>
+    <li>If the recipient is offline, the message stays in their inbox and a push notification is sent through
+    FCM or APNs. On reconnect, the app asks for everything after its last seq.</li>
+  </ol>
+
+  <h4>6. Deep dive A: gateways, routing and scale of connections</h4>
+  <ul>
+    <li><strong>Stateful connections.</strong> A WebSocket is tied to one gateway, so load balancing happens only
+    at connect time (L4 load balancer or a connection router). After that, messages for a user must be sent to
+    <em>their</em> gateway. The session registry gives that mapping. Alternative: publish to a pub/sub channel
+    per user or per gateway and let gateways subscribe (Redis pub/sub, Kafka); simpler but chattier.</li>
+    <li><strong>Gateway failure.</strong> Clients reconnect automatically with exponential backoff and jitter
+    (so 100,000 clients lost together do not reconnect at the same millisecond) and then sync from their last
+    seq. No message is lost because messages are stored before being routed.</li>
+    <li><strong>Deploys.</strong> Draining a gateway means asking clients to reconnect elsewhere gradually.</li>
+    <li><strong>Group chat.</strong> The message service stores one copy under the chat id, then fans out to each
+    member's gateway. For groups up to a few hundred this is cheap. Very large groups or channels need a
+    different design (clients pull, or fan-out through a queue).</li>
+  </ul>
+
+  <h4>7. Deep dive B: ordering, IDs and delivery guarantees</h4>
+  <ul>
+    <li><strong>Ordering.</strong> Global ordering is impossible and unnecessary; users only need order inside a
+    conversation. The message service owns a per-chat counter: all writes for one chat are handled by the same
+    shard or partition (shard key = chat id), so it can assign increasing <code>seq</code> numbers. Clients sort
+    by <code>seq</code>, not by device clock time. Timestamps from phones are wrong too often.</li>
+    <li><strong>IDs.</strong> <code>msgId</code> should be unique and time-sortable (Snowflake, see
+    <a href="#m6-unique-ids">Unique IDs</a>); <code>seq</code> gives dense ordering per chat for gap detection:
+    if the client sees 410, 411, 413 it knows 412 is missing and requests it.</li>
+    <li><strong>Delivery semantics.</strong> Client to server and server to client are both at-least-once, with
+    dedupe by <code>clientMsgId</code> and <code>msgId</code> so the user sees each message exactly once
+    (<a href="#m6-delivery-semantics">Delivery semantics</a>). The client resends until it gets an ack.</li>
+    <li><strong>Receipts.</strong> Delivered and read events travel the reverse path and update the watermark;
+    the sender's app is told by the same routing. Batch read receipts ("read up to seq 412") to avoid sending
+    one event per message. Users can disable read receipts for privacy.</li>
+    <li><strong>Multiple devices.</strong> Each device is a separate connection and has its own last-synced seq;
+    the inbox model delivers to all of them.</li>
+  </ul>
+
+  <h4>8. Deep dive C: presence and offline handling</h4>
+  <ul>
+    <li><strong>Online status.</strong> The gateway marks a user online in Redis when the socket opens
+    (<code>SET presence:&lt;id&gt; online EX 60</code>) and refreshes it on each heartbeat. If heartbeats stop
+    (network drop), the key expires and the user becomes offline with <code>last_seen</code> = last heartbeat.
+    This TTL approach copes with crashes where no "disconnect" event arrives
+    (<a href="#m6-coordination">Heartbeats</a>).</li>
+    <li><strong>Who sees presence?</strong> Pushing every status change to every contact is a fan-out problem
+    (a user with 500 contacts flickering online/offline). Fetch presence on demand when a chat is opened, and
+    subscribe only for the chats currently on screen. Add a small delay before announcing "offline" so brief
+    network blips do not flicker.</li>
+    <li><strong>Offline users.</strong> Messages remain in the inbox until acked as delivered. Push
+    notifications carry no or minimal content (privacy) and wake the app. Limit retention for undelivered
+    messages (for example 30 days) to bound storage.</li>
+    <li><strong>Media.</strong> The client uploads the file to object storage (pre-signed URL), gets a media id,
+    and sends a normal message carrying that id and a thumbnail; receivers download via CDN
+    (<a href="#m5">Module 5</a>).</li>
+    <li><strong>End-to-end encryption</strong> (brief): keys live on devices, the server stores and routes
+    ciphertext it cannot read. This makes server-side search, spam filtering and multi-device sync harder, and
+    needs a key exchange protocol (the Signal protocol is the best-known design). Mention it as a design choice
+    with trade-offs.</li>
+  </ul>
+
+  <h4>9. Bottlenecks, scaling and failure</h4>
+  <ul>
+    <li><strong>Gateways</strong> scale by adding servers; the limit is connections per machine. <strong>Message
+    store</strong> scales by partitioning on chat id. <strong>Hot chats</strong> (huge groups) may need special
+    handling.</li>
+    <li><strong>Redis session registry:</strong> replicate it; if lost, gateways re-register connected users
+    within a heartbeat or two. Rebuildable state is a good property.</li>
+    <li><strong>Overload:</strong> rate limit senders to stop spam (<a href="#m7-rate-limiter">Rate
+    limiter</a>), bound per-connection send buffers, drop slow consumers.</li>
+    <li><strong>Monitoring:</strong> connected users, message latency end to end, undelivered backlog, reconnect
+    rate, push failure rate.</li>
+  </ul>
+
+  <h4>Follow-up questions</h4>
+  <ul>
+    <li>How do you support "typing…" indicators? (Ephemeral events through the gateways only; never stored;
+    throttled.)</li>
+    <li>How does search in chat history work? (Local on device for E2E; otherwise an index per user.)</li>
+    <li>How would you design channels with a million members? (Pull-based, fan-out on read, cached latest pages;
+    see <a href="#m7-news-feed">News feed</a>.)</li>
+    <li>What if two devices send at the same moment? (Server assigns seq; both messages appear in seq order.)</li>
+    <li>How do you migrate off a failing gateway without dropping messages? (Store-then-route, client resync by
+    seq.)</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>The central trick: store first, then route; then offline and reconnect come almost for free.</li>
+      <li>Do the connection maths: 20 million connections ÷ 100,000 per gateway = 200 servers.</li>
+      <li>Ordering is per conversation (a server-assigned seq), not global and not by phone clocks.</li>
+    </ul>
+  </div>
+</article>

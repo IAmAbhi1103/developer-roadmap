@@ -1,0 +1,730 @@
+<article class="topic" id="m4-users-db">
+  <h3>Loading users from the database: User, UserDetailsService and registration</h3>
+  <p class="tldr">Store users with a hashed password and a role, implement UserDetailsService to load them by email, wrap them in a UserDetails with the account-status flags, and offer a registration endpoint that hashes the password before saving.</p>
+
+  <p>Spring Security does not know your <code>User</code> table. You teach it in two small steps: a class that describes a user in Security's terms (<code>UserDetails</code>), and a service that fetches that class from your database (<code>UserDetailsService</code>). Registration is the other half: how users get into the table with a safe password hash.</p>
+
+  <h4>The User entity and roles</h4>
+  <p>Project 2 already has a <code>User</code> entity from <a href="#m3">module 3</a>. For security it needs three things: a unique login name (we use the email), a <strong>password hash</strong> (never the password), and a role. Roles are an enum stored as text.</p>
+  <pre data-title="Role.java"><code class="language-java">public enum Role {
+    CANDIDATE, RECRUITER, ADMIN
+}</code></pre>
+  <pre data-title="User.java (security-related fields)"><code class="language-java">@Entity
+@Table(name = "app_user")
+public class User extends BaseEntity {
+
+    @Column(nullable = false)
+    private String name;
+
+    @Column(nullable = false, unique = true)
+    private String email;
+
+    @Column(name = "password_hash", nullable = false)
+    private String passwordHash;           // BCrypt hash, 60 characters
+
+    @Enumerated(EnumType.STRING)           // never ORDINAL: reordering would break data
+    @Column(nullable = false, length = 20)
+    private Role role;
+
+    private boolean enabled = true;
+    private boolean locked = false;
+
+    // constructor, getters; no setter for passwordHash except changePassword(hash)
+}</code></pre>
+  <pre data-title="Migration (Flyway or schema.sql)"><code class="language-sql">alter table app_user add column password_hash varchar(100) not null;
+alter table app_user add column role varchar(20) not null default 'CANDIDATE';
+alter table app_user add column enabled boolean not null default true;
+alter table app_user add column locked boolean not null default false;
+create unique index uq_app_user_email on app_user (lower(email));</code></pre>
+  <div class="co co-note">
+    <p class="co-t">One role or many?</p>
+    <p>One role per user keeps Project 2 simple and covers most apps. If a user can hold several, map <code>Set&lt;Role&gt;</code> with <code>@ElementCollection</code> and <code>@Enumerated(EnumType.STRING)</code>; the rest of this module (authorities as a list) works unchanged. Load the roles together with the user (<code>@EntityGraph</code>), because login happens outside any long transaction.</p>
+  </div>
+
+  <h4>UserDetails and UserDetailsService</h4>
+  <p><code>UserDetails</code> is Spring Security's view of a user: name, password hash, authorities, and four status flags. <code>UserDetailsService</code> has one method, <code>loadUserByUsername(String)</code>, and is how <code>DaoAuthenticationProvider</code> finds the user. "Username" is just the login identifier; here it is the email.</p>
+  <pre data-title="AppUserDetails.java"><code class="language-java">public class AppUserDetails implements UserDetails {
+
+    private final Long id;
+    private final String email;
+    private final String passwordHash;
+    private final Role role;
+    private final boolean enabled;
+    private final boolean accountNonLocked;
+
+    public AppUserDetails(User u) {
+        this.id = u.getId();
+        this.email = u.getEmail();
+        this.passwordHash = u.getPasswordHash();
+        this.role = u.getRole();
+        this.enabled = u.isEnabled();
+        this.accountNonLocked = !u.isLocked();
+    }
+
+    public Long getId() { return id; }
+    public Role getRole() { return role; }
+
+    @Override public Collection&lt;? extends GrantedAuthority&gt; getAuthorities() {
+        return List.of(new SimpleGrantedAuthority("ROLE_" + role.name()));
+    }
+    @Override public String getPassword() { return passwordHash; }
+    @Override public String getUsername() { return email; }
+    @Override public boolean isAccountNonExpired() { return true; }
+    @Override public boolean isAccountNonLocked() { return accountNonLocked; }
+    @Override public boolean isCredentialsNonExpired() { return true; }
+    @Override public boolean isEnabled() { return enabled; }
+}</code></pre>
+  <pre data-title="DbUserDetailsService.java"><code class="language-java">@Service
+public class DbUserDetailsService implements UserDetailsService {
+
+    private final UserRepository userRepository;
+
+    public DbUserDetailsService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public UserDetails loadUserByUsername(String email) {
+        return userRepository.findByEmailIgnoreCase(email)
+                .map(AppUserDetails::new)
+                .orElseThrow(() -&gt; new UsernameNotFoundException("User not found"));
+    }
+}</code></pre>
+  <p>The repository method is a derived query: <code>Optional&lt;User&gt; findByEmailIgnoreCase(String email);</code>. With a <code>UserDetailsService</code> bean and a <code>PasswordEncoder</code> bean in the context, Spring Boot wires <code>DaoAuthenticationProvider</code> for you, and the generated default user disappears.</p>
+  <p>For a small app you can skip the custom <code>UserDetails</code> class and return Spring's own builder instead. The catch is that you then lose extra fields like the user id, and you must use the full class name because it clashes with your entity:</p>
+  <pre data-title="Using Spring's built-in User class"><code class="language-java">return org.springframework.security.core.userdetails.User
+        .withUsername(u.getEmail())
+        .password(u.getPasswordHash())
+        .roles(u.getRole().name())          // adds the ROLE_ prefix itself
+        .disabled(!u.isEnabled())
+        .accountLocked(u.isLocked())
+        .build();</code></pre>
+
+  <h4>How DaoAuthenticationProvider uses them</h4>
+  <p>When a login request reaches the <code>AuthenticationManager</code>, it delegates to <code>DaoAuthenticationProvider</code>. This is the exact order of work, and it explains every exception you will see:</p>
+  <ol class="steps">
+    <li>It receives a <code>UsernamePasswordAuthenticationToken</code> holding the email and the raw password the user typed.</li>
+    <li>It calls <code>userDetailsService.loadUserByUsername(email)</code>. If your service throws <code>UsernameNotFoundException</code>, the provider by default converts it into <code>BadCredentialsException</code> ("Bad credentials") so the caller cannot tell a wrong email from a wrong password. When the user is not found it still runs one password hash comparison against a dummy hash, so the response time does not reveal which emails exist (a protection against timing attacks).</li>
+    <li>Pre-checks: it rejects a locked, disabled or expired account (<code>LockedException</code>, <code>DisabledException</code>, <code>AccountExpiredException</code>) <em>before</em> checking the password.</li>
+    <li>It calls <code>passwordEncoder.matches(rawPassword, user.getPassword())</code>. A mismatch is a <code>BadCredentialsException</code>.</li>
+    <li>Post-check: expired credentials give <code>CredentialsExpiredException</code>.</li>
+    <li>On success it builds a new, authenticated <code>Authentication</code> with the <code>UserDetails</code> as principal and its authorities. The raw password is not kept.</li>
+  </ol>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as AuthController
+  participant M as AuthenticationManager
+  participant P as DaoAuthenticationProvider
+  participant U as DbUserDetailsService
+  participant E as PasswordEncoder
+  C->>M: authenticate(email, rawPassword)
+  M->>P: authenticate(token)
+  P->>U: loadUserByUsername(email)
+  U-->>P: AppUserDetails (hash, role, flags)
+  P->>E: matches(rawPassword, hash)
+  E-->>P: true
+  P-->>C: authenticated Authentication
+</pre>
+<figcaption>How a login is checked against the database</figcaption>
+  </figure>
+  <p>Your login endpoint calls the manager directly. The result is an authenticated principal whose id and role you put into the JWT (<a href="#m4-jwt-basics">JWT basics</a>). The matching of the hash itself is explained in <a href="#m4-password-hashing">password hashing</a>.</p>
+  <pre data-title="AuthService.java (login part)"><code class="language-java">public AppUserDetails login(String email, String password) {
+    Authentication auth = authenticationManager.authenticate(
+            new UsernamePasswordAuthenticationToken(email, password));
+    return (AppUserDetails) auth.getPrincipal();     // then create the token from it
+}</code></pre>
+  <p>The <code>AuthenticationManager</code> bean is not created by default. Expose it from the configuration:</p>
+  <pre data-title="In SecurityConfig"><code class="language-java">@Bean
+AuthenticationManager authenticationManager(AuthenticationConfiguration config)
+        throws Exception {
+    return config.getAuthenticationManager();
+}</code></pre>
+
+  <h4>The account-status flags</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Flag</th><th>Meaning</th><th>Exception on failure</th></tr></thead>
+    <tbody>
+      <tr><td><code>isEnabled()</code></td><td>Account is active (email verified, not deleted)</td><td><code>DisabledException</code></td></tr>
+      <tr><td><code>isAccountNonLocked()</code></td><td>Not locked, e.g. after too many failed logins</td><td><code>LockedException</code></td></tr>
+      <tr><td><code>isAccountNonExpired()</code></td><td>Account validity not over (trial accounts)</td><td><code>AccountExpiredException</code></td></tr>
+      <tr><td><code>isCredentialsNonExpired()</code></td><td>Password not too old</td><td><code>CredentialsExpiredException</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>All of them extend <code>AccountStatusException</code> or <code>AuthenticationException</code>, so a login failure becomes a 401. Returning one generic message ("Invalid email or password") for all of them is safer than telling an attacker which accounts exist. One caution: <code>DisabledException</code> and <code>LockedException</code> are thrown only <em>after</em> the user was found, so a different message for them does reveal that the email exists. Map all of them to the same public message in your error handler.</p>
+
+  <h4>Registration endpoint</h4>
+  <p>Registration creates a user and hashes the password. The caller may choose CANDIDATE or RECRUITER; ADMIN accounts are created by seed data or by another admin, never by the public endpoint. Otherwise anyone could register as ADMIN, a classic privilege-escalation bug.</p>
+  <pre data-title="RegisterRequest.java"><code class="language-java">public record RegisterRequest(
+        @NotBlank @Size(max = 100) String name,
+        @NotBlank @Email String email,
+        @NotBlank @Size(min = 8, max = 72) String password,
+        @NotNull Role role) {}</code></pre>
+  <pre data-title="AuthService.java (registration part)"><code class="language-java">@Service
+public class AuthService {
+
+    private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+
+    public AuthService(UserRepository userRepository, PasswordEncoder passwordEncoder) {
+        this.userRepository = userRepository;
+        this.passwordEncoder = passwordEncoder;
+    }
+
+    @Transactional
+    public UserResponse register(RegisterRequest req) {
+        if (req.role() == Role.ADMIN) {
+            throw new AccessDeniedException("Cannot self-register as ADMIN");
+        }
+        if (userRepository.existsByEmailIgnoreCase(req.email())) {
+            throw new DuplicateResourceException("Email already registered");
+        }
+        User user = new User(req.name(), req.email().toLowerCase(),
+                passwordEncoder.encode(req.password()), req.role());
+        return UserResponse.from(userRepository.save(user));
+    }
+}</code></pre>
+  <pre data-title="AuthController.java (register)"><code class="language-java">@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
+    // fields + constructor omitted
+
+    @PostMapping("/register")
+    @ResponseStatus(HttpStatus.CREATED)
+    public UserResponse register(@Valid @RequestBody RegisterRequest req) {
+        return authService.register(req);
+    }
+}</code></pre>
+  <pre class="out" data-title="Registering a user"><code class="language-http">POST /api/auth/register
+Content-Type: application/json
+
+{"name":"Asha Rao","email":"Asha@Example.com","password":"S3cure-pass!","role":"RECRUITER"}
+
+HTTP/1.1 201
+{"id":7,"name":"Asha Rao","email":"asha@example.com","role":"RECRUITER"}
+
+# the same email again
+HTTP/1.1 409
+{"status":409,"detail":"Email already registered"}</code></pre>
+  <p>Never return the entity or its hash: <code>UserResponse</code> is a record with id, name, email and role only (<a href="#m2-dtos">DTOs</a>). The same email check also needs the unique index shown above, because two simultaneous requests can both pass <code>existsBy...</code>; map <code>DataIntegrityViolationException</code> to 409. Registration returning 201 with a <code>Location</code> header is an even better fit (<a href="#m2-response-entity">ResponseEntity</a>).</p>
+
+  <h4>Seeding the first ADMIN</h4>
+  <p>Because the public endpoint refuses ADMIN, the first admin comes from a one-time seed. A runner that reads the password from the environment is a simple option (never hard-code it):</p>
+  <pre data-title="AdminSeeder.java"><code class="language-java">@Component
+class AdminSeeder implements CommandLineRunner {
+
+    private final UserRepository users;
+    private final PasswordEncoder encoder;
+    private final String adminPassword;
+
+    AdminSeeder(UserRepository users, PasswordEncoder encoder,
+                @Value("${app.admin.password:}") String adminPassword) {
+        this.users = users;
+        this.encoder = encoder;
+        this.adminPassword = adminPassword;
+    }
+
+    @Override
+    public void run(String... args) {
+        if (!adminPassword.isBlank() &amp;&amp; !users.existsByEmailIgnoreCase("admin@example.com")) {
+            users.save(new User("Admin", "admin@example.com",
+                    encoder.encode(adminPassword), Role.ADMIN));
+        }
+    }
+}</code></pre>
+
+  <h4>Comparison: where users can come from</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Source</th><th>How</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td>In-memory</td><td><code>InMemoryUserDetailsManager</code></td><td>Demos and tests only</td></tr>
+      <tr><td>JDBC tables</td><td><code>JdbcUserDetailsManager</code> (fixed schema)</td><td>Quick start with Security's own tables</td></tr>
+      <tr><td>Your JPA entity</td><td>Custom <code>UserDetailsService</code> (this article)</td><td>Real applications</td></tr>
+      <tr><td>External identity provider</td><td>OAuth2 / OIDC (<a href="#m4-oauth2-login">OAuth2 login</a>)</td><td>Login with Google, company SSO</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Store only a hash made by a <code>PasswordEncoder</code>; the same encoder bean must be used for registration and for login.</li>
+      <li><code>loadUserByUsername</code> must never return <code>null</code>; throw <code>UsernameNotFoundException</code> when the user is missing.</li>
+      <li>The role stored in the database is the plain name (<code>RECRUITER</code>); the authority is <code>ROLE_RECRUITER</code>.</li>
+      <li>The public registration endpoint must not accept ADMIN.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Keep the entity free of Spring Security types; wrap it in a separate <code>UserDetails</code> class, as above.</li>
+      <li>Normalise the email (lower case, trimmed) once, in the service, and query case-insensitively.</li>
+      <li>Add a unique index on the normalised email; it is the real protection against duplicates.</li>
+      <li>Put registration and login in an <code>AuthService</code>, not in the controller.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Letting the request body set the role without a whitelist (mass assignment).</li>
+      <li>Case-sensitive email lookup: <code>Asha@x.com</code> and <code>asha@x.com</code> become two accounts. Normalise to lower case.</li>
+      <li>Returning the <code>User</code> entity from a controller: the hash leaks into JSON.</li>
+      <li>Throwing a different message for "unknown email" and "wrong password" (user enumeration).</li>
+    </ul>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: plain password saved, role from the client</p><pre><code class="language-java">User u = new User(req.name(), req.email(), req.password(), req.role());
+userRepository.save(u);        // plain text; ADMIN accepted</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: hash it, restrict the role</p><pre><code class="language-java">if (req.role() == Role.ADMIN) throw new AccessDeniedException("no");
+String hash = passwordEncoder.encode(req.password());
+userRepository.save(new User(req.name(), email, hash, req.role()));</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and exceptions</p>
+    <ul>
+      <li><code>UsernameNotFoundException</code> is hidden as <code>BadCredentialsException</code> by default. If you set <code>hideUserNotFoundExceptions</code> to false yourself, the real reason leaks.</li>
+      <li><code>LazyInitializationException</code> in <code>getAuthorities()</code>: you read a lazy role collection outside a transaction. Copy the data in the constructor of <code>AppUserDetails</code>, inside the transactional <code>loadUserByUsername</code>, as above.</li>
+      <li><code>IllegalArgumentException: There is no PasswordEncoder mapped for the id "null"</code> means the stored value has no <code>{bcrypt}</code> prefix while you use a delegating encoder. Use a plain <code>BCryptPasswordEncoder</code> bean (as in the config article) or store the prefix.</li>
+      <li><code>DataIntegrityViolationException</code> on <code>save</code>: duplicate email under a race; return 409.</li>
+      <li>A user who is deleted or disabled after receiving a JWT keeps a valid token until it expires, because stateless checks do not call the database. Keep access tokens short (<a href="#m4-refresh-tokens">refresh tokens</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>Real systems add email verification (the user starts with <code>enabled = false</code> and a verification link flips it), a failed-login counter that sets <code>locked</code> for 15 minutes, password reset by a one-time token mailed to the user, and a rule that the first ADMIN comes from a deployment seed or a migration script. Many teams also record <code>createdAt</code> and <code>lastLoginAt</code> (<a href="#m3-auditing">auditing</a>).</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How does Spring Security load a user?" <code>DaoAuthenticationProvider</code> calls your <code>UserDetailsService.loadUserByUsername</code>, gets a <code>UserDetails</code>, checks the flags, then compares the password with <code>PasswordEncoder.matches</code>. Follow-up: "What does <code>UsernameNotFoundException</code> become?" By default <code>BadCredentialsException</code>, to hide which part was wrong. Another favourite: "How do you stop a user registering as ADMIN?" Whitelist the role in the service; admins are created by seed or by another admin. And: "Why store a hash, not the password?" See <a href="#m4-password-hashing">password hashing</a>.</p>
+  </div>
+</article>
+
+<article class="topic" id="m4-password-hashing">
+  <h3>Password hashing with BCrypt</h3>
+  <p class="tldr">Never store passwords or encrypt them; store a salted, deliberately slow hash such as BCrypt, check logins with PasswordEncoder.matches, and use DelegatingPasswordEncoder so the algorithm can change later.</p>
+
+  <h4>Why hash, and why not encrypt</h4>
+  <p>If your database leaks (it happens to big companies), the attacker must not get passwords. Plain text is the worst choice. <strong>Encryption</strong> is reversible: whoever has the key (and the key is usually on the same server) gets every password back. A <strong>hash</strong> is a one-way function: you can turn a password into a hash, but not a hash back into the password. At login you hash the typed password and compare hashes.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Encryption (AES)</th><th>Fast hash (SHA-256)</th><th>Password hash (BCrypt)</th></tr></thead>
+    <tbody>
+      <tr><td>Reversible</td><td>Yes, with key</td><td>No</td><td>No</td></tr>
+      <tr><td>Salted</td><td>n/a</td><td>Only if you add one</td><td>Yes, automatically</td></tr>
+      <tr><td>Speed</td><td>Fast</td><td>Billions per second on a GPU</td><td>Deliberately slow, tunable</td></tr>
+      <tr><td>Use for passwords</td><td>No</td><td>No</td><td><strong>Yes</strong></td></tr>
+    </tbody>
+  </table></div>
+  <p>Two problems remain with a plain hash. First, equal passwords give equal hashes, and attackers keep huge tables of common passwords and their hashes (<strong>rainbow tables</strong>). A <strong>salt</strong> fixes this: a random value added to each password before hashing, so two users with <code>password123</code> get different hashes and precomputed tables are useless. Second, SHA-256 is designed to be fast, so an attacker can try billions of guesses per second. A password hash must be <strong>slow</strong> on purpose: a <strong>work factor</strong> makes each guess expensive, and you can raise it as computers get faster.</p>
+
+  <h4>BCrypt</h4>
+  <p>BCrypt generates its own random 16-byte salt, applies a slow key-derivation, and writes everything into one 60-character string:</p>
+  <pre class="out" data-title="A BCrypt hash"><code class="language-plaintext">$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy
+ |  |  |                     |
+ |  |  |                     +-- 31 characters of hash
+ |  |  +-- 22 characters of salt
+ |  +-- cost factor (work factor): 2^10 rounds
+ +-- algorithm version</code></pre>
+  <p>Because salt and cost are inside the string, you store just this one column and need no separate salt column. The cost factor is the exponent: strength 10 means 2<sup>10</sup> = 1,024 rounds; every +1 doubles the time. The default of <code>BCryptPasswordEncoder</code> is 10 (allowed 4 to 31). Choose a value so that one hash takes roughly 100–300 ms on your production hardware; raising it to 12 is common today. Too high and a login burst becomes a denial-of-service on your own CPU.</p>
+
+  <h4>PasswordEncoder in Spring</h4>
+  <pre data-title="Using PasswordEncoder"><code class="language-java">PasswordEncoder encoder = new BCryptPasswordEncoder();          // strength 10
+// PasswordEncoder encoder = new BCryptPasswordEncoder(12);     // stronger
+
+String hash1 = encoder.encode("S3cret#2026");
+String hash2 = encoder.encode("S3cret#2026");
+System.out.println(hash1.equals(hash2));                        // false (random salt)
+System.out.println(encoder.matches("S3cret#2026", hash1));      // true
+System.out.println(encoder.matches("wrong", hash1));            // false</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">false
+true
+false</code></pre>
+  <ul>
+    <li><code>encode(raw)</code> returns a new hash every time, so you can never compare hashes with <code>equals</code>.</li>
+    <li><code>matches(raw, stored)</code> reads the salt and cost from <code>stored</code>, hashes <code>raw</code> the same way and compares in constant time.</li>
+    <li><code>upgradeEncoding(stored)</code> says whether the hash should be recomputed with a newer setting (used by <code>DaoAuthenticationProvider</code> to upgrade hashes at login).</li>
+  </ul>
+
+  <h4>DelegatingPasswordEncoder and the {bcrypt} prefix</h4>
+  <p>Algorithms age. <code>PasswordEncoderFactories.createDelegatingPasswordEncoder()</code> returns an encoder that writes an id in front of the hash and uses that id to pick the algorithm at check time:</p>
+  <pre class="out" data-title="Stored value"><code class="language-plaintext">{bcrypt}$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy
+{argon2@SpringSecurity_v5_8}...   (another algorithm; different prefix)</code></pre>
+  <pre data-title="Delegating encoder bean"><code class="language-java">@Bean
+PasswordEncoder passwordEncoder() {
+    return PasswordEncoderFactories.createDelegatingPasswordEncoder();
+}</code></pre>
+  <p>New passwords use the current default (bcrypt); old rows with another prefix still work; you migrate users gradually. If a stored value has <em>no</em> prefix you get <code>IllegalArgumentException: There is no PasswordEncoder mapped for the id "null"</code>. Either add the prefix to old data, or use a plain <code>BCryptPasswordEncoder</code> bean. For a new app that will never change algorithm, a plain <code>BCryptPasswordEncoder</code> is fine; the delegating form is the framework default and the safer long-term choice. Spring also provides <code>Argon2PasswordEncoder</code> (needs the Bouncy Castle library), <code>SCryptPasswordEncoder</code> and <code>Pbkdf2PasswordEncoder</code>.</p>
+
+  <h4>Limits and good habits</h4>
+  <ul>
+    <li><strong>72-byte limit.</strong> BCrypt only uses the first 72 bytes of the password, so the rest is ignored (some library versions reject longer input with an exception instead). Limit the password length in validation (<code>@Size(max = 72)</code>, as in the DTO above). Do not pre-hash with SHA-256 unless you know exactly why.</li>
+    <li><strong>Never log or return a password or a hash.</strong> Check <code>toString()</code> of request records (a record prints all its fields), Lombok <code>@Data</code> classes, and request-logging filters.</li>
+    <li><strong>Do not invent your own scheme</strong> ("MD5 twice with a pepper"). Use the framework.</li>
+    <li><strong>Password rules:</strong> minimum length matters more than odd character rules; check against a list of leaked passwords if you can.</li>
+    <li><strong>Hashing is slow.</strong> That is the point, but it means the login endpoint needs rate limiting (<a href="#m4-best-practices">checklist</a>).</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: compare with matches, never equals</p>
+    <p>A salted hash differs every time. Always call <code>passwordEncoder.matches(raw, stored)</code>.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Saving <code>request.password()</code> directly, so the database holds plain text.</li>
+      <li>Hashing the password twice: once in the controller and once in the service, so login can never match.</li>
+      <li>Using MD5 or SHA-1 because "it is hashing too".</li>
+      <li>Seeding test users with a plain password in SQL, then wondering why login fails (generate the BCrypt hash first).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you store passwords?" Salted adaptive hash (BCrypt/Argon2), one-way, work factor tunable; never encryption, never plain SHA. "What is a salt?" Random per-user value stored with the hash, defeats rainbow tables and makes equal passwords differ. "Why is BCrypt slow on purpose?" To make brute force expensive. "What is the <code>{bcrypt}</code> prefix?" <code>DelegatingPasswordEncoder</code> id, used to support several algorithms and migrate.</p>
+  </div>
+</article>
+
+<article class="topic" id="m4-jwt-basics">
+  <h3>JWT in depth: structure, claims, signing and the login flow</h3>
+  <p class="tldr">A JWT is a signed JSON document (header.payload.signature) that proves who the user is without server-side storage; anyone can read it but nobody can change it without the key, and it is valid until it expires.</p>
+
+  <h4>What and why</h4>
+  <p>A <strong>JSON Web Token</strong> (JWT, pronounced "jot") is a compact string that carries claims about a user and a signature that proves the server issued it. After login the server gives one to the client; the client sends it with each request; the server verifies the signature and trusts the claims inside, with no database or session lookup. That is what makes the API <em>stateless</em> (see <a href="#m4-authn-authz">sessions vs tokens</a>).</p>
+
+  <h4>Structure</h4>
+  <p>A JWT has three parts separated by dots, each encoded with <strong>base64url</strong> (base64 with <code>-</code> and <code>_</code> instead of <code>+</code> and <code>/</code>, no padding):</p>
+  <pre class="out" data-title="header.payload.signature"><code class="language-plaintext">eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiIsInJvbGVzIjpbIlJFQ1JVSVRFUiJdfQ.Sx3...k9A</code></pre>
+  <pre data-title="Decoded header (part 1)"><code class="language-json">{
+  "alg": "HS256",
+  "typ": "JWT"
+}</code></pre>
+  <pre data-title="Decoded payload (part 2)"><code class="language-json">{
+  "iss": "jobportal-api",
+  "sub": "42",
+  "roles": ["RECRUITER"],
+  "iat": 1790000000,
+  "exp": 1790003600
+}</code></pre>
+  <p>The signature (part 3) is computed over <code>base64url(header) + "." + base64url(payload)</code> with the secret key (or private key). If anybody changes one character of the payload, the signature no longer matches and verification fails.</p>
+  <div class="co co-rule">
+    <p class="co-t">Rule: the payload is readable by everyone</p>
+    <p>Base64url is encoding, not encryption. Paste any JWT into a decoder and you see the claims. Never put passwords, card numbers, or secrets in a JWT. Put identifiers and roles only. (An encrypted token format, JWE, exists but is rarely needed.)</p>
+  </div>
+
+  <h4>Claims</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Claim</th><th>Name</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>sub</code></td><td>Subject</td><td>Who the token is about: the user id (or email)</td></tr>
+      <tr><td><code>iss</code></td><td>Issuer</td><td>Who created it, e.g. <code>jobportal-api</code>; check it on validation</td></tr>
+      <tr><td><code>aud</code></td><td>Audience</td><td>Who it is meant for (which API); check it when several services exist</td></tr>
+      <tr><td><code>iat</code></td><td>Issued at</td><td>Creation time (seconds since 1970)</td></tr>
+      <tr><td><code>exp</code></td><td>Expiration</td><td>After this time the token is invalid</td></tr>
+      <tr><td><code>nbf</code></td><td>Not before</td><td>Not valid before this time</td></tr>
+      <tr><td><code>jti</code></td><td>JWT ID</td><td>Unique id, useful for revocation lists</td></tr>
+      <tr><td><code>roles</code>, <code>scope</code></td><td>Custom</td><td>Your own claims (keep them small)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Times are numbers in <strong>seconds</strong>, not milliseconds, a frequent source of "token expired in 1970" bugs when you mix them up.</p>
+
+  <h4>Signing: HS256 vs RS256</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>HS256 (HMAC-SHA256)</th><th>RS256 (RSA + SHA-256)</th></tr></thead>
+    <tbody>
+      <tr><td>Key type</td><td>One shared secret</td><td>Key pair: private signs, public verifies</td></tr>
+      <tr><td>Who can create tokens</td><td>Anyone who has the secret (every verifier)</td><td>Only the holder of the private key</td></tr>
+      <tr><td>Who can verify</td><td>Anyone who has the secret</td><td>Anyone with the public key (can be published, e.g. JWKS)</td></tr>
+      <tr><td>Speed</td><td>Very fast</td><td>Slower signing</td></tr>
+      <tr><td>Use</td><td>One application issuing and verifying its own tokens</td><td>Separate auth server and many resource servers; microservices; third-party login</td></tr>
+    </tbody>
+  </table></div>
+  <p>Project 2 has one application, so HS256 is enough. The HS256 secret must be long and random (at least 256 bits = 32 bytes) and come from an environment variable or secret store, never from the Git repository. Moving to RS256 later is a configuration change when you use the Spring support.</p>
+
+  <h4>The login flow</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client (React)
+  participant A as AuthController
+  participant M as AuthenticationManager
+  participant T as TokenService
+  participant F as JWT filter / BearerTokenAuthenticationFilter
+  participant J as JobController
+  C->>A: POST /api/auth/login (email, password)
+  A->>M: authenticate(email, password)
+  M-->>A: Authentication (user + roles)
+  A->>T: issue token (sub, roles, exp)
+  T-->>A: signed JWT
+  A-->>C: 200 accessToken
+  C->>F: GET /api/jobs/mine, Authorization Bearer token
+  F->>F: verify signature, issuer, expiry
+  F->>F: put Authentication in SecurityContext
+  F->>J: request continues
+  J-->>C: 200 data for the current user
+</pre>
+  <figcaption>Stateless JWT login and a later authenticated request</figcaption>
+  </figure>
+  <ol class="steps">
+    <li>The client sends the email and password once to the public login endpoint (over HTTPS).</li>
+    <li>The controller calls <code>AuthenticationManager.authenticate</code>, which runs the <code>DaoAuthenticationProvider</code> path from the <a href="#m4-filter-chain">architecture article</a>. A wrong password throws and becomes 401.</li>
+    <li>On success the server builds a JWT with the user id, roles and an expiry (for example 15–60 minutes) and signs it.</li>
+    <li>The client keeps the token and sends <code>Authorization: Bearer &lt;token&gt;</code> on each call.</li>
+    <li>A filter verifies signature, expiry (and issuer), creates an <code>Authentication</code> from the claims, and stores it in the <code>SecurityContext</code> for this request.</li>
+    <li>URL rules, method security and your controller now see the current user.</li>
+  </ol>
+
+  <h4>Expiry and what JWT cannot do</h4>
+  <p>The server holds no record of issued tokens, so it cannot "log out" a token: until <code>exp</code> passes, any holder is accepted. That is why access tokens are <strong>short-lived</strong> and paired with a refresh token (<a href="#m4-refresh-tokens">refresh tokens</a>). Roles inside the token are also a snapshot: if an admin removes a user's role, the old token still carries it until it expires. Keep the lifetime short, or look the user up on each request when you need immediate effect.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>A weak or hard-coded secret ("secret", "mykey") committed to GitHub. Anyone can then forge an ADMIN token.</li>
+      <li>Putting personal or sensitive data in the payload.</li>
+      <li>Accepting tokens without checking expiry, or setting a lifetime of months.</li>
+      <li>Trusting the <code>alg</code> header from the token (the old "alg: none" attack). Libraries today reject it; always configure the expected algorithm yourself.</li>
+      <li>Treating JWT as a replacement for authorization: the token says who the user is, your code must still check ownership.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is a JWT and how is it verified?" Three base64url parts; the server recomputes the signature with the key and checks <code>exp</code>/<code>iss</code>. "Is the payload secret?" No, only tamper-proof. "HS256 vs RS256?" Shared secret vs key pair. "How do you invalidate a JWT?" You mostly cannot; use short expiry, refresh-token rotation, or a deny list keyed by <code>jti</code>.</p>
+  </div>
+</article>
+
+<article class="topic" id="m4-jwt-custom-filter">
+  <h3>JWT way 1: a custom OncePerRequestFilter with the jjwt library</h3>
+  <p class="tldr">Write a TokenService that signs and parses tokens with jjwt, a OncePerRequestFilter that turns a valid Bearer token into an Authentication, and register it before UsernamePasswordAuthenticationFilter.</p>
+
+  <p>This approach gives you full control and shows exactly what happens. <a href="#m4-jwt-resource-server">The next article</a> shows the shorter Spring-supported way, which is recommended for new code. Both versions use the same login controller, so read this one for understanding even if you ship the other.</p>
+
+  <h4>Dependencies and configuration</h4>
+  <p>The jjwt library (<code>io.jsonwebtoken</code>) is split into an API jar and two runtime jars. The code below uses the 0.12.x API (<code>parseSignedClaims</code>, <code>verifyWith</code>, <code>subject</code>); older 0.11 tutorials use <code>parseClaimsJws</code> and <code>setSubject</code>, which differ.</p>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;io.jsonwebtoken&lt;/groupId&gt;
+    &lt;artifactId&gt;jjwt-api&lt;/artifactId&gt;
+    &lt;version&gt;0.12.6&lt;/version&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;io.jsonwebtoken&lt;/groupId&gt;
+    &lt;artifactId&gt;jjwt-impl&lt;/artifactId&gt;
+    &lt;version&gt;0.12.6&lt;/version&gt;
+    &lt;scope&gt;runtime&lt;/scope&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;io.jsonwebtoken&lt;/groupId&gt;
+    &lt;artifactId&gt;jjwt-jackson&lt;/artifactId&gt;
+    &lt;version&gt;0.12.6&lt;/version&gt;
+    &lt;scope&gt;runtime&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+  <pre data-title="application.yml"><code class="language-yaml">app:
+  jwt:
+    secret: ${JWT_SECRET}          # Base64 text of at least 32 random bytes
+    issuer: jobportal-api
+    access-ttl-minutes: 30</code></pre>
+  <pre data-title="Generate a secret"><code class="language-shell">$ openssl rand -base64 32
+q3L0x1m...(44 characters)...=</code></pre>
+  <pre data-title="JwtProperties.java"><code class="language-java">@ConfigurationProperties(prefix = "app.jwt")
+public record JwtProperties(String secret, String issuer, long accessTtlMinutes) {}</code></pre>
+  <p>Register it with <code>@EnableConfigurationProperties(JwtProperties.class)</code> on any configuration class (or <code>@ConfigurationPropertiesScan</code> on the application class).</p>
+
+  <h4>The TokenService contract</h4>
+  <p>The login controller depends on a small interface, so you can swap the implementation (this one, or the Nimbus one) without touching the controller.</p>
+  <pre data-title="TokenService.java"><code class="language-java">public interface TokenService {
+    String issueAccessToken(AppUserDetails user);
+}</code></pre>
+
+  <h4>JjwtService: create and parse tokens</h4>
+  <pre data-title="JjwtService.java"><code class="language-java">import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.io.Decoders;
+import io.jsonwebtoken.security.Keys;
+import javax.crypto.SecretKey;
+
+@Service
+public class JjwtService implements TokenService {
+
+    private final SecretKey key;
+    private final String issuer;
+    private final Duration ttl;
+
+    public JjwtService(JwtProperties props) {
+        this.key = Keys.hmacShaKeyFor(Decoders.BASE64.decode(props.secret()));
+        this.issuer = props.issuer();
+        this.ttl = Duration.ofMinutes(props.accessTtlMinutes());
+    }
+
+    @Override
+    public String issueAccessToken(AppUserDetails user) {
+        Instant now = Instant.now();
+        return Jwts.builder()
+                .issuer(issuer)
+                .subject(String.valueOf(user.getId()))
+                .claim("email", user.getUsername())
+                .claim("roles", List.of(user.getRole().name()))
+                .issuedAt(Date.from(now))
+                .expiration(Date.from(now.plus(ttl)))
+                .signWith(key)                 // HS256 chosen from the key size
+                .compact();
+    }
+
+    /** Verifies signature, expiry and issuer. Throws JwtException if invalid. */
+    public Claims parse(String token) {
+        return Jwts.parser()
+                .verifyWith(key)
+                .requireIssuer(issuer)
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+    }
+}</code></pre>
+  <p><code>Keys.hmacShaKeyFor</code> throws <code>WeakKeyException</code> if the key is shorter than 256 bits for HS256, which is a useful safety net. <code>parseSignedClaims</code> only accepts a signed token (an unsigned or "alg: none" token fails). The parser checks <code>exp</code> and <code>nbf</code> itself.</p>
+
+  <h4>What the parser can throw</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Exception</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>ExpiredJwtException</code></td><td><code>exp</code> is in the past</td></tr>
+      <tr><td><code>SignatureException</code></td><td>Signature does not match (tampered or wrong key)</td></tr>
+      <tr><td><code>MalformedJwtException</code></td><td>Not a valid JWT structure</td></tr>
+      <tr><td><code>UnsupportedJwtException</code></td><td>Unexpected token type (e.g. unsigned)</td></tr>
+      <tr><td><code>IncorrectClaimException</code> / <code>MissingClaimException</code></td><td>The issuer you require is wrong or missing</td></tr>
+      <tr><td><code>IllegalArgumentException</code></td><td>Token is null or empty</td></tr>
+    </tbody>
+  </table></div>
+  <p>All JWT-specific ones extend <code>io.jsonwebtoken.JwtException</code>, so one catch is enough.</p>
+
+  <h4>The filter</h4>
+  <p><code>OncePerRequestFilter</code> guarantees one execution per request. The filter's job: read the header, validate the token, and store an <code>Authentication</code>. It does <em>not</em> write error responses itself; if the token is missing or bad it simply leaves the context empty and lets the rest of the chain decide (a protected URL then triggers the authentication entry point, which returns 401).</p>
+  <pre data-title="JwtAuthenticationFilter.java"><code class="language-java">public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private static final String PREFIX = "Bearer ";
+    private final JjwtService jwtService;
+
+    public JwtAuthenticationFilter(JjwtService jwtService) {
+        this.jwtService = jwtService;
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain chain)
+            throws ServletException, IOException {
+
+        String header = request.getHeader(HttpHeaders.AUTHORIZATION);
+        if (header == null || !header.startsWith(PREFIX)) {
+            chain.doFilter(request, response);          // anonymous request
+            return;
+        }
+        try {
+            Claims claims = jwtService.parse(header.substring(PREFIX.length()));
+            List&lt;?&gt; roles = claims.get("roles", List.class);
+            List&lt;SimpleGrantedAuthority&gt; authorities = roles.stream()
+                    .map(r -&gt; new SimpleGrantedAuthority("ROLE_" + r))
+                    .toList();
+
+            var auth = new UsernamePasswordAuthenticationToken(
+                    claims.getSubject(), null, authorities);   // principal = user id
+            auth.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+            SecurityContextHolder.getContext().setAuthentication(auth);
+        } catch (JwtException | IllegalArgumentException e) {
+            SecurityContextHolder.clearContext();       // bad token: stay anonymous
+            request.setAttribute("auth.error", e.getClass().getSimpleName());
+        }
+        chain.doFilter(request, response);
+    }
+}</code></pre>
+  <p>The three-argument <code>UsernamePasswordAuthenticationToken</code> constructor creates an <em>authenticated</em> token (the two-argument one is "not yet authenticated"). The principal here is the user id as a string, so <code>authentication.getName()</code> returns <code>"42"</code>. We read the roles from the token and trust the signature; there is no database call per request. If you need fresh account status (disabled users blocked immediately), load the user inside the filter instead, at the cost of one query per request (or a short cache).</p>
+
+  <h4>Registering the filter and exposing the AuthenticationManager</h4>
+  <pre data-title="SecurityConfig.java (JWT filter version)"><code class="language-java">@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+@EnableConfigurationProperties(JwtProperties.class)
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain api(HttpSecurity http, JjwtService jwtService,
+                            JsonSecurityHandlers handlers) throws Exception {
+        http
+            .csrf(csrf -&gt; csrf.disable())
+            .cors(Customizer.withDefaults())
+            .sessionManagement(s -&gt;
+                    s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .httpBasic(b -&gt; b.disable())
+            .formLogin(f -&gt; f.disable())
+            .exceptionHandling(e -&gt; e
+                    .authenticationEntryPoint(handlers)      // 401 JSON
+                    .accessDeniedHandler(handlers))          // 403 JSON
+            .authorizeHttpRequests(auth -&gt; auth
+                    .requestMatchers("/api/auth/**").permitAll()
+                    .requestMatchers(HttpMethod.GET, "/api/jobs/**").permitAll()
+                    .anyRequest().authenticated())
+            .addFilterBefore(new JwtAuthenticationFilter(jwtService),
+                    UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+
+    @Bean
+    AuthenticationManager authenticationManager(AuthenticationConfiguration cfg)
+            throws Exception {
+        return cfg.getAuthenticationManager();
+    }
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        return PasswordEncoderFactories.createDelegatingPasswordEncoder();
+    }
+}</code></pre>
+  <p><code>JsonSecurityHandlers</code> is defined in the <a href="#m4-error-responses">error-response article</a>. Note that the filter is created with <code>new</code> inside the configuration and is <strong>not</strong> annotated with <code>@Component</code>: Spring Boot registers every <code>Filter</code> bean in the servlet container too, so a <code>@Component</code> filter would run twice (once outside and once inside the security chain). If you prefer a bean, add a <code>FilterRegistrationBean</code> with <code>setEnabled(false)</code>.</p>
+
+  <h4>The login controller</h4>
+  <pre data-title="LoginRequest / TokenResponse"><code class="language-java">public record LoginRequest(@NotBlank @Email String email, @NotBlank String password) {}
+
+public record TokenResponse(String accessToken, String tokenType, long expiresIn) {}</code></pre>
+  <pre data-title="AuthController.java (login)"><code class="language-java">@PostMapping("/login")
+public TokenResponse login(@Valid @RequestBody LoginRequest req) {
+    Authentication auth = authenticationManager.authenticate(
+            UsernamePasswordAuthenticationToken.unauthenticated(
+                    req.email().toLowerCase(), req.password()));
+    AppUserDetails user = (AppUserDetails) auth.getPrincipal();
+    String token = tokenService.issueAccessToken(user);
+    return new TokenResponse(token, "Bearer", 1800);
+}</code></pre>
+  <pre data-title="Try it"><code class="language-shell">$ curl -s -X POST localhost:8080/api/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"email":"asha@example.com","password":"S3cret#2026"}'
+{"accessToken":"eyJhbGciOiJIUzI1NiJ9...","tokenType":"Bearer","expiresIn":1800}
+
+$ curl -s localhost:8080/api/jobs/mine -H "Authorization: Bearer eyJhbGciOi..."
+[ {"id":7,"title":"Java Developer"} ]</code></pre>
+  <p>A wrong password makes <code>authenticate</code> throw <code>BadCredentialsException</code>. Because this happens inside a controller (after the filter chain), <code>ExceptionTranslationFilter</code> is not involved; handle <code>AuthenticationException</code> in your <code>@RestControllerAdvice</code> and return 401 with the same generic message for every cause.</p>
+  <pre data-title="Handling login failures in @RestControllerAdvice"><code class="language-java">@ExceptionHandler(AuthenticationException.class)
+ProblemDetail loginFailed(AuthenticationException ex) {
+    ProblemDetail pd = ProblemDetail.forStatusAndDetail(
+            HttpStatus.UNAUTHORIZED, "Invalid email or password");
+    pd.setTitle("Authentication failed");
+    return pd;
+}</code></pre>
+
+  <h4>Expired and invalid tokens</h4>
+  <p>With this design an expired token makes the filter catch <code>ExpiredJwtException</code>, leave the request anonymous, and the protected URL returns 401. The client reads 401, uses its refresh token (or sends the user to the login screen) and retries. To tell the client <em>why</em>, read the <code>auth.error</code> request attribute in your entry point and put <code>"token_expired"</code> or <code>"token_invalid"</code> in the JSON body.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Annotating the filter with <code>@Component</code> (double registration) or forgetting <code>addFilterBefore</code>, so the filter never runs.</li>
+      <li>Catching the exception and writing a 500 or a stack trace, or swallowing it and still authenticating.</li>
+      <li>Mixing seconds and milliseconds in <code>exp</code>, or using the 0.11 API names with the 0.12 jar.</li>
+      <li>Reading the secret with <code>getBytes()</code> when it is stored as Base64 (or the other way round); both ends must agree.</li>
+      <li>Forgetting <code>permitAll()</code> on the login URL, so nobody can ever log in.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Walk me through JWT authentication in Spring Boot." Login controller authenticates through the <code>AuthenticationManager</code> and returns a signed token; a <code>OncePerRequestFilter</code> placed before <code>UsernamePasswordAuthenticationFilter</code> reads the Bearer header, validates it, sets the <code>SecurityContext</code>; the stateless session policy means every request repeats this. Mention failure behaviour: invalid token leaves the request anonymous, so the entry point returns 401.</p>
+  </div>
+</article>

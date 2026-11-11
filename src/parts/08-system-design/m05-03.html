@@ -1,0 +1,374 @@
+<article class="topic" id="m5-caching-patterns">
+  <h3>Caching: layers, patterns, eviction and invalidation</h3>
+  <p class="tldr">A cache keeps copies of expensive-to-get data in a faster place; you choose where to cache
+  (browser, CDN, proxy, app, Redis), a read/write pattern (cache-aside, read-through, write-through,
+  write-behind, write-around), an eviction policy (LRU, LFU, TTL) and an invalidation strategy, accepting
+  some staleness in return for speed and lower load.</p>
+
+  <h4>What problem it solves</h4>
+  <p>Reading from memory is about 1,000 times faster than from SSD and far faster than a cross-network
+  database query (<a href="#m4-latency-throughput">latency numbers</a>). Most workloads read a small hot set
+  of data again and again (the same products, the same profiles). A <strong>cache</strong> stores that hot
+  data in fast storage so most reads skip the slow source. Benefits: lower latency, higher throughput,
+  fewer database queries (and a smaller database bill). The price: stale data, extra moving parts, and the
+  famous hard problem of knowing when to invalidate.</p>
+  <p>For Spring's <code>@Cacheable</code> and Redis integration see <a href="04-spring-boot.html#m6">Spring
+  Boot · Module 6</a>, and for Redis itself <a href="03-sql-databases.html#m6">SQL · Module 6</a>. This
+  article is the system-design view.</p>
+
+  <h4>Where to cache: the layers</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  B[Browser cache] --> CDN[CDN edge]
+  CDN --> RP[Reverse proxy cache]
+  RP --> LC[App local cache]
+  LC --> RC[(Redis distributed cache)]
+  RC --> DB[(Database with buffer cache)]
+</pre>
+    <figcaption>A request is served by the first layer that has the data; each layer further right is slower and bigger</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Layer</th><th>Caches</th><th>Strength</th><th>Weakness</th></tr></thead>
+    <tbody>
+      <tr><td>Browser / client</td><td>Static files, API responses with headers</td><td>Zero network cost</td><td>You cannot purge a user's browser</td></tr>
+      <tr><td>CDN</td><td>Static assets, public pages</td><td>Near the user, huge offload</td><td>Slow invalidation (<a href="#m5-cdn">CDN</a>)</td></tr>
+      <tr><td>Reverse proxy (Nginx, Varnish)</td><td>Whole HTTP responses</td><td>No app code change</td><td>Coarse; keys by URL</td></tr>
+      <tr><td>Application local (Caffeine, in-heap map)</td><td>Hot objects, config, lookups</td><td>Nanoseconds, no network</td><td>Each instance has its own copy; may disagree</td></tr>
+      <tr><td>Distributed (Redis, Memcached)</td><td>Sessions, objects, query results, counters</td><td>Shared by all instances, large</td><td>Network hop; an extra system to run</td></tr>
+      <tr><td>Database (buffer pool, query cache)</td><td>Pages and index blocks in memory</td><td>Automatic</td><td>Outside your control; still a DB call</td></tr>
+    </tbody>
+  </table></div>
+  <p>A common combo is a tiny local cache (Caffeine) in front of Redis: a "two-level" cache. It is fastest
+  but doubles the staleness problem, so keep local TTLs very short (seconds).</p>
+
+  <h4>The caching patterns</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant App
+  participant Cache
+  participant DB
+  App->>Cache: GET product:42
+  Cache-->>App: miss
+  App->>DB: SELECT product 42
+  DB-->>App: row
+  App->>Cache: SET product:42 (TTL 5 min)
+  App-->>App: return row
+</pre>
+    <figcaption>Cache-aside (lazy loading): the application checks the cache and fills it on a miss</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pattern</th><th>Read path</th><th>Write path</th><th>Consistency</th><th>Main risk</th></tr></thead>
+    <tbody>
+      <tr><td>Cache-aside</td><td>App checks cache, on a miss loads from DB and fills the cache</td><td>App writes to DB, then deletes (or updates) the cache key</td><td>Eventual; stale until TTL or delete</td><td>Races between a delete and a concurrent read-fill</td></tr>
+      <tr><td>Read-through</td><td>Cache itself loads from DB on a miss</td><td>Same as cache-aside</td><td>Eventual</td><td>Needs a cache layer with loader support</td></tr>
+      <tr><td>Write-through</td><td>Reads hit a warm cache</td><td>Write goes to cache and DB together, returns after both</td><td>Strong between cache and DB</td><td>Slower writes; caches data never read</td></tr>
+      <tr><td>Write-behind (write-back)</td><td>Reads hit the cache</td><td>Write to cache, DB updated later in batches</td><td>DB lags behind</td><td>Data loss if the cache dies before flushing</td></tr>
+      <tr><td>Write-around</td><td>Misses go to DB then cache</td><td>Writes go to DB only, bypass cache</td><td>Cache stale until TTL</td><td>First read after write is slow</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><strong>Cache-aside</strong> is the default for web apps: simple, resilient (if the cache dies, the
+    app still works from the database), and caches only what is requested. Spring's <code>@Cacheable</code>
+    implements it.</li>
+    <li><strong>Read-through</strong> is the same idea with the loading logic inside the cache library or
+    service (Caffeine <code>LoadingCache</code>, many managed caches).</li>
+    <li><strong>Write-through</strong> keeps the cache always fresh for written data; good for read-heavy data
+    that is updated rarely and must not be stale (profile settings). Write latency is the cost.</li>
+    <li><strong>Write-behind</strong> gives very fast writes and batching (counters, analytics), but you can
+    lose acknowledged writes. Use it only where loss is tolerable or the cache is durable.</li>
+    <li><strong>Write-around</strong> avoids filling the cache with data that is written once and rarely
+    read (logs, uploads).</li>
+  </ul>
+  <pre data-title="CacheAsideService.java"><code class="language-java">import java.time.Duration;
+import java.util.Optional;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+public class ProductService {
+    private final StringRedisTemplate redis;
+    private final ProductRepository repo;
+    private final ObjectMapper json = new ObjectMapper();
+
+    public ProductService(StringRedisTemplate redis, ProductRepository repo) {
+        this.redis = redis;
+        this.repo = repo;
+    }
+
+    public Optional&lt;Product&gt; find(long id) throws Exception {
+        String key = "product:" + id;
+        String cached = redis.opsForValue().get(key);
+        if (cached != null) {                                   // hit
+            return Optional.of(json.readValue(cached, Product.class));
+        }
+        Optional&lt;Product&gt; fromDb = repo.findById(id);           // miss
+        if (fromDb.isPresent()) {
+            redis.opsForValue().set(key, json.writeValueAsString(fromDb.get()),
+                                    Duration.ofMinutes(5));
+        }
+        return fromDb;
+    }
+
+    public void update(Product p) {
+        repo.save(p);                                           // 1. write the source of truth
+        redis.delete("product:" + p.id());                      // 2. then invalidate the cache
+    }
+}</code></pre>
+  <p>Note the order in <code>update</code>: write the database first, then delete the cache entry. Deleting
+  first lets a concurrent reader refill the cache with the old value before your write lands. Even in the
+  right order a tiny race window remains; a TTL bounds the damage.</p>
+
+  <h4>Eviction policies</h4>
+  <p>Memory is limited, so when the cache is full it must <strong>evict</strong> something.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Policy</th><th>Evicts</th><th>Good for</th><th>Weakness</th></tr></thead>
+    <tbody>
+      <tr><td>LRU (least recently used)</td><td>The entry untouched the longest</td><td>General use; recent items are likely reused</td><td>One big scan can flush the hot set</td></tr>
+      <tr><td>LFU (least frequently used)</td><td>The entry used the fewest times</td><td>Stable popularity (top products)</td><td>Old popular items linger; needs counters</td></tr>
+      <tr><td>FIFO</td><td>The oldest inserted</td><td>Simple</td><td>Ignores usage entirely</td></tr>
+      <tr><td>TTL (time to live)</td><td>Entries after a fixed lifetime</td><td>Bounding staleness</td><td>Not an eviction by memory pressure by itself</td></tr>
+      <tr><td>Random</td><td>A random entry</td><td>Cheap, surprisingly decent</td><td>Unpredictable</td></tr>
+    </tbody>
+  </table></div>
+  <p>Redis configures this with <code>maxmemory</code> and <code>maxmemory-policy</code> (for example
+  <code>allkeys-lru</code>, <code>allkeys-lfu</code>, <code>volatile-ttl</code>; Redis uses sampled
+  approximations rather than an exact LRU). Caffeine uses a modern frequency-aware policy (W-TinyLFU).</p>
+  <p>LRU is a classic interview coding task. A hash map plus a doubly linked list gives O(1) get and put.
+  In Java, <code>LinkedHashMap</code> in access order does it in a few lines:</p>
+  <pre data-title="LruCache.java"><code class="language-java">import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class LruCache&lt;K, V&gt; extends LinkedHashMap&lt;K, V&gt; {
+    private final int capacity;
+
+    public LruCache(int capacity) {
+        super(16, 0.75f, true);              // true = access order (LRU)
+        this.capacity = capacity;
+    }
+
+    @Override
+    protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) {
+        return size() &gt; capacity;            // evict the least recently used
+    }
+
+    public static void main(String[] args) {
+        LruCache&lt;String, Integer&gt; c = new LruCache&lt;&gt;(2);
+        c.put("a", 1); c.put("b", 2);
+        c.get("a");                          // a is now most recent
+        c.put("c", 3);                       // evicts b
+        System.out.println(c.keySet());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[a, c]</code></pre>
+  <p>This class is not thread-safe; production code uses Caffeine or Redis.</p>
+
+  <h4>Invalidation strategies</h4>
+  <ul>
+    <li><strong>TTL only:</strong> accept staleness up to N seconds. Simple and robust; always set one, even
+    when you also invalidate explicitly, as a safety net.</li>
+    <li><strong>Explicit invalidation on write:</strong> delete the key (or tag) after updating the
+    database. Fresh, but every writer must know every cached view of the data.</li>
+    <li><strong>Event-driven invalidation:</strong> publish a "product changed" event (Kafka, Redis pub/sub,
+    or CDC from the database log); consumers evict. Decouples writers from caches.</li>
+    <li><strong>Versioned keys:</strong> include a version in the key (<code>product:42:v7</code>); a new
+    version makes the old entry unreachable, and eviction cleans it up.</li>
+    <li><strong>Write-through or refresh-ahead:</strong> update or reload the entry instead of deleting it.</li>
+  </ul>
+  <div class="co co-note">
+    <p class="co-t">"There are only two hard things in computer science"</p>
+    <p>Cache invalidation is on the famous list because the cache and the source can disagree in many ways:
+    races, failed deletes, multiple writers, derived data. The robust answer is: short TTL for safety,
+    delete on write for freshness, and a design where occasional staleness is acceptable.</p>
+  </div>
+
+  <h4>What to cache, and what not to</h4>
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Cache this</p><ul>
+      <li>Read-heavy, rarely changing data: catalogues, configuration, reference data.</li>
+      <li>Expensive results: aggregates, rendered fragments, results of slow joins.</li>
+      <li>Hot objects: popular profiles, trending lists, session data.</li>
+      <li>Data where slight staleness is fine.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Avoid or be careful</p><ul>
+      <li>Frequently changing data with strict freshness needs (account balance, stock count at checkout).</li>
+      <li>Write-heavy data that is rarely re-read.</li>
+      <li>Per-user private data in a shared cache without the user id in the key.</li>
+      <li>Huge objects, or anything that is cheaper to compute than to fetch.</li>
+    </ul></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"I use cache-aside with Redis, a TTL of a few minutes, and delete the key after writing the
+      database."</li>
+      <li>Be ready to compare write-through (fresh, slower writes) with write-behind (fast, can lose
+      data).</li>
+      <li>For eviction, say LRU by default; LFU when popularity is stable; mention O(1) with a hash map and
+      a doubly linked list.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-cache-problems">
+  <h3>Classic cache problems: stampede, penetration, avalanche, hot keys</h3>
+  <p class="tldr">Caches fail in a few well-known ways: stale data, a stampede when a hot key expires,
+  penetration by requests for keys that do not exist, an avalanche when many keys expire together, and hot
+  keys that overload one node; each has a standard fix, and the hit ratio tells you if the cache works.</p>
+
+  <h4>1. Stale data</h4>
+  <p>The cache holds an old value after the source changed. Causes: a TTL that is too long, a missed
+  invalidation, a race between a read-fill and a write. Fixes: delete on write after the database commit,
+  a short TTL as a safety net, versioned keys, and event-based invalidation. Decide per data type how much
+  staleness the business accepts: a product description may be 10 minutes old, a stock count at checkout
+  may not.</p>
+
+  <h4>2. Cache stampede (thundering herd)</h4>
+  <p>A very popular key expires. In the same instant, thousands of requests miss, and all of them run the
+  same expensive database query to rebuild it. The database spikes or collapses.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant R1 as Request 1
+  participant R2 as Request 2
+  participant R3 as Request 3
+  participant C as Cache
+  participant D as Database
+  Note over C: hot key expires
+  R1->>C: get
+  R2->>C: get
+  R3->>C: get
+  C-->>R1: miss
+  C-->>R2: miss
+  C-->>R3: miss
+  R1->>D: heavy query
+  R2->>D: heavy query
+  R3->>D: heavy query
+</pre>
+    <figcaption>All three misses hit the database at once; at 10,000 requests per second the damage is large</figcaption>
+  </figure>
+  <p>Fixes:</p>
+  <ul>
+    <li><strong>Locking (mutex per key):</strong> only the first requester rebuilds; the others wait or get
+    the old value. Distributed version: <code>SET lock:key token NX PX 5000</code> in Redis; always set an
+    expiry on the lock and release it only if you still own it.</li>
+    <li><strong>Request coalescing (single flight):</strong> inside one instance, concurrent requests for
+    the same key share one in-flight load. In Java use a <code>ConcurrentHashMap</code> of
+    <code>CompletableFuture</code>, or Caffeine's <code>LoadingCache</code>, which already does this.</li>
+    <li><strong>Early (probabilistic) refresh:</strong> refresh a key shortly <em>before</em> it expires, in
+    the background, or let the cache serve slightly stale data while one request refreshes
+    (stale-while-revalidate).</li>
+    <li><strong>Never-expire hot keys</strong> and refresh them with a scheduled job.</li>
+  </ul>
+  <pre data-title="SingleFlight.java"><code class="language-java">import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
+
+public class SingleFlight&lt;V&gt; {
+    private final ConcurrentHashMap&lt;String, CompletableFuture&lt;V&gt;&gt; inFlight =
+        new ConcurrentHashMap&lt;&gt;();
+
+    public V load(String key, Supplier&lt;V&gt; loader) {
+        CompletableFuture&lt;V&gt; mine = new CompletableFuture&lt;&gt;();
+        CompletableFuture&lt;V&gt; existing = inFlight.putIfAbsent(key, mine);
+        if (existing != null) {
+            return existing.join();               // someone else is loading: wait for them
+        }
+        try {
+            V value = loader.get();               // only one thread runs the expensive load
+            mine.complete(value);
+            return value;
+        } catch (RuntimeException e) {
+            mine.completeExceptionally(e);
+            throw e;
+        } finally {
+            inFlight.remove(key);
+        }
+    }
+}</code></pre>
+
+  <h4>3. Cache penetration</h4>
+  <p>Requests ask for keys that <em>do not exist</em> (a random product id, or an attacker's flood). The
+  cache never has them, so every request goes through to the database, and the cache gives no protection.</p>
+  <ul>
+    <li><strong>Cache the empty result</strong> (a "null" marker) with a short TTL, such as 30–60 seconds.</li>
+    <li><strong>Bloom filter</strong> in front: a compact probabilistic set of all valid ids. If the filter
+    says "definitely not present", reject at once. It can have false positives (rare, a harmless extra DB
+    check) but never false negatives. Libraries: Guava <code>BloomFilter</code>; Redis has Bloom filter
+    support through its modules. You must add new ids to the filter when records are created.</li>
+    <li><strong>Validate input</strong> (id ranges, formats) and apply rate limiting per client.</li>
+  </ul>
+
+  <h4>4. Cache avalanche</h4>
+  <p>Many keys expire at the same moment (you loaded them together with the same TTL), or the whole cache
+  restarts empty. Suddenly the database gets the load of everything. Fixes:</p>
+  <ul>
+    <li><strong>TTL jitter:</strong> add a random amount, for example 5 minutes plus a random 0–60 seconds.</li>
+    <li><strong>Warm the cache</strong> before taking traffic after a restart.</li>
+    <li><strong>High availability for the cache</strong> (Redis replicas or cluster) so one failure does not
+    empty it.</li>
+    <li><strong>Protect the database:</strong> rate limiting, circuit breaker, request queues, and degraded
+    responses if the cache is down.</li>
+  </ul>
+  <pre data-title="TtlJitter.java"><code class="language-java">import java.time.Duration;
+import java.util.concurrent.ThreadLocalRandom;
+
+static Duration ttlWithJitter(Duration base, Duration maxJitter) {
+    long extra = ThreadLocalRandom.current().nextLong(maxJitter.toSeconds() + 1);
+    return base.plusSeconds(extra);       // 5 min + 0..60 s
+}</code></pre>
+
+  <h4>5. Hot keys</h4>
+  <p>One key gets a huge share of traffic (a celebrity's profile, a flash-sale product). In a sharded cache
+  that key lives on one node, which becomes the bottleneck even though the cluster is idle. Fixes: a short
+  local (in-process) cache in front of Redis for those keys; <strong>replicate the hot key</strong> under
+  several names (<code>product:42#1</code> … <code>#8</code>) and read a random one; detect hot keys by
+  monitoring and promote them automatically.</p>
+
+  <h4>Summary table</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Problem</th><th>What happens</th><th>Main fixes</th></tr></thead>
+    <tbody>
+      <tr><td>Stale data</td><td>Old value served</td><td>Delete on write, short TTL, versioned keys</td></tr>
+      <tr><td>Stampede</td><td>Many rebuilds of one expired key</td><td>Lock, single flight, early refresh</td></tr>
+      <tr><td>Penetration</td><td>Misses for non-existent keys hit the DB</td><td>Cache null, Bloom filter, validation</td></tr>
+      <tr><td>Avalanche</td><td>Many keys expire together</td><td>TTL jitter, warm-up, HA cache</td></tr>
+      <tr><td>Hot key</td><td>One node overloaded</td><td>Local cache, key replication</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Measuring: the hit ratio</h4>
+  <p><strong>Hit ratio</strong> = hits ÷ (hits + misses). A healthy read cache is often above 90%, but the
+  right target depends on the workload. A cache with a 60% hit ratio and an expensive miss path may not be
+  worth its complexity. In Redis, <code>INFO stats</code> reports <code>keyspace_hits</code> and
+  <code>keyspace_misses</code>. Also watch evictions (a high count means the cache is too small), memory
+  use, latency, and the miss-path latency. Spring Boot Actuator and Micrometer expose cache metrics
+  (<a href="04-spring-boot.html#m6">Spring Boot · Module 6</a>).</p>
+  <p>The value of a hit ratio is easy to compute: if a hit costs 1 ms and a miss costs 51 ms (1 ms cache
+  check plus 50 ms database), a 90% ratio gives an average of 0.9 × 1 + 0.1 × 51 = 6 ms; at 99% it is
+  1.5 ms. Small ratio gains matter a lot when misses are expensive.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Caching without a TTL: stale entries live forever after one missed invalidation.</li>
+      <li>One shared TTL for everything loaded together (avalanche).</li>
+      <li>Not caching "not found", so misses are never absorbed.</li>
+      <li>Storing mutable objects shared across threads in a local cache, then changing them.</li>
+      <li>Treating the cache as the source of truth. It can disappear at any time; the app must work without
+      it, only slower.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Name all three: stampede (hot key expires; fix with locking or early refresh), penetration
+      (non-existent keys; fix with null caching and Bloom filters), avalanche (mass expiry; fix with TTL
+      jitter).</li>
+      <li>Explain the cache-aside write order: database first, then delete the key.</li>
+      <li>Close with the metric: "I would track the hit ratio, evictions and miss latency."</li>
+    </ul>
+  </div>
+</article>

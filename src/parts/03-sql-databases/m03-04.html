@@ -1,0 +1,659 @@
+<article class="topic" id="m3-classic-nth-salary">
+  <h3>Classic query: second and Nth highest salary</h3>
+  <p class="tldr">"Find the second highest salary" is the most asked SQL interview question. Know three
+  answers: a subquery with <code>MAX</code>, <code>LIMIT … OFFSET</code> on distinct values, and
+  <code>DENSE_RANK</code>, then turn the last into an Nth-highest function.</p>
+
+  <h4>The question and its traps</h4>
+  <p>Distinct salaries in the sample data, highest first: 300000, 220000, 160000, 150000, 120000, 110000,
+  90000, 75000, 65000, 55000. Three people share 150000, which is why the question says "highest
+  <em>salary</em>", not "second row". Clarify in the interview: do ties count once (the usual meaning)? What
+  should be returned if there is no second salary (NULL, not an error)?</p>
+
+  <h4>How each approach works</h4>
+  <p>Knowing the mechanics lets you explain the answer, not just recite it.</p>
+  <ul>
+    <li><strong>MAX approach.</strong> The inner query finds the top value (300000). The outer query throws that
+    value away with <code>salary &lt; 300000</code> and takes the maximum of what is left (220000). It is two
+    passes over the table, or two index lookups when <code>salary</code> is indexed.</li>
+    <li><strong>OFFSET approach.</strong> <code>SELECT DISTINCT salary</code> makes a list of unique values,
+    <code>ORDER BY … DESC</code> sorts it, <code>OFFSET 1</code> skips the top value and
+    <code>LIMIT 1</code> keeps the next one. Think "sort the distinct values, skip N-1".</li>
+    <li><strong>DENSE_RANK approach.</strong> The window function numbers the rows by salary, giving tied rows
+    the same number and never leaving gaps (1, 2, 3, 4, 4, 4, 5 …). Then a plain <code>WHERE rnk = N</code>
+    picks the group. The <code>CTE</code> is needed because a window function cannot be used directly in
+    <code>WHERE</code> (it runs after it; see <a href="#m2-logical-order">Logical order of a query</a>).</li>
+  </ul>
+  <p>The rank each tool gives to the sample salaries shows why the choice matters:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Salary</th><th><code>ROW_NUMBER</code></th><th><code>RANK</code></th><th><code>DENSE_RANK</code></th></tr></thead>
+    <tbody>
+      <tr><td>300000</td><td>1</td><td>1</td><td>1</td></tr>
+      <tr><td>220000</td><td>2</td><td>2</td><td>2</td></tr>
+      <tr><td>160000</td><td>3</td><td>3</td><td>3</td></tr>
+      <tr><td>150000 (three people)</td><td>4, 5, 6</td><td>4, 4, 4</td><td>4, 4, 4</td></tr>
+      <tr><td>120000</td><td>7</td><td>7</td><td>5</td></tr>
+    </tbody>
+  </table></div>
+  <p>The fifth highest <em>salary</em> is 120000. Only <code>DENSE_RANK = 5</code> finds it. <code>RANK = 5</code>
+  returns no row at all (the ranks jump from 4 to 7), and <code>ROW_NUMBER = 5</code> returns one of the three
+  150000 earners, chosen arbitrarily. Details of the three functions are in
+  <a href="#m3-window-ranking">ranking functions</a>.</p>
+
+  <h4>Approach 1: subquery with MAX</h4>
+  <pre data-title="Highest salary below the maximum"><code class="language-sql">SELECT MAX(salary) AS second_highest
+FROM employees
+WHERE salary &lt; (SELECT MAX(salary) FROM employees);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> second_highest
+----------------
+      220000.00
+(1 row)</code></pre>
+  <p>Works everywhere, returns NULL if no second value exists (MAX of nothing), and is easy to explain. It does
+  not generalise to the Nth value without nesting more.</p>
+
+  <h4>Approach 2: LIMIT with OFFSET on distinct values</h4>
+  <pre data-title="Skip one distinct value, take the next"><code class="language-sql">SELECT (SELECT DISTINCT salary
+        FROM employees
+        ORDER BY salary DESC
+        LIMIT 1 OFFSET 1) AS second_highest;</code></pre>
+  <p>Same output. The outer <code>SELECT ( … )</code> is the trick that turns "no row" into NULL; without it
+  the query returns an empty result. Forgetting <code>DISTINCT</code> is the classic bug: the rows 150000, 150000, 150000 count as three positions, so the fifth "row" is 150000 while the fifth highest salary is 120000. Standard SQL spelling:
+  <code>OFFSET 1 ROWS FETCH FIRST 1 ROW ONLY</code>.</p>
+
+  <h4>Approach 3: DENSE_RANK</h4>
+  <pre data-title="Rank the salaries, pick rank 2"><code class="language-sql">WITH ranked AS (
+    SELECT first_name, salary,
+           DENSE_RANK() OVER (ORDER BY salary DESC) AS rnk
+    FROM employees
+)
+SELECT first_name, salary
+FROM ranked
+WHERE rnk = 2;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name |  salary
+------------+-----------
+ Vikram     | 220000.00
+(1 row)</code></pre>
+  <p>This version returns the <em>people</em> and returns all of them when several share the Nth salary: change
+  to <code>rnk = 4</code> and you get Ananya, Priya and Rahul (150000). It is the answer to give when the
+  interviewer asks "who earns the Nth highest?".</p>
+
+  <h4>Nth highest salary per department</h4>
+  <p>The usual follow-up. Add <code>PARTITION BY dept_id</code> so the numbering restarts in every department:</p>
+  <pre data-title="Second highest salary in each department"><code class="language-sql">WITH ranked AS (
+    SELECT dept_id, first_name, salary,
+           DENSE_RANK() OVER (PARTITION BY dept_id ORDER BY salary DESC) AS rnk
+    FROM employees
+)
+SELECT dept_id, first_name, salary
+FROM ranked
+WHERE rnk = 2
+ORDER BY dept_id, first_name;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id | first_name |  salary
+---------+------------+-----------
+       1 | Priya      | 150000.00
+       1 | Rahul      | 150000.00
+       2 | Ananya     | 150000.00
+       3 | Farhan     |  65000.00
+(4 rows)</code></pre>
+  <p>Engineering has salaries 220000, 150000, 150000, 110000 and 90000, so both 150000 earners are second.
+  Meera is alone in her group (no department), so there is no second salary and she does not appear. A
+  department with one distinct salary simply has no row in the result; if the question wants one row per
+  department with NULL for "none", join the result back to <code>departments</code> with a
+  <code>LEFT JOIN</code>.</p>
+
+  <h4>Nth highest as a function</h4>
+  <pre data-title="PostgreSQL"><code class="language-sql">CREATE OR REPLACE FUNCTION nth_highest_salary(n INT)
+RETURNS NUMERIC
+LANGUAGE sql STABLE
+AS $$
+    SELECT (SELECT DISTINCT salary
+            FROM employees
+            ORDER BY salary DESC
+            LIMIT 1 OFFSET n - 1);
+$$;
+
+SELECT nth_highest_salary(3) AS third, nth_highest_salary(20) AS twentieth;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">   third   | twentieth
+-----------+-----------
+ 160000.00 |    (null)
+(1 row)</code></pre>
+  <p>MySQL does not accept an expression after <code>LIMIT</code> or <code>OFFSET</code> inside a function,
+  so the usual form first computes the offset in a variable:</p>
+  <pre data-title="MySQL"><code class="language-sql">CREATE FUNCTION getNthHighestSalary(N INT) RETURNS DECIMAL(10,2)
+DETERMINISTIC
+BEGIN
+    SET N = N - 1;
+    RETURN (SELECT DISTINCT salary FROM employees ORDER BY salary DESC LIMIT 1 OFFSET N);
+END;</code></pre>
+  <p>A fourth, window-free way that works on any version is the counting definition: a salary is the Nth
+  highest if exactly N-1 distinct salaries are above it.</p>
+  <pre data-title="Counting distinct higher salaries"><code class="language-sql">SELECT DISTINCT e1.salary
+FROM employees e1
+WHERE (SELECT COUNT(DISTINCT e2.salary) FROM employees e2 WHERE e2.salary &gt; e1.salary) = 2;
+-- 160000.00  (the third highest)</code></pre>
+  <p>It is a correlated subquery, so it is slow on big tables; mention it as the "no window functions"
+  answer.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Approach</th><th>Handles ties</th><th>Missing Nth value</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>MAX</code> + subquery</td><td>yes</td><td>NULL</td><td>only practical for 2nd</td></tr>
+      <tr><td><code>DISTINCT … OFFSET</code></td><td>yes (needs <code>DISTINCT</code>)</td><td>NULL if wrapped</td><td>short; fast with an index on salary</td></tr>
+      <tr><td><code>DENSE_RANK</code></td><td>yes</td><td>empty result</td><td>returns the people; most flexible</td></tr>
+      <tr><td>Counting subquery</td><td>yes</td><td>empty result</td><td>works on old MySQL; slow</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases: NULLs, one value, empty table</p>
+    <ul>
+      <li><strong>NULL salaries.</strong> The sample column is <code>NOT NULL</code>, but in other tables it may
+      not be. PostgreSQL sorts NULL <em>first</em> in <code>DESC</code> order, so
+      <code>ORDER BY salary DESC LIMIT 1 OFFSET 1</code> can return NULL as the "highest". Add
+      <code>WHERE salary IS NOT NULL</code> (or <code>NULLS LAST</code>). MySQL sorts NULL last in
+      <code>DESC</code>, so the same query behaves differently there. <code>MAX</code> ignores NULL, so
+      approach 1 is safe.</li>
+      <li><strong>Only one distinct salary.</strong> All employees earn the same: there is no second value.
+      Approach 1 returns NULL, approach 2 (wrapped) returns NULL, approach 3 returns no rows.</li>
+      <li><strong>Empty table.</strong> <code>MAX</code> of nothing is NULL, so approach 1 returns NULL as
+      well.</li>
+      <li><strong>N larger than the number of values.</strong> <code>nth_highest_salary(20)</code> returns NULL
+      as shown. A negative N makes <code>OFFSET</code> fail with a "OFFSET must not be negative" error.</li>
+    </ul>
+  </div>
+  <div class="co co-rule">
+    <p class="co-t">Rule: say what "Nth highest" means before you write SQL</p>
+    <p>Two readings exist. <em>Nth highest value</em>: ties count once (what this article solves). <em>Nth
+    row</em> in the sorted list: ties take several places. The first is the standard interview meaning. Return
+    the <strong>salary</strong> for a "value" question and the <strong>employees</strong> for a "who" question.
+    State your choice in one sentence.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: pick by what you need back</p>
+    <p>Need only the number, once, on any database: the <code>MAX</code> subquery or the wrapped
+    <code>OFFSET</code>. Need the people, ties, or a per-group answer: <code>DENSE_RANK</code>. Need it in a
+    reusable function or API: the wrapped <code>OFFSET</code> inside a function, as above. In an application,
+    prefer one query with <code>DENSE_RANK</code> over loading all salaries into Java and sorting them.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: ORDER BY salary DESC LIMIT 1 OFFSET 1 without DISTINCT</p>
+    <p>Without <code>DISTINCT</code> it counts rows, not values: the 4th, 5th and 6th rows all hold 150000, so "fifth highest" comes out wrong, and it also gives the wrong second value whenever two people share the top salary. Rank values, not rows.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: RANK() for the Nth highest value</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: no row for N = 5</p><pre><code class="language-sql">SELECT salary FROM (
+    SELECT salary, RANK() OVER (ORDER BY salary DESC) AS rnk
+    FROM employees) t
+WHERE rnk = 5;        -- 0 rows: ranks go 4, 4, 4, 7</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: DENSE_RANK has no gaps</p><pre><code class="language-sql">SELECT DISTINCT salary FROM (
+    SELECT salary, DENSE_RANK() OVER (ORDER BY salary DESC) AS rnk
+    FROM employees) t
+WHERE rnk = 5;        -- 120000.00</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Give approach 1 first (always works), then the <code>DENSE_RANK</code> version for Nth and ties. Say what
+    you return when there is no such salary. Variants: "Nth highest per department" (add
+    <code>PARTITION BY dept_id</code>), "second highest without <code>LIMIT</code> or window functions"
+    (approach 1).</p>
+    <p>Expect these follow-ups: "what if two people share the top salary?", "what if there is no second salary?", "do it for every department", and "how would you make it fast on 50 million rows?" (an index on <code>salary</code> lets the database walk the index from the top and stop; the counting subquery cannot use it well).</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-classic-duplicates">
+  <h3>Classic query: find and delete duplicates</h3>
+  <p class="tldr">Find duplicates with <code>GROUP BY … HAVING COUNT(*) &gt; 1</code>, see the extra rows with a
+  window <code>ROW_NUMBER</code>, delete all but one copy with a self-join or window delete, and then add a
+  <code>UNIQUE</code> constraint so it cannot happen again.</p>
+
+  <p>Duplicates enter a table in a few predictable ways: a form submitted twice, a retry after a timeout
+  (the first request had actually succeeded), a CSV imported twice, or a missing <code>UNIQUE</code>
+  constraint in the first place. The fix always has two parts: clean the existing rows, then close the door so
+  it cannot happen again. First decide what "duplicate" means: the same email, or the same name <em>and</em>
+  date of birth? That decision is the list of columns you group by.</p>
+
+  <h4>A table with duplicates</h4>
+  <p>The sample <code>employees.email</code> is unique, so create a scratch table that lacks the constraint, like
+  a badly imported sign-up list:</p>
+  <pre data-title="Practice data"><code class="language-sql">CREATE TEMP TABLE signups (
+    id    INT PRIMARY KEY,
+    email VARCHAR(100) NOT NULL
+);
+INSERT INTO signups VALUES
+    (1, 'a@x.com'), (2, 'b@x.com'), (3, 'a@x.com'),
+    (4, 'c@x.com'), (5, 'b@x.com'), (6, 'a@x.com');</code></pre>
+
+  <h4>Finding duplicates</h4>
+  <pre data-title="Which values repeat"><code class="language-sql">SELECT email, COUNT(*) AS copies
+FROM signups
+GROUP BY email
+HAVING COUNT(*) &gt; 1
+ORDER BY email;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">  email  | copies
+---------+--------
+ a@x.com |      3
+ b@x.com |      2
+(2 rows)</code></pre>
+  <p>To see the rows themselves, with their ids, number the copies of each email. Row number 1 is the original,
+  higher numbers are the extras:</p>
+  <pre data-title="Number the copies"><code class="language-sql">SELECT id, email,
+       ROW_NUMBER() OVER (PARTITION BY email ORDER BY id) AS copy_no
+FROM signups
+ORDER BY email, id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> id |  email  | copy_no
+----+---------+---------
+  1 | a@x.com |       1
+  3 | a@x.com |       2
+  6 | a@x.com |       3
+  2 | b@x.com |       1
+  5 | b@x.com |       2
+  4 | c@x.com |       1
+(6 rows)</code></pre>
+  <p>Another way is a self join: <code>FROM signups a JOIN signups b ON a.email = b.email AND a.id &lt;
+  b.id</code> returns each duplicate pair once. For several columns together (name and date of birth), group by
+  all of them.</p>
+
+  <p><strong>How <code>GROUP BY … HAVING</code> finds them.</strong> The database puts rows with the same email
+  into one group, counts each group, and <code>HAVING</code> keeps only the groups with a count above 1. Each
+  returned row stands for several table rows. That is why this query tells you <em>which values</em> repeat
+  but not which ids; use the window query or a join when you need the ids.</p>
+
+  <h4>Duplicates over several columns, and near-duplicates</h4>
+  <p>Group by every column that together defines a duplicate. Another scratch table, where the same person is
+  entered twice in different cities:</p>
+  <pre data-title="Practice data and the finder"><code class="language-sql">CREATE TEMP TABLE contacts (id INT PRIMARY KEY, name VARCHAR(30), city VARCHAR(30));
+INSERT INTO contacts VALUES
+    (1,'Asha','Pune'), (2,'Asha','Pune'), (3,'Asha','Delhi'),
+    (4,'Bilal','Delhi'), (5,'Bilal','Delhi');
+
+SELECT name, city, COUNT(*) AS copies
+FROM contacts
+GROUP BY name, city
+HAVING COUNT(*) &gt; 1
+ORDER BY name;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> name  | city  | copies
+-------+-------+--------
+ Asha  | Pune  |      2
+ Bilal | Delhi |      2
+(2 rows)</code></pre>
+  <p>Asha in Delhi is a different group, so she is not reported. Real data is messier:
+  <code>'A@x.com'</code>, <code>'a@x.com'</code> and <code>'a@x.com '</code> (trailing space) are the same
+  address to a human but three values to <code>GROUP BY</code>. Normalise inside the query:
+  <code>GROUP BY LOWER(TRIM(email))</code>. Clean the data on the way in, too.</p>
+
+  <h4>Deleting duplicates, keeping one row</h4>
+  <p>Keep the row with the lowest id. Three ways; each deletes ids 3, 5 and 6 and leaves 1, 2 and 4. Try them
+  inside <code>BEGIN … ROLLBACK</code>.</p>
+  <pre data-title="1. Self-join delete (PostgreSQL)"><code class="language-sql">DELETE FROM signups AS s
+USING signups AS keep
+WHERE s.email = keep.email
+  AND s.id &gt; keep.id;</code></pre>
+  <pre data-title="2. Keep the MIN(id) of each group"><code class="language-sql">DELETE FROM signups
+WHERE id NOT IN (SELECT MIN(id) FROM signups GROUP BY email);</code></pre>
+  <pre data-title="3. ROW_NUMBER"><code class="language-sql">DELETE FROM signups
+WHERE id IN (
+    SELECT id
+    FROM (SELECT id,
+                 ROW_NUMBER() OVER (PARTITION BY email ORDER BY id) AS rn
+          FROM signups) AS t
+    WHERE rn &gt; 1
+);</code></pre>
+  <pre class="out" data-title="Result after any of them: DELETE 3"><code class="language-plaintext"> id |  email
+----+---------
+  1 | a@x.com
+  2 | b@x.com
+  4 | c@x.com
+(3 rows)</code></pre>
+  <p>Approach 2 is safe here because <code>MIN(id)</code> is never NULL; with a nullable column <code>NOT
+  IN</code> is the trap from <a href="#m2-join-traps">Join traps</a>. In MySQL you cannot select from the table
+  you delete from in a subquery (<code>ERROR 1093</code>), so use a join delete:
+  <code>DELETE s FROM signups s JOIN signups k ON s.email = k.email AND s.id &gt; k.id;</code>. If the table has
+  no id column, PostgreSQL offers the hidden physical row id <code>ctid</code> to tell identical rows apart
+  (<code>DELETE FROM t WHERE ctid NOT IN (SELECT MIN(ctid) FROM t GROUP BY …)</code>).</p>
+  <p>Another option for a huge table is to build a clean copy and swap:
+  <code>CREATE TABLE signups_clean AS SELECT DISTINCT ON (email) * FROM signups ORDER BY email, id;</code>.</p>
+
+  <p>Before deleting, look at what <em>would</em> go. <code>DELETE … RETURNING</code> in PostgreSQL shows the
+  rows it removed, which is handy for an audit log or a quick check inside a transaction:</p>
+  <pre data-title="See what was removed (PostgreSQL)"><code class="language-sql">BEGIN;
+DELETE FROM signups s
+USING signups keep
+WHERE s.email = keep.email AND s.id &gt; keep.id
+RETURNING s.id, s.email;      -- 3 a@x.com, 5 b@x.com, 6 a@x.com
+ROLLBACK;                     -- change to COMMIT when the list is right</code></pre>
+  <p><strong>Keeping the newest instead.</strong> Change the tie-breaker. With the window version, number the
+  copies from the other end (<code>ORDER BY id DESC</code>) and still delete <code>rn &gt; 1</code>; with
+  <code>MIN(id)</code> use <code>MAX(id)</code>. "Keep the most complete row" needs a rule such as "the row with
+  the fewest NULLs", usually a window <code>ORDER BY</code> on a computed score.</p>
+
+  <h4>Which method to choose</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Strength</th><th>Weakness</th></tr></thead>
+    <tbody>
+      <tr><td>Self-join delete</td><td>Short; easy to reason about</td><td>Different syntax in MySQL and
+      PostgreSQL; slow without an index on the key column</td></tr>
+      <tr><td><code>NOT IN (SELECT MIN(id) …)</code></td><td>Readable</td><td>NULL trap; MySQL error 1093</td></tr>
+      <tr><td><code>ROW_NUMBER</code> then delete <code>rn &gt; 1</code></td><td>Very flexible keep rule;
+      the <code>SELECT</code> doubles as a preview</td><td>Needs MySQL 8 or PostgreSQL</td></tr>
+      <tr><td>Build a clean copy (<code>DISTINCT ON</code>), swap names</td><td>No long delete, no dead rows</td>
+      <td>Must recreate indexes, constraints and grants</td></tr>
+      <tr><td><code>ctid</code> (PostgreSQL)</td><td>Works with no key column at all</td><td>Physical
+      address, changes on update; use only in a controlled cleanup</td></tr>
+    </tbody>
+  </table></div>
+  <p>With <em>no</em> unique column, rank the physical rows instead. This works in PostgreSQL for completely
+  identical rows (<code>ORDER BY ctid</code> inside the window picks a stable survivor):</p>
+  <pre data-title="Identical rows, no key (PostgreSQL)"><code class="language-sql">DELETE FROM signups
+WHERE ctid IN (
+    SELECT ctid
+    FROM (SELECT ctid,
+                 ROW_NUMBER() OVER (PARTITION BY email ORDER BY ctid) AS rn
+          FROM signups) AS t
+    WHERE rn &gt; 1
+);</code></pre>
+  <p>The shorter <code>MIN(ctid)</code> form shown above needs a recent PostgreSQL (the <code>MIN</code>
+  aggregate for <code>ctid</code> arrived in version 14); the window form works on older ones too. On a very
+  large table, delete in batches (for example 10,000 ids at a time) so locks and the transaction stay short.
+  PostgreSQL leaves the removed rows as dead space until <code>VACUUM</code> reclaims it.</p>
+
+  <h4>Preventing duplicates</h4>
+  <pre data-title="Stop it at the source"><code class="language-sql">ALTER TABLE signups ADD CONSTRAINT uq_signups_email UNIQUE (email);
+-- case-insensitive version:  CREATE UNIQUE INDEX uq_signups_email_lower ON signups (LOWER(email));</code></pre>
+  <p>You can only add the constraint after the duplicates are gone, otherwise it fails with
+  <code>ERROR:  could not create unique index "uq_signups_email"</code> and
+  <code>DETAIL:  Key (email)=(a@x.com) is duplicated.</code>.</p>
+
+  <p>If the duplicates come from a data load, let the database skip them: PostgreSQL
+  <code>INSERT … ON CONFLICT (email) DO NOTHING</code>, MySQL <code>INSERT IGNORE</code> or
+  <code>ON DUPLICATE KEY UPDATE</code> (see <a href="#m1-insert-upsert">INSERT and upserts</a>). In application
+  code, catch the constraint violation (in Spring this surfaces as
+  <code>DataIntegrityViolationException</code>) instead of "check then insert", which two parallel requests can
+  both pass.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: decide which copy survives, then test with SELECT first</p>
+    <p>"Keep the oldest", "keep the newest", "keep the most complete" are different queries. Run the
+    <code>SELECT</code> of the rows to be removed (<code>rn &gt; 1</code>), check the count, then delete inside a
+    transaction.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases: NULLs and the unique constraint</p>
+    <ul>
+      <li><code>GROUP BY</code> puts all NULLs into one group, so rows with a NULL email show up as a "duplicate
+      group". But a plain <code>a.email = b.email</code> self-join never matches NULL to NULL. Pick one on
+      purpose; to match NULLs write <code>a.email IS NOT DISTINCT FROM b.email</code> (PostgreSQL) or
+      <code>a.email &lt;=&gt; b.email</code> (MySQL).</li>
+      <li>A <code>UNIQUE</code> constraint does <em>not</em> stop repeated NULLs in PostgreSQL or MySQL. If
+      "no two empty emails" must hold, make the column <code>NOT NULL</code>.</li>
+      <li>If the unique key is case-insensitive (usernames), enforce it with
+      <code>UNIQUE (LOWER(email))</code> as an index, not just a constraint on the raw column. MySQL's default
+      collation is already case-insensitive, so there <code>'A@x.com'</code> and <code>'a@x.com'</code> clash
+      without extra work.</li>
+      <li>Foreign keys that point at the removed rows block the delete (or cascade). Re-point the children to the
+      surviving id first.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: deleting every row that has a duplicate</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: removes the originals too</p><pre><code class="language-sql">DELETE FROM signups
+WHERE email IN (SELECT email FROM signups
+                GROUP BY email HAVING COUNT(*) &gt; 1);
+-- deletes ids 1, 2, 3, 5, 6: only id 4 survives</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: spare one row per group</p><pre><code class="language-sql">DELETE FROM signups
+WHERE id NOT IN (SELECT MIN(id) FROM signups GROUP BY email);
+-- deletes ids 3, 5, 6</code></pre></div>
+    </div>
+    <p>The finder query returns <em>values</em>; deleting by value removes every copy. Always keep one id.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: verify after the cleanup</p>
+    <p>Re-run the finder query; it must return 0 rows. Compare the row count before and after
+    (<code>6 − 3 = 3</code> here). Only then add the constraint, in the same migration if possible. In real
+    projects this goes into a Flyway or Liquibase script, run on a copy of production data first.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: SELECT DISTINCT is not a cleanup</p>
+    <p><code>SELECT DISTINCT</code> hides duplicates in one query but leaves them in the table. The data problem
+    stays, and every other query has to remember to hide them.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Two parts: "find duplicate emails" (<code>GROUP BY … HAVING</code>) and "delete duplicates keeping one"
+    (self join or <code>ROW_NUMBER</code>). The follow-up is "how do you prevent them?" (unique constraint) and
+    "what if there is no primary key?" (<code>ctid</code>, or create a new table with <code>DISTINCT</code>).</p>
+    <p>A strong answer also names the trade-offs: the self join needs an index to be fast, <code>NOT IN</code> has the NULL trap, <code>ROW_NUMBER</code> lets you choose which copy to keep, and you always preview with a <code>SELECT</code> and run the delete in a transaction. Another variant: "find the second occurrence only" (<code>rn = 2</code>).</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-classic-comparisons">
+  <h3>Classic queries: higher than manager, top N per group, nothing to match</h3>
+  <p class="tldr">Employees earning more than their manager (a self join), the top 3 salaries per department
+  (<code>DENSE_RANK</code>), and departments or customers with nothing attached (anti-joins) are the next three
+  interview staples.</p>
+
+  <h4>Employees who earn more than their manager</h4>
+  <p>Join the table to itself: <code>e</code> is the employee, <code>m</code> is the manager, and compare their
+  salaries.</p>
+  <pre data-title="Approach 1: self join"><code class="language-sql">SELECT e.first_name AS employee, e.salary,
+       m.first_name AS manager,  m.salary AS manager_salary
+FROM employees AS e
+JOIN employees AS m ON m.emp_id = e.manager_id
+WHERE e.salary &gt; m.salary;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> employee |  salary   | manager | manager_salary
+----------+-----------+---------+----------------
+ Karan    | 160000.00 | Ananya  |      150000.00
+(1 row)</code></pre>
+  <p>Rahul earns exactly what his manager Priya earns, so he does not qualify (strict
+  <code>&gt;</code>). An inner join is right here: the CEO has no manager and cannot earn more than one.
+  Approach 2 is a correlated subquery:</p>
+  <pre data-title="Approach 2: correlated subquery"><code class="language-sql">SELECT first_name, salary
+FROM employees AS e
+WHERE salary &gt; (SELECT m.salary FROM employees AS m WHERE m.emp_id = e.manager_id);</code></pre>
+  <p>Same result (Karan). It is fine because each employee has at most one manager, so the subquery returns at
+  most one value.</p>
+
+  <p><strong>How the self join works.</strong> The same table is used twice under two aliases, so each row of
+  <code>e</code> is paired with exactly one row of <code>m</code>: the one whose <code>emp_id</code> equals
+  its <code>manager_id</code>. After the join the database has one wide row per employee that has a manager;
+  <code>WHERE</code> then compares the two salaries. A few of the 11 pairs:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Employee</th><th>Salary</th><th>Manager</th><th>Manager salary</th><th>Earns more?</th></tr></thead>
+    <tbody>
+      <tr><td>Priya</td><td>150000</td><td>Vikram</td><td>220000</td><td>no</td></tr>
+      <tr><td>Rahul</td><td>150000</td><td>Priya</td><td>150000</td><td>no (equal)</td></tr>
+      <tr><td>Karan</td><td>160000</td><td>Ananya</td><td>150000</td><td>yes</td></tr>
+      <tr><td>Isha</td><td>55000</td><td>Sunita</td><td>120000</td><td>no</td></tr>
+    </tbody>
+  </table></div>
+  <p>To list <em>everyone</em> with the manager's name, including the CEO, switch to a <code>LEFT JOIN</code>;
+  Meera then shows NULL as manager. For a comparison question, though, the inner join is correct.</p>
+
+  <h4>Earning more than the department average</h4>
+  <p>A close cousin: compare each row with an aggregate of its own group. The window version computes the
+  average once per department and keeps it next to every row:</p>
+  <pre data-title="Above the department average"><code class="language-sql">SELECT first_name, dept_id, salary
+FROM (SELECT first_name, dept_id, salary,
+             AVG(salary) OVER (PARTITION BY dept_id) AS dept_avg
+      FROM employees) AS t
+WHERE salary &gt; dept_avg
+ORDER BY dept_id, salary DESC, first_name;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name | dept_id |  salary
+------------+---------+-----------
+ Vikram     |       1 | 220000.00
+ Priya      |       1 | 150000.00
+ Rahul      |       1 | 150000.00
+ Karan      |       2 | 160000.00
+ Ananya     |       2 | 150000.00
+ Sunita     |       3 | 120000.00
+(6 rows)</code></pre>
+  <p>The averages are 144,000 for Engineering, about 128,333 for Sales and 80,000 for HR. Meera forms a group of
+  one, and nobody is above their own average there. The older form is a correlated subquery,
+  <code>WHERE salary &gt; (SELECT AVG(salary) FROM employees x WHERE x.dept_id = e.dept_id)</code>; it gives the
+  same rows but recomputes the average per row unless the optimizer rewrites it. Note that in the subquery
+  version <code>x.dept_id = e.dept_id</code> is never true for NULL, so Meera would be dropped (her salary is
+  compared with NULL).</p>
+
+  <h4>Top 3 salaries in each department</h4>
+  <p>Covered in <a href="#m3-window-ranking">ranking functions</a>; here is the answer to give in an interview
+  (department names included):</p>
+  <pre data-title="Approach 1: DENSE_RANK in a CTE"><code class="language-sql">WITH ranked AS (
+    SELECT e.dept_id, e.first_name, e.salary,
+           DENSE_RANK() OVER (PARTITION BY e.dept_id ORDER BY e.salary DESC) AS pos
+    FROM employees AS e
+)
+SELECT d.name AS department, r.first_name, r.salary
+FROM ranked AS r
+JOIN departments AS d ON d.dept_id = r.dept_id
+WHERE r.pos &lt;= 3
+ORDER BY d.name, r.pos, r.first_name;</code></pre>
+  <pre class="out" data-title="Output (10 rows)"><code class="language-plaintext"> department | first_name |  salary
+------------+------------+-----------
+ Engineering | Vikram    | 220000.00
+ Engineering | Priya     | 150000.00
+ Engineering | Rahul     | 150000.00
+ Engineering | Arjun     | 110000.00
+ HR          | Sunita    | 120000.00
+ HR          | Farhan    |  65000.00
+ HR          | Isha      |  55000.00
+ Sales       | Karan     | 160000.00
+ Sales       | Ananya    | 150000.00
+ Sales       | Neha      |  75000.00
+(10 rows)</code></pre>
+  <p>The inner join drops Meera (no department). Approach 2 is the correlated count of distinct higher salaries
+  (&lt; 3) and approach 3 the <code>LATERAL</code> join with <code>LIMIT 3</code>, both shown in the ranking
+  article. Say clearly whether ties may return more than 3 rows.</p>
+
+  <p><strong>Ties decide which function to use.</strong> Engineering has two people at 150000, so "top 2" is
+  not clear-cut:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Function, rank &lt;= 2</th><th>Engineering rows returned</th><th>Comment</th></tr></thead>
+    <tbody>
+      <tr><td><code>ROW_NUMBER</code></td><td>Vikram, plus one of Priya or Rahul</td><td>Exactly 2 rows, but the
+      second is arbitrary unless you add a tie-breaker</td></tr>
+      <tr><td><code>RANK</code></td><td>Vikram, Priya, Rahul</td><td>Everyone tied for 2nd; 3 rows</td></tr>
+      <tr><td><code>DENSE_RANK</code></td><td>Vikram, Priya, Rahul</td><td>Same here; differs from
+      <code>RANK</code> only below a tie</td></tr>
+    </tbody>
+  </table></div>
+  <p>Choose <code>ROW_NUMBER</code> (with <code>ORDER BY salary DESC, emp_id</code>) when you need exactly N rows
+  per group, and <code>DENSE_RANK</code> when "top N salaries" means N distinct values. For the special case
+  "the single highest earner per department" PostgreSQL has a short form:</p>
+  <pre data-title="Top 1 per group with DISTINCT ON (PostgreSQL)"><code class="language-sql">SELECT DISTINCT ON (dept_id) dept_id, first_name, salary
+FROM employees
+ORDER BY dept_id, salary DESC;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id | first_name |  salary
+---------+------------+-----------
+       1 | Vikram     | 220000.00
+       2 | Karan      | 160000.00
+       3 | Sunita     | 120000.00
+  (null) | Meera      | 300000.00
+(4 rows)</code></pre>
+  <p>Here Meera appears, because <code>DISTINCT ON</code> treats NULL as its own group; the join-based answer
+  above drops her. Decide whether people without a department belong in the report. MySQL has no
+  <code>DISTINCT ON</code>; use <code>ROW_NUMBER() … = 1</code>.</p>
+
+  <h4>Departments with no employees</h4>
+  <pre data-title="Three ways"><code class="language-sql">-- 1. LEFT JOIN ... IS NULL
+SELECT d.name FROM departments d
+LEFT JOIN employees e ON e.dept_id = d.dept_id
+WHERE e.emp_id IS NULL;
+
+-- 2. NOT EXISTS
+SELECT d.name FROM departments d
+WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.dept_id);
+
+-- 3. NOT IN  (broken here)
+SELECT d.name FROM departments d
+WHERE d.dept_id NOT IN (SELECT dept_id FROM employees);</code></pre>
+  <pre class="out" data-title="Output of 1 and 2; query 3 returns 0 rows"><code class="language-plaintext">   name
+-----------
+ Marketing
+(1 row)</code></pre>
+  <p>Query 3 returns nothing because <code>employees.dept_id</code> contains a NULL (Meera). This is the
+  sample database's built-in trap. A fourth form uses aggregation:
+  <code>… LEFT JOIN … GROUP BY d.dept_id HAVING COUNT(e.emp_id) = 0</code>.</p>
+
+  <h4>Customers who never ordered</h4>
+  <p>The same pattern on the shop tables; the answer is Sara Khan and Tanvi Desai. All three forms are in
+  <a href="#m2-join-traps">Join traps</a>. Related variants to practise: products never sold (Desk Lamp),
+  customers with only cancelled orders (none: Kabir has a delivered one), and departments without an active
+  project (Sales).</p>
+
+  <p>Run it to see the real output for customers (the pattern is identical to the department query):</p>
+  <pre data-title="Customers who never ordered"><code class="language-sql">SELECT c.customer_id, c.name
+FROM customers AS c
+WHERE NOT EXISTS (SELECT 1 FROM orders AS o WHERE o.customer_id = c.customer_id)
+ORDER BY c.customer_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> customer_id |    name
+-------------+-------------
+           6 | Sara Khan
+           7 | Tanvi Desai
+(2 rows)</code></pre>
+
+  <h4>Choosing an anti-join form</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Form</th><th>NULL-safe</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>NOT EXISTS</code></td><td>yes</td><td>Clearest intent; PostgreSQL plans it as an anti-join.
+      Default choice.</td></tr>
+      <tr><td><code>LEFT JOIN … WHERE x IS NULL</code></td><td>yes</td><td>Same plan; test a column that is
+      never NULL in the right table (its key)</td></tr>
+      <tr><td><code>NOT IN (subquery)</code></td><td>no</td><td>One NULL in the subquery makes it return
+      nothing; often slower</td></tr>
+      <tr><td><code>EXCEPT</code></td><td>yes</td><td>Compares whole rows, removes duplicates; gives ids only</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: in an anti-join, a condition on the missing side goes in ON</p>
+    <p>When the question adds a condition ("no employee earning above 130,000"), that condition describes
+    which right-side rows count as a match. Put it in the <code>ON</code> clause (or inside the
+    <code>NOT EXISTS</code>). In <code>WHERE</code> it removes the NULL row you are looking for.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: filtering the right table in WHERE</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: always returns 0 rows</p><pre><code class="language-sql">SELECT d.name
+FROM departments d
+LEFT JOIN employees e ON e.dept_id = d.dept_id
+WHERE e.emp_id IS NULL AND e.salary &gt; 130000;</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: HR and Marketing</p><pre><code class="language-sql">SELECT d.name
+FROM departments d
+LEFT JOIN employees e ON e.dept_id = d.dept_id
+                     AND e.salary &gt; 130000
+WHERE e.emp_id IS NULL
+ORDER BY d.name;</code></pre></div>
+    </div>
+    <p>In the wrong version, a row cannot have <code>emp_id IS NULL</code> and a salary above 130,000 at the same
+    time. HR's best salary is 120,000, and Marketing has nobody, so the right query lists both. More on this in
+    <a href="#m2-join-traps">Join traps</a>.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Empty result is valid.</strong> "Employees earning more than the manager" returns one row
+      here, but on a table where nobody does, zero rows is the correct answer, not an error. Say so.</li>
+      <li><strong>Strict vs non-strict.</strong> <code>&gt;</code> excludes Rahul (equal to his manager);
+      <code>&gt;=</code> would include him. Ask which one is meant.</li>
+      <li><strong>Missing manager.</strong> The CEO has a NULL <code>manager_id</code>, so the join finds no
+      partner and drops her. If a manager row could be missing (deleted), the join also drops that employee.</li>
+      <li><strong>Employees with no department</strong> vanish from any inner join to <code>departments</code>;
+      use <code>LEFT JOIN</code> if they must appear.</li>
+    </ul>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: state your assumptions out loud</p>
+    <p>Before writing, say: "Ties count as the same salary", "the CEO has no manager so an inner join is fine",
+    "I return NULL when no row exists". Interviewers grade the reasoning at least as much as the SQL.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>For each of these, be ready to give two solutions and say which you prefer: self join vs correlated
+    subquery, <code>DENSE_RANK</code> vs <code>LATERAL</code>, <code>NOT EXISTS</code> vs <code>LEFT JOIN … IS
+    NULL</code>. The <code>NOT IN</code> NULL trap is the usual follow-up.</p>
+    <p>Also practise the neighbours: "employees earning more than the department average", "highest paid per department", "customers with no orders in the last 30 days", and "managers with no reports" (a self-join anti-join on <code>manager_id</code>).</p>
+  </div>
+</article>

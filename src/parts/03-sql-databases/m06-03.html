@@ -1,0 +1,349 @@
+<article class="topic" id="m6-migrations">
+  <h3>Schema migrations with Flyway and Liquibase</h3>
+  <p class="tldr">A migration tool keeps the database schema in versioned, reviewed files that run in order and
+  are recorded in a history table; Flyway uses plain SQL files like <code>V1__create_users.sql</code>, Liquibase
+  uses changelogs, and an applied migration must never be edited.</p>
+
+  <h4>Why migrations</h4>
+  <p>The code lives in Git; the database should too. Without migrations, developers run ad-hoc <code>ALTER
+  TABLE</code> statements by hand, staging and production drift apart, nobody knows which version a database is
+  at, and a new teammate cannot build a working database. A <strong>schema migration</strong> is a small, ordered,
+  versioned script that moves the schema from one version to the next. The tool:</p>
+  <ul>
+    <li>keeps a history table of which migrations ran,</li>
+    <li>runs the missing ones, in order, when the application starts or in the pipeline,</li>
+    <li>checks that already-applied scripts were not changed, and</li>
+    <li>makes every environment (laptop, CI, staging, production) reach the same schema.</li>
+  </ul>
+  <p>Do not use Hibernate's <code>spring.jpa.hibernate.ddl-auto=update</code> for this. It guesses changes,
+  never drops, has no history and no review. In production use <code>validate</code> (or <code>none</code>) and let
+  the migration tool own the schema.</p>
+
+  <h4>Flyway</h4>
+  <p><strong>Flyway</strong> is the simplest tool: migrations are plain SQL files named by a convention. In Spring
+  Boot they live in <code>src/main/resources/db/migration</code>.</p>
+<pre data-title="File names"><code class="language-plaintext">src/main/resources/db/migration/
+  V1__create_users.sql
+  V2__create_restaurants_and_menu_items.sql
+  V3__add_orders.sql
+  V4__add_users_mobile_index.sql
+  R__refresh_reporting_views.sql</code></pre>
+  <dl class="terms">
+    <dt><code>V&lt;version&gt;__&lt;description&gt;.sql</code></dt><dd>A <strong>versioned</strong> migration: capital
+    <code>V</code>, a version number, <em>two</em> underscores, a description with underscores. Runs exactly once,
+    in version order.</dd>
+    <dt><code>R__&lt;description&gt;.sql</code></dt><dd>A <strong>repeatable</strong> migration: no version. It runs again
+    whenever its content (checksum) changes, after all versioned ones. Use it for views, functions and
+    procedures that you recreate.</dd>
+    <dt><code>flyway_schema_history</code></dt><dd>The table Flyway creates to record every applied migration.</dd>
+  </dl>
+<pre data-title="V1__create_users.sql"><code class="language-sql">CREATE TABLE users (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email      TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_users_email UNIQUE (email)
+);</code></pre>
+<pre data-title="V4__add_users_mobile_index.sql"><code class="language-sql">ALTER TABLE users ADD COLUMN mobile TEXT;
+CREATE UNIQUE INDEX uq_users_mobile ON users (mobile);</code></pre>
+<pre data-title="R__refresh_reporting_views.sql"><code class="language-sql">CREATE OR REPLACE VIEW v_daily_sales AS
+SELECT placed_at::date AS day, count(*) AS orders, sum(total_paise) AS revenue_paise
+FROM orders
+GROUP BY placed_at::date;</code></pre>
+  <p>The history table after a run:</p>
+<pre data-title="SELECT installed_rank, version, description, success FROM flyway_schema_history;"><code class="language-plaintext"> installed_rank | version |          description          | success
+----------------+---------+-------------------------------+---------
+              1 | 1       | create users                  | t
+              2 | 2       | create restaurants and menu   | t
+              3 | 3       | add orders                    | t
+              4 | 4       | add users mobile index        | t
+              5 |         | refresh reporting views       | t</code></pre>
+  <p>The table also stores a <strong>checksum</strong> of each script. On the next start Flyway recomputes the
+  checksums of already-applied files. If one differs (someone edited a past migration), it stops with an error such
+  as "Migration checksum mismatch for migration version 2", because that database no longer matches what the file
+  says. That is the reason for the iron rule below.</p>
+
+  <h4>Flyway in Spring Boot</h4>
+<pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.flywaydb&lt;/groupId&gt;
+    &lt;artifactId&gt;flyway-core&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;!-- Flyway 10 and later: add the module for your database --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.flywaydb&lt;/groupId&gt;
+    &lt;artifactId&gt;flyway-database-postgresql&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+<pre data-title="application.yml"><code class="language-yaml">spring:
+  flyway:
+    enabled: true                         # default when flyway-core is on the classpath
+    locations: classpath:db/migration     # default
+    baseline-on-migrate: false            # set true only to adopt an existing database
+  jpa:
+    hibernate:
+      ddl-auto: validate                  # Hibernate checks entities against the schema, never changes it</code></pre>
+  <p>With <code>flyway-core</code> on the classpath, Spring Boot runs pending migrations at start-up, before JPA
+  uses the schema. The version of the Flyway artifacts is managed by Spring Boot's dependency management. See
+  <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a> for the data-access setup.</p>
+  <p>The Flyway command-line tool has the same main commands: <code>migrate</code> (apply pending),
+  <code>info</code> (status of each migration), <code>validate</code> (check checksums),
+  <code>baseline</code> (mark an existing database as a given version, so only later migrations run),
+  <code>repair</code> (fix the history table), and <code>clean</code> (drops everything; never in production,
+  disable it).</p>
+
+  <h4>Liquibase</h4>
+  <p><strong>Liquibase</strong> describes changes in a <strong>changelog</strong> made of <strong>changesets</strong>.
+  The file can be XML, YAML, JSON or SQL, and Liquibase can generate SQL for the target database, which helps
+  when you support several databases. Each changeset is identified by <code>id</code> + <code>author</code> + file
+  path, and recorded in the <code>DATABASECHANGELOG</code> table (with a checksum; a lock table
+  <code>DATABASECHANGELOGLOCK</code> prevents two runs at once).</p>
+<pre data-title="db/changelog/db.changelog-master.yaml"><code class="language-yaml">databaseChangeLog:
+  - changeSet:
+      id: 1-create-users
+      author: asha
+      changes:
+        - createTable:
+            tableName: users
+            columns:
+              - column:
+                  name: id
+                  type: BIGINT
+                  autoIncrement: true
+                  constraints: { primaryKey: true, nullable: false }
+              - column:
+                  name: email
+                  type: VARCHAR(255)
+                  constraints: { nullable: false, unique: true }
+  - changeSet:
+      id: 2-add-users-mobile
+      author: asha
+      changes:
+        - addColumn:
+            tableName: users
+            columns:
+              - column: { name: mobile, type: VARCHAR(20) }
+      rollback:
+        - dropColumn: { tableName: users, columnName: mobile }</code></pre>
+  <p>Spring Boot looks for <code>classpath:/db/changelog/db.changelog-master.yaml</code> by default when
+  <code>liquibase-core</code> is on the classpath (change it with <code>spring.liquibase.change-log</code>).</p>
+
+  <h4>Flyway vs Liquibase</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Flyway</th><th>Liquibase</th></tr></thead>
+    <tbody>
+      <tr><td>Format</td><td>Plain SQL files (also Java migrations)</td><td>XML, YAML, JSON or SQL changesets</td></tr>
+      <tr><td>Learning curve</td><td>Very low: you already know SQL</td><td>Higher: its own change vocabulary</td></tr>
+      <tr><td>Database independence</td><td>Write SQL per database</td><td>Abstract changes; one changelog for many databases</td></tr>
+      <tr><td>Rollback</td><td>Undo is a paid/edition feature; normally you write a new forward migration</td>
+      <td>Rollback blocks per changeset</td></tr>
+      <tr><td>History table</td><td><code>flyway_schema_history</code></td><td><code>DATABASECHANGELOG</code></td></tr>
+      <tr><td>Typical choice</td><td>One database, SQL-first teams</td><td>Multi-database products, teams that want
+      abstraction</td></tr>
+    </tbody>
+  </table></div>
+  <p>Either is fine. Most Spring Boot teams on PostgreSQL pick Flyway for its simplicity. Official docs:
+  <a href="https://documentation.red-gate.com/flyway">Flyway documentation</a> and
+  <a href="https://docs.liquibase.com/">Liquibase documentation</a>.</p>
+
+  <h4>The iron rule: never edit an applied migration</h4>
+  <p>Once a migration has run anywhere beyond your own laptop (shared dev, CI, staging, production), it is history.
+  Editing it breaks the checksum and leaves different databases with different schemas. To change something, add a
+  <em>new</em> migration: <code>V5__fix_users_mobile_length.sql</code>. If you made a mistake before pushing, you
+  may delete and redo it locally.</p>
+
+  <h4>Safe migration practices</h4>
+  <p>On a running system, old and new versions of your application run together for a moment during a deploy, and
+  a long lock on a hot table can take the site down. Follow these habits:</p>
+  <ul>
+    <li><strong>Make changes backward compatible.</strong> The old code must keep working against the new schema.</li>
+    <li><strong>Add, don't change in place.</strong> Adding a nullable column or a new table is safe; renaming or
+    dropping a column the old code uses is not.</li>
+    <li><strong>Watch locks.</strong> Many <code>ALTER TABLE</code> forms take a strong lock. Use short
+    <code>lock_timeout</code>; create indexes with <code>CREATE INDEX CONCURRENTLY</code> in PostgreSQL (it cannot run in a
+    transaction, so configure that migration to run outside one).</li>
+    <li><strong>Backfill in batches</strong> (thousands of rows per transaction), not one giant
+    <code>UPDATE</code> that locks the table and bloats the log.</li>
+    <li><strong>Test migrations</strong> against a copy of production-size data and a real PostgreSQL
+    (Testcontainers), not only H2.</li>
+    <li><strong>Keep each migration small</strong> and reviewed like code. Take a backup before risky ones.</li>
+  </ul>
+
+  <h4>Expand, migrate, contract</h4>
+  <p>To change something incompatible, such as renaming <code>users.full_name</code> to <code>name</code>, split it
+  across several releases:</p>
+  <ol class="steps">
+    <li><strong>Expand.</strong> Add the new column (nullable). Old code is unaffected.
+<pre data-title="V10__expand_add_name.sql"><code class="language-sql">ALTER TABLE users ADD COLUMN name TEXT;</code></pre></li>
+    <li><strong>Migrate.</strong> Deploy code that writes both columns and still reads the old one. Copy existing
+    data in batches, then deploy code that reads the new column.
+<pre data-title="V11__backfill_name.sql (batch, repeat until 0 rows)"><code class="language-sql">UPDATE users SET name = full_name
+WHERE id IN (SELECT id FROM users WHERE name IS NULL LIMIT 10000);</code></pre></li>
+    <li><strong>Contract.</strong> When no running code uses the old column, drop it in a later release.
+<pre data-title="V12__contract_drop_full_name.sql"><code class="language-sql">ALTER TABLE users ALTER COLUMN name SET NOT NULL;
+ALTER TABLE users DROP COLUMN full_name;</code></pre></li>
+  </ol>
+  <p>Each step can be deployed and rolled back independently, with zero downtime. The same pattern covers changing
+  a type, splitting a table or adding a <code>NOT NULL</code> column.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: migrations are append-only and run in the same order everywhere</p>
+    <p>Never edit or delete an applied migration; never reuse a version number. If two branches create
+    <code>V7</code>, renumber one before merging (Flyway can also be set to allow out-of-order versions, but avoid
+    relying on it).</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: ddl-auto=update in production, and edited migrations</p>
+    <p>"It worked on my machine" because Hibernate quietly changed a table. Move all schema changes to migrations
+    and use <code>ddl-auto=validate</code>. When a checksum error appears after someone edited an old file, revert
+    the edit and add a new migration; use <code>repair</code> only when you understand why.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Adopting Flyway on an existing database: set a baseline (<code>baseline-on-migrate: true</code> or
+      <code>flyway baseline</code>) so existing objects are treated as the starting version.</li>
+      <li>On MySQL, DDL statements commit implicitly, so a failing multi-statement migration can be left half
+      applied. PostgreSQL can roll DDL back with the transaction, which is a real advantage.</li>
+      <li>Seed data for tests belongs in test-only locations (<code>db/testdata</code>), not in the production
+      migration path.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Why use Flyway or Liquibase?</b> Versioned, reviewed, repeatable schema changes that reach every
+      environment in order, with a history and checksums.</li>
+      <li><b>Can you edit an applied migration?</b> No: the checksum fails and environments diverge; add a new one.</li>
+      <li><b>Versioned vs repeatable migrations?</b> Versioned run once in order; repeatable run again whenever their
+      content changes (views, functions).</li>
+      <li><b>How do you rename a column without downtime?</b> Expand, migrate, contract over several releases.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m6-interview">
+  <h3>Interview questions — Beyond relational</h3>
+  <details class="qa"><summary>When would you choose NoSQL over a relational database?</summary><div class="qa-a">
+    <p>When a specific need beats relational strengths: key lookups at huge speed (Redis), flexible nested documents
+    (MongoDB), massive write volumes with a known access pattern (Cassandra), graph traversals (Neo4j) or text
+    search (Elasticsearch). For money, orders and data with relationships and transactions, stay relational. Often the
+    answer is both: relational as the source of truth plus a NoSQL store for one job (polyglot persistence).</p></div></details>
+  <details class="qa"><summary>What is the difference between ACID and BASE?</summary><div class="qa-a">
+    <p>ACID: atomic, consistent, isolated, durable transactions. BASE: basically available, soft state, eventually
+    consistent: a looser model for distributed systems that favours availability and scale. BASE systems accept
+    stale reads and conflicting copies that converge later.</p></div></details>
+  <details class="qa"><summary>Why is Redis so fast, and what is it used for?</summary><div class="qa-a">
+    <p>Data is held in memory in efficient structures, and commands run on a mostly single-threaded loop with no lock
+    overhead. Typical uses: cache, sessions, rate limiting, leaderboards (sorted sets), counters, simple queues and
+    short-lived locks.</p></div></details>
+  <details class="qa"><summary>RDB vs AOF persistence in Redis?</summary><div class="qa-a">
+    <p>RDB writes periodic snapshots: compact and fast to restore, but changes since the last snapshot are lost on a
+    crash. AOF logs every write command: far less data loss (about one second with <code>everysec</code>) but larger
+    and slower to replay. Use both for important data, none for a pure cache.</p></div></details>
+  <details class="qa"><summary>Explain cache-aside, and how you keep the cache fresh.</summary><div class="qa-a">
+    <p>The app reads the cache; on a miss it reads the database and stores the result with a TTL. On a write it
+    updates the database and deletes the cache key. TTL is the safety net for missed invalidations. Watch for the
+    stale window and for stampedes on expiry of hot keys (lock, TTL jitter, background refresh).</p></div></details>
+  <details class="qa"><summary>What is a cache stampede?</summary><div class="qa-a">
+    <p>A popular key expires and many requests miss at once, all rebuilding it from the database and overloading it.
+    Prevent it with a single-flight lock so one request rebuilds, random TTL jitter, refreshing before expiry, and
+    caching "not found" results briefly.</p></div></details>
+  <details class="qa"><summary>Embed or reference in MongoDB?</summary><div class="qa-a">
+    <p>Embed when the data is read together, small and bounded, and owned by the parent (a restaurant's menu).
+    Reference when the data grows without bound, is shared, or is used on its own (a user's orders). Model for how the
+    application reads the data.</p></div></details>
+  <details class="qa"><summary>Write a MongoDB query for open restaurants in Pune with rating above 4, best first.</summary><div class="qa-a">
+    <pre><code class="language-javascript">db.restaurants.find(
+  { city: "Pune", isOpen: true, rating: { $gt: 4 } },
+  { name: 1, rating: 1, _id: 0 }
+).sort({ rating: -1 })</code></pre>
+    <p>A compound index on <code>{ city: 1, rating: -1 }</code> would support it.</p></div></details>
+  <details class="qa"><summary>Explain the CAP theorem.</summary><div class="qa-a">
+    <p>A distributed data store can provide at most two of consistency (every read sees the latest write),
+    availability (every request to a live node gets an answer) and partition tolerance (it keeps working when
+    the network splits). Because partitions happen, the real choice during one is C or A: refuse requests to stay
+    correct (CP), or answer possibly stale data (AP). Without a partition you can have both.</p></div></details>
+  <details class="qa"><summary>How is consistency in CAP different from consistency in ACID?</summary><div class="qa-a">
+    <p>In ACID it means a transaction keeps the data valid (constraints and business rules hold). In CAP it means all
+    replicas return the same, up-to-date value. They are different guarantees about different things.</p></div></details>
+  <details class="qa"><summary>What is eventual consistency and what is PACELC?</summary><div class="qa-a">
+    <p>Eventual consistency: replicas converge when writes stop, but reads can be stale meanwhile. PACELC extends CAP:
+    if there is a partition choose availability or consistency; else, in normal operation, choose between latency and
+    consistency, because keeping replicas in step costs time.</p></div></details>
+  <details class="qa"><summary>Replication vs sharding vs partitioning?</summary><div class="qa-a">
+    <p>Replication copies the same data to more servers for availability and read capacity. Partitioning splits one
+    table into pieces (PostgreSQL range, list or hash partitions) on one server. Sharding puts pieces on different
+    servers to scale writes and storage, using a shard key. Replication does not scale writes; sharding makes joins
+    and transactions across shards hard.</p></div></details>
+  <details class="qa"><summary>What is replication lag and how do you handle read-your-writes?</summary><div class="qa-a">
+    <p>With asynchronous replication a replica trails the primary by some time, so a read right after a write may
+    return old data. Read from the primary for a short period after the user's write or on critical pages, and send
+    only staleness-tolerant reads to replicas.</p></div></details>
+  <details class="qa"><summary>Why do teams use Flyway or Liquibase, and what is the golden rule?</summary><div class="qa-a">
+    <p>They keep schema changes in versioned files applied in order and tracked in a history table, so every
+    environment has the same schema and changes are reviewed. The rule: never edit a migration that has been applied;
+    add a new one. Release breaking changes as expand, migrate, contract.</p></div></details>
+</article>
+
+<article class="topic recap" id="m6-cheatsheet">
+  <h3>Cheat sheet — Beyond relational</h3>
+  <ul class="cheat">
+    <li><b>NoSQL families</b> key-value (Redis, DynamoDB), document (MongoDB), wide-column (Cassandra), graph (Neo4j), search (Elasticsearch)</li>
+    <li><b>ACID vs BASE</b> strict transactions vs basically available, soft state, eventually consistent</li>
+    <li><b>Default choice</b> PostgreSQL as source of truth; add a specialised store only for a measured need (polyglot persistence)</li>
+    <li><b>Redis</b> in-memory, mostly single-threaded, atomic commands; types String, List, Hash, Set, Sorted Set (+ Streams, HyperLogLog, Bitmaps)</li>
+    <li><b>Redis expiry</b> <code>SET k v EX 60 NX</code>, <code>EXPIRE</code>, <code>TTL</code> (-1 no expiry, -2 missing)</li>
+    <li><b>Redis persistence</b> RDB snapshots (fast restart, may lose minutes) vs AOF log (less loss, bigger)</li>
+    <li><b>Eviction</b> <code>maxmemory</code> + <code>allkeys-lru</code> for caches; default <code>noeviction</code></li>
+    <li><b>Redis uses</b> cache, sessions, rate limit (<code>INCR</code> + <code>EXPIRE</code>), leaderboard (<code>ZADD</code>), queue, lock (with care)</li>
+    <li><b>Never</b> <code>KEYS *</code> in production; use <code>SCAN</code></li>
+    <li><b>Cache-aside</b> read cache, miss → DB → fill; write DB → delete key</li>
+    <li><b>Read-through / write-through / write-behind</b> cache loads / writes both sync / writes cache first, DB later (loss risk)</li>
+    <li><b>Invalidation</b> TTL + delete on write; stampede: lock, jitter, refresh ahead</li>
+    <li><b>MongoDB</b> database → collection → document (BSON), <code>_id</code> primary key (ObjectId), 16 MB document limit</li>
+    <li><b>Mongo CRUD</b> <code>insertOne/insertMany</code>, <code>find(filter, projection).sort().limit()</code>, <code>updateOne(filter, {$set,$inc,$push})</code>, <code>deleteOne</code></li>
+    <li><b>Mongo operators</b> <code>$gt $gte $lt $in $and $or $exists</code>; dot notation for nested fields</li>
+    <li><b>Aggregation</b> <code>$match → $group → $sort → $project</code>, <code>$lookup</code> for joins</li>
+    <li><b>Embed vs reference</b> embed bounded data read together; reference unbounded or shared data</li>
+    <li><b>CAP</b> during a partition choose C (CP, refuse) or A (AP, maybe stale); P is not optional</li>
+    <li><b>PACELC</b> partition: A or C; else: latency or consistency</li>
+    <li><b>ACID C vs CAP C</b> valid data vs same data on all replicas</li>
+    <li><b>Replication</b> primary writes, replicas read; async = lag and possible loss, sync = safe but slower; not a backup</li>
+    <li><b>Partitioning</b> PostgreSQL <code>PARTITION BY RANGE | LIST | HASH</code>; pruning; drop old partitions fast</li>
+    <li><b>Sharding</b> pieces on different servers by shard key; avoid hot spots; cross-shard joins and transactions are hard</li>
+    <li><b>Flyway</b> <code>V1__name.sql</code> versioned, <code>R__name.sql</code> repeatable, <code>flyway_schema_history</code>, checksums; <code>ddl-auto=validate</code></li>
+    <li><b>Migration safety</b> never edit applied migrations; backward compatible; expand → migrate → contract; <code>CREATE INDEX CONCURRENTLY</code>; batch backfills</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m6-practice">
+  <h3>Practice — Beyond relational</h3>
+  <ol class="steps">
+    <li><strong>Choose the store.</strong> For a food-delivery platform, decide the best store for: orders and
+    payments, restaurant menus shown on a hot page, login sessions, "top 10 riders today", restaurant search with
+    typo tolerance, and rider GPS pings. Write one sentence of reasoning each and name the source of truth.</li>
+    <li><strong>Redis hands-on.</strong> Run Redis in Docker and open <code>redis-cli</code>. Practise one command group
+    for each type: a string with <code>EX</code>, a list queue, a hash cart, a set of likes and a sorted-set
+    leaderboard. Check <code>TTL</code> counts down and the key disappears.</li>
+    <li><strong>Rate limiter.</strong> With <code>INCR</code> and <code>EXPIRE</code>, implement "5 requests per minute per
+    user" in <code>redis-cli</code>, then in a small Spring Boot service using <code>StringRedisTemplate</code>. Done when
+    the sixth request in a minute is rejected and the counter resets by itself.</li>
+    <li><strong>Cache-aside.</strong> Add a Redis cache in front of "get menu by restaurant" in a Spring Boot app (manual
+    code, then <code>@Cacheable</code>). Measure response time with and without the cache, invalidate on update, and
+    log the hit ratio.</li>
+    <li><strong>Stampede test.</strong> Expire a hot key and fire 100 parallel requests. Count database calls, then add a
+    lock or TTL jitter and compare.</li>
+    <li><strong>MongoDB hands-on.</strong> Run MongoDB in Docker and use <code>mongosh</code>: insert 10 restaurants with
+    nested menus, query by city and rating with projection and sort, update with <code>$set</code>/<code>$inc</code>/<code>$push</code>,
+    create a compound index and compare <code>explain("executionStats")</code> before and after.</li>
+    <li><strong>Aggregation.</strong> Write a pipeline that returns the average rating and count of open restaurants
+    per city, sorted best first; then a <code>$lookup</code> from orders to restaurants.</li>
+    <li><strong>Design decision.</strong> Model "users and their orders" in MongoDB twice: with orders embedded and with
+    orders referenced. List when each breaks (document growth, queries by order) and which you would pick.</li>
+    <li><strong>CAP discussion.</strong> For a shopping cart, a bank balance and a "likes" counter, say whether you would
+    choose CP or AP, what a user sees during a partition, and how conflicts are resolved.</li>
+    <li><strong>Migrations.</strong> Add Flyway to a Spring Boot project. Write <code>V1</code> (users), <code>V2</code>
+    (orders) and a repeatable view. Set <code>ddl-auto=validate</code>. Then edit <code>V1</code> on purpose and observe
+    the checksum error; revert it and add <code>V3</code> instead. Finally, rename a column using expand, migrate,
+    contract in three migrations.</li>
+  </ol>
+</article>

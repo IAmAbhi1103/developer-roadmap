@@ -1,0 +1,258 @@
+<article class="topic" id="m7-messaging-concepts">
+  <h3>Messaging concepts: queues, topics and the Kafka model</h3>
+  <p class="tldr">A message broker lets services communicate asynchronously: producers send messages, the broker stores them, and consumers process them later; a queue gives each message to one worker, a topic gives it to every subscriber, and Kafka stores topics as partitioned, replicated logs that consumer groups read at their own pace.</p>
+
+  <h4>Why messaging</h4>
+  <p>Take "a candidate applies for a job". After saving the application you want to email the recruiter, update search, add to analytics and notify the candidate. If the application service calls all four synchronously, the user waits for the slowest, and any failure breaks the request. With a <strong>message broker</strong> in the middle, the service publishes one message, "ApplicationSubmitted", and returns. Other services consume it in their own time.</p>
+  <ul>
+    <li><strong>Decoupling:</strong> the producer does not know who consumes, or how many.</li>
+    <li><strong>Buffering:</strong> a spike (10,000 applications in a minute) is stored in the broker and processed at the consumers' speed.</li>
+    <li><strong>Resilience:</strong> if the notification service is down for an hour, messages wait and are processed on recovery.</li>
+    <li><strong>Scalability:</strong> add consumer instances to share the work.</li>
+  </ul>
+  <p>The costs: more infrastructure, eventual consistency, harder debugging, and the need to deal with duplicates and ordering (<a href="#m7-delivery-outbox">delivery semantics</a>).</p>
+
+  <h4>Queue vs topic</h4>
+  <dl class="terms">
+    <dt>Queue (point-to-point)</dt><dd>Each message is delivered to <strong>one</strong> consumer among those listening. Several consumers on one queue are <em>competing consumers</em>: they share the load. Example: a queue of "send this email" tasks.</dd>
+    <dt>Topic (publish/subscribe)</dt><dd>Each message is delivered to <strong>every</strong> subscriber group. Example: "ApplicationSubmitted" is read independently by notifications, analytics and search.</dd>
+  </dl>
+  <p>RabbitMQ models both through exchanges and queues; Kafka models everything as topics, and gets queue behaviour with consumer groups.</p>
+
+  <h4>Kafka: the model</h4>
+  <p><strong>Apache Kafka</strong> is a distributed, durable <strong>commit log</strong>. Unlike a classic queue, a consumed message is not deleted: Kafka keeps messages for a retention period (days or weeks, or by size), and consumers remember how far they have read. That makes replay possible and lets many independent consumers read the same data.</p>
+  <dl class="terms">
+    <dt>Broker</dt><dd>A Kafka server. A cluster has several brokers.</dd>
+    <dt>Topic</dt><dd>A named stream of records, such as <code>application-events</code>.</dd>
+    <dt>Partition</dt><dd>A topic is split into partitions; each partition is an ordered, append-only log. Partitions let a topic scale over many brokers and many consumers.</dd>
+    <dt>Offset</dt><dd>The position number of a record inside a partition (0, 1, 2...). A consumer commits the offset it has processed.</dd>
+    <dt>Key</dt><dd>An optional value on each record. Records with the same key always go to the same partition (hash of the key), which gives <strong>ordering per key</strong>.</dd>
+    <dt>Producer / Consumer</dt><dd>Clients that write to and read from topics.</dd>
+    <dt>Consumer group</dt><dd>Consumers with the same <code>group.id</code> share a topic: each partition is read by exactly one consumer in the group. Different groups each get all records.</dd>
+    <dt>Replication</dt><dd>Each partition has copies on several brokers (replication factor, commonly 3): one leader serves reads and writes, followers replicate. If the leader dies, a follower takes over.</dd>
+  </dl>
+  <figure class="fig">
+<pre class="diagram">
+ Topic: application-events (3 partitions)
+
+ Producer ─key=job7──▶ P0: [0][1][2][3][4] ──▶ ┐
+          ─key=job9──▶ P1: [0][1][2]       ──▶ ├─ Group "notification":
+          ─key=job2──▶ P2: [0][1][2][3]    ──▶ ┘  C1 reads P0, C2 reads P1+P2
+
+                      (same records) ──▶ Group "analytics": C3 reads P0+P1+P2
+</pre>
+  <figcaption>One partition goes to one consumer per group; each group reads everything</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Ordering</strong> is guaranteed only <em>inside a partition</em>. Use the entity id as key (job id, order id) so all events of one entity stay in order.</li>
+    <li><strong>Parallelism</strong> of a group is limited by the number of partitions: 3 partitions can keep at most 3 consumers busy; a fourth consumer sits idle. Choose the partition count with future growth in mind (it can be increased later but then key-to-partition mapping changes).</li>
+    <li>When consumers join or leave a group, Kafka <strong>rebalances</strong>: partitions are reassigned, with a short pause.</li>
+    <li>Modern Kafka runs without ZooKeeper, in <strong>KRaft</strong> mode: brokers (some acting as controllers) manage the metadata themselves. Single-node KRaft is easy for development (see <a href="#m7-compose">Compose</a>).</li>
+  </ul>
+
+  <h4>When to use messaging, and when not</h4>
+  <ul>
+    <li><strong>Good:</strong> notifications, workflows across services, replicating data to other services or search indexes, activity/analytics streams, smoothing spikes, background jobs that must survive restarts.</li>
+    <li><strong>Not good:</strong> a user waiting for a result right now (use a synchronous call); tiny apps where <code>@Async</code> plus an after-commit event (<a href="#m6-async">module 6</a>) is enough.</li>
+  </ul>
+  <p>Event types you will hear: <strong>event notification</strong> (a small message "job 7 was updated", consumers call back for details), <strong>event-carried state transfer</strong> (the message contains the data, so consumers keep their own copy), and <strong>commands</strong> ("send this email", directed at one service). Name events in the past tense (<code>ApplicationSubmitted</code>); commands in the imperative (<code>SendEmail</code>).</p>
+  <p>Broker theory (log-structured storage, consensus) appears in <a href="08-system-design.html#m5">System Design · Module 5</a>.</p>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Why a message broker?" Decoupling, buffering, resilience. "Queue vs topic?" One consumer vs every subscriber. "Explain partitions, offsets and consumer groups." Define each; partition = ordering and parallelism unit; group = load sharing; offset = progress. "How do you keep events of one order in order?" Use the order id as the record key. "What if there are more consumers than partitions?" Extra consumers idle.</p>
+  </div>
+</article>
+
+<article class="topic" id="m7-kafka-spring">
+  <h3>Kafka with Spring: KafkaTemplate, @KafkaListener, JSON and dead-letter topics</h3>
+  <p class="tldr">Add spring-kafka, configure serializers and a consumer group in YAML, publish with KafkaTemplate using a business key, consume with @KafkaListener, and handle failures with retries and a dead-letter topic through DefaultErrorHandler.</p>
+
+  <h4>Setup</h4>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.kafka&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-kafka&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <pre data-title="application.yml"><code class="language-yaml">spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    producer:
+      acks: all                                  # wait for all in-sync replicas
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        enable.idempotence: true                 # no duplicates from producer retries
+        spring.json.add.type.headers: false      # do not tie consumers to our class names
+    consumer:
+      group-id: notification-service             # consumer group
+      auto-offset-reset: earliest                # new group starts from the beginning
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: >-
+          org.springframework.kafka.support.serializer.JsonDeserializer
+        spring.json.trusted.packages: com.example.events
+        spring.json.value.default.type: com.example.events.ApplicationSubmitted
+    listener:
+      ack-mode: record                           # commit the offset after each record
+      concurrency: 3                             # 3 consumer threads in this instance
+    template:
+      observation-enabled: true                  # tracing for sends (see tracing article)</code></pre>
+  <ul>
+    <li><code>acks: all</code> with <code>enable.idempotence: true</code> is the safe producer setting: a message is acknowledged only when all in-sync replicas have it, and a retry cannot create a duplicate in the partition.</li>
+    <li><code>auto-offset-reset</code> matters only when the group has no committed offset: <code>earliest</code> reads history, <code>latest</code> reads only new records.</li>
+    <li><code>ErrorHandlingDeserializer</code> wraps the real deserializer so a malformed message does not crash the consumer in an endless loop (a "poison pill"); the error is delivered to the error handler.</li>
+    <li><code>spring.json.trusted.packages</code> is a security setting: JSON deserialization may only create classes from these packages. Do not use <code>*</code> in production.</li>
+  </ul>
+  <div class="co co-version">
+    <p class="co-t">Version note</p>
+    <p>The class names <code>JsonSerializer</code> and <code>JsonDeserializer</code> come from Spring for Apache Kafka and use Jackson 2. Spring Boot 4 moves to Jackson 3, and Spring for Apache Kafka 4 provides matching Jackson 3 serializers; names and packages differ, so use the ones in the reference for your version. The Kafka concepts and the property structure (<code>spring.kafka.*</code>) are unchanged.</p>
+  </div>
+
+  <h4>The event class</h4>
+  <p>A shared contract. Keep events small, immutable and versionable. Records are perfect:</p>
+  <pre data-title="ApplicationSubmitted.java"><code class="language-java">package com.example.events;
+
+import java.time.Instant;
+import java.util.UUID;
+
+public record ApplicationSubmitted(
+        UUID eventId,              // unique id: lets consumers detect duplicates
+        Long applicationId,
+        Long jobId,
+        Long candidateId,
+        String recruiterEmail,
+        Instant occurredAt) { }</code></pre>
+
+  <h4>Creating the topic</h4>
+  <pre data-title="KafkaTopicConfig.java"><code class="language-java">@Configuration
+public class KafkaTopicConfig {
+
+    public static final String APPLICATION_EVENTS = "application-events";
+
+    @Bean
+    NewTopic applicationEventsTopic() {
+        return TopicBuilder.name(APPLICATION_EVENTS)
+                .partitions(3)
+                .replicas(1)                   // 3 in a real cluster
+                .build();                      // created at startup if it does not exist
+    }
+}</code></pre>
+
+  <h4>Producer: KafkaTemplate</h4>
+  <pre data-title="ApplicationEventPublisher.java"><code class="language-java">@Component
+public class ApplicationEventsProducer {
+
+    private static final Logger log = LoggerFactory.getLogger(ApplicationEventsProducer.class);
+    private final KafkaTemplate&lt;String, ApplicationSubmitted&gt; kafkaTemplate;
+
+    public ApplicationEventsProducer(KafkaTemplate&lt;String, ApplicationSubmitted&gt; kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
+    }
+
+    public void publish(ApplicationSubmitted event) {
+        String key = String.valueOf(event.jobId());              // same job -> same partition
+        kafkaTemplate.send(KafkaTopicConfig.APPLICATION_EVENTS, key, event)
+                .whenComplete((result, ex) -&gt; {                  // send() is asynchronous
+                    if (ex != null) {
+                        log.error("Publish failed for application {}", event.applicationId(), ex);
+                    } else {
+                        var md = result.getRecordMetadata();
+                        log.info("Published to {}-{} offset {}", md.topic(), md.partition(), md.offset());
+                    }
+                });
+    }
+}</code></pre>
+  <ul>
+    <li><code>send()</code> returns a <code>CompletableFuture&lt;SendResult&gt;</code> in current Spring Kafka versions (older versions returned a <code>ListenableFuture</code>). It is non-blocking; a failure appears only in the callback, so always handle it.</li>
+    <li>Choose the key deliberately. No key means records are spread without ordering. A skewed key (one huge customer) overloads one partition.</li>
+    <li>Do <strong>not</strong> publish inside the database transaction and hope: if the transaction rolls back, the event is already out; if the app crashes after commit and before publishing, the event is lost. See the outbox pattern in the <a href="#m7-delivery-outbox">next articles</a>.</li>
+  </ul>
+
+  <h4>Consumer: @KafkaListener</h4>
+  <pre data-title="ApplicationEventsListener.java (notification-service)"><code class="language-java">@Component
+public class ApplicationEventsListener {
+
+    private static final Logger log = LoggerFactory.getLogger(ApplicationEventsListener.class);
+    private final NotificationService notificationService;
+    private final ProcessedEventRepository processedEvents;
+
+    // constructor omitted
+
+    @KafkaListener(topics = "application-events", groupId = "notification-service")
+    @Transactional
+    public void onApplicationSubmitted(ApplicationSubmitted event,
+                                       @Header(KafkaHeaders.RECEIVED_PARTITION) int partition,
+                                       @Header(KafkaHeaders.OFFSET) long offset) {
+        log.info("Received {} from partition {} offset {}", event.eventId(), partition, offset);
+
+        if (!processedEvents.markProcessed(event.eventId())) {     // idempotency: seen already?
+            log.info("Duplicate event {} ignored", event.eventId());
+            return;
+        }
+        notificationService.notifyRecruiter(event);                 // do the real work
+    }
+}</code></pre>
+  <ul>
+    <li>The method parameter type is the payload; add <code>@Header</code> parameters for metadata, or take a whole <code>ConsumerRecord&lt;String, ApplicationSubmitted&gt;</code>.</li>
+    <li>Instances with the same <code>groupId</code> share the partitions. A second group (<code>analytics</code>) with its own listener gets every event too.</li>
+    <li><code>concurrency</code> starts several consumer threads in one instance; the total across all instances cannot usefully exceed the partition count.</li>
+    <li>Listener threads are not request threads: no <code>SecurityContext</code>, no web request. Wrap work in its own transaction.</li>
+    <li>Process quickly. If one poll's processing takes longer than <code>max.poll.interval.ms</code> (5 minutes by default), Kafka thinks the consumer died and rebalances.</li>
+  </ul>
+  <p>Commit behaviour: with <code>ack-mode: record</code> the offset is committed after the listener method returns normally; if it throws, the error handler decides (retry, skip, dead-letter). With <code>MANUAL</code> ack mode you inject an <code>Acknowledgment</code> and call <code>acknowledge()</code> yourself, useful when work finishes asynchronously.</p>
+
+  <h4>Error handling: retries and a dead-letter topic</h4>
+  <p>A listener will meet bad data or temporary failures (database down). Without a plan, a failing record is retried again and again and blocks its partition. Spring Kafka's <code>DefaultErrorHandler</code> retries with a back-off, then hands the record to a <strong>recoverer</strong>. The standard recoverer publishes it to a <strong>dead-letter topic</strong> (DLT), a parking place for messages that could not be processed, where humans or tools inspect them.</p>
+  <pre data-title="KafkaErrorConfig.java"><code class="language-java">@Configuration
+public class KafkaErrorConfig {
+
+    @Bean
+    DefaultErrorHandler errorHandler(KafkaTemplate&lt;Object, Object&gt; template) {
+        // after retries are used up, publish to "&lt;topic&gt;.DLT" (same partition number)
+        var recoverer = new DeadLetterPublishingRecoverer(template);
+
+        var backOff = new ExponentialBackOffWithMaxRetries(4);   // up to 4 retries
+        backOff.setInitialInterval(1_000);
+        backOff.setMultiplier(2.0);
+        backOff.setMaxInterval(10_000);
+
+        var handler = new DefaultErrorHandler(recoverer, backOff);
+        handler.addNotRetryableExceptions(IllegalArgumentException.class);   // bad data: no retry
+        return handler;
+    }
+}</code></pre>
+  <p>Boot picks up a single <code>CommonErrorHandler</code> bean for its listener container factory. A dead-letter record carries headers with the original topic, partition, offset and the exception message, so you can diagnose and, after a fix, re-publish it. Alternatively, <code>@RetryableTopic</code> creates retry topics (<code>-retry-0</code>, <code>-retry-1</code>) and a DLT for you, so retries do not block the main partition, at the cost of more topics and weaker ordering.</p>
+  <p>Monitor the DLT (alert when it is not empty) and the <strong>consumer lag</strong>, the difference between the latest offset and the group's committed offset, which shows whether consumers keep up.</p>
+
+  <h4>Testing</h4>
+  <p>Use Testcontainers with a Kafka container (<code>@ServiceConnection</code> sets the bootstrap address, <a href="#m5">module 5</a>) and Awaitility to wait for the asynchronous result: publish, then <code>await().atMost(10, SECONDS).untilAsserted(...)</code>. <code>@EmbeddedKafka</code> from <code>spring-kafka-test</code> is faster to start but less like the real broker.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Ignoring the future returned by <code>send()</code>: failures vanish.</li>
+      <li>No key, then wondering why events of one job are processed out of order.</li>
+      <li>Unlimited retries on a poison message: the partition is blocked for ever.</li>
+      <li>Sharing a Java class between services through a "common" library so every change forces all services to redeploy; prefer a stable, versioned schema (JSON schema, Avro with a schema registry).</li>
+      <li>Using the same <code>group.id</code> for two different services: they steal each other's messages.</li>
+      <li>Doing slow, blocking work in the listener until the poll timeout expires and a rebalance storm begins.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>SerializationException</code> or <code>DeserializationException</code>: bad payload or a missing trusted package; wrapped by the <code>ErrorHandlingDeserializer</code>.</li>
+      <li><code>TimeoutException: Topic ... not present in metadata</code>: wrong bootstrap server, topic missing, or auto-creation disabled.</li>
+      <li><code>org.apache.kafka.common.errors.RecordTooLargeException</code>: message above the broker limit (about 1 MB by default); send a reference to the data instead of the data.</li>
+      <li><code>CommitFailedException</code> / rebalance: processing took too long between polls.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you produce and consume in Spring?" <code>KafkaTemplate.send(topic, key, value)</code> and <code>@KafkaListener(topics, groupId)</code>. "How do you handle a failing message?" Retry with back-off, then dead-letter topic; no-retry for bad data; alert on DLT. "How do you avoid duplicates?" Idempotent producer plus idempotent consumer with an event id. "Why a key?" Ordering per entity. "What is consumer lag?" Distance between the log end and the group's committed offset.</p>
+  </div>
+</article>

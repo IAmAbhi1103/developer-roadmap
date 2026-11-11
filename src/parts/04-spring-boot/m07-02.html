@@ -1,0 +1,348 @@
+<article class="topic" id="m7-discovery-config">
+  <h3>Service discovery and centralized configuration</h3>
+  <p class="tldr">Services find each other by name instead of fixed addresses (client-side discovery with Eureka, or DNS in Kubernetes), and shared configuration comes from a config server, environment variables, ConfigMaps or Vault instead of files inside each JAR.</p>
+
+  <h4>The problem: addresses change</h4>
+  <p>In the monolith you called a method. Between services you need a URL. But service instances start and stop all the time (autoscaling, deployments, crashes), and their IP addresses change. Hard-coding <code>http://10.0.4.17:8081</code> breaks within a day. <strong>Service discovery</strong> solves it: services register under a logical name (<code>job-service</code>), and callers look the name up to get the current healthy instances.</p>
+
+  <h4>Client-side discovery: Eureka</h4>
+  <p><strong>Eureka</strong> (from Netflix, wrapped by Spring Cloud) is a registry server. Each service instance registers itself at startup, sends heartbeats, and unregisters on shutdown. A caller asks Eureka for the instances of <code>job-service</code>, picks one (client-side load balancing), and calls it directly.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant J as job-service (2 instances)
+  participant E as Eureka registry
+  participant A as application-service
+  J->>E: register "job-service" at 10.0.1.5:8081
+  J->>E: heartbeat every 30 s
+  A->>E: instances of job-service?
+  E-->>A: 10.0.1.5:8081, 10.0.1.6:8081
+  A->>J: GET /api/jobs/7 (picked one, round-robin)
+</pre>
+  <figcaption>Register, look up, call directly</figcaption>
+  </figure>
+  <pre data-title="Registry server: pom has spring-cloud-starter-netflix-eureka-server"><code class="language-java">@SpringBootApplication
+@EnableEurekaServer
+public class DiscoveryServerApplication {
+    public static void main(String[] args) { SpringApplication.run(DiscoveryServerApplication.class, args); }
+}</code></pre>
+  <pre data-title="registry application.yml"><code class="language-yaml">server:
+  port: 8761
+eureka:
+  client:
+    register-with-eureka: false        # the registry itself does not register
+    fetch-registry: false</code></pre>
+  <pre data-title="Each service: spring-cloud-starter-netflix-eureka-client, application.yml"><code class="language-yaml">spring:
+  application:
+    name: job-service                  # the logical name in the registry
+eureka:
+  client:
+    service-url:
+      defaultZone: http://discovery:8761/eureka
+  instance:
+    prefer-ip-address: true</code></pre>
+  <p>With Spring Cloud LoadBalancer on the classpath, a client built from a <code>@LoadBalanced</code> builder understands logical names:</p>
+  <pre data-title="Calling by name"><code class="language-java">@Configuration
+class ClientConfig {
+    @Bean
+    @LoadBalanced                                   // resolve "job-service" via discovery
+    RestClient.Builder loadBalancedBuilder() {
+        return RestClient.builder();
+    }
+}
+
+@Service
+class JobLookup {
+    private final RestClient client;
+    JobLookup(@LoadBalanced RestClient.Builder builder) {
+        this.client = builder.baseUrl("http://job-service").build();   // not a real DNS name
+    }
+    JobDto get(Long id) {
+        return client.get().uri("/api/jobs/{id}", id).retrieve().body(JobDto.class);
+    }
+}</code></pre>
+  <p>Gateway routes use the same idea: <code>uri: lb://job-service</code>. Eureka tolerates failures by design (it favours availability): the registry may briefly list a dead instance until its lease expires, so callers still need timeouts and retries. Remember to run more than one registry in production.</p>
+
+  <h4>Server-side discovery: Kubernetes and Docker DNS</h4>
+  <p>On Kubernetes (or Docker Compose) the platform does discovery for you. A Kubernetes <strong>Service</strong> gets a stable DNS name (<code>job-service</code>, or <code>job-service.default.svc.cluster.local</code>) and a virtual IP; the platform spreads traffic across the healthy pods behind it. Your code simply calls <code>http://job-service:8081</code>. There is no registry to run and no client library, which is why many teams skip Eureka on Kubernetes (<a href="07-devops.html#m5">DevOps · Module 5</a>). Docker Compose gives the same by service name on a shared network (<a href="#m7-compose">Compose</a>).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Client-side (Eureka)</th><th>Server-side / platform DNS</th></tr></thead>
+    <tbody>
+      <tr><td>Who picks an instance</td><td>The calling service</td><td>The platform (kube-proxy, load balancer)</td></tr>
+      <tr><td>Extra infrastructure</td><td>A registry cluster</td><td>None beyond the platform</td></tr>
+      <tr><td>Code impact</td><td>Starter, <code>@LoadBalanced</code>, <code>lb://</code></td><td>Plain URLs</td></tr>
+      <tr><td>Fits</td><td>VMs and Docker without an orchestrator</td><td>Kubernetes, ECS, Compose</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Centralized configuration</h4>
+  <p>With 20 services and 3 environments, copying <code>application.yml</code> files around is a mess; changing a database password means rebuilding images. Principles: keep the <strong>build the same everywhere</strong> and inject configuration from outside (12-factor). Choices:</p>
+  <ul>
+    <li><strong>Environment variables</strong>: the simplest. Boot's relaxed binding reads <code>SPRING_DATASOURCE_URL</code>. Works with Docker, Compose and Kubernetes. Hard to manage for hundreds of values.</li>
+    <li><strong>Kubernetes ConfigMaps and Secrets</strong>: mounted as environment variables or files. ConfigMaps for plain settings, Secrets for passwords (base64-encoded, so also protect them with RBAC and consider encryption at rest or an external secrets operator).</li>
+    <li><strong>Spring Cloud Config Server</strong>: a Spring Boot app that serves configuration files stored in a Git repository over HTTP; clients fetch at startup. Gives history and review (Git), per-service and per-profile files, and optional refresh.</li>
+    <li><strong>HashiCorp Vault / cloud secret managers</strong> (AWS Secrets Manager, Azure Key Vault) for secrets: access control, auditing, rotation.</li>
+  </ul>
+  <pre data-title="Config server: spring-cloud-config-server"><code class="language-java">@SpringBootApplication
+@EnableConfigServer
+public class ConfigServerApplication {
+    public static void main(String[] args) { SpringApplication.run(ConfigServerApplication.class, args); }
+}</code></pre>
+  <pre data-title="Config server application.yml"><code class="language-yaml">server:
+  port: 8888
+spring:
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://github.com/example-org/jobs-config    # files: job-service.yml, job-service-prod.yml
+          default-label: main</code></pre>
+  <pre data-title="Client (spring-cloud-starter-config) application.yml"><code class="language-yaml">spring:
+  application:
+    name: job-service                                  # selects job-service*.yml in the repo
+  config:
+    import: "optional:configserver:http://config-server:8888"
+  profiles:
+    active: prod</code></pre>
+  <p>The client merges the fetched properties with its own, with the usual precedence rules (environment variables and command-line arguments still win). Changing a value at runtime without restart is possible with <code>@RefreshScope</code> and the Actuator <code>refresh</code> endpoint (or Spring Cloud Bus), but many teams prefer to redeploy, which is simpler to reason about. Never store plain-text secrets in the config repository; use encryption support or a vault.</p>
+  <div class="co co-tip">
+    <p class="co-t">Practical advice</p>
+    <p>For Project 4 and for most real teams on Kubernetes: environment variables + ConfigMaps + Secrets, no Eureka, no Config Server. Learn Eureka and Config Server so you can explain them and maintain older Spring Cloud systems, but do not add them just because the tutorial does.</p>
+  </div>
+
+  <h4>OpenFeign vs HTTP service clients</h4>
+  <p><strong>OpenFeign</strong> (<code>spring-cloud-starter-openfeign</code>) is a declarative HTTP client from Spring Cloud: you write an interface with <code>@FeignClient(name = "job-service")</code> and Spring Cloud-style mapping annotations, and it creates the client, integrated with discovery and load balancing. It is common in existing microservice code. The newer Spring-native alternative is the <code>@HttpExchange</code> interface from <a href="#m6-http-clients">module 6</a>, which needs no extra Spring Cloud library and works with a <code>@LoadBalanced</code> builder as well.</p>
+  <pre data-title="Feign style (existing code you will meet)"><code class="language-java">@FeignClient(name = "job-service")                  // logical name, resolved by discovery
+public interface JobClient {
+    @GetMapping("/api/jobs/{id}")
+    JobDto byId(@PathVariable("id") Long id);
+}
+// @EnableFeignClients on a configuration class turns this on</code></pre>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Hard-coded <code>localhost</code> URLs that work on a laptop and fail in Docker (each container has its own <code>localhost</code>).</li>
+      <li>A config server as a single point of failure with no <code>optional:</code> import or retry.</li>
+      <li>Secrets in the config Git repository, or in an image layer.</li>
+      <li>Starting services in an order that requires the registry to be up, instead of retrying.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is service discovery and why?" Dynamic addresses; registry plus load balancing. "Client-side vs server-side discovery?" Eureka vs Kubernetes Service. "How do you manage configuration and secrets across environments?" Same artifact, external config, ConfigMaps/Secrets/Vault or a Config Server backed by Git. "Feign vs RestClient?" Declarative Spring Cloud client vs Spring's own client and HTTP interfaces.</p>
+  </div>
+</article>
+
+<article class="topic" id="m7-resilience4j">
+  <h3>Resilience4j: timeouts, retries, circuit breaker, bulkhead and rate limiter</h3>
+  <p class="tldr">In a distributed system, calls fail; protect each remote call with a timeout first, then a retry (for idempotent calls only, with exponential backoff and jitter), a circuit breaker that stops calling a failing service, and a bulkhead that limits concurrency, all with a sensible fallback.</p>
+
+  <h4>Why: failures spread</h4>
+  <p>Suppose the application service calls the payment service for every request, and payments become slow (10 seconds per call). Each request now holds a thread for 10 seconds; soon all of the application service's threads are stuck waiting; it stops answering; services that call <em>it</em> start to hang. One slow dependency has taken down the whole system. This is a <strong>cascading failure</strong>. Resilience patterns stop it by failing fast, limiting damage and giving the failing service room to recover.</p>
+  <p><strong>Resilience4j</strong> is the standard lightweight Java library for these patterns (it replaced Netflix Hystrix, which is retired). It integrates with Spring Boot through annotations and YAML configuration.</p>
+
+  <h4>The patterns</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pattern</th><th>What it does</th><th>Annotation</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Time limiter / timeout</strong></td><td>Stops waiting after a set time</td><td><code>@TimeLimiter</code></td></tr>
+      <tr><td><strong>Retry</strong></td><td>Tries again after a failure, with waiting between attempts</td><td><code>@Retry</code></td></tr>
+      <tr><td><strong>Circuit breaker</strong></td><td>After too many failures, rejects calls immediately for a while</td><td><code>@CircuitBreaker</code></td></tr>
+      <tr><td><strong>Bulkhead</strong></td><td>Limits concurrent calls to one dependency (like watertight ship compartments)</td><td><code>@Bulkhead</code></td></tr>
+      <tr><td><strong>Rate limiter</strong></td><td>Limits calls per time period to a dependency</td><td><code>@RateLimiter</code></td></tr>
+      <tr><td><strong>Fallback</strong></td><td>A substitute result when the call fails</td><td><code>fallbackMethod</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Setup</h4>
+  <pre data-title="pom.xml (Spring Boot 3.x)"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;io.github.resilience4j&lt;/groupId&gt;
+    &lt;artifactId&gt;resilience4j-spring-boot3&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-aop&lt;/artifactId&gt;      &lt;!-- annotations are AOP proxies --&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-actuator&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <p>Add the version of Resilience4j that matches your Boot version (use the project's BOM or the version in its release notes). The annotations are AOP proxies like <code>@Transactional</code>, so the same rules apply: public methods, called from another bean, no self-invocation (<a href="#m1">module 1</a>).</p>
+  <div class="co co-version">
+    <p class="co-t">Version note</p>
+    <p>The artifact <code>resilience4j-spring-boot3</code> targets Boot 3.x. For Boot 4, check the Resilience4j release notes for the artifact and version that support it. Spring Framework 7 also ships basic resilience features in core (<code>@Retryable</code> and <code>@ConcurrencyLimit</code>, switched on with <code>@EnableResilientMethods</code>), which cover simple retry and concurrency limiting without an extra library; circuit breakers, bulkheads and time limiters still come from Resilience4j.</p>
+  </div>
+
+  <h4>Why timeouts come first</h4>
+  <p>Every other pattern needs the call to <em>end</em>. A retry cannot happen and a circuit breaker cannot count a failure while the call waits for ever. So always set the client's connect and read timeouts (<a href="#m6-http-clients">module 6</a>), and keep them shorter than the caller's own timeout: if your API promises an answer in 3 seconds, the sum of timeouts and retries inside it must fit in 3 seconds. <code>@TimeLimiter</code> adds a time limit for an asynchronous call, but it works on <code>CompletableFuture</code> return types, which is why a client-level timeout is usually the first line of defence.</p>
+
+  <h4>Circuit breaker</h4>
+  <p>It works like the electrical one in your house. In normal state calls go through. If too many calls fail, the breaker "trips" and further calls fail instantly without touching the broken service. After a pause it lets a few test calls through; if they succeed, it closes again.</p>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> CLOSED
+  CLOSED --> OPEN: failure rate above threshold
+  OPEN --> HALF_OPEN: wait duration over
+  HALF_OPEN --> CLOSED: test calls succeed
+  HALF_OPEN --> OPEN: test calls fail
+</pre>
+  <figcaption>Circuit breaker states: closed, open, half-open</figcaption>
+  </figure>
+  <ul>
+    <li><strong>CLOSED:</strong> calls pass; the breaker records successes and failures in a sliding window (last N calls, or last N seconds).</li>
+    <li><strong>OPEN:</strong> calls are rejected at once with <code>CallNotPermittedException</code> (and your fallback runs). The failing service gets time to recover, and your threads are free.</li>
+    <li><strong>HALF_OPEN:</strong> after <code>waitDurationInOpenState</code>, a limited number of probe calls are allowed. Enough successes close the breaker; failures reopen it.</li>
+  </ul>
+  <p>A call counts as failed when it throws an exception (configurable which ones) or when it is slow (above <code>slowCallDurationThreshold</code>). Business exceptions such as "payment declined" or a 404 should usually <em>not</em> count; list them in <code>ignoreExceptions</code>.</p>
+
+  <h4>Configuration in YAML</h4>
+  <pre data-title="application.yml"><code class="language-yaml">resilience4j:
+  circuitbreaker:
+    instances:
+      paymentService:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 20                    # judge the last 20 calls
+        minimumNumberOfCalls: 10                 # do not decide before 10 calls
+        failureRateThreshold: 50                 # open at 50% failures
+        slowCallDurationThreshold: 2s
+        slowCallRateThreshold: 80
+        waitDurationInOpenState: 15s
+        permittedNumberOfCallsInHalfOpenState: 3
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+        registerHealthIndicator: true
+        ignoreExceptions:
+          - com.example.jobs.payment.PaymentDeclinedException
+  retry:
+    instances:
+      paymentService:
+        maxAttempts: 3                           # first call + 2 retries
+        waitDuration: 500ms
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2          # 500 ms, 1 s, 2 s ...
+        enableRandomizedWait: true               # jitter
+        randomizedWaitFactor: 0.5
+        retryExceptions:
+          - java.io.IOException
+          - org.springframework.web.client.ResourceAccessException
+          - org.springframework.web.client.HttpServerErrorException
+        ignoreExceptions:
+          - com.example.jobs.payment.PaymentDeclinedException
+  bulkhead:
+    instances:
+      paymentService:
+        maxConcurrentCalls: 10                   # at most 10 calls in parallel
+        maxWaitDuration: 0                       # reject at once when full
+  ratelimiter:
+    instances:
+      paymentService:
+        limitForPeriod: 50
+        limitRefreshPeriod: 1s
+        timeoutDuration: 0
+  timelimiter:
+    instances:
+      paymentService:
+        timeoutDuration: 3s
+        cancelRunningFuture: true
+
+management:
+  health:
+    circuitbreakers:
+      enabled: true
+  endpoints:
+    web:
+      exposure:
+        include: health, circuitbreakers, circuitbreakerevents, retries</code></pre>
+
+  <h4>Using the annotations with a fallback</h4>
+  <pre data-title="PaymentGateway.java"><code class="language-java">@Service
+public class PaymentGateway {
+
+    private static final Logger log = LoggerFactory.getLogger(PaymentGateway.class);
+    private final RestClient client;
+
+    public PaymentGateway(@Qualifier("paymentRestClient") RestClient client) { this.client = client; }
+
+    @CircuitBreaker(name = "paymentService", fallbackMethod = "chargeFallback")
+    @Retry(name = "paymentService")
+    @Bulkhead(name = "paymentService")
+    public PaymentResult charge(PaymentRequest request) {
+        return client.post().uri("/payments")
+                .header("Idempotency-Key", request.idempotencyKey())     // makes retry safe
+                .body(request).retrieve().body(PaymentResult.class);
+    }
+
+    // same parameters + a Throwable (or a specific exception type) as the last one
+    private PaymentResult chargeFallback(PaymentRequest request, Throwable cause) {
+        log.warn("Payment service unavailable for order {}: {}", request.orderId(),
+                cause.toString());
+        return PaymentResult.pending(request.orderId());     // accept the order, charge later
+    }
+}</code></pre>
+  <ul>
+    <li>The fallback method must be in the same class, with the same parameters plus an exception parameter, and the same return type. You can have several fallbacks, one per exception type; the most specific wins.</li>
+    <li><strong>Order of the aspects</strong> (outermost first): Retry, CircuitBreaker, RateLimiter, TimeLimiter, Bulkhead. So a retry wraps the circuit breaker: each retry attempt is recorded by the breaker, and when the breaker is open, the retry sees <code>CallNotPermittedException</code>, which you should list in <code>ignoreExceptions</code> of the retry to avoid hammering.</li>
+  </ul>
+
+  <h4>Retries: only when safe</h4>
+  <ul>
+    <li><strong>Retry only idempotent operations</strong> (GET, PUT, DELETE, or a POST with an idempotency key). Retrying "charge 500 rupees" without protection can charge twice, because the first request may have succeeded and only the response got lost.</li>
+    <li><strong>Retry only transient errors:</strong> timeouts, connection refused, 502/503/504. Never retry 400, 401, 403, 404 or a validation error; they will fail again.</li>
+    <li><strong>Exponential backoff</strong> (wait 0.5 s, 1 s, 2 s...) gives the service room to recover. <strong>Jitter</strong> (random variation) stops all clients retrying at the same instant, which would create a <em>retry storm</em>.</li>
+    <li>Keep <code>maxAttempts</code> small (2 or 3). Retries multiply load: 3 attempts across 3 layers of services is 27 calls.</li>
+    <li>Use a total time budget; a retry loop that takes longer than the user waits is useless.</li>
+  </ul>
+
+  <h4>Fallbacks that make sense</h4>
+  <ul>
+    <li><strong>Cached or default data:</strong> show the last known company logo, or an empty recommendation list.</li>
+    <li><strong>Degraded mode:</strong> accept the order as "payment pending", queue it, charge later.</li>
+    <li><strong>A clear error</strong> (503 with a message and <code>Retry-After</code>) is also a valid fallback. For money, security and consistency-critical operations, a wrong guess is worse than failing: do not invent "payment succeeded".</li>
+    <li>Do not hide failures: log and count fallbacks.</li>
+  </ul>
+
+  <h4>Bulkhead and rate limiter</h4>
+  <p>A <strong>bulkhead</strong> reserves a limited capacity for each dependency: with <code>maxConcurrentCalls: 10</code> for payments, at most ten threads can be busy with payments, so a slow payment service cannot use all your Tomcat threads, and image resizing still works. It throws <code>BulkheadFullException</code> when full. The semaphore type (the default) limits concurrent calls on the caller's thread; a thread-pool type isolates calls on a separate pool (for <code>CompletableFuture</code> methods). A <strong>rate limiter</strong> here protects a <em>dependency with a quota</em> (for example an SMS provider that allows 50 requests per second); it is the outgoing cousin of the incoming rate limits from <a href="#m6-rate-limiting">module 6</a>.</p>
+
+  <h4>Observing it</h4>
+  <p>With Actuator, <code>/actuator/circuitbreakers</code> lists breakers and their states, <code>/actuator/circuitbreakerevents</code> shows the recent events (success, error, state transition), and with <code>registerHealthIndicator</code> the health endpoint reports breakers. Resilience4j publishes Micrometer metrics (<code>resilience4j_circuitbreaker_state</code>, <code>resilience4j_circuitbreaker_calls</code> and others) for Prometheus. Alert on "breaker open for more than a few minutes" (<a href="#m6-micrometer">Micrometer</a>).</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Timeout on every remote call. Always.</li>
+      <li>Retry only idempotent, transient failures, with backoff and jitter and a small limit.</li>
+      <li>Do not count business errors as circuit-breaker failures.</li>
+      <li>The total time of all attempts must fit within your own deadline.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Annotations that do nothing: self-invocation, a missing AOP starter, a private method.</li>
+      <li>Retry on a POST that is not idempotent.</li>
+      <li>Fixed-delay retries with no jitter from hundreds of clients.</li>
+      <li>A fallback that returns fake success, hiding a real outage.</li>
+      <li>No <code>minimumNumberOfCalls</code>: one failure out of one call is "100% failure rate" and opens the breaker.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions you will see</p>
+    <ul>
+      <li><code>CallNotPermittedException</code>: breaker is OPEN.</li>
+      <li><code>BulkheadFullException</code>: too many concurrent calls.</li>
+      <li><code>RequestNotPermitted</code>: rate limiter quota used.</li>
+      <li><code>TimeoutException</code>: from the time limiter.</li>
+      <li><code>NoFallbackAvailableException</code>: no matching fallback method signature.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Explain the circuit breaker." Three states, failure-rate threshold, wait duration, half-open probes, fail fast and recover. "Retry and circuit breaker together?" Order, idempotency, backoff with jitter, ignore <code>CallNotPermittedException</code>. "What is a cascading failure and how do you prevent it?" Timeouts, bulkheads, circuit breakers, fallbacks. "What is a good fallback?" A degraded but honest answer. "Why timeouts first?" Nothing else works while calls hang.</p>
+  </div>
+</article>

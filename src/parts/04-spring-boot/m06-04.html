@@ -1,0 +1,602 @@
+<article class="topic" id="m6-http-clients">
+  <h3>Calling other APIs: RestClient, HTTP service clients, WebClient and RestTemplate</h3>
+  <p class="tldr">Use RestClient (Spring 6.1+, Boot 3.2+) for synchronous HTTP calls with a fluent API, wrap it in an @HttpExchange interface for a declarative client, always set timeouts, and map error statuses deliberately.</p>
+
+  <h4>What and why</h4>
+  <p>Your backend often calls other services: a payment gateway, a resume parser, an email API, another microservice. This is an <strong>outgoing</strong> HTTP call, the mirror image of a controller. It is where production systems fail most: the other side is slow, down or returns something unexpected. So the three rules are: set <strong>timeouts</strong>, handle <strong>errors</strong> explicitly, and decide what to do when the call fails (retry, fallback, circuit breaker; see <a href="#m7-resilience4j">Resilience4j</a>).</p>
+
+  <h4>The four clients: which one?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Client</th><th>Style</th><th>Status</th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td><code>RestClient</code></td><td>Synchronous, fluent</td><td>Current (since Spring 6.1 / Boot 3.2)</td><td><strong>New code</strong> in a servlet (blocking) application</td></tr>
+      <tr><td>HTTP service client (<code>@HttpExchange</code>)</td><td>Declarative interface on top of RestClient or WebClient</td><td>Current</td><td>A typed client for one remote API; the least code</td></tr>
+      <tr><td><code>WebClient</code></td><td>Reactive (Mono/Flux), also works blocking</td><td>Current, part of WebFlux</td><td>Reactive apps, streaming, parallel calls</td></tr>
+      <tr><td><code>RestTemplate</code></td><td>Synchronous, template methods</td><td>Maintenance mode; will not get new features</td><td>Existing code; do not start new code with it</td></tr>
+    </tbody>
+  </table></div>
+  <p>You will meet <code>RestTemplate</code> in most older codebases and interviews, so know its methods (<code>getForObject</code>, <code>postForEntity</code>, <code>exchange</code>). <code>RestClient</code> was created to give the same blocking model with the modern fluent style of <code>WebClient</code>, without needing the reactive stack.</p>
+
+  <h4>RestClient basics</h4>
+  <p>Boot provides a <code>RestClient.Builder</code> bean already configured (message converters, observability). Inject it, set a base URL and defaults once, and keep the built client in a bean:</p>
+  <pre data-title="PaymentClientConfig.java"><code class="language-java">@Configuration
+public class PaymentClientConfig {
+
+    @Bean
+    RestClient paymentRestClient(RestClient.Builder builder,
+                                 @Value("${payments.base-url}") String baseUrl,
+                                 @Value("${payments.api-key}") String apiKey) {
+
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(2000);        // ms to open the connection
+        factory.setReadTimeout(5000);           // ms to wait for the response
+
+        return builder
+                .baseUrl(baseUrl)
+                .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
+                .defaultHeader(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE)
+                .requestFactory(factory)
+                .build();
+    }
+}</code></pre>
+  <pre data-title="Using it"><code class="language-java">@Service
+public class PaymentGateway {
+
+    private final RestClient client;
+    public PaymentGateway(@Qualifier("paymentRestClient") RestClient client) { this.client = client; }
+
+    public PaymentStatus status(String paymentId) {
+        return client.get()
+                .uri("/payments/{id}", paymentId)               // URI template: encoded safely
+                .retrieve()
+                .body(PaymentStatus.class);                     // deserialises JSON into a record
+    }
+
+    public ResponseEntity&lt;PaymentResponse&gt; pay(PaymentRequest request) {
+        return client.post()
+                .uri("/payments")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(request)                                  // serialised to JSON
+                .retrieve()
+                .toEntity(PaymentResponse.class);               // status, headers and body
+    }
+
+    public List&lt;PaymentStatus&gt; recent(int days) {
+        return client.get()
+                .uri(b -&gt; b.path("/payments").queryParam("days", days).build())
+                .retrieve()
+                .body(new ParameterizedTypeReference&lt;List&lt;PaymentStatus&gt;&gt;() { });  // generics
+    }
+}</code></pre>
+  <ul>
+    <li><code>retrieve()</code> is the simple path: send, check status, give the body. <code>exchange()</code> gives full control of the raw response when you need it.</li>
+    <li><code>body(Class)</code> returns the object; <code>toEntity(Class)</code> keeps headers and status; <code>toBodilessEntity()</code> ignores the body; <code>.body(new ParameterizedTypeReference&lt;...&gt;(){})</code> keeps generic types.</li>
+    <li>Use URI templates (<code>"/payments/{id}"</code>) instead of string concatenation, so values are encoded and you do not get injection into the URL.</li>
+  </ul>
+
+  <h4>Error handling with onStatus</h4>
+  <p>By default, <code>retrieve()</code> throws <code>HttpClientErrorException</code> (4xx) or <code>HttpServerErrorException</code> (5xx), both subclasses of <code>RestClientResponseException</code>. Turn these into your own domain exceptions, so the rest of your code does not depend on HTTP:</p>
+  <pre data-title="Mapping statuses"><code class="language-java">public PaymentStatus status(String paymentId) {
+    return client.get()
+            .uri("/payments/{id}", paymentId)
+            .retrieve()
+            .onStatus(status -&gt; status.value() == 404, (request, response) -&gt; {
+                throw new PaymentNotFoundException(paymentId);
+            })
+            .onStatus(HttpStatusCode::is5xxServerError, (request, response) -&gt; {
+                throw new PaymentProviderException("Provider error " + response.getStatusCode());
+            })
+            .body(PaymentStatus.class);
+}</code></pre>
+  <p>Other failures: a connection refused or a timeout surfaces as <code>ResourceAccessException</code> (wrapping <code>ConnectException</code> or <code>SocketTimeoutException</code>). Catch it where you decide to retry or fall back. Never log the full request when it holds API keys or personal data.</p>
+
+  <h4>Timeouts: always</h4>
+  <p>The default of many HTTP clients is "wait for ever". One slow dependency then occupies all your threads and your whole application stops answering: a <strong>cascading failure</strong>. Always set a connect timeout (1 to 3 s) and a read timeout (based on the remote service's normal speed, for example 3 to 10 s). Three ways, from simplest:</p>
+  <ul>
+    <li><strong>Boot properties</strong> (Boot 3.4+): <code>spring.http.client.connect-timeout</code> and <code>spring.http.client.read-timeout</code> apply to clients built from the auto-configured builder.</li>
+    <li><strong>A request factory</strong> in code, as above (<code>SimpleClientHttpRequestFactory</code>, <code>JdkClientHttpRequestFactory</code>, or the Apache / Jetty factories when those libraries are present).</li>
+    <li><strong>Resilience4j <code>@TimeLimiter</code></strong> as an outer deadline for the whole operation.</li>
+  </ul>
+  <p>Retries are the next layer; they belong with circuit breakers and backoff in <a href="#m7-resilience4j">module 7</a>. Retry only idempotent calls (GET, PUT, DELETE), not a payment POST unless the API supports idempotency keys.</p>
+
+  <h4>HTTP service clients: a declarative interface</h4>
+  <p>Instead of writing a class full of <code>client.get().uri(...)</code>, describe the remote API as an interface. Spring creates the implementation (a proxy) at runtime; the style is like Feign or Retrofit.</p>
+  <pre data-title="CompanyDirectoryApi.java"><code class="language-java">import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.service.annotation.GetExchange;
+import org.springframework.web.service.annotation.HttpExchange;
+import org.springframework.web.service.annotation.PostExchange;
+
+@HttpExchange("/api/companies")
+public interface CompanyDirectoryApi {
+
+    @GetExchange("/{id}")
+    CompanyDto byId(@PathVariable("id") Long id);
+
+    @GetExchange
+    List&lt;CompanyDto&gt; search(@RequestParam("q") String query);
+
+    @PostExchange
+    CompanyDto create(@RequestBody CompanyDto company);
+}</code></pre>
+  <pre data-title="Creating the proxy bean"><code class="language-java">@Configuration
+public class DirectoryClientConfig {
+
+    @Bean
+    CompanyDirectoryApi companyDirectoryApi(RestClient.Builder builder,
+                                            @Value("${directory.base-url}") String baseUrl) {
+        RestClient restClient = builder.baseUrl(baseUrl).build();
+        RestClientAdapter adapter = RestClientAdapter.create(restClient);
+        HttpServiceProxyFactory factory = HttpServiceProxyFactory.builderFor(adapter).build();
+        return factory.createClient(CompanyDirectoryApi.class);
+    }
+}</code></pre>
+  <p>Now other beans just inject <code>CompanyDirectoryApi</code> and call <code>api.byId(5L)</code>. The same interface with a <code>WebClientAdapter</code> works on <code>WebClient</code>. Methods can return the body type, <code>ResponseEntity&lt;T&gt;</code>, or <code>void</code>. It uses the Spring MVC annotations for parameters (<code>@PathVariable</code>, <code>@RequestParam</code>, <code>@RequestBody</code>, <code>@RequestHeader</code>) and its own <code>@HttpExchange</code> family for the verb and path (<code>@GetExchange</code>, <code>@PostExchange</code>, <code>@PutExchange</code>, <code>@DeleteExchange</code>, <code>@PatchExchange</code>).</p>
+  <div class="co co-version">
+    <p class="co-t">Version note</p>
+    <p><code>HttpServiceProxyFactory</code> is available from Spring Framework 6.0, and <code>RestClient</code> support from 6.1. Spring Framework 7 / Boot 4 adds simpler registration of such clients (annotations and properties so you do not write the factory bean yourself); the interface you write stays the same, only the bean wiring becomes shorter. Check the Spring reference for your version if you use 7 or later.</p>
+  </div>
+
+  <h4>WebClient and RestTemplate in short</h4>
+  <pre data-title="WebClient (needs spring-boot-starter-webflux)"><code class="language-java">WebClient webClient = WebClient.builder().baseUrl("https://api.example.com").build();
+
+Mono&lt;PaymentStatus&gt; mono = webClient.get().uri("/payments/{id}", id)
+        .retrieve().bodyToMono(PaymentStatus.class);          // reactive: nothing happens until subscribed
+
+PaymentStatus blocking = mono.block(Duration.ofSeconds(5));   // blocking style, with a timeout</code></pre>
+  <pre data-title="RestTemplate (older code)"><code class="language-java">RestTemplate rest = new RestTemplateBuilder()
+        .rootUri("https://api.example.com")
+        .connectTimeout(Duration.ofSeconds(2))        // method names differ between Boot versions
+        .readTimeout(Duration.ofSeconds(5))
+        .build();
+
+PaymentStatus s = rest.getForObject("/payments/{id}", PaymentStatus.class, id);
+ResponseEntity&lt;PaymentResponse&gt; r = rest.postForEntity("/payments", request, PaymentResponse.class);</code></pre>
+  <p>Do not add the WebFlux starter to a servlet app just for <code>WebClient</code>; use <code>RestClient</code>. Choose <code>WebClient</code> when your whole stack is reactive or you must call many services in parallel without blocking threads.</p>
+
+  <h4>Testing outgoing calls</h4>
+  <p>Test your client against a fake server: <code>MockRestServiceServer</code> (bind it to the <code>RestClient.Builder</code> with <code>MockRestServiceServer.bindTo(builder)</code>), or WireMock / MockWebServer for real HTTP. Test the error cases too: 404, 500, a slow response, an invalid JSON. See <a href="#m5">module 5</a>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>No timeouts, so one slow dependency freezes the application.</li>
+      <li>Creating a new client (<code>RestClient.create()</code>) for each call: lose pooling and configuration. Build once, reuse.</li>
+      <li>Calling a remote API inside a database transaction, holding a connection while waiting.</li>
+      <li>Catching <code>Exception</code> and returning an empty object: the failure becomes invisible.</li>
+      <li>Retrying non-idempotent POSTs and charging a customer twice.</li>
+      <li>Building URLs with string concatenation of user input.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"RestTemplate vs RestClient vs WebClient?" Legacy blocking, modern blocking, reactive. "What is an HTTP service client?" A proxy generated from an <code>@HttpExchange</code> interface. "What happens if the remote service is slow?" Timeouts, then circuit breaker and fallback. "How do you handle 4xx and 5xx?" <code>onStatus</code>, map to domain exceptions.</p>
+  </div>
+</article>
+
+<article class="topic" id="m6-rate-limiting">
+  <h3>Rate limiting: algorithms, Bucket4j, 429 responses and distributed limits</h3>
+  <p class="tldr">Rate limiting caps how many requests a client may make in a time window; implement a token bucket per user or IP (Bucket4j) in a filter, return 429 with Retry-After, store counters in Redis when you run several instances, and prefer doing coarse limiting at the gateway or Nginx.</p>
+
+  <h4>What and why</h4>
+  <p><strong>Rate limiting</strong> restricts how often a client may call your API. Reasons:</p>
+  <ul>
+    <li><strong>Abuse and attacks:</strong> brute-force logins, OTP guessing, scraping, a denial-of-service attempt.</li>
+    <li><strong>Cost:</strong> every request that sends an email or calls a paid API costs money.</li>
+    <li><strong>Fairness and stability:</strong> one noisy client must not slow the service for everyone.</li>
+    <li><strong>Protecting downstream systems</strong> (database, third-party APIs with their own limits).</li>
+  </ul>
+
+  <h4>Algorithms in brief</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Algorithm</th><th>How it works</th><th>Good</th><th>Weak</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Fixed window</strong></td><td>Count requests per clock window (per minute); reset at the boundary</td><td>Simplest; one Redis key</td><td>Burst at the boundary: 100 at 10:00:59 and 100 at 10:01:00</td></tr>
+      <tr><td><strong>Sliding window</strong></td><td>Count the last N seconds continuously (log of timestamps, or weighted two windows)</td><td>Smooth, accurate</td><td>More memory and work</td></tr>
+      <tr><td><strong>Token bucket</strong></td><td>Bucket holds up to N tokens; each request takes one; tokens refill at a steady rate</td><td>Allows short bursts, enforces the average rate; cheap</td><td>Two parameters to tune</td></tr>
+      <tr><td><strong>Leaky bucket</strong></td><td>Requests enter a queue that drains at a fixed rate</td><td>Very smooth output</td><td>Adds delay; queue can fill</td></tr>
+    </tbody>
+  </table></div>
+  <p>Token bucket is the most common. Example: capacity 20, refill 10 tokens per minute: a client can burst 20 requests at once, then is held to one every 6 seconds. Design notes for the algorithms are in <a href="08-system-design.html#m5">System Design · Module 5</a>.</p>
+
+  <h4>In-app implementation with Bucket4j</h4>
+  <p><strong>Bucket4j</strong> is a Java library that implements the token bucket correctly and thread-safely. Add the <code>bucket4j-core</code> dependency (check the Bucket4j site for the current group and artifact name for your Java version). We keep one bucket per client key and consult it in a servlet filter:</p>
+  <pre data-title="RateLimitFilter.java"><code class="language-java">import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import io.bucket4j.Bucket;
+import io.bucket4j.ConsumptionProbe;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.time.Duration;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+@Component
+public class RateLimitFilter extends OncePerRequestFilter {
+
+    // one bucket per client; entries unused for 10 minutes are dropped (no memory leak)
+    private final Cache&lt;String, Bucket&gt; buckets = Caffeine.newBuilder()
+            .expireAfterAccess(Duration.ofMinutes(10))
+            .maximumSize(100_000)
+            .build();
+
+    private Bucket newBucket() {
+        return Bucket.builder()
+                .addLimit(limit -&gt; limit.capacity(20).refillGreedy(10, Duration.ofMinutes(1)))
+                .build();
+    }
+
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        return !request.getRequestURI().startsWith("/api/");     // limit the API only
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+                                    FilterChain chain) throws ServletException, IOException {
+        String key = clientKey(request);
+        Bucket bucket = buckets.get(key, k -&gt; newBucket());
+        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+
+        if (probe.isConsumed()) {
+            response.setHeader("X-RateLimit-Remaining", String.valueOf(probe.getRemainingTokens()));
+            chain.doFilter(request, response);
+        } else {
+            long waitSeconds = Math.max(1, probe.getNanosToWaitForRefill() / 1_000_000_000L);
+            response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());          // 429
+            response.setHeader("Retry-After", String.valueOf(waitSeconds));
+            response.setContentType("application/problem+json");
+            response.getWriter().write("{\"title\":\"Too many requests\",\"status\":429,"
+                    + "\"detail\":\"Try again in " + waitSeconds + " seconds\"}");
+        }
+    }
+
+    private String clientKey(HttpServletRequest request) {
+        var auth = org.springframework.security.core.context.SecurityContextHolder
+                .getContext().getAuthentication();
+        if (auth != null &amp;&amp; auth.isAuthenticated() &amp;&amp; !"anonymousUser".equals(auth.getPrincipal())) {
+            return "user:" + auth.getName();                 // logged in: limit per user
+        }
+        return "ip:" + request.getRemoteAddr();              // anonymous: limit per IP
+    }
+}</code></pre>
+  <ul>
+    <li>The filter needs a Caffeine dependency here; a plain <code>ConcurrentHashMap</code> works too but never forgets old clients.</li>
+    <li>If you want to limit authenticated users, register the filter <em>after</em> the security filter that sets the authentication; for login and OTP endpoints (anonymous) use the IP.</li>
+    <li>You can give different endpoints different limits: strict for <code>/api/auth/login</code> (5 per minute) and loose for reads. Select the bucket configuration by path.</li>
+  </ul>
+
+  <h4>Returning 429 properly</h4>
+  <p>Status <strong>429 Too Many Requests</strong> is the standard answer. Add a <code>Retry-After</code> header (seconds to wait) so well-behaved clients back off, and optionally informal headers such as <code>X-RateLimit-Limit</code> and <code>X-RateLimit-Remaining</code>. Use the same error body format as the rest of your API (<code>ProblemDetail</code>, <a href="#m2">module 2</a>). Log rejections at WARN with the key, and count them with a Micrometer counter so you can see attacks.</p>
+
+  <h4>Which client key? Be careful with proxies</h4>
+  <p>Behind Nginx, a load balancer or a gateway, <code>request.getRemoteAddr()</code> is the proxy's address, so everyone shares one bucket and gets blocked together. Set <code>server.forward-headers-strategy=framework</code> (or <code>native</code> for Tomcat) so Spring reads the <code>X-Forwarded-For</code> header, and make sure only your trusted proxy can set it; otherwise an attacker sends a fake header with a new value on each request and escapes the limit. Authenticated user id or an API key is a better key than IP, because many people share one IP (a college or an office network behind NAT).</p>
+
+  <h4>Distributed rate limiting with Redis</h4>
+  <p>With three instances of the app, each with its own in-memory buckets, a client effectively gets three times the limit. Counters must live in a shared store, and Redis is the usual choice because it is fast and has atomic operations. Two ways:</p>
+  <ul>
+    <li><strong>Bucket4j with a Redis backend</strong> (extension modules for Lettuce, Redisson, Jedis and others): the same bucket API, with the state kept in Redis.</li>
+    <li><strong>A simple fixed-window counter</strong> with <code>StringRedisTemplate</code>:</li>
+  </ul>
+  <pre data-title="Fixed window in Redis (INCR + EXPIRE)"><code class="language-java">public boolean allow(String clientKey, int limit, Duration window) {
+    long slot = System.currentTimeMillis() / window.toMillis();          // current window number
+    String key = "rl:" + clientKey + ":" + slot;
+    Long count = redis.opsForValue().increment(key);                     // atomic
+    if (count != null &amp;&amp; count == 1L) {
+        redis.expire(key, window);                                       // first hit sets the TTL
+    }
+    return count != null &amp;&amp; count &lt;= limit;
+}</code></pre>
+  <p>This has a tiny race (the app can crash between <code>INCR</code> and <code>EXPIRE</code>, leaving a key with no TTL); production code puts both steps in a Lua script that Redis runs atomically. It also has the fixed-window boundary burst. For a sliding window use a sorted set (<code>opsForZSet()</code>): add the timestamp, remove entries older than the window, count the rest, all in one script. Decide what happens if Redis is down: <strong>fail open</strong> (allow requests, accept the risk) or <strong>fail closed</strong> (reject). Most public APIs fail open, with an alert.</p>
+
+  <h4>Limit at the edge instead</h4>
+  <p>The cheapest request to handle is the one that never reaches Java. Put coarse limits in front of the application:</p>
+  <pre data-title="nginx.conf (fragment)"><code class="language-nginx">http {
+    limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;     # 10 requests per second per IP
+
+    server {
+        location /api/ {
+            limit_req zone=api burst=20 nodelay;                     # allow short bursts
+            limit_req_status 429;
+            proxy_pass http://backend;
+        }
+    }
+}</code></pre>
+  <p>Spring Cloud Gateway has a built-in <code>RequestRateLimiter</code> filter backed by Redis (<a href="#m7-gateway">gateway article</a>), and cloud API gateways and CDNs offer limits too. A good layering: Nginx or gateway for coarse per-IP limits and DDoS protection; the application for business limits (5 resume uploads per hour per user, 3 password-reset mails per hour per address) that need to know who the user is.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Place</th><th>Strength</th><th>Weakness</th></tr></thead>
+    <tbody>
+      <tr><td>Nginx / CDN / WAF</td><td>Blocks before Java; very cheap</td><td>Knows IP and URL, not your users</td></tr>
+      <tr><td>API gateway</td><td>One place for all services; can use user or API key</td><td>Another component to run</td></tr>
+      <tr><td>Application filter</td><td>Business rules, per-user, per-plan</td><td>Uses app resources; needs Redis for several instances</td></tr>
+      <tr><td>Resilience4j <code>@RateLimiter</code></td><td>Limits <em>your calls to</em> another service</td><td>Outgoing, not for protecting your API from clients</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>An unbounded <code>HashMap</code> of buckets: one attacker with a million fake IPs fills memory.</li>
+      <li>Rate limiting by <code>getRemoteAddr()</code> behind a proxy (everybody is "the proxy").</li>
+      <li>Trusting <code>X-Forwarded-For</code> from anyone.</li>
+      <li>Same limit for login and for reading job lists.</li>
+      <li>Returning 500 or 403 instead of 429, with no <code>Retry-After</code>.</li>
+      <li>In-memory limits on several instances (limit multiplied by the instance count).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How would you rate-limit an API?" Pick key (user/IP/API key), algorithm (token bucket for bursts), shared store (Redis) for several instances, answer 429 + <code>Retry-After</code>, and do coarse limiting at the edge. "Token bucket vs fixed window?" Bursts allowed with a steady average vs boundary double-burst. "What if Redis fails?" Fail open or closed, a stated decision.</p>
+  </div>
+</article>
+
+<article class="topic" id="m6-prod-checklist">
+  <h3>Production-readiness checklist</h3>
+  <p class="tldr">Before you deploy, check that configuration comes from the environment, health checks and logs work, shutdown is graceful, every external call has a timeout, pools are sized, the schema is migrated by a tool, and the API is documented.</p>
+
+  <p>"It works" is not "it is ready". This checklist collects the lessons of the whole module and ties them to Project 2. Go through it before the first real deployment, and again when a service misbehaves.</p>
+
+  <h4>1. Configuration and secrets</h4>
+  <ul>
+    <li><strong>12-factor style:</strong> the same JAR runs everywhere; only environment variables change. Spring's relaxed binding maps <code>SPRING_DATASOURCE_URL</code> to <code>spring.datasource.url</code>.</li>
+    <li>No passwords, API keys or JWT secrets in Git, in <code>application.yml</code> defaults, or in logs. Use environment variables, Docker/Kubernetes secrets or a vault.</li>
+    <li>Profiles (<code>dev</code>, <code>test</code>, <code>prod</code>) for differences; <code>prod</code> must not fall back to development defaults silently.</li>
+    <li>Fail fast: validate required properties at startup with <code>@ConfigurationProperties</code> and <code>@Validated</code>.</li>
+  </ul>
+  <pre data-title="application-prod.yml"><code class="language-yaml">spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate           # Flyway owns the schema; Hibernate only checks it
+  flyway:
+    enabled: true
+server:
+  shutdown: graceful
+  forward-headers-strategy: framework
+  tomcat:
+    threads:
+      max: 200
+spring.lifecycle.timeout-per-shutdown-phase: 30s
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+logging:
+  structured:
+    format:
+      console: ecs</code></pre>
+
+  <h4>2. Database</h4>
+  <ul>
+    <li><strong>Migrations with Flyway or Liquibase</strong>, never <code>ddl-auto=update</code> in production (<a href="#m3">module 3</a>). Migrations run on startup before traffic is served.</li>
+    <li><strong>Connection pool sizing:</strong> HikariCP <code>maximum-pool-size</code> defaults to 10. More is not better: a pool larger than the database can serve only moves the queue into the database. Start at about 10 to 20 per instance and make sure (instances x pool size) stays below the database's <code>max_connections</code>. Watch <code>hikaricp.connections.pending</code>.</li>
+    <li>Set <code>spring.datasource.hikari.connection-timeout</code> (default 30 s) lower, so overloaded requests fail fast.</li>
+    <li>Indexes for your real queries, slow-query log on, <code>open-in-view=false</code>, N+1 checked.</li>
+  </ul>
+
+  <h4>3. Health, shutdown and timeouts</h4>
+  <ul>
+    <li>Actuator health with liveness and readiness probes; the container or Kubernetes uses them (<a href="#m6-actuator">Actuator</a>).</li>
+    <li><strong>Graceful shutdown:</strong> <code>server.shutdown=graceful</code> makes Tomcat stop accepting new requests, finish in-flight ones, then exit; <code>spring.lifecycle.timeout-per-shutdown-phase=30s</code> sets how long it waits. Without it, a deployment cuts requests in half (HTTP 502 for users). Match it with the platform's termination grace period.</li>
+    <li><strong>Timeouts everywhere:</strong> outgoing HTTP (<a href="#m6-http-clients">clients</a>), database (<code>spring.jpa.properties.jakarta.persistence.query.timeout</code> or per-transaction <code>timeout</code>), Redis, SMTP. A missing timeout is a future outage.</li>
+    <li>Executors have bounded queues; scheduled jobs are idempotent and single-run in a cluster.</li>
+  </ul>
+
+  <h4>4. Observability</h4>
+  <ul>
+    <li>Structured logs to stdout with a request or trace id; correct levels; no secrets (<a href="#m6-logging">Logging</a>).</li>
+    <li>Metrics scraped by Prometheus; dashboards for latency, traffic, errors and saturation; alerts on error rate and latency (<a href="#m6-micrometer">Micrometer</a>).</li>
+    <li>Version in <code>/actuator/info</code> (build and git info), so you know what is running.</li>
+    <li>Later: tracing across services (<a href="#m7-tracing">module 7</a>).</li>
+  </ul>
+
+  <h4>5. Performance and protection</h4>
+  <ul>
+    <li>Caching for hot read paths with TTL and invalidation (<a href="#m6-caching">Caching</a>); pagination on every list endpoint; compression (<code>server.compression.enabled=true</code>) if not handled by Nginx.</li>
+    <li>Rate limiting on login, OTP, upload, email-sending endpoints (<a href="#m6-rate-limiting">Rate limiting</a>).</li>
+    <li>Request size limits (<code>max-file-size</code>, Tomcat <code>max-http-form-post-size</code> where relevant).</li>
+    <li>Security: HTTPS at the edge, CORS limited to your frontend origin, security headers, actuator locked, dependencies updated (<a href="#m4">module 4</a>).</li>
+  </ul>
+
+  <h4>6. API quality</h4>
+  <ul>
+    <li><strong>API documentation</strong> with springdoc-openapi (Swagger UI) from your controllers and DTOs (<a href="#m2">module 2</a>). Disable or protect Swagger UI in production if the API is not public.</li>
+    <li>Consistent error responses (<code>ProblemDetail</code>), correct status codes, validation, idempotency for payments.</li>
+    <li>Versioning strategy (<code>/api/v1</code>) and a deprecation policy before you have many clients.</li>
+  </ul>
+
+  <h4>7. Build and deploy</h4>
+  <ul>
+    <li>A multi-stage <code>Dockerfile</code>, non-root user, small base image, JVM that respects container memory limits (<a href="07-devops.html#m3">DevOps · Module 3</a>). Layered JARs make rebuilds faster.</li>
+    <li>CI runs tests and builds the image on every push (<a href="07-devops.html#m4">DevOps · Module 4</a>).</li>
+    <li>A rollback plan; migrations that are backward-compatible for one release (add a column first, remove it later).</li>
+    <li>Backups of the database and a tested restore.</li>
+  </ul>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Teams turn this list into a template: a company "service starter" with logging, Actuator, metrics, Dockerfile and CI already configured, so every new service is production-ready on day one. The same list is also a good outline for the "how do you take a Spring Boot app to production?" interview question.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Treating production as "dev with a bigger server": same <code>ddl-auto=update</code>, same passwords, debug logs.</li>
+      <li>Health check that returns UP while the database is unreachable (or the opposite: liveness depending on the database).</li>
+      <li>A 200-connection pool times ten instances, killing PostgreSQL.</li>
+      <li>No graceful shutdown, so every deploy shows errors to users.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m6-interview">
+  <h3>Interview questions — Production features</h3>
+
+  <details class="qa">
+    <summary>What is the difference between SLF4J and Logback, and why use placeholders in log calls?</summary>
+    <div class="qa-a">
+      <p>SLF4J is the logging API (a facade) that your code uses; Logback is the implementation that formats and writes the lines, and it is Spring Boot's default. The facade lets you change the implementation without touching code. Placeholders (<code>log.info("user {}", id)</code>) build the message only when the level is enabled, and they keep the exception as a separate last argument so the stack trace is printed.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you follow one request through many log lines, including across threads?</summary>
+    <div class="qa-a">
+      <p>Put a correlation id into the MDC in a servlet filter at the start of the request, print <code>%X{requestId}</code> in the log pattern, and clear the MDC in <code>finally</code>. The MDC is thread-local, so for <code>@Async</code> or executors you copy it with a <code>TaskDecorator</code>. With Micrometer Tracing the trace and span ids are put in the MDC for you and propagated between services.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is Spring Boot Actuator, and how do you secure it?</summary>
+    <div class="qa-a">
+      <p>It adds production endpoints (health, info, metrics, loggers, env, threaddump and others). Only <code>health</code> is exposed over HTTP by default. You choose exposure with <code>management.endpoints.web.exposure.include</code>, restrict sensitive endpoints to an admin role with Spring Security, and/or serve them on a separate <code>management.server.port</code> that is not reachable from the internet. Never expose <code>heapdump</code> or <code>env</code> publicly.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Liveness vs readiness probe?</summary>
+    <div class="qa-a">
+      <p>Liveness answers "is the process broken?"; failure makes the platform restart the container, so it should not depend on external systems. Readiness answers "can it serve traffic now?"; failure removes the instance from the load balancer but does not restart it, and it may include the database. Boot exposes <code>/actuator/health/liveness</code> and <code>/readiness</code> when probes are enabled.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What are counters, gauges and timers in Micrometer, and why is tag cardinality dangerous?</summary>
+    <div class="qa-a">
+      <p>A counter only increases (requests, errors); a gauge reports a current value that can rise and fall (queue size); a timer records count and duration of events. Each unique combination of tag values becomes a separate time series, so a tag such as user id or a raw URL creates millions of series and overloads Prometheus and your application's memory. Use low-cardinality tags only.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does <code>@Cacheable</code> work, and why might it not work?</summary>
+    <div class="qa-a">
+      <p>A proxy intercepts the call, builds a key from the arguments, looks it up in the named cache and calls the method only on a miss. It fails silently when <code>@EnableCaching</code> is missing, when the method is called from the same class (self-invocation bypasses the proxy), when the method is private or final, or when the bean is not created by Spring. The key can also be wrong, for example when it ignores a parameter.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>@Cacheable vs @CachePut vs @CacheEvict?</summary>
+    <div class="qa-a">
+      <p><code>@Cacheable</code> skips the method if the value is cached. <code>@CachePut</code> always runs the method and updates the cache with the result (use on updates). <code>@CacheEvict</code> removes an entry, or all entries with <code>allEntries = true</code> (use on deletes and on changes that make other cached results stale). <code>@Caching</code> combines several on one method.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Caffeine or Redis for a cache? What serialization would you use with Redis?</summary>
+    <div class="qa-a">
+      <p>Caffeine is in-process memory: fastest, no network, but every instance has its own copy, so entries can differ between instances. Redis is shared and survives restarts of the application, at the cost of a network hop. With Redis, replace the default JDK serialization by JSON (and string keys) so values are readable, need not be <code>Serializable</code>, and are less fragile to class changes; always set a TTL.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between <code>fixedRate</code>, <code>fixedDelay</code> and <code>cron</code>? What problems appear in a cluster?</summary>
+    <div class="qa-a">
+      <p><code>fixedRate</code> measures the period from the start of one run to the start of the next; <code>fixedDelay</code> from the end of one run to the start of the next; <code>cron</code> uses a calendar expression (six fields in Spring, with seconds) and a time zone. In a cluster each instance runs the job, so use ShedLock, a dedicated worker instance, or an external scheduler. The default scheduler also has one thread, so a long job delays the others.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why can an <code>@Async</code> method run synchronously, and what does not propagate to the async thread?</summary>
+    <div class="qa-a">
+      <p>It runs synchronously when <code>@EnableAsync</code> is missing or when it is called from within the same class, because the proxy is bypassed. Thread-local state does not propagate: the caller's transaction, the Spring Security context and the MDC are not available in the new thread. Pass ids instead of entities, start async work after commit, and copy context with a decorator if needed.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What do virtual threads change in Spring Boot?</summary>
+    <div class="qa-a">
+      <p>With Java 21+ and Boot 3.2+, <code>spring.threads.virtual.enabled=true</code> runs request handling, <code>@Async</code> and scheduled tasks on cheap virtual threads. Blocking calls (JDBC, HTTP) no longer hold an OS thread, so a blocking-style application scales to many concurrent requests. They do not speed up CPU-bound work, and your connection pool and downstream services still limit the throughput. Older Java versions could pin carrier threads in <code>synchronized</code> blocks.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you implement a secure file upload?</summary>
+    <div class="qa-a">
+      <p>Limit sizes (<code>spring.servlet.multipart.max-file-size</code> and a business limit), check the content type by looking at the bytes with an allow-list, never use the client's file name for the path (path traversal), generate a UUID name, normalise and verify that the path stays inside the upload folder, store outside the web root, keep metadata and ownership in the database, authorise downloads and send them with <code>Content-Disposition</code>. In production use object storage such as S3.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>RestTemplate, RestClient and WebClient: which one do you use, and what must you configure?</summary>
+    <div class="qa-a">
+      <p>For new blocking code use <code>RestClient</code> (Spring 6.1+); <code>RestTemplate</code> is in maintenance mode but common in old code; <code>WebClient</code> is for reactive stacks. Whatever the client, set connect and read timeouts, map 4xx/5xx errors to domain exceptions (<code>onStatus</code>), reuse the client bean, and add retry and circuit breaking for unreliable dependencies. An <code>@HttpExchange</code> interface gives a declarative client.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How would you rate-limit the login endpoint across three instances of a service?</summary>
+    <div class="qa-a">
+      <p>Use a shared counter store, normally Redis, with a token bucket or sliding window keyed by IP (and username for login). Local in-memory buckets would give each instance its own allowance. Respond with 429 and <code>Retry-After</code>, decide fail-open or fail-closed if Redis is down, make sure the real client IP is read correctly behind the proxy, and add coarse limits at Nginx or the gateway as well.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What would you check before putting a Spring Boot service in production?</summary>
+    <div class="qa-a">
+      <p>Config and secrets from the environment, Flyway migrations with <code>ddl-auto=validate</code>, <code>open-in-view=false</code>, sized connection pool, timeouts on every external call, health and readiness probes, graceful shutdown, structured logs without secrets, metrics and alerts, rate limits on sensitive endpoints, locked-down Actuator, API docs, a multi-stage Docker image and a rollback plan.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m6-cheatsheet">
+  <h3>Cheat sheet — Production features</h3>
+  <ul class="cheat">
+    <li><b>Logger</b> <code>LoggerFactory.getLogger(X.class)</code> or Lombok <code>@Slf4j</code>; use <code>{}</code> placeholders; exception as the last argument</li>
+    <li><b>Levels</b> ERROR &gt; WARN &gt; INFO &gt; DEBUG &gt; TRACE; Boot default is INFO; set with <code>logging.level.com.example=DEBUG</code></li>
+    <li><b>Log files</b> <code>logging.file.name</code>, <code>logging.logback.rollingpolicy.max-file-size</code>, <code>max-history</code>; in containers log to stdout</li>
+    <li><b>JSON logs</b> <code>logging.structured.format.console=ecs</code> (Boot 3.4+); <b>MDC</b> filter puts <code>requestId</code>, clear in <code>finally</code></li>
+    <li><b>Never log</b> passwords, tokens, OTPs, card or ID numbers, full bodies</li>
+    <li><b>Actuator</b> <code>spring-boot-starter-actuator</code>; expose with <code>management.endpoints.web.exposure.include</code>; separate <code>management.server.port</code></li>
+    <li><b>Probes</b> <code>/actuator/health/liveness</code> (restart) and <code>/readiness</code> (traffic); custom check = <code>HealthIndicator</code></li>
+    <li><b>Runtime log level</b> <code>POST /actuator/loggers/&lt;logger&gt;</code> with <code>{"configuredLevel":"DEBUG"}</code></li>
+    <li><b>Micrometer</b> Counter (up), Gauge (current), Timer (duration); low-cardinality tags; <code>/actuator/prometheus</code> needs <code>micrometer-registry-prometheus</code></li>
+    <li><b>Caching</b> <code>@EnableCaching</code>; <code>@Cacheable(key, condition, unless)</code>, <code>@CachePut</code>, <code>@CacheEvict(allEntries)</code>, <code>@Caching</code></li>
+    <li><b>Cache pitfalls</b> self-invocation, no TTL, wrong key, cached entities; cache DTOs</li>
+    <li><b>Redis cache</b> <code>spring.cache.type=redis</code>, <code>spring.cache.redis.time-to-live</code>, JSON value serializer, string keys; <code>StringRedisTemplate</code> for direct use</li>
+    <li><b>Caffeine</b> local, <code>spring.cache.caffeine.spec=maximumSize=1000,expireAfterWrite=10m</code></li>
+    <li><b>@Scheduled</b> <code>@EnableScheduling</code>; <code>fixedRate</code> (start to start), <code>fixedDelay</code> (end to start), 6-field <code>cron</code> + <code>zone="Asia/Kolkata"</code></li>
+    <li><b>Scheduler pool</b> default 1 thread: <code>spring.task.scheduling.pool.size</code>; cluster: ShedLock</li>
+    <li><b>@Async</b> <code>@EnableAsync</code>; returns void or <code>CompletableFuture</code>; named executor <code>@Async("mailExecutor")</code>; bounded queue</li>
+    <li><b>Async limits</b> no caller transaction, no security context, no MDC; start after commit with <code>@TransactionalEventListener(AFTER_COMMIT)</code></li>
+    <li><b>Virtual threads</b> <code>spring.threads.virtual.enabled=true</code> (Boot 3.2+, Java 21+); for blocking I/O, not CPU work</li>
+    <li><b>Upload</b> <code>MultipartFile</code>; <code>spring.servlet.multipart.max-file-size</code>/<code>max-request-size</code>; check bytes, UUID name, normalised path, outside web root</li>
+    <li><b>Download</b> <code>ResponseEntity&lt;Resource&gt;</code> + <code>ContentDisposition.attachment().filename(n, UTF_8)</code>; big data: <code>StreamingResponseBody</code></li>
+    <li><b>Email</b> <code>spring-boot-starter-mail</code>, <code>spring.mail.*</code>; <code>SimpleMailMessage</code> vs <code>MimeMessageHelper</code> (HTML, attachments); test with Mailpit (SMTP 1025, UI 8025)</li>
+    <li><b>RestClient</b> <code>builder.baseUrl().build()</code>; <code>.get().uri(..).retrieve().body(T.class)</code>; <code>onStatus</code>; always timeouts</li>
+    <li><b>HTTP service client</b> <code>@HttpExchange</code> interface + <code>HttpServiceProxyFactory</code></li>
+    <li><b>Rate limiting</b> token bucket (Bucket4j) per user/IP; 429 + <code>Retry-After</code>; Redis for several instances; coarse limits in Nginx/gateway</li>
+    <li><b>Production</b> env-var config, Flyway + <code>ddl-auto=validate</code>, <code>open-in-view=false</code>, <code>server.shutdown=graceful</code>, timeouts, pool sizing, probes</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m6-practice">
+  <h3>Practice — Production features</h3>
+  <ol class="steps">
+    <li><strong>Logging (easy).</strong> In your Project 2 API, add an SLF4J logger to the application service, log "application submitted" at INFO with ids, and set <code>logging.level.com.example</code> to DEBUG in a <code>dev</code> profile. Done when the console shows the line with the right level and no secret appears.</li>
+    <li><strong>Correlation id (easy).</strong> Write the <code>RequestIdFilter</code>, print <code>%X{requestId}</code> in the pattern, and return the id in an <code>X-Request-Id</code> response header. Done when two requests show different ids across several log lines each, and the id does not leak into the next request.</li>
+    <li><strong>Actuator health and info (easy).</strong> Add Actuator, expose <code>health,info,metrics,prometheus</code>, enable probes, add build info, and write a custom <code>HealthIndicator</code> for the upload folder. Done when <code>/actuator/health</code> shows your component, turns DOWN (503) if the folder is removed, and the other endpoints need the ADMIN role.</li>
+    <li><strong>Custom metric (medium).</strong> Add a counter for submitted applications and a timer for the mail sending, then scrape <code>/actuator/prometheus</code>. Done when the counter increases after each application and the timer appears in the output.</li>
+    <li><strong>Caching (medium).</strong> Cache <code>getJob(id)</code> and the company list with Caffeine (TTL 10 minutes), evict on update and delete, and prove it with a test that counts repository calls. Then switch to Redis with JSON values and a per-cache TTL, and inspect keys with <code>redis-cli</code>. Done when the second call does not hit the database and an update makes the next read fresh.</li>
+    <li><strong>Project 2: resume upload (medium).</strong> Add <code>POST /api/applications/{id}/resume</code> (PDF only, 2 MB, UUID name, metadata table through a Flyway migration) and an owner-only download endpoint. Done when a renamed <code>.exe</code> is rejected, a file called <code>../../x.pdf</code> cannot escape the folder, and another user gets 404/403.</li>
+    <li><strong>Project 2: email to the recruiter (medium).</strong> When someone applies, send an HTML mail to the job's recruiter (Thymeleaf template, resume attached) asynchronously after commit using a dedicated executor, tested against Mailpit in Docker. Done when the API answers quickly, the mail appears in Mailpit, and no mail is sent if the transaction rolls back.</li>
+    <li><strong>Scheduled job (medium).</strong> Close jobs whose deadline passed every night at 00:30 IST, idempotently and in batches, with a log line and a counter. Done when running it twice changes nothing the second time; bonus: protect it with ShedLock and start two instances.</li>
+    <li><strong>Rate limiting (hard).</strong> Limit <code>/api/auth/login</code> to 5 requests per minute per IP using Bucket4j, returning 429 with <code>Retry-After</code>. Then move the counter into Redis and verify with two instances. Done when the sixth call in a minute fails on both instances.</li>
+    <li><strong>Project 2 finishing steps (hard).</strong> Complete the production side of the job portal: Swagger/OpenAPI docs for all endpoints, Flyway migrations for the whole schema with <code>ddl-auto=validate</code>, an Actuator health endpoint with probes, proper logging (levels, request id, JSON in the <code>prod</code> profile), graceful shutdown, and a README that lists the endpoints and contains the ER diagram of User, Company, Job and Application. Done when a new developer can clone the repository, start it with one command and find every endpoint and the data model in the README, and the checklist in this module is ticked.</li>
+  </ol>
+</article>

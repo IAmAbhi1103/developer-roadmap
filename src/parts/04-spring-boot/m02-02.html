@@ -1,0 +1,610 @@
+<article class="topic" id="m2-json-jackson">
+  <h3>JSON and Jackson basics</h3>
+  <p class="tldr">JSON is the text format APIs speak; Jackson converts Java objects to JSON (serialization) and JSON back to Java objects (deserialization), and Spring Boot configures it for you.</p>
+
+  <p><strong>JSON</strong> (JavaScript Object Notation) is the body format of almost every REST API: easy to read, light, and understood by every language. In a Spring Boot app, a library called <strong>Jackson</strong> does the conversion between Java objects and JSON. You rarely call Jackson yourself — Spring's message converters call it for <code>@RequestBody</code> parameters and for return values — but every surprise about dates, nulls and field names comes from Jackson's rules, so you need to know them.</p>
+
+  <h4>JSON in one minute</h4>
+  <pre data-title="product.json"><code class="language-json">{
+  "id": 42,
+  "name": "Wireless Mouse",
+  "price": 799.00,
+  "inStock": true,
+  "tags": ["wireless", "usb"],
+  "dimensions": { "widthMm": 60, "heightMm": 35 },
+  "discount": null
+}</code></pre>
+  <p>JSON has only six kinds of value: <strong>object</strong> (<code>{…}</code> with named members), <strong>array</strong> (<code>[…]</code>), <strong>string</strong>, <strong>number</strong>, <strong>boolean</strong> and <strong>null</strong>. The rules are strict: keys and strings use double quotes only, there are no comments, no trailing commas, and the text is UTF-8. A single misplaced comma makes the whole document invalid.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>JSON value</th><th>Usually maps to this Java type</th></tr></thead>
+    <tbody>
+      <tr><td>object</td><td>a record, a class, or <code>Map&lt;String, Object&gt;</code></td></tr>
+      <tr><td>array</td><td><code>List&lt;T&gt;</code>, <code>Set&lt;T&gt;</code>, <code>T[]</code></td></tr>
+      <tr><td>string</td><td><code>String</code>, an <code>enum</code>, <code>LocalDate</code>, <code>UUID</code>, …</td></tr>
+      <tr><td>number</td><td><code>int</code>, <code>long</code>, <code>double</code>, <code>BigDecimal</code></td></tr>
+      <tr><td>boolean</td><td><code>boolean</code> / <code>Boolean</code></td></tr>
+      <tr><td>null</td><td><code>null</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Serialization and deserialization</h4>
+  <dl class="terms">
+    <dt>Serialization</dt>
+    <dd>Java object → JSON text. It happens when your controller returns an object. Jackson reads the object through its getters (or the accessors of a record).</dd>
+    <dt>Deserialization</dt>
+    <dd>JSON text → Java object. It happens for <code>@RequestBody</code>. Jackson creates the object through a constructor, or through the no-argument constructor plus setters.</dd>
+  </dl>
+  <p>Returning a record from a controller is all you need; Spring Boot's auto-configured <code>ObjectMapper</code> does the rest.</p>
+  <pre data-title="ProductResponse.java"><code class="language-java">public record ProductResponse(
+        Long id,
+        String name,
+        BigDecimal price,
+        boolean inStock,
+        List&lt;String&gt; tags,
+        LocalDate launchDate) {}</code></pre>
+  <pre class="out" data-title="Response body"><code class="language-json">{
+  "id": 42,
+  "name": "Wireless Mouse",
+  "price": 799.00,
+  "inStock": true,
+  "tags": ["wireless", "usb"],
+  "launchDate": "2026-08-15"
+}</code></pre>
+  <p>You can also use the mapper by hand, for example in a test, in a Kafka consumer, or when you store JSON in a column:</p>
+  <pre data-title="Using ObjectMapper directly (fragment)"><code class="language-java">// objectMapper is the auto-configured bean; inject it through the constructor
+String json = objectMapper.writeValueAsString(response);                 // Java → JSON
+ProductResponse back = objectMapper.readValue(json, ProductResponse.class);  // JSON → Java
+
+// Generic types need a TypeReference because of type erasure
+List&lt;ProductResponse&gt; list = objectMapper.readValue(
+        listJson, new TypeReference&lt;List&lt;ProductResponse&gt;&gt;() {});
+
+// No class available? Read a tree
+JsonNode tree = objectMapper.readTree(json);
+String name = tree.get("name").asText();</code></pre>
+
+  <h4>What Spring Boot configures for you</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Behaviour</th><th>Spring Boot default</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>Dates and times</td><td>Written as ISO-8601 strings, not numbers</td><td><code>"2026-10-21"</code> is readable and unambiguous</td></tr>
+      <tr><td><code>java.time</code> types</td><td>Supported out of the box</td><td><code>LocalDate</code>, <code>Instant</code> and friends just work</td></tr>
+      <tr><td>Unknown JSON properties</td><td>Ignored (plain Jackson would fail)</td><td>Clients can send extra fields without a 400</td></tr>
+      <tr><td>Constructor parameter names</td><td>Recognised</td><td>Classes with an all-args constructor can be deserialized</td></tr>
+      <tr><td>Property names</td><td>Used as they are (camelCase)</td><td>Matches what JavaScript expects</td></tr>
+      <tr><td>Nulls</td><td>Written as <code>null</code></td><td>Stable JSON shape</td></tr>
+    </tbody>
+  </table></div>
+  <p>Change the defaults with <code>spring.jackson.*</code> properties — for example <code>spring.jackson.default-property-inclusion=non_null</code> or <code>spring.jackson.property-naming-strategy=SNAKE_CASE</code> — or per class with annotations.</p>
+
+  <h4>The annotations you use most</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation</th><th>Effect</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>@JsonProperty</code></td><td>Rename a JSON key; or make it write-only</td><td><code>@JsonProperty("product_name")</code></td></tr>
+      <tr><td><code>@JsonIgnore</code></td><td>Leave the field out, both ways</td><td>internal codes</td></tr>
+      <tr><td><code>@JsonIgnoreProperties</code></td><td>Ignore listed names, or <code>ignoreUnknown = true</code></td><td>on a class</td></tr>
+      <tr><td><code>@JsonInclude</code></td><td>Omit nulls (<code>NON_NULL</code>) or empties (<code>NON_EMPTY</code>)</td><td>on a class or field</td></tr>
+      <tr><td><code>@JsonFormat</code></td><td>Custom date pattern or shape</td><td><code>@JsonFormat(pattern = "dd-MM-yyyy")</code></td></tr>
+      <tr><td><code>@JsonAlias</code></td><td>Accept other names when reading</td><td><code>@JsonAlias({"qty", "count"})</code></td></tr>
+      <tr><td><code>@JsonCreator</code></td><td>Choose the constructor or factory for reading</td><td>immutable classes</td></tr>
+      <tr><td><code>@JsonNaming</code></td><td>Change the naming style of a whole class</td><td>snake_case</td></tr>
+      <tr><td><code>@JsonValue</code></td><td>Use one method's result as the JSON value</td><td>enum codes</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="ProductView.java"><code class="language-java">@JsonInclude(JsonInclude.Include.NON_NULL)
+public record ProductView(
+        Long id,
+        @JsonProperty("product_name") String name,
+        BigDecimal price,
+        @JsonFormat(pattern = "dd-MM-yyyy") LocalDate launchDate,
+        String note,                      // null, so it is left out
+        @JsonIgnore String internalCode) {}   // never sent</code></pre>
+  <pre class="out" data-title="Resulting JSON"><code class="language-json">{"id":42,"product_name":"Wireless Mouse","price":799.00,"launchDate":"15-08-2026"}</code></pre>
+
+  <h4>Dates and times</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Java type</th><th>JSON value</th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td><code>LocalDate</code></td><td><code>"2026-10-21"</code></td><td>A calendar date with no time or zone: birthday, due date</td></tr>
+      <tr><td><code>LocalDateTime</code></td><td><code>"2026-10-21T10:15:30"</code></td><td>Wall-clock time with no zone (ambiguous; avoid for events)</td></tr>
+      <tr><td><code>Instant</code></td><td><code>"2026-10-21T04:45:30Z"</code></td><td>A precise moment in time: <code>createdAt</code>, <code>updatedAt</code></td></tr>
+      <tr><td><code>OffsetDateTime</code></td><td><code>"2026-10-21T10:15:30+05:30"</code></td><td>A moment plus the offset the user saw (+05:30 is India)</td></tr>
+    </tbody>
+  </table></div>
+  <p>The professional habit: send timestamps as UTC <code>Instant</code> values (they end with <code>Z</code>), store them in UTC, and convert to the user's time zone only when you display them, in the React app. Do not use <code>java.util.Date</code> in new code. A <code>LocalDateTime</code> without a zone is the usual source of "the time is off by 5½ hours" bugs.</p>
+
+  <h4>Nulls and missing fields</h4>
+  <ul>
+    <li><strong>Writing:</strong> nulls are written as <code>null</code>. Omit them per class with <code>@JsonInclude(NON_NULL)</code> or for the whole app with <code>spring.jackson.default-property-inclusion=non_null</code>. Omitting shrinks the payload; always writing keys gives a stable shape that is easier to type in TypeScript. Choose one policy for the whole API.</li>
+    <li><strong>Reading:</strong> a missing field becomes <code>null</code> for objects, but <code>0</code> or <code>false</code> for primitives. You cannot tell "missing" from "zero". Use wrapper types (<code>Integer</code>, <code>Boolean</code>) together with <code>@NotNull</code> for required numbers.</li>
+    <li>A plain DTO also cannot tell "field absent" from "field explicitly null". That matters for PATCH; see the partial-update section of <a href="#m2-dtos">the DTO article</a>.</li>
+  </ul>
+
+  <h4>Unknown properties</h4>
+  <p>Because Boot ignores unknown properties, a client that sends <code>"prcie": 500</code> (a typo) gets no error — the field is silently dropped. That is friendly to clients that add fields later, but it hides mistakes. To be strict, set <code>spring.jackson.deserialization.fail-on-unknown-properties=true</code>; unknown fields then produce a <code>400</code>. Public APIs usually stay tolerant; internal APIs often go strict.</p>
+
+  <h4>Enums, money and big numbers</h4>
+  <ul>
+    <li><strong>Enums</strong> are written by name (<code>"status": "ACTIVE"</code>). An unknown name on input fails with a <code>400</code>. If the API value must differ from the constant name, use <code>@JsonValue</code> and <code>@JsonCreator</code>.</li>
+    <li><strong>Money:</strong> never <code>double</code> (<code>0.1 + 0.2</code> is not <code>0.3</code>). Use <code>BigDecimal</code>, which becomes a JSON number like <code>799.00</code>. Some teams send an integer in paise (<code>79900</code>) or a string to avoid any rounding in JavaScript.</li>
+    <li><strong>Big numbers:</strong> JavaScript reads JSON numbers as 64-bit floating point, which is exact only up to 9,007,199,254,740,991 (2<sup>53</sup> − 1). A <code>Long</code> id larger than that loses digits in the browser; send such ids as strings.</li>
+  </ul>
+
+  <h4>Records, classes and constructors</h4>
+  <p>Records work without any annotations (Jackson 2.12 and newer). For a normal class, Jackson needs either a no-argument constructor plus setters, or a constructor whose parameter names it can see (Spring Boot compiles with <code>-parameters</code> and registers the right module), or an explicit <code>@JsonCreator</code>. If none exists you get <code>InvalidDefinitionException: Cannot construct instance of … (no Creators, like default constructor, exist)</code>. Spring reports this as a <strong>500</strong>, not a 400, because the fault is in your class definition and not in the client's JSON.</p>
+
+  <div class="co co-version">
+    <p class="co-t">Spring Boot 3.x uses Jackson 2; Spring Boot 4 uses Jackson 3</p>
+    <p>Boot 3.x ships Jackson 2 (<code>com.fasterxml.jackson.databind.ObjectMapper</code>). Spring Boot 4 uses Jackson 3 by default. Jackson 3 moved its core and databind classes to a new package, <code>tools.jackson</code> (for example <code>tools.jackson.databind.ObjectMapper</code>), and its exceptions are unchecked. The annotations in this article (<code>@JsonProperty</code>, <code>@JsonIgnore</code>, <code>@JsonInclude</code>, <code>@JsonFormat</code> and the rest) still live in <code>com.fasterxml.jackson.annotation</code>. Everything above about annotations, dates and null policy applies to both versions; only the imports and the direct <code>ObjectMapper</code> calls differ. If you upgrade an existing app, read the Boot 4 migration guide for its Jackson section.</p>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>JSON must be valid: double quotes, no comments, no trailing commas.</li>
+      <li>Jackson derives property names from getters: <code>getName()</code> gives <code>name</code>, and <code>isActive()</code> on a <code>boolean</code> gives <code>active</code> (not <code>isActive</code>).</li>
+      <li>For reading, Jackson needs a way to create the object: a record, a no-arg constructor with setters, or a constructor it can map.</li>
+      <li>Generic collections read by hand need a <code>TypeReference</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Use camelCase keys, ISO-8601 dates, UTC <code>Instant</code> for timestamps, and one consistent null policy.</li>
+      <li>Serialize DTOs, not JPA entities (<a href="#m2-dtos">DTO article</a>).</li>
+      <li>Do not hand-write JSON with string concatenation. Build objects and let Jackson write them.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and the exceptions you will see</p>
+    <ul>
+      <li><strong>Infinite recursion:</strong> an entity graph where <code>Order</code> points to <code>OrderItem</code> and back fails with <code>JsonMappingException: Infinite recursion (StackOverflowError)</code>; Spring wraps it in <code>HttpMessageNotWritableException</code> and the client gets a 500.</li>
+      <li><strong>Hibernate proxies:</strong> serializing a lazy entity can fail with <code>No serializer found for class org.hibernate.proxy.pojo.bytebuddy.ByteBuddyInterceptor</code>. Another reason to use DTOs.</li>
+      <li><strong>Input errors</strong> (bad JSON syntax, wrong type, unknown enum name) arrive as <code>HttpMessageNotReadableException</code> and become a <code>400</code>.</li>
+      <li><code>@JsonIgnore</code> on a field also blocks reading it. A write-only password field needs <code>@JsonProperty(access = JsonProperty.Access.WRITE_ONLY)</code> instead.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: hiding a password with @JsonIgnore on a two-way class</p>
+    <p>The client must be able to <em>send</em> the password when registering but must never <em>receive</em> it back. <code>@JsonIgnore</code> blocks both directions, so registration silently stores a null password.</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: the password can no longer be read from the request</p><pre><code class="language-java">public class UserDto {
+    private String email;
+    @JsonIgnore
+    private String password;
+    // getters and setters
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: accepted on input, never written to output</p><pre><code class="language-java">public class UserDto {
+    private String email;
+    @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
+    private String password;
+    // getters and setters
+}</code></pre></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How does Spring convert JSON to objects? How do you handle dates and nulls?"</p>
+    <ul>
+      <li>An <code>HttpMessageConverter</code> backed by Jackson's <code>ObjectMapper</code> reads the body for <code>@RequestBody</code> and writes return values, chosen by <code>Content-Type</code> and <code>Accept</code>.</li>
+      <li>Serialization = object to JSON (getters); deserialization = JSON to object (constructor or setters).</li>
+      <li>Dates: ISO-8601 strings, <code>Instant</code> in UTC for timestamps, <code>@JsonFormat</code> only when a contract demands another pattern.</li>
+      <li>Nulls: <code>@JsonInclude(NON_NULL)</code> or <code>spring.jackson.default-property-inclusion</code>; use wrapper types and <code>@NotNull</code> to detect missing input.</li>
+      <li>Common annotations: <code>@JsonProperty</code>, <code>@JsonIgnore</code>, <code>@JsonIgnoreProperties</code>, <code>@JsonInclude</code>, <code>@JsonFormat</code>, <code>@JsonCreator</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-rest-principles">
+  <h3>What makes an API RESTful</h3>
+  <p class="tldr">REST is an architectural style in which resources are identified by URLs and handled through representations with standard HTTP methods, one stateless request at a time; most real-world "REST APIs" follow it only partly, at level 2 of the Richardson model.</p>
+
+  <p><strong>REST</strong> stands for <em>Representational State Transfer</em>. Roy Fielding described it in his 2000 PhD dissertation as a set of design rules for networked systems, taken from how the web itself works. REST is a <strong>style</strong>, not a protocol, a library or a standard. An API that follows the rules is called <strong>RESTful</strong>. In daily work, "REST API" usually means "JSON over HTTP with sensible URLs, methods and status codes".</p>
+
+  <h4>The key ideas</h4>
+  <dl class="terms">
+    <dt>Resource</dt>
+    <dd>Anything the API can name: a product, an order, a user, "the cart of user 7". A resource is a <em>noun</em> with a URL. It is not a database table and not a Java class; one resource may combine data from several tables.</dd>
+    <dt>Representation</dt>
+    <dd>A snapshot of a resource's state in some format, usually JSON. The same resource could have a JSON and an XML representation. The client never touches the database row; it exchanges representations.</dd>
+    <dt>Statelessness</dt>
+    <dd>Every request contains everything the server needs (token, parameters, body). The server keeps no conversation memory between requests.</dd>
+    <dt>Uniform interface</dt>
+    <dd>Every resource is handled the same way: identified by a URL, changed through representations, with standard methods and status codes, in self-descriptive messages (the method, status and <code>Content-Type</code> tell you what is going on).</dd>
+    <dt>Client–server</dt>
+    <dd>The UI and the data store are separate. The React app can change without touching the backend, and the other way round.</dd>
+    <dt>Cacheable</dt>
+    <dd>Responses say whether they may be reused (<code>Cache-Control</code>, <code>ETag</code>), so repeated reads can be cheap.</dd>
+    <dt>Layered system</dt>
+    <dd>A client cannot tell whether it talks to your server or to a proxy, CDN or load balancer in front of it.</dd>
+  </dl>
+  <p>Fielding also lists "code on demand" (the server sends executable code, like JavaScript) as an <em>optional</em> constraint. The uniform interface includes one more rule, <strong>HATEOAS</strong>, which is explained below.</p>
+
+  <h4>Statelessness: why it matters</h4>
+  <p>Imagine an e-commerce site on three server instances behind a load balancer. If server A kept your login in its own memory, your next request could land on server B, which would not know you. With a stateless design, you send a token every time and any instance can check it. The benefits are real:</p>
+  <ul>
+    <li><strong>Scaling:</strong> add or remove instances freely.</li>
+    <li><strong>Reliability:</strong> if one instance dies, nothing is lost with it.</li>
+    <li><strong>Simplicity:</strong> a request can be understood on its own, logged, replayed and retried.</li>
+  </ul>
+  <p>The cost is that the token travels with every request and the server must verify it every time. This is why JWT-based security (<a href="#m4">Module 4</a>) is configured as stateless in Spring Security. The client's UI state (which page you are on) may still be remembered by the client — "stateless" is about the <em>server</em>.</p>
+
+  <h4>Richardson Maturity Model</h4>
+  <p>Leonard Richardson's model grades how much of REST an API uses. It is a favourite interview topic.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Level</th><th>Idea</th><th>Looks like</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>One URL, one method; HTTP is only a tunnel (RPC style)</td><td><code>POST /api</code> with <code>{"action":"getProduct","id":42}</code></td></tr>
+      <tr><td>1</td><td>Separate resources, each with its own URL</td><td><code>POST /products/42</code> for everything</td></tr>
+      <tr><td>2</td><td>Proper HTTP methods and status codes</td><td><code>GET /products/42</code> → <code>200</code> or <code>404</code></td></tr>
+      <tr><td>3</td><td>Hypermedia: responses contain links to the next possible actions (HATEOAS)</td><td>An order with <code>cancel</code> and <code>pay</code> links</td></tr>
+    </tbody>
+  </table></div>
+  <p>Most production APIs, including the ones you will write, sit at <strong>level 2</strong>. That is a good, practical target.</p>
+
+  <h4>HATEOAS in one paragraph</h4>
+  <p><strong>HATEOAS</strong> (Hypermedia As The Engine Of Application State) means a response tells the client what it can do next by including links, the way a web page has links. The client follows links instead of building URLs from documentation. For an order that can still be cancelled, the response could carry a <code>cancel</code> link; once the order ships, that link disappears. Spring has a library for this (<code>spring-boot-starter-hateoas</code>) and a common format called HAL. In practice, JSON APIs for single-page apps rarely go to level 3, because the front-end developers already know the URLs. Know the idea for interviews; do not feel bad about not using it.</p>
+  <pre data-title="A HAL-style response"><code class="language-json">{
+  "id": 5,
+  "status": "PLACED",
+  "total": 1598.00,
+  "_links": {
+    "self":   { "href": "/api/v1/orders/5" },
+    "cancel": { "href": "/api/v1/orders/5/cancel" }
+  }
+}</code></pre>
+
+  <h4>REST compared with other API styles</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Style</th><th>Format</th><th>Best for</th><th>Watch out for</th></tr></thead>
+    <tbody>
+      <tr><td>REST</td><td>JSON over HTTP, many URLs</td><td>Public and web/mobile APIs; cacheable reads</td><td>Over- or under-fetching of fields</td></tr>
+      <tr><td>GraphQL</td><td>One endpoint, client writes the query</td><td>Apps that need flexible data shapes</td><td>Caching and rate limiting are harder</td></tr>
+      <tr><td>gRPC</td><td>Binary Protocol Buffers over HTTP/2</td><td>Fast, strongly typed service-to-service calls</td><td>Browsers need extra tooling</td></tr>
+      <tr><td>SOAP</td><td>XML envelopes</td><td>Legacy enterprise and banking integrations</td><td>Verbose; heavy tooling</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules of a RESTful API</p>
+    <ul>
+      <li>Identify things with nouns in URLs (<code>/orders/5</code>), and let the HTTP method be the verb.</li>
+      <li>Keep requests self-contained: no server-side session needed to understand them.</li>
+      <li>Use standard status codes and media types so that clients and proxies understand the messages.</li>
+      <li>Do not let a read change data: <code>GET</code> must be safe.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions: a practical checklist</p>
+    <ul>
+      <li>Plural nouns, lowercase, consistent naming (<a href="#m2-url-design">URL design</a>).</li>
+      <li>JSON in and out; camelCase keys; ISO-8601 dates.</li>
+      <li>Correct status codes and one error format everywhere.</li>
+      <li>Pagination for every list; a version in the URL when you must break clients.</li>
+      <li>Token-based authentication in the <code>Authorization</code> header.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases: where pure REST bends</p>
+    <ul>
+      <li>Some operations do not map to CRUD: "cancel an order", "send an OTP", "transfer money". Model them as sub-resources or action URLs and use <code>POST</code> (see <a href="#m2-url-design">URL design</a>).</li>
+      <li>A "session" or "cart" is state, but you can store it on the server as a <em>resource</em> (<code>/carts/{id}</code>) that the client refers to by id. That is still stateless communication.</li>
+      <li>Long-running work does not fit request–response; answer <code>202 Accepted</code> and give a status resource to poll.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: RPC in disguise</p>
+    <p>Endpoints named after methods (<code>/getUser</code>, <code>/createOrder</code>, <code>/deleteProduct</code>) with everything sent as <code>POST</code> are level 0 or 1. Caches, monitoring and developers lose all the meaning that HTTP already provides.</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: verbs in URLs, POST for everything</p><pre><code class="language-http">POST /api/getUser        {"id": 7}
+POST /api/createOrder    {"userId": 7, "items": [...]}
+POST /api/deleteProduct  {"id": 42}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: resources and methods</p><pre><code class="language-http">GET    /api/v1/users/7
+POST   /api/v1/orders          {"items": [...]}
+DELETE /api/v1/products/42</code></pre></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is REST? What are its constraints? What does stateless mean?"</p>
+    <ul>
+      <li>An architectural style from Fielding's dissertation: client–server, stateless, cacheable, uniform interface, layered system, optional code on demand.</li>
+      <li>Resources are named by URLs; clients exchange representations (JSON) using standard methods and status codes.</li>
+      <li>Stateless: each request is complete on its own, so any server instance can serve it; this makes horizontal scaling easy.</li>
+      <li>Richardson levels 0–3: single endpoint, resources, HTTP verbs and codes, then HATEOAS. Say that most APIs are level 2.</li>
+      <li>Be ready for "REST vs GraphQL vs gRPC": REST is simple and cacheable, GraphQL gives flexible queries, gRPC is binary and fast for internal calls.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-url-design">
+  <h3>Designing resource URLs</h3>
+  <p class="tldr">Name resources with plural lowercase nouns, let the HTTP method be the verb, nest at most one or two levels, and use query parameters for filtering, sorting and paging.</p>
+
+  <p>URLs are the user interface of your API. A consistent scheme means a developer who has seen <code>/products</code> can guess <code>/orders</code> without reading any documentation. The rules below are the common agreement of the industry; follow them unless your team has a written reason not to.</p>
+
+  <h4>The standard shape for one resource</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operation</th><th>Method and URL</th><th>Success</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>List</td><td><code>GET /products</code></td><td><code>200</code></td><td>Filter, sort and page with query parameters</td></tr>
+      <tr><td>Read one</td><td><code>GET /products/{id}</code></td><td><code>200</code></td><td><code>404</code> if missing</td></tr>
+      <tr><td>Create</td><td><code>POST /products</code></td><td><code>201</code></td><td><code>Location</code> header with the new URL</td></tr>
+      <tr><td>Replace</td><td><code>PUT /products/{id}</code></td><td><code>200</code> / <code>204</code></td><td>Whole representation in the body</td></tr>
+      <tr><td>Update part</td><td><code>PATCH /products/{id}</code></td><td><code>200</code></td><td>Only changed fields in the body</td></tr>
+      <tr><td>Delete</td><td><code>DELETE /products/{id}</code></td><td><code>204</code></td><td><code>404</code> if missing</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The rules</h4>
+  <ol class="steps">
+    <li><strong>Use nouns, not verbs.</strong> The method already says what to do. <code>POST /products</code>, not <code>/createProduct</code>.</li>
+    <li><strong>Use plural for collections.</strong> <code>/products</code> and <code>/products/42</code>, always plural, even for the single item. A mix of <code>/product</code> and <code>/products</code> is confusing.</li>
+    <li><strong>Lowercase letters with hyphens.</strong> Paths are case-sensitive, so <code>/Products</code> and <code>/products</code> would be different URLs. Hyphens are readable: <code>/order-items</code>, not <code>/order_items</code> or <code>/orderItems</code>.</li>
+    <li><strong>No trailing slash, no file extension.</strong> Not <code>/products/</code> and not <code>/products.json</code>; the format is chosen by the <code>Accept</code> header. (Spring 6 and later already treats <code>/products/</code> as a different, unmapped URL.)</li>
+    <li><strong>Identity goes in the path; options go in the query.</strong> <code>/products/42</code> says <em>which</em> product; <code>?sort=price</code> says <em>how to show</em> the list.</li>
+    <li><strong>Nest only when a resource belongs to another.</strong> <code>/orders/9/items</code> is fine, because an item cannot exist without its order. Go at most two levels deep. For anything deeper, expose the child directly: <code>/order-items/3/reviews</code>.</li>
+    <li><strong>Start with a stable prefix and a version.</strong> <code>/api/v1/...</code> separates the API from the React app's own routes and leaves room to evolve.</li>
+    <li><strong>Use ids that you can keep stable.</strong> Do not use names or database internals. Sequential numeric ids are easy to guess, so never rely on "nobody knows the id" for security; always check permissions. UUIDs make guessing harder but are not a security control either.</li>
+  </ol>
+
+  <h4>Good and bad URLs</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Bad</th><th>Problem</th><th>Better</th></tr></thead>
+    <tbody>
+      <tr><td><code>GET /getAllProducts</code></td><td>Verb in the URL; <code>GET</code> already says "read"</td><td><code>GET /products</code></td></tr>
+      <tr><td><code>POST /createProduct</code></td><td>Verb in the URL</td><td><code>POST /products</code></td></tr>
+      <tr><td><code>GET /product/42</code></td><td>Singular; inconsistent with the collection</td><td><code>GET /products/42</code></td></tr>
+      <tr><td><code>GET /Products/42/</code></td><td>Capital letter and trailing slash</td><td><code>GET /products/42</code></td></tr>
+      <tr><td><code>DELETE /products?id=42</code></td><td>Identity belongs in the path</td><td><code>DELETE /products/42</code></td></tr>
+      <tr><td><code>GET /products/search?name=mouse</code></td><td>"search" is not a resource; it is a filter</td><td><code>GET /products?name=mouse</code></td></tr>
+      <tr><td><code>GET /order_items</code></td><td>Underscore</td><td><code>GET /order-items</code></td></tr>
+      <tr><td><code>GET /users/7/orders/9/items/3/reviews</code></td><td>Too deeply nested</td><td><code>GET /order-items/3/reviews</code></td></tr>
+      <tr><td><code>GET /products.json</code></td><td>Format in the URL</td><td><code>GET /products</code> with <code>Accept: application/json</code></td></tr>
+      <tr><td><code>GET /tbl_prod_mst</code></td><td>Leaks database naming</td><td><code>GET /products</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Actions that are not CRUD</h4>
+  <p>Some things are not "create, read, update, delete": cancel an order, send an OTP, transfer money, log in. You have three honest choices, in order of preference.</p>
+  <ol>
+    <li><strong>Model the result as a noun:</strong> <code>POST /orders/5/cancellation</code>, <code>POST /payments/9/refunds</code>, <code>POST /accounts/3/transfers</code>. Each call creates something (a cancellation, a refund, a transfer) that you can later read with <code>GET</code>.</li>
+    <li><strong>Use an action sub-path with POST:</strong> <code>POST /orders/5/cancel</code>. This is pragmatic, very common, and acceptable. It breaks the "nouns only" rule on purpose, because there is no good noun.</li>
+    <li><strong>Top-level action endpoints</strong> for things that are not tied to a resource: <code>POST /auth/login</code>, <code>POST /auth/logout</code>, <code>POST /search</code>.</li>
+  </ol>
+  <p>Whichever you choose, use <code>POST</code>, never <code>GET</code>, and say in the docs whether it is idempotent.</p>
+  <pre data-title="OrderController.java (fragment)"><code class="language-java">@PostMapping("/{id}/cancel")
+public OrderResponse cancel(@PathVariable Long id) {
+    return orderService.cancel(id);   // 200 with the updated order, or 409 if already shipped
+}</code></pre>
+
+  <h4>Query parameters: what belongs there</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Purpose</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Filtering</td><td><code>/products?category=books&amp;inStock=true&amp;maxPrice=500</code></td></tr>
+      <tr><td>Free-text search</td><td><code>/products?q=wireless+mouse</code></td></tr>
+      <tr><td>Sorting</td><td><code>/products?sort=price,desc</code></td></tr>
+      <tr><td>Paging</td><td><code>/products?page=0&amp;size=20</code></td></tr>
+      <tr><td>Choosing fields</td><td><code>/products?fields=id,name,price</code></td></tr>
+      <tr><td>Including related data</td><td><code>/products/42?expand=category</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>All of these are optional and never change <em>which</em> resource you mean. A list URL such as <code>/products?name=mouse</code> always answers with a list (possibly empty); <code>/products/mouse</code> would claim there is one resource named "mouse".</p>
+
+  <h4>A worked example: a job portal API</h4>
+  <p>The Project 2 job portal fits the rules directly:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Request</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>GET /api/v1/jobs?title=java&amp;location=pune&amp;minSalary=800000&amp;page=0&amp;size=10</code></td><td>Search jobs</td></tr>
+      <tr><td><code>POST /api/v1/jobs</code></td><td>A recruiter posts a job</td></tr>
+      <tr><td><code>GET /api/v1/jobs/{id}</code></td><td>Job details</td></tr>
+      <tr><td><code>POST /api/v1/jobs/{jobId}/applications</code></td><td>A candidate applies</td></tr>
+      <tr><td><code>GET /api/v1/jobs/{jobId}/applications</code></td><td>A recruiter lists the applications for one job</td></tr>
+      <tr><td><code>GET /api/v1/applications/{id}</code></td><td>One application (deeper nesting avoided)</td></tr>
+      <tr><td><code>POST /api/v1/applications/{id}/withdraw</code></td><td>Action that is not CRUD</td></tr>
+      <tr><td><code>GET /api/v1/users/me</code></td><td>The logged-in user (a "singleton" resource)</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for responses that go with the URLs</p>
+    <ul>
+      <li>A list endpoint always returns a JSON <strong>object</strong> or array of the same item shape every time; an empty result is <code>[]</code> or an empty <code>content</code>, not an error.</li>
+      <li>Wrap paged lists in an object (<code>{"content": [...], "page": 0, ...}</code>). A bare array has no room for paging metadata, so adding it later would break every client.</li>
+      <li>Keep the same field names for the same concept across endpoints (<code>id</code>, <code>createdAt</code>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>One controller class per resource, with the base path on the class (<code>@RequestMapping("/api/v1/products")</code>).</li>
+      <li>Query parameter names are camelCase (<code>minPrice</code>) and match the JSON field names.</li>
+      <li>Boolean fields read as adjectives: <code>active</code>, <code>inStock</code>, not <code>isActive</code> (Jackson turns <code>isActive()</code> into <code>active</code> anyway).</li>
+      <li>Irregular plurals are fine (<code>/people</code>); just be consistent.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A path variable cannot contain a slash. An encoded slash (<code>%2F</code>) is rejected by Tomcat by default. Use a query parameter for values such as file paths.</li>
+      <li>Words with special characters in the path must be URL-encoded (<code>/search/c%2B%2B</code>); clients' HTTP libraries usually do it for you.</li>
+      <li>Verbs are acceptable for real actions: <code>/login</code>, <code>/logout</code>, <code>/orders/{id}/cancel</code>, <code>/search</code>.</li>
+      <li>Bulk operations (create 100 items) do not have a standard URL. <code>POST /products/bulk</code> or a <code>POST</code> of an array to the collection are both used; document which one you choose.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using the query string to identify a resource</p>
+    <p><code>GET /products?id=42</code> works, but it reads like a filter and returns a list in the minds of most developers. If the URL points to exactly one thing, put the id in the path.</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: id and verb in the query</p><pre><code class="language-java">@GetMapping("/getProduct")
+public ProductResponse get(@RequestParam Long id) {
+    return service.findById(id);
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: id in the path</p><pre><code class="language-java">@GetMapping("/{id}")
+public ProductResponse get(@PathVariable Long id) {
+    return service.findById(id);
+}</code></pre></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Design the URLs for a library / e-commerce system" and "Path variable or query parameter?"</p>
+    <ul>
+      <li>Name the resources first (books, members, loans), then give each the collection and item URLs with the standard methods.</li>
+      <li>Show nesting for owned data (<code>/members/{id}/loans</code>), keep it shallow, and put filters, sorting and paging in the query string.</li>
+      <li>Path = identifies a resource; query = refines the view. Query parameters are optional; path variables are not.</li>
+      <li>For actions, explain the trade-off: a noun sub-resource if you can (<code>/loans/{id}/return</code> or <code>/returns</code>), otherwise a clearly named action with <code>POST</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-api-versioning">
+  <h3>API versioning strategies</h3>
+  <p class="tldr">Version an API so existing clients keep working while you make breaking changes; the most common way is a version in the URL path (<code>/api/v1/…</code>), with header, media-type and query-parameter versioning as alternatives.</p>
+
+  <p>Once other people depend on your API, you cannot change it freely. A mobile app installed on a million phones cannot be updated the day you rename a JSON field. <strong>Versioning</strong> lets you publish a new, incompatible shape (<code>v2</code>) while the old one (<code>v1</code>) keeps working until its clients have moved.</p>
+
+  <h4>Breaking and non-breaking changes</h4>
+  <p>You only need a new version for a <strong>breaking</strong> change. Everything else you can add to the current version.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Breaking — needs a new version</th><th>Non-breaking — safe in the same version</th></tr></thead>
+    <tbody>
+      <tr><td>Removing or renaming a field</td><td>Adding a new optional response field</td></tr>
+      <tr><td>Changing a field's type or meaning (<code>price</code> from number to object)</td><td>Adding a new endpoint</td></tr>
+      <tr><td>Making an optional request field required</td><td>Adding an optional request field or query parameter</td></tr>
+      <tr><td>Changing a URL, a status code or the error format</td><td>Making a validation rule more lenient</td></tr>
+      <tr><td>Tightening validation so that old requests fail</td><td>Fixing a bug so the API matches its documentation</td></tr>
+    </tbody>
+  </table></div>
+  <p>This works only if clients are <strong>tolerant readers</strong>: they ignore response fields they do not know. Tell your API consumers this in the docs. Adding a new value to an enum is a grey area: clients that switch over the values may break, so announce it.</p>
+
+  <h4>The four strategies</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Strategy</th><th>Example</th><th>Good</th><th>Bad</th></tr></thead>
+    <tbody>
+      <tr><td>URI path</td><td><code>GET /api/v2/products/42</code></td><td>Visible, easy to test in a browser, easy to route and cache, simple docs</td><td>Purists say a URL should identify a resource, not a version; every client URL changes</td></tr>
+      <tr><td>Custom header</td><td><code>X-API-Version: 2</code></td><td>Clean URLs; one URL per resource</td><td>Hidden; harder to try in a browser; caches need <code>Vary</code>; easy to forget</td></tr>
+      <tr><td>Media type</td><td><code>Accept: application/vnd.shop.v2+json</code></td><td>Most "pure" REST; versions each representation</td><td>Complex; weaker tool support; hard to explore</td></tr>
+      <tr><td>Query parameter</td><td><code>GET /products/42?version=2</code></td><td>Easy to try; easy to default</td><td>Clutters URLs and cache keys; optional parameter that is easy to omit</td></tr>
+    </tbody>
+  </table></div>
+  <p>Some public APIs, such as Stripe's, use <strong>date-based versions</strong> sent in a header, so each client stays on the behaviour of the day it integrated. For most teams, <strong>the URI path is the right default</strong>: it is boring, visible and works with every tool.</p>
+
+  <h4>Implementing path versioning in Spring MVC</h4>
+  <p>Keep one service layer and version only the web layer: the controller and its DTOs. Suppose <code>v2</code> changes <code>price</code> from a plain number into an object with a currency.</p>
+  <pre data-title="Versioned DTOs"><code class="language-java">public record ProductResponseV1(Long id, String name, BigDecimal price) {}
+
+public record Money(BigDecimal amount, String currency) {}
+
+public record ProductResponseV2(Long id, String name, Money price, Instant createdAt) {}</code></pre>
+  <pre data-title="ProductControllerV1.java and ProductControllerV2.java"><code class="language-java">@RestController
+@RequestMapping("/api/v1/products")
+public class ProductControllerV1 {
+    private final ProductService service;
+
+    public ProductControllerV1(ProductService service) {
+        this.service = service;
+    }
+
+    @GetMapping("/{id}")
+    public ProductResponseV1 get(@PathVariable Long id) {
+        ProductDetails d = service.getDetails(id);          // shared business logic
+        return new ProductResponseV1(d.id(), d.name(), d.price());
+    }
+}
+
+@RestController
+@RequestMapping("/api/v2/products")
+public class ProductControllerV2 {
+    private final ProductService service;
+
+    public ProductControllerV2(ProductService service) {
+        this.service = service;
+    }
+
+    @GetMapping("/{id}")
+    public ProductResponseV2 get(@PathVariable Long id) {
+        ProductDetails d = service.getDetails(id);          // the same service call
+        return new ProductResponseV2(d.id(), d.name(),
+                new Money(d.price(), "INR"), d.createdAt());
+    }
+}</code></pre>
+  <p>The other strategies are variations on the mapping attributes you will meet in <a href="#m2-rest-controller">the mapping annotations article</a>:</p>
+  <pre data-title="The same endpoint selected by header, media type or parameter"><code class="language-java">// Header versioning: the request must contain "X-API-Version: 2"
+@GetMapping(value = "/{id}", headers = "X-API-Version=2")
+
+// Media-type versioning: the request must send Accept: application/vnd.shop.v2+json
+@GetMapping(value = "/{id}", produces = "application/vnd.shop.v2+json")
+
+// Query-parameter versioning: the request must end with ?version=2
+@GetMapping(value = "/{id}", params = "version=2")</code></pre>
+
+  <div class="co co-version">
+    <p class="co-t">Spring Framework 7 / Spring Boot 4: built-in API versioning</p>
+    <p>Spring Framework 7, the base of Spring Boot 4, adds first-class support for API versioning. The mapping annotations get a <code>version</code> attribute (for example <code>@GetMapping(path = "/{id}", version = "2")</code>), and you configure once, in the MVC configuration, where the version is read from: a request header, a path segment, a query parameter or a media-type parameter. That replaces the hand-written <code>headers</code>, <code>params</code> and <code>produces</code> tricks above. The configuration API is new, so follow the Spring Framework 7 reference for your exact release. The strategies and trade-offs in this article stay the same, and on Boot 3.x you still use the manual approach.</p>
+  </div>
+
+  <h4>The lifecycle of a version</h4>
+  <ol class="steps">
+    <li><strong>Release</strong> <code>v2</code> with documentation of what changed and why.</li>
+    <li><strong>Keep <code>v1</code> stable.</strong> Fix bugs and security problems only; add nothing new.</li>
+    <li><strong>Announce deprecation</strong> with a date, in the docs and by email. You can also send the <code>Sunset</code> response header (RFC 8594) with the planned end date.</li>
+    <li><strong>Measure usage</strong> per version (a metric tagged with the version). When nobody calls <code>v1</code> any more, remove it.</li>
+    <li><strong>Return <code>410 Gone</code></strong> or a clear error from the removed version for a while instead of a mysterious <code>404</code>.</li>
+  </ol>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Never change an existing version's behaviour in a breaking way. That is the whole point of a version.</li>
+      <li>Version the whole API together (<code>/api/v1/...</code>), not one resource at a time. Mixed versions per resource are painful to document and use.</li>
+      <li>Use whole-number major versions (<code>v1</code>, <code>v2</code>). Minor versions in URLs (<code>v1.1</code>) only multiply the paths.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Start with <code>/api/v1</code> from day one, even if <code>v2</code> never comes; adding a prefix later is itself a breaking change.</li>
+      <li>Support at most two versions at a time. Each live version doubles testing and support.</li>
+      <li>Share services and the database; version controllers and DTOs only.</li>
+      <li>Publish one OpenAPI group per version (<a href="#m2-openapi">OpenAPI article</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Missing version</strong> with header or parameter versioning: decide the default. Serving the oldest stable version protects old clients; requiring an explicit version avoids guessing.</li>
+      <li><strong>Evolve without versioning</strong> where you can: add optional fields, deprecate old ones, and migrate in the "expand then contract" way (add the new field, let clients move, remove the old one later).</li>
+      <li><strong>Internal APIs</strong> that you control end to end (one team owns client and server, deployed together) often need no versioning at all.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: copying the whole stack for every version</p>
+    <p>Duplicating services and repositories for <code>v2</code> doubles every bug fix. Put business rules in one service; let each controller only translate between that service and its own DTOs.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you version a REST API? What counts as a breaking change?"</p>
+    <ul>
+      <li>Four options: URI path (most common), custom header, media type (<code>vnd.…+json</code>) and query parameter. Give one pro and one con of each.</li>
+      <li>Breaking: removing or renaming fields, changing types or status codes, adding required inputs. Non-breaking: adding optional fields or endpoints.</li>
+      <li>Version only the web layer; keep one service layer. Deprecate with a timeline, a <code>Sunset</code> header, and usage metrics.</li>
+      <li>Mention that clients should be tolerant readers, and that Spring Framework 7 adds built-in versioning support.</li>
+    </ul>
+  </div>
+</article>

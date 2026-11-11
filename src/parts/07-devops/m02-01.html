@@ -1,0 +1,426 @@
+<div class="mintro">
+  <p>Your Spring Boot app is useful only when someone else can reach it. Between a user's browser and your
+  code sit IP addresses, DNS, TCP, TLS, firewalls and usually a reverse proxy such as Nginx. When
+  something breaks, the error is rarely "your code is wrong"; it is "the request never arrived". This
+  module gives you the small, practical mental model of that path, and the tools to test each hop.</p>
+  <p>It builds on <a href="#m1">Module 1</a> (you will use <code>ss</code>, <code>curl</code> and SSH
+  constantly) and prepares <a href="#m3">Docker</a> networking and <a href="#m5">cloud deployment</a>.
+  The deeper theory (OSI model, TCP internals, congestion) is in
+  <a href="09-cs-fundamentals.html#m2">CS Fundamentals · Module 2</a>; web basics from the browser side
+  are in <a href="06-frontend.html#m1">Frontend · Module 1</a>.</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>Explain IP addresses, ports, private ranges, CIDR and why an app must listen on
+    <code>0.0.0.0</code> on a server.</li>
+    <li>Trace how a domain name becomes an IP, and point a domain at your server with the right
+    records.</li>
+    <li>Explain HTTP versus HTTPS, what a TLS certificate proves, and get a free certificate from
+    Let's Encrypt.</li>
+    <li>Open only the ports you need with <code>ufw</code> and AWS security groups.</li>
+    <li>Debug "my app is not reachable" step by step with a checklist and the right commands.</li>
+    <li>Write a complete Nginx config: HTTPS, reverse proxy to Spring Boot, React single-page app,
+    compression and basic load balancing.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m2-ip-ports">
+  <h3>IP addresses, ports, CIDR, NAT and localhost versus 0.0.0.0</h3>
+  <p class="tldr">An IP address finds a machine and a port finds a program on it; private ranges are used
+  inside networks, NAT lets them reach the internet, and a server app must listen on <code>0.0.0.0</code>,
+  not just <code>127.0.0.1</code>, to accept outside connections.</p>
+
+  <h4>IP addresses</h4>
+  <p>Every device on a network has an <strong>IP address</strong>, the number that packets are routed to.
+  <strong>IPv4</strong> addresses are 32 bits, written as four numbers from 0 to 255:
+  <code>203.0.113.10</code>. That gives about 4.3 billion addresses, which ran short.
+  <strong>IPv6</strong> addresses are 128 bits, written in hexadecimal groups such as
+  <code>2001:db8::1</code>, with an effectively unlimited supply. Both are in use today; most examples in
+  these notes use IPv4 because that is what you will configure first. Your cloud VM has at least a
+  <strong>private</strong> IP and usually a <strong>public</strong> IP as well.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>IPv4</th><th>IPv6</th></tr></thead>
+    <tbody>
+      <tr><td>Size</td><td>32 bits</td><td>128 bits</td></tr>
+      <tr><td>Example</td><td><code>192.168.1.20</code></td><td><code>2001:db8::1</code></td></tr>
+      <tr><td>Loopback (this machine)</td><td><code>127.0.0.1</code></td><td><code>::1</code></td></tr>
+      <tr><td>"All addresses" (binding)</td><td><code>0.0.0.0</code></td><td><code>::</code></td></tr>
+      <tr><td>In <code>ss</code> output</td><td><code>0.0.0.0:8080</code></td><td><code>[::]:8080</code> or <code>*:8080</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Public and private addresses</h4>
+  <p>Three IPv4 blocks are reserved for <strong>private</strong> networks. They are never routed on the
+  public internet, so your home, office and every AWS VPC can reuse them.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Range</th><th>Size</th><th>Where you see it</th></tr></thead>
+    <tbody>
+      <tr><td><code>10.0.0.0/8</code></td><td>16.7 million addresses</td><td>Companies, cloud VPCs</td></tr>
+      <tr><td><code>172.16.0.0/12</code></td><td>1 million addresses</td><td>Docker's default bridge uses <code>172.17.0.0/16</code>; AWS default VPC uses <code>172.31.0.0/16</code></td></tr>
+      <tr><td><code>192.168.0.0/16</code></td><td>65 thousand addresses</td><td>Home Wi-Fi routers</td></tr>
+    </tbody>
+  </table></div>
+  <p>Anything else is a <strong>public</strong> address (for example <code>203.0.113.10</code>, a
+  documentation range we use in examples). Also special: <code>127.0.0.0/8</code> is loopback, and
+  <code>169.254.x.x</code> is link-local (self-assigned when DHCP fails).</p>
+
+  <h4>CIDR in simple words</h4>
+  <p><strong>CIDR</strong> notation writes a block of addresses as <code>address/prefix</code>. The prefix
+  is how many of the 32 bits are fixed (the network part); the rest can change (the host part).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>CIDR</th><th>Fixed bits</th><th>Addresses</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>/32</code></td><td>All 32</td><td>1 (one host)</td><td><code>203.0.113.10/32</code> = just my IP</td></tr>
+      <tr><td><code>/24</code></td><td>First 3 numbers</td><td>256</td><td><code>192.168.1.0/24</code> = 192.168.1.0 to .255</td></tr>
+      <tr><td><code>/16</code></td><td>First 2 numbers</td><td>65,536</td><td><code>10.0.0.0/16</code> = 10.0.0.0 to 10.0.255.255</td></tr>
+      <tr><td><code>/8</code></td><td>First number</td><td>16.7 million</td><td><code>10.0.0.0/8</code></td></tr>
+      <tr><td><code>/0</code></td><td>None</td><td>Everything</td><td><code>0.0.0.0/0</code> = the whole internet</td></tr>
+    </tbody>
+  </table></div>
+  <p>Rule of thumb: <strong>a bigger prefix number is a smaller block</strong>. You meet CIDR in AWS
+  security groups and VPC subnets: "allow port 22 from <code>203.0.113.10/32</code>" means only your IP;
+  "from <code>0.0.0.0/0</code>" means anyone. A cloud provider reserves a few addresses in each subnet, so
+  a /24 gives slightly fewer than 256 usable ones.</p>
+
+  <h4>NAT: how private machines reach the internet</h4>
+  <p>Your laptop at <code>192.168.1.20</code> cannot be routed to from the internet. Your home router
+  does <strong>NAT</strong> (Network Address Translation): it rewrites outgoing packets to use the router's
+  one public IP and remembers the connection, so replies come back to the right device. In AWS the same
+  idea appears as an Internet Gateway (for instances with public IPs) and a NAT Gateway (so private
+  instances can go out but nobody can come in). Consequence: devices behind NAT cannot accept incoming
+  connections unless you forward a port.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Laptop 192.168.1.20 ─┐
+                      ├── Router (NAT) ── public IP 203.0.113.50 ── Internet
+ Phone  192.168.1.21 ─┘     rewrites source address and port
+</pre>
+    <figcaption>NAT: many private devices share one public IP</figcaption>
+  </figure>
+
+  <h4>Ports</h4>
+  <p>A <strong>port</strong> is a 16-bit number (0-65535) that picks the program on a machine. A connection
+  is identified by source IP and port plus destination IP and port. Servers use fixed, well-known ports;
+  clients get a random high port (<em>ephemeral</em>) for each connection.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Port</th><th>Service</th><th>Port</th><th>Service</th></tr></thead>
+    <tbody>
+      <tr><td><code>22</code></td><td>SSH</td><td><code>6379</code></td><td>Redis</td></tr>
+      <tr><td><code>53</code></td><td>DNS (UDP and TCP)</td><td><code>8080</code></td><td>Common app / Tomcat / Spring Boot dev port</td></tr>
+      <tr><td><code>80</code></td><td>HTTP</td><td><code>9092</code></td><td>Kafka</td></tr>
+      <tr><td><code>443</code></td><td>HTTPS</td><td><code>27017</code></td><td>MongoDB</td></tr>
+      <tr><td><code>3306</code></td><td>MySQL</td><td><code>5432</code></td><td>PostgreSQL</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>localhost, 127.0.0.1 and 0.0.0.0</h4>
+  <p><code>localhost</code> is a hostname that resolves to <code>127.0.0.1</code>, the
+  <strong>loopback</strong> address: traffic never leaves the machine. When a program starts a server it
+  chooses which address to <strong>bind</strong> to:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Bind address</th><th>Who can connect</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>127.0.0.1</code></td><td>Only programs on the same machine</td><td>A database used only by the local app; an app behind Nginx on the same host</td></tr>
+      <tr><td>A specific private IP, e.g. <code>10.0.1.5</code></td><td>Clients that can reach that network interface</td><td>Services that talk only inside a VPC</td></tr>
+      <tr><td><code>0.0.0.0</code></td><td>Any interface: loopback, private and public</td><td>Anything that must accept outside traffic; apps in Docker</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>0.0.0.0</code> is not a destination you connect to; it means "all my addresses" when
+  <em>listening</em>. Spring Boot's embedded Tomcat listens on all interfaces by default, and you can
+  restrict it with <code>server.address</code>:</p>
+  <pre data-title="application.properties"><code class="language-properties"># default: all interfaces (0.0.0.0). Uncomment to allow only local connections.
+# server.address=127.0.0.1
+server.port=8080</code></pre>
+  <p>Inside a Docker container, <code>localhost</code> is the <em>container itself</em>. If your app
+  binds only to <code>127.0.0.1</code> inside the container, published ports do not work. Bind
+  <code>0.0.0.0</code> (Module 3).</p>
+  <pre data-title="See your own addresses"><code class="language-shell">$ ip a
+1: lo: &lt;LOOPBACK,UP,LOWER_UP&gt; ...
+    inet 127.0.0.1/8 scope host lo
+2: eth0: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; ...
+    inet 172.31.5.20/20 brd 172.31.15.255 scope global eth0
+$ curl -s https://checkip.amazonaws.com
+203.0.113.10</code></pre>
+  <p><code>ip a</code> shows the private address(es) assigned to the machine, here 172.31.5.20. The public
+  IP of an EC2 instance is not on the interface at all: AWS translates it (1:1 NAT), so ask an external
+  service (or the EC2 console) for it. On Windows use <code>ipconfig</code>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "it works on localhost, so it works"</p>
+    <p><code>curl localhost:8080</code> on the server only proves the app listens on the loopback. It says
+    nothing about the firewall, the security group, DNS or the bind address as seen from outside. Test from
+    another machine too, or with the server's private/public IP.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Overlapping private ranges break VPNs and VPC peering: two networks both using
+      <code>10.0.0.0/16</code> cannot be joined. Plan address ranges early.</li>
+      <li>A public IP on an EC2 instance changes after a stop/start unless it is an Elastic IP.</li>
+      <li><code>localhost</code> can resolve to <code>::1</code> (IPv6) first. If the app listens only on
+      IPv4, some clients fail; use <code>127.0.0.1</code> to be explicit.</li>
+      <li>Ports below 1024 need root to bind; use 8080 for the app and let Nginx take 80/443.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Difference between 127.0.0.1 and 0.0.0.0? What is a private IP?"</p>
+    <ul>
+      <li>127.0.0.1 is loopback (same machine only). 0.0.0.0 as a bind address means all interfaces.</li>
+      <li>Private ranges: 10/8, 172.16/12, 192.168/16; not routable on the internet; NAT gives them
+      outbound access.</li>
+      <li>Explain CIDR with an example such as /24 = 256 addresses, and "/32 = my one IP" for SSH rules.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-dns">
+  <h3>DNS: how a domain becomes an IP address</h3>
+  <p class="tldr">DNS is the internet's phone book: your computer asks a resolver, which asks the root, TLD
+  and authoritative servers, and gets back the IP for a name; you control the answer with records such as A
+  and CNAME at your domain provider.</p>
+
+  <h4>The problem DNS solves</h4>
+  <p>Computers connect with IP addresses, but people remember names like <code>shop.example.com</code>.
+  The <strong>Domain Name System (DNS)</strong> is a distributed database that maps names to IPs (and
+  other data). It also lets you move a service to a new server by changing one record, without telling
+  users. A name is read from right to left: <code>shop</code> (subdomain) . <code>example</code> (domain you
+  bought) . <code>com</code> (top-level domain, TLD) . and an invisible root dot.</p>
+
+  <h4>Resolution step by step</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant B as Browser or OS
+  participant R as Recursive resolver (ISP, 8.8.8.8)
+  participant Root as Root server
+  participant TLD as .com TLD server
+  participant A as Authoritative server for example.com
+  B->>R: IP for shop.example.com?
+  R->>Root: Who knows .com?
+  Root->>R: Ask the .com TLD servers
+  R->>TLD: Who knows example.com?
+  TLD->>R: Ask ns1.example-dns.net
+  R->>A: IP for shop.example.com?
+  A->>R: A record 203.0.113.10, TTL 300
+  R->>B: 203.0.113.10 (cached)
+</pre>
+    <figcaption>A full DNS lookup when nothing is cached</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><strong>Local caches.</strong> The browser and operating system check their own cache and the
+    <strong>hosts file</strong> first (<code>/etc/hosts</code>, or
+    <code>C:\Windows\System32\drivers\etc\hosts</code>).</li>
+    <li><strong>Recursive resolver.</strong> If not found, the OS asks the configured resolver (your ISP,
+    your router, or a public one like <code>8.8.8.8</code>). It does the hard work and caches answers.</li>
+    <li><strong>Root servers</strong> point to the servers for the TLD (<code>.com</code>,
+    <code>.in</code>).</li>
+    <li><strong>TLD servers</strong> point to the domain's <strong>name servers</strong> (set at your
+    registrar).</li>
+    <li><strong>Authoritative server</strong> holds the real records and returns the answer.</li>
+    <li>The resolver caches the answer for the record's <strong>TTL</strong> and returns it. The browser
+    then opens a TCP connection to that IP.</li>
+  </ol>
+
+  <h4>Record types</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Maps</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>A</code></td><td>Name to an IPv4 address</td><td><code>shop.example.com  A  203.0.113.10</code></td></tr>
+      <tr><td><code>AAAA</code></td><td>Name to an IPv6 address</td><td><code>shop  AAAA  2001:db8::10</code></td></tr>
+      <tr><td><code>CNAME</code></td><td>Name to <em>another name</em> (alias)</td><td><code>www  CNAME  shop.example.com.</code></td></tr>
+      <tr><td><code>MX</code></td><td>Mail servers for the domain</td><td><code>example.com  MX  10 mail.example.com.</code></td></tr>
+      <tr><td><code>TXT</code></td><td>Free text: domain verification, SPF, DKIM</td><td><code>"v=spf1 include:..."</code></td></tr>
+      <tr><td><code>NS</code></td><td>The name servers of the domain</td><td><code>example.com  NS  ns1.example-dns.net.</code></td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>A versus CNAME.</strong> An A record points to an IP. A CNAME says "this name is an alias of
+  that name; look that one up instead". Use A for a server with a fixed IP (an Elastic IP). Use CNAME for
+  hosted services that give you a hostname, such as an AWS load balancer
+  (<code>my-lb-123.ap-south-1.elb.amazonaws.com</code>) or a CDN, because their IPs change. A CNAME cannot
+  be placed at the root of the domain (<code>example.com</code> itself) under the standard rules; many DNS
+  providers offer an "ALIAS" or "ANAME" feature for that case, and AWS Route 53 has alias records.</p>
+
+  <h4>TTL and propagation</h4>
+  <p><strong>TTL</strong> (time to live) is how many seconds a resolver may cache a record. With TTL 300,
+  a change can take up to five minutes to reach users who looked it up just before; with 86400 it can take
+  a day. "Propagation" is not a push through the internet: it is the old cached answers expiring. Before a
+  planned move, lower the TTL a day ahead (to 300), switch the record, then raise it again.</p>
+
+  <h4>Tools: dig, nslookup, the hosts file</h4>
+  <pre data-title="Ask DNS questions"><code class="language-shell">$ dig +short shop.example.com
+203.0.113.10
+$ dig shop.example.com A
+
+;; ANSWER SECTION:
+shop.example.com.   300   IN   A   203.0.113.10
+
+;; Query time: 24 msec
+;; SERVER: 127.0.0.53#53(127.0.0.53)
+$ dig www.example.com CNAME +short
+shop.example.com.
+$ dig NS example.com +short
+ns1.example-dns.net.
+ns2.example-dns.net.
+$ dig @8.8.8.8 shop.example.com +short
+203.0.113.10
+$ nslookup shop.example.com
+Server:         127.0.0.53
+Address:        127.0.0.53#53
+
+Non-authoritative answer:
+Name:   shop.example.com
+Address: 203.0.113.10</code></pre>
+  <p>Read the answer line: name, <strong>TTL</strong> (300), class <code>IN</code> (Internet), type, value.
+  "Non-authoritative" means the answer came from a cache, not the domain's own server.
+  <code>dig @8.8.8.8</code> asks a specific resolver, which is a quick way to see whether a change has
+  reached the public. On Windows, <code>nslookup</code> works out of the box; <code>dig</code> is in the
+  <code>dnsutils</code> package (<code>sudo apt install dnsutils</code>) on Ubuntu.</p>
+  <p>The <strong>hosts file</strong> overrides DNS on one machine. It is handy for testing before a DNS
+  change, or for blocking a site:</p>
+  <pre data-title="/etc/hosts"><code class="language-plaintext">127.0.0.1   localhost
+203.0.113.10   shop.example.com</code></pre>
+
+  <h4>Connecting a domain to your server</h4>
+  <ol class="steps">
+    <li>Buy a domain from a registrar (GoDaddy, Namecheap, Route 53, ...).</li>
+    <li>Give your server a stable public IP: on AWS, allocate an <strong>Elastic IP</strong> and attach it
+    to the instance.</li>
+    <li>In the DNS settings (at the registrar, or a DNS host such as Route 53 or Cloudflare), add an
+    <code>A</code> record: name <code>@</code> (the root) or <code>shop</code>, value the IP, TTL 300.</li>
+    <li>Add <code>www</code> as a CNAME to the root name, if you want both.</li>
+    <li>Check: <code>dig +short shop.example.com</code> returns your IP (it may take a few minutes).</li>
+    <li>Make sure the web server (Nginx) has a <code>server_name</code> for the domain, then get a
+    certificate (<a href="#m2-http-tls">HTTPS</a>).</li>
+  </ol>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: changing DNS and testing in the browser straight away</p>
+    <p>Browsers and the OS cache answers, and the old IP may still be cached for the old TTL. Test with
+    <code>dig @8.8.8.8 name +short</code> to see what public resolvers return, and clear the local cache
+    if needed (Windows: <code>ipconfig /flushdns</code>). Also, a "negative" answer (name not found) is
+    cached too.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and errors</p>
+    <ul>
+      <li><code>NXDOMAIN</code> — the name does not exist (typo, or the record is missing).</li>
+      <li><code>curl: (6) Could not resolve host</code> or <code>UnknownHostException</code> in Java —
+      DNS failed. Check the name, <code>/etc/resolv.conf</code> and network access.</li>
+      <li>The JVM caches successful DNS lookups; if a service's IP changes (a load balancer behind a
+      CNAME), a long-running app may keep using the old IP until the cache expires. The JVM's cache time
+      is controlled by the <code>networkaddress.cache.ttl</code> security property.</li>
+      <li>You cannot put a CNAME at the same name as other records (such as MX) — the root domain needs
+      A or ALIAS records.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What happens when you type a URL in the browser? (DNS part)"</p>
+    <ul>
+      <li>Cache and hosts file, then the recursive resolver, root, TLD, authoritative server; the answer
+      is an A record with a TTL; then TCP, TLS and HTTP follow.</li>
+      <li>Know A, CNAME, MX, TXT, NS, and why TTL makes changes take time.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-tcp-udp">
+  <h3>TCP versus UDP, and the three-way handshake</h3>
+  <p class="tldr">TCP gives reliable, ordered delivery after a handshake and is used by HTTP, SSH and
+  databases; UDP just sends packets with no guarantees and is used for DNS queries, video calls and
+  games.</p>
+
+  <p>Both are <strong>transport layer</strong> protocols that carry data between ports on two hosts. IP
+  only delivers packets to a machine and may lose, duplicate or reorder them. TCP and UDP sit above IP and
+  decide how much help the application gets.</p>
+
+  <h4>TCP: reliable stream</h4>
+  <p>Before any data moves, TCP sets up a connection with a <strong>three-way handshake</strong>:</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant S as Server (listening on 443)
+  C->>S: SYN (let us talk, my sequence number is x)
+  S->>C: SYN-ACK (agreed, mine is y, I got x)
+  C->>S: ACK (I got y)
+  Note over C,S: Connection open, data can flow
+</pre>
+    <figcaption>The TCP three-way handshake</figcaption>
+  </figure>
+  <p>After that, TCP numbers every byte, the receiver acknowledges what arrived, lost segments are sent
+  again, data is delivered <strong>in order</strong>, and the sender slows down if the network or receiver
+  is overloaded (flow and congestion control). Closing uses a FIN exchange. Details of windows and
+  congestion are in <a href="09-cs-fundamentals.html#m2">CS Fundamentals · Module 2</a>. The practical
+  meaning: a TCP connection costs one round trip to set up, which is why servers keep connections open
+  (HTTP keep-alive, connection pools).</p>
+
+  <h4>UDP: fire and forget</h4>
+  <p>UDP has no connection, no retransmission and no ordering. Each message (datagram) is sent
+  independently; some may be lost. In exchange it is lightweight and fast to start, and the application
+  decides what to do about loss. It suits traffic where a late packet is worse than a lost one.</p>
+
+  <h4>Comparison</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>TCP</th><th>UDP</th></tr></thead>
+    <tbody>
+      <tr><td>Connection</td><td>Yes (handshake first)</td><td>No</td></tr>
+      <tr><td>Reliability</td><td>Lost data is resent</td><td>No guarantee</td></tr>
+      <tr><td>Order</td><td>Guaranteed</td><td>Not guaranteed</td></tr>
+      <tr><td>Speed and overhead</td><td>Slower start, more overhead</td><td>Faster, small header</td></tr>
+      <tr><td>Data unit</td><td>Byte stream</td><td>Separate datagrams</td></tr>
+      <tr><td>Used by</td><td>HTTP/1.1, HTTP/2, HTTPS, SSH, databases, SMTP</td><td>DNS lookups, DHCP, VoIP, video streaming, games, HTTP/3 (QUIC)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Notes: DNS uses UDP port 53 for ordinary small queries and TCP when answers are large. HTTP/3 runs
+  over QUIC, a protocol built on UDP that adds its own reliability and encryption. The ports in firewall
+  rules are per protocol: opening TCP 53 does not open UDP 53.</p>
+
+  <h4>Seeing TCP and UDP on your machine</h4>
+  <pre data-title="Connections and listeners"><code class="language-shell">$ ss -tn state established
+Recv-Q Send-Q Local Address:Port    Peer Address:Port
+0      0      172.31.5.20:22        203.0.113.77:51234
+0      0      172.31.5.20:8080      127.0.0.1:43872
+$ ss -tn state established | wc -l
+3
+$ ss -s
+Total: 182
+TCP:   9 (estab 2, closed 4, orphaned 0, timewait 4)</code></pre>
+  <p>Each established line is one TCP connection: your SSH session on port 22 and a proxy connection to
+  the app on 8080. A server's connection count includes states such as <code>TIME-WAIT</code> (recently
+  closed, waiting a short time to catch stray packets). A very high count of
+  <code>SYN-RECV</code> can point to a SYN flood attack.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: testing a UDP service with TCP tools</p>
+    <p><code>nc -zv host 53</code> tests TCP only. For UDP use <code>nc -zvu host 53</code> and remember
+    that a silent UDP port can mean "open" or "filtered", because no reply is expected.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and errors</p>
+    <ul>
+      <li><code>Connection refused</code> — the host answered with a reset: nothing listens on that
+      port.</li>
+      <li><code>Connection timed out</code> — no answer at all: a firewall dropped the packets, or the
+      host is unreachable.</li>
+      <li><code>Connection reset by peer</code> — the other side closed abruptly (app crash, a proxy
+      timeout, an idle connection dropped).</li>
+      <li>In Java you meet these as <code>java.net.ConnectException</code>,
+      <code>java.net.SocketTimeoutException</code> and <code>java.net.SocketException</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "TCP versus UDP; explain the three-way handshake."</p>
+    <ul>
+      <li>TCP: connection, reliable, ordered, flow and congestion control. UDP: connectionless, no
+      guarantees, low latency.</li>
+      <li>SYN, SYN-ACK, ACK agree on sequence numbers; examples: HTTP and SSH on TCP; DNS queries,
+      video calls and QUIC on UDP.</li>
+      <li>Add that refused versus timed out tells you whether the host or the firewall is the problem.</li>
+    </ul>
+  </div>
+</article>

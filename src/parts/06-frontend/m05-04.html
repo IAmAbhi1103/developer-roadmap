@@ -1,0 +1,1042 @@
+<article class="topic" id="m5-forms">
+  <h3>Forms: controlled inputs and validation</h3>
+  <p class="tldr">In a controlled form, React state is the single source of truth for every input
+  (<code>value</code> + <code>onChange</code>); you validate on submit, show errors next to fields, and
+  disable the button while the request is running.</p>
+
+  <h4>Controlled inputs</h4>
+  <p>A <strong>controlled input</strong> gets its value from state and reports every change through
+  <code>onChange</code>. The DOM input never holds its own truth; React does. That makes it easy to
+  validate, format, clear or pre-fill the field. An <strong>uncontrolled</strong> input keeps its own
+  value in the DOM and you read it later with a ref or <code>FormData</code>; it is simpler for tiny
+  forms and is what libraries like React Hook Form use internally.</p>
+
+<pre data-title="Controlled variants"><code class="language-jsx">const [name, setName] = useState('');
+const [role, setRole] = useState('DEVELOPER');
+const [active, setActive] = useState(true);
+const [shift, setShift] = useState('day');
+
+// Text, number, email, password, textarea: value + onChange
+&lt;input value={name} onChange={(e) =&gt; setName(e.target.value)} /&gt;
+
+// Select: value on the select, not "selected" on options
+&lt;select value={role} onChange={(e) =&gt; setRole(e.target.value)}&gt;
+  &lt;option value="DEVELOPER"&gt;Developer&lt;/option&gt;
+  &lt;option value="TESTER"&gt;Tester&lt;/option&gt;
+&lt;/select&gt;
+
+// Checkbox: checked + e.target.checked
+&lt;input type="checkbox" checked={active} onChange={(e) =&gt; setActive(e.target.checked)} /&gt;
+
+// Radio group: checked is "does this one match the state?"
+&lt;input type="radio" name="shift" value="day"
+       checked={shift === 'day'} onChange={(e) =&gt; setShift(e.target.value)} /&gt;
+&lt;input type="radio" name="shift" value="night"
+       checked={shift === 'night'} onChange={(e) =&gt; setShift(e.target.value)} /&gt;</code></pre>
+
+  <h4>One state object and one handleChange</h4>
+  <p>For forms with many fields, keep one object in state and give every input a <code>name</code>
+  matching the key. One handler updates the right field using a computed property name
+  <code>[name]</code>.</p>
+
+<pre data-title="EmployeeForm.jsx"><code class="language-jsx">import { useState } from 'react';
+
+const empty = { name: '', email: '', salary: '', department: 'ENGINEERING', active: true };
+
+function validate(values) {
+  const errors = {};
+  if (!values.name.trim()) errors.name = 'Name is required';
+  if (!/^\S+@\S+\.\S+$/.test(values.email)) errors.email = 'Enter a valid email';
+  const salary = Number(values.salary);
+  if (!Number.isFinite(salary) || salary &lt;= 0) errors.salary = 'Salary must be greater than 0';
+  return errors;
+}
+
+function EmployeeForm({ initialValues = empty, onSubmit }) {
+  const [values, setValues] = useState(initialValues);
+  const [errors, setErrors] = useState({});
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState(null);
+
+  function handleChange(e) {
+    const { name, type, value, checked } = e.target;
+    setValues((prev) =&gt; ({ ...prev, [name]: type === 'checkbox' ? checked : value }));
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault();                       // stop the page reload
+    const found = validate(values);
+    setErrors(found);
+    if (Object.keys(found).length &gt; 0) return;   // do not send invalid data
+
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      await onSubmit({ ...values, salary: Number(values.salary) });
+    } catch (err) {
+      setSubmitError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    &lt;form onSubmit={handleSubmit} noValidate&gt;
+      &lt;label htmlFor="name"&gt;Name&lt;/label&gt;
+      &lt;input id="name" name="name" value={values.name} onChange={handleChange}
+             aria-invalid={Boolean(errors.name)} aria-describedby="name-error" /&gt;
+      {errors.name &amp;&amp; &lt;p id="name-error" className="error"&gt;{errors.name}&lt;/p&gt;}
+
+      &lt;label htmlFor="email"&gt;Email&lt;/label&gt;
+      &lt;input id="email" name="email" type="email" value={values.email}
+             onChange={handleChange} /&gt;
+      {errors.email &amp;&amp; &lt;p className="error"&gt;{errors.email}&lt;/p&gt;}
+
+      &lt;label htmlFor="salary"&gt;Salary (₹ per month)&lt;/label&gt;
+      &lt;input id="salary" name="salary" type="number" value={values.salary}
+             onChange={handleChange} /&gt;
+      {errors.salary &amp;&amp; &lt;p className="error"&gt;{errors.salary}&lt;/p&gt;}
+
+      &lt;label&gt;
+        &lt;input type="checkbox" name="active" checked={values.active} onChange={handleChange} /&gt;
+        Active
+      &lt;/label&gt;
+
+      {submitError &amp;&amp; &lt;p role="alert" className="error"&gt;{submitError}&lt;/p&gt;}
+      &lt;button type="submit" disabled={submitting}&gt;
+        {submitting ? 'Saving…' : 'Save employee'}
+      &lt;/button&gt;
+    &lt;/form&gt;
+  );
+}
+
+export default EmployeeForm;</code></pre>
+
+  <h4>Validation: when and where</h4>
+  <ul>
+    <li><strong>On submit</strong> is the simplest and least annoying: validate all fields, show all
+    errors.</li>
+    <li><strong>On blur</strong> (when the user leaves a field) gives early feedback; track a
+    <code>touched</code> object so you do not show errors on fields the user has not visited.</li>
+    <li><strong>On every change</strong> suits password strength or availability hints, but shouting
+    "invalid email" while the user is still typing is bad UX.</li>
+    <li><strong>HTML attributes</strong> (<code>required</code>, <code>minLength</code>,
+    <code>pattern</code>, <code>type="email"</code>) give free browser validation. Use
+    <code>noValidate</code> on the form when you show your own messages.</li>
+    <li><strong>The server decides.</strong> Client validation is for convenience. Spring Boot's
+    <code>@Valid</code> must check everything again, and the UI must display the server's field errors
+    (see <a href="#m6-backend-validation-errors">Module 6</a>).</li>
+  </ul>
+
+  <h4>Edge cases that surprise people</h4>
+  <ul>
+    <li><code>value</code> must never be <code>undefined</code> or <code>null</code>. React then treats
+    the input as uncontrolled and later warns "A component is changing an uncontrolled input to be
+    controlled." Start with <code>''</code>.</li>
+    <li><code>value</code> without <code>onChange</code> makes a read-only input and a warning. Use
+    <code>readOnly</code> or add the handler.</li>
+    <li>Number inputs return strings. Convert with <code>Number()</code> before sending JSON, or
+    Spring will complain it cannot parse <code>"85000"</code> into a <code>BigDecimal</code> in some
+    configurations (it usually coerces, but do not rely on it).</li>
+    <li>Date inputs return <code>yyyy-MM-dd</code> strings, which Jackson maps to
+    <code>LocalDate</code> directly.</li>
+    <li>For file uploads use <code>&lt;input type="file" /&gt;</code> (always uncontrolled) and send
+    <code>FormData</code>.</li>
+    <li>Every input needs a <code>&lt;label htmlFor&gt;</code> matching its <code>id</code> (or wrap
+    the input in the label) for accessibility.</li>
+  </ul>
+
+  <h4>React Hook Form + Zod (the common library choice)</h4>
+  <p>Hand-written forms get long. Most teams use <strong>React Hook Form</strong> (RHF), which tracks
+  inputs without re-rendering on every keystroke, together with <strong>Zod</strong>, a schema library
+  that defines the rules once and also gives you TypeScript types. The bridge is the
+  <code>@hookform/resolvers</code> package. Install with
+  <code>npm install react-hook-form zod @hookform/resolvers</code>.</p>
+
+<pre data-title="EmployeeFormRhf.jsx"><code class="language-jsx">import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { z } from 'zod';
+
+const schema = z.object({
+  name: z.string().min(1, 'Name is required'),
+  email: z.string().email('Enter a valid email'),
+  salary: z.coerce.number().positive('Salary must be greater than 0'),
+});
+
+function EmployeeFormRhf({ onSubmit }) {
+  const {
+    register,
+    handleSubmit,
+    setError,
+    formState: { errors, isSubmitting },
+  } = useForm({ resolver: zodResolver(schema) });
+
+  async function submit(values) {
+    try {
+      await onSubmit(values);
+    } catch (err) {
+      setError('email', { message: 'This email is already registered' });  // server error
+    }
+  }
+
+  return (
+    &lt;form onSubmit={handleSubmit(submit)} noValidate&gt;
+      &lt;input {...register('name')} placeholder="Name" /&gt;
+      {errors.name &amp;&amp; &lt;p className="error"&gt;{errors.name.message}&lt;/p&gt;}
+
+      &lt;input {...register('email')} placeholder="Email" /&gt;
+      {errors.email &amp;&amp; &lt;p className="error"&gt;{errors.email.message}&lt;/p&gt;}
+
+      &lt;input type="number" {...register('salary')} placeholder="Salary" /&gt;
+      {errors.salary &amp;&amp; &lt;p className="error"&gt;{errors.salary.message}&lt;/p&gt;}
+
+      &lt;button disabled={isSubmitting}&gt;Save&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+  <p>The API names above (<code>register</code>, <code>handleSubmit</code>, <code>formState</code>,
+  <code>setError</code>, <code>zodResolver</code>) are stable across recent versions, but check the
+  library docs for current details. Zod's Java parallel is Bean Validation: the schema is your
+  <code>@NotBlank</code>, <code>@Email</code> and <code>@Positive</code> in one place.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for forms</p>
+    <ul>
+      <li>Always <code>e.preventDefault()</code> in <code>onSubmit</code> (or let RHF's
+      <code>handleSubmit</code> do it).</li>
+      <li>Use a real <code>&lt;form&gt;</code> with a <code>type="submit"</code> button so Enter works.
+      Buttons that are not submit buttons should say <code>type="button"</code>.</li>
+      <li>Never trust client validation; the backend validates again.</li>
+      <li>Disable the submit button (or ignore clicks) while a request is running to prevent double
+      submits.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Forgetting <code>preventDefault</code>: the page reloads and all state vanishes.</li>
+      <li>Writing <code>onChange={setName(e.target.value)}</code> (calling instead of passing).</li>
+      <li>Mutating the state object in <code>handleChange</code> (<code>values[name] = value</code>).</li>
+      <li>A button inside the form that should not submit but has no <code>type="button"</code>.</li>
+      <li>Using <code>defaultValue</code> and <code>value</code> on the same input.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Controlled vs uncontrolled components?"</p>
+    <ul>
+      <li>Controlled: value lives in React state, changes come through <code>onChange</code>; easy
+      validation and dependent fields, more re-renders.</li>
+      <li>Uncontrolled: DOM keeps the value, read through a ref or <code>FormData</code>; less code,
+      fewer renders. File inputs are always uncontrolled.</li>
+      <li>Libraries such as React Hook Form use uncontrolled inputs with refs for speed.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-router">
+  <h3>Routing with React Router</h3>
+  <p class="tldr">React Router maps URL paths to components inside a single page: declare
+  <code>Route</code>s, navigate with <code>Link</code> and <code>useNavigate</code>, read URL data
+  with <code>useParams</code> and <code>useSearchParams</code>, and nest routes with
+  <code>Outlet</code>.</p>
+
+  <h4>Why a router?</h4>
+  <p>A single-page app has one HTML file, but users expect different URLs for different screens:
+  <code>/employees</code>, <code>/employees/42</code>, <code>/login</code>. They also expect the back
+  button, bookmarks and shareable links to work. A <strong>client-side router</strong> watches the URL
+  (using the browser History API), renders the matching component, and changes the address without a
+  page reload. Install it with <code>npm install react-router</code>.</p>
+
+  <div class="co co-version">
+    <p class="co-t">Version note: React Router v7</p>
+    <p>React Router v7 is the current major version. In v7 the package is <code>react-router</code>;
+    the DOM pieces (<code>BrowserRouter</code>, <code>Link</code>, <code>NavLink</code>, …) are imported
+    from <code>react-router</code>, and <code>react-router-dom</code> remains as a package that
+    re-exports them for older projects. Older v6 code imports from <code>react-router-dom</code>.
+    v7 can be used in two ways: the classic <strong>declarative</strong> mode shown here
+    (<code>BrowserRouter</code> + <code>Routes</code>), a <strong>data</strong> mode with
+    <code>createBrowserRouter</code> and loaders, and a <strong>framework</strong> mode (Remix
+    merged into it). This module uses the declarative API because it is the same in v6 and v7. If your
+    project's <code>package.json</code> says <code>react-router-dom</code>, use that import path.</p>
+  </div>
+
+  <h4>Setup</h4>
+<pre data-title="src/main.jsx"><code class="language-jsx">import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { BrowserRouter } from 'react-router';
+import App from './App.jsx';
+
+createRoot(document.getElementById('root')).render(
+  &lt;StrictMode&gt;
+    &lt;BrowserRouter&gt;
+      &lt;App /&gt;
+    &lt;/BrowserRouter&gt;
+  &lt;/StrictMode&gt;,
+);</code></pre>
+
+<pre data-title="src/App.jsx"><code class="language-jsx">import { Route, Routes } from 'react-router';
+import Layout from './components/Layout.jsx';
+import HomePage from './pages/HomePage.jsx';
+import EmployeeListPage from './pages/EmployeeListPage.jsx';
+import EmployeeDetailPage from './pages/EmployeeDetailPage.jsx';
+import LoginPage from './pages/LoginPage.jsx';
+import NotFoundPage from './pages/NotFoundPage.jsx';
+
+function App() {
+  return (
+    &lt;Routes&gt;
+      &lt;Route path="/login" element={&lt;LoginPage /&gt;} /&gt;
+
+      {/* Layout route: renders the shared header, then the child route in its Outlet */}
+      &lt;Route element={&lt;Layout /&gt;}&gt;
+        &lt;Route index element={&lt;HomePage /&gt;} /&gt;
+        &lt;Route path="employees" element={&lt;EmployeeListPage /&gt;} /&gt;
+        &lt;Route path="employees/:id" element={&lt;EmployeeDetailPage /&gt;} /&gt;
+      &lt;/Route&gt;
+
+      &lt;Route path="*" element={&lt;NotFoundPage /&gt;} /&gt;   {/* 404: matches anything else */}
+    &lt;/Routes&gt;
+  );
+}
+
+export default App;</code></pre>
+
+  <h4>Links and navigation</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>API</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td><code>&lt;Link to="/employees"&gt;</code></td><td>Navigate without a reload. Use instead of <code>&lt;a href&gt;</code> for internal links</td></tr>
+      <tr><td><code>&lt;NavLink&gt;</code></td><td>Like Link, but knows if it is active; adds an <code>active</code> class (also accepts a function for <code>className</code>)</td></tr>
+      <tr><td><code>useNavigate()</code></td><td>Navigate from code, e.g. after login or save: <code>navigate('/employees')</code>; <code>navigate(-1)</code> goes back</td></tr>
+      <tr><td><code>&lt;Navigate to="/login" replace /&gt;</code></td><td>Redirect while rendering (used in protected routes)</td></tr>
+      <tr><td><code>useParams()</code></td><td>Read <code>:id</code> from the path: <code>{ id } = useParams()</code> (always a string)</td></tr>
+      <tr><td><code>useSearchParams()</code></td><td>Read and set the query string, like <code>?page=2&amp;sort=name</code></td></tr>
+      <tr><td><code>useLocation()</code></td><td>Current <code>pathname</code>, <code>search</code> and <code>state</code></td></tr>
+      <tr><td><code>&lt;Outlet /&gt;</code></td><td>Where a layout route renders its matched child</td></tr>
+    </tbody>
+  </table></div>
+
+<pre data-title="src/components/Layout.jsx"><code class="language-jsx">import { NavLink, Outlet } from 'react-router';
+
+function Layout() {
+  return (
+    &lt;div&gt;
+      &lt;header&gt;
+        &lt;nav&gt;
+          &lt;NavLink to="/" end&gt;Home&lt;/NavLink&gt;
+          &lt;NavLink to="/employees"&gt;Employees&lt;/NavLink&gt;
+        &lt;/nav&gt;
+      &lt;/header&gt;
+      &lt;main&gt;
+        &lt;Outlet /&gt;   {/* the matched child page appears here */}
+      &lt;/main&gt;
+    &lt;/div&gt;
+  );
+}
+
+export default Layout;</code></pre>
+
+<pre data-title="src/pages/EmployeeListPage.jsx"><code class="language-jsx">import { Link, useSearchParams } from 'react-router';
+
+function EmployeeListPage() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = Number(searchParams.get('page') ?? 0);
+  const q = searchParams.get('q') ?? '';
+
+  // The URL is the state: refresh or share the link and you get the same view
+  function nextPage() {
+    setSearchParams({ q, page: String(page + 1) });
+  }
+
+  return (
+    &lt;section&gt;
+      &lt;input value={q} onChange={(e) =&gt; setSearchParams({ q: e.target.value, page: '0' })} /&gt;
+      {/* ...fetch /api/employees?q=...&amp;page=... and render the list... */}
+      &lt;Link to="/employees/42"&gt;Open employee 42&lt;/Link&gt;
+      &lt;button onClick={nextPage}&gt;Next page&lt;/button&gt;
+    &lt;/section&gt;
+  );
+}
+
+export default EmployeeListPage;</code></pre>
+
+<pre data-title="src/pages/EmployeeDetailPage.jsx"><code class="language-jsx">import { useNavigate, useParams } from 'react-router';
+
+function EmployeeDetailPage() {
+  const { id } = useParams();        // "42" - a string; convert with Number(id) if needed
+  const navigate = useNavigate();
+
+  return (
+    &lt;section&gt;
+      &lt;h1&gt;Employee {id}&lt;/h1&gt;
+      &lt;button onClick={() =&gt; navigate(-1)}&gt;Back&lt;/button&gt;
+      &lt;button onClick={() =&gt; navigate(`/employees/${id}/edit`)}&gt;Edit&lt;/button&gt;
+    &lt;/section&gt;
+  );
+}
+
+export default EmployeeDetailPage;</code></pre>
+
+  <h4>Nested routes and the path rules</h4>
+  <ul>
+    <li>A route with no <code>path</code> but an <code>element</code> is a <strong>layout route</strong>:
+    it wraps its children and shows them in <code>&lt;Outlet /&gt;</code>.</li>
+    <li><code>index</code> marks the default child of a parent path (the page at exactly
+    <code>/</code> or <code>/employees</code>).</li>
+    <li>Child paths are relative to the parent: <code>path="employees"</code> then
+    <code>path=":id"</code> gives <code>/employees/:id</code>. Do not start child paths with
+    <code>/</code> unless you want an absolute path.</li>
+    <li><code>path="*"</code> matches anything not matched elsewhere — your 404 page.</li>
+    <li>Router v6+ ranks routes by specificity, so the order you write them in does not matter.</li>
+    <li><code>&lt;NavLink to="/" end&gt;</code> needs <code>end</code> so "Home" is not active on every
+    page.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the server must also serve index.html for every path</p>
+    <p>Routing happens in the browser. If a user refreshes on <code>/employees/42</code>, the browser
+    asks the web server for that path, and a plain static server returns 404. Vite's dev server already
+    falls back to <code>index.html</code>. In production you must configure the same fallback
+    (Netlify/Vercel rewrites, Nginx <code>try_files</code>, a Spring Boot forward controller) — see <a
+    href="#m6-deploy">deployment in Module 6</a>.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Keep one component per route in <code>src/pages/</code>, named <code>XxxPage</code>; they
+      fetch data and compose smaller components.</li>
+      <li>Put list filters, sort order and page numbers in search params so links are shareable.</li>
+      <li>Use <code>replace</code> when a redirect should not add a history entry (login redirect).</li>
+      <li>Link to routes with a helper or constants if paths repeat a lot.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>useParams</code> values are always strings (<code>"42"</code>), so
+      <code>id === 42</code> is false. This breaks strict comparisons with numeric ids.</li>
+      <li>The same page component rendered for <code>/employees/1</code> and
+      <code>/employees/2</code> is <em>not</em> remounted when the id changes; state is kept, and your
+      fetch effect must list <code>id</code> as a dependency.</li>
+      <li>Using <code>&lt;a href="/employees"&gt;</code> inside the app causes a full page reload and
+      loses all state.</li>
+      <li><code>useNavigate</code> must be called inside a component under the Router; calling it
+      outside gives an error "useNavigate() may be used only in the context of a &lt;Router&gt;
+      component".</li>
+      <li>Hash router (<code>HashRouter</code>, URLs like <code>/#/employees</code>) works without
+      server rewrites but looks old; prefer <code>BrowserRouter</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How does client-side routing work?"</p>
+    <ul>
+      <li>The router listens to URL changes via the History API (<code>pushState</code>, popstate),
+      matches the path to a route, and renders its component without a page reload.</li>
+      <li>Dynamic segments (<code>:id</code>) come from <code>useParams</code>; query data from
+      <code>useSearchParams</code>; layouts use nested routes with <code>Outlet</code>.</li>
+      <li>On refresh, the server must return <code>index.html</code> for all app paths (SPA
+      fallback).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-lifting-context">
+  <h3>Sharing state: lifting state up and the Context API</h3>
+  <p class="tldr">When two components need the same state, move it to their closest common parent and
+  pass it down; when many distant components need it, put it in a Context provider and read it with
+  <code>useContext</code>.</p>
+
+  <h4>Lifting state up</h4>
+  <p>Each piece of state has one owner. If a sibling needs it too, you <strong>lift it up</strong>: the
+  parent owns the state and passes the value (down) and a setter or handler (so children can ask for
+  changes) as props. There is one source of truth, so the siblings can never disagree.</p>
+
+<pre data-title="Lifting the search text up"><code class="language-jsx">function EmployeesPage() {
+  const [search, setSearch] = useState('');           // owned by the parent
+  const [employees] = useState(initialEmployees);
+
+  const visible = employees.filter((e) =&gt;
+    e.name.toLowerCase().includes(search.toLowerCase()),
+  );
+
+  return (
+    &lt;&gt;
+      &lt;SearchBar value={search} onChange={setSearch} /&gt;     {/* writes the state */}
+      &lt;ResultCount count={visible.length} /&gt;               {/* reads derived data */}
+      &lt;EmployeeList employees={visible} /&gt;
+    &lt;/&gt;
+  );
+}
+
+function SearchBar({ value, onChange }) {          // a controlled component
+  return &lt;input value={value} onChange={(e) =&gt; onChange(e.target.value)} /&gt;;
+}</code></pre>
+
+  <figure class="fig">
+<pre class="diagram">
+          EmployeesPage  (owns search)
+            │        │          │
+   value ▼  ▲ onChange  count ▼          employees ▼
+        SearchBar     ResultCount      EmployeeList
+
+  data goes down as props;  events go up as function calls
+</pre>
+    <figcaption>One owner, many readers: the state lives in the closest common parent</figcaption>
+  </figure>
+
+  <p>How far up should you lift? To the <em>closest</em> common parent, and no further. Lifting too high
+  makes that parent re-render (and re-render all its children) on every change, and passes props through
+  components that do not care. A good habit: keep state as low as possible, and lift it only when a
+  second component needs it. The opposite move also exists: if only one child uses a piece of state,
+  push it down into that child.</p>
+
+  <h4>Props, children and composition</h4>
+  <p>Before reaching for Context, try <strong>composition</strong>. A component can accept
+  <code>children</code> (or JSX in other props) so the page that owns the data builds the middle
+  layers' content itself, and the middle layers never see the props.</p>
+
+<pre data-title="Composition instead of drilling"><code class="language-jsx">// The Layout does not know about user at all
+function Layout({ sidebar, children }) {
+  return (
+    &lt;div className="layout"&gt;
+      &lt;aside&gt;{sidebar}&lt;/aside&gt;
+      &lt;main&gt;{children}&lt;/main&gt;
+    &lt;/div&gt;
+  );
+}
+
+function DashboardPage({ user }) {
+  return (
+    &lt;Layout sidebar={&lt;UserCard user={user} /&gt;}&gt;
+      &lt;Orders userId={user.id} /&gt;
+    &lt;/Layout&gt;
+  );
+}</code></pre>
+
+  <h4>The Context API</h4>
+  <p>Lifting works until the value must pass through many layers (prop drilling). <strong>Context</strong>
+  lets a component make a value available to everything below it without passing props. It has three
+  steps: create the context, provide a value high in the tree, and read it anywhere below. Think of it
+  like a Spring bean in the application context: you declare it once at the top and any component
+  below "injects" it with <code>useContext</code>, though it only lives in the component tree, not
+  globally.</p>
+
+<pre data-title="src/context/AuthContext.jsx"><code class="language-jsx">import { createContext, useCallback, useContext, useMemo, useState } from 'react';
+
+// 1. Create. The default is used only when there is no provider above.
+const AuthContext = createContext(null);
+
+// 2. Provide
+export function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);       // { id, name, roles } or null
+
+  const login = useCallback((userData) =&gt; setUser(userData), []);
+  const logout = useCallback(() =&gt; setUser(null), []);
+
+  // Memoise so consumers re-render only when something really changed
+  const value = useMemo(() =&gt; ({ user, login, logout }), [user, login, logout]);
+
+  return &lt;AuthContext.Provider value={value}&gt;{children}&lt;/AuthContext.Provider&gt;;
+}
+
+// 3. Read, wrapped in a custom hook with a helpful error
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (ctx === null) throw new Error('useAuth must be used inside an AuthProvider');
+  return ctx;
+}</code></pre>
+
+<pre data-title="Using it"><code class="language-jsx">// main.jsx: wrap the app once
+&lt;AuthProvider&gt;
+  &lt;App /&gt;
+&lt;/AuthProvider&gt;
+
+// Any component, any depth
+function Header() {
+  const { user, logout } = useAuth();
+  return user ? &lt;button onClick={logout}&gt;Logout {user.name}&lt;/button&gt; : null;
+}</code></pre>
+
+  <h4>A realistic AuthProvider: restoring the session</h4>
+  <p>A real provider also has to answer "is someone already logged in?" when the page loads. With a
+  cookie-based session or a stored token you ask the backend (for example <code>GET /api/auth/me</code>
+  in Spring Boot), and until the answer arrives the app does not know. That is why the context exposes
+  an <code>isLoading</code> flag; <a href="#m6-protected-routes">protected routes</a> use it so they do
+  not redirect too early. The token flow itself is in <a href="#m6-jwt-flow">JWT login end to
+  end</a>.</p>
+
+<pre data-title="AuthProvider with session restore"><code class="language-jsx">export function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);     // true until /me answers
+
+  useEffect(() =&gt; {
+    const controller = new AbortController();
+    fetch('/api/auth/me', { signal: controller.signal, credentials: 'include' })
+      .then((res) =&gt; (res.ok ? res.json() : null))      // 401 = not logged in
+      .then((me) =&gt; setUser(me))
+      .catch(() =&gt; {})                                   // aborted or network error
+      .finally(() =&gt; {
+        if (!controller.signal.aborted) setIsLoading(false);
+      });
+    return () =&gt; controller.abort();
+  }, []);
+
+  const login = useCallback((me) =&gt; setUser(me), []);
+  const logout = useCallback(() =&gt; setUser(null), []);
+
+  const value = useMemo(
+    () =&gt; ({ user, isLoading, login, logout }),
+    [user, isLoading, login, logout],
+  );
+  return &lt;AuthContext.Provider value={value}&gt;{children}&lt;/AuthContext.Provider&gt;;
+}</code></pre>
+
+  <div class="co co-version">
+    <p class="co-t">Version note: React 19 and Context</p>
+    <p>In React 19 you can render the context itself as the provider:
+    <code>&lt;AuthContext value={value}&gt;…&lt;/AuthContext&gt;</code>. The
+    <code>&lt;AuthContext.Provider&gt;</code> form still works and is what most existing code uses. The
+    <code>use(AuthContext)</code> API can read a context too, but <code>useContext</code> is still the
+    everyday choice.</p>
+  </div>
+
+  <h4>What Context is good and bad at</h4>
+  <p>When the provider's <code>value</code> changes, <strong>every</strong> component that reads that
+  context re-renders, even if it only uses one field. Context has no selector mechanism. So it suits
+  values that change rarely and are needed widely: the current user, theme, language, feature flags,
+  the router. It is a poor fit for fast-changing data (mouse position, a form on every keystroke,
+  large lists) or for server data (use <a href="#m5-tanstack-query">TanStack Query</a>). For big client
+  state with frequent updates, look at Redux Toolkit or Zustand in <a
+  href="#m7-state-libraries">Module 7</a>.</p>
+
+  <h4>How context re-renders work</h4>
+  <p>Two different things can cause a re-render, and they are easy to mix up.</p>
+  <ul>
+    <li><strong>The provider's parent re-renders.</strong> If the provider component gets new props or
+    its own state changes, it renders again. Its <code>children</code> prop is the same element
+    objects as before (they were created by the component above), so React skips re-rendering those
+    children. That is why wrapping <code>children</code> inside the provider is cheap, as in
+    <code>AuthProvider</code> above.</li>
+    <li><strong>The context value changes.</strong> React compares the new <code>value</code> with the
+    old one using <code>Object.is</code>. If different, every component that called
+    <code>useContext</code> for that context re-renders, skipping any <code>memo</code> in between.</li>
+  </ul>
+  <p>This is why the object literal matters. <code>value={{ user, login }}</code> creates a new
+  object each render of the provider, so the comparison always says "changed", and all consumers
+  re-render even if <code>user</code> is the same. <code>useMemo</code> keeps the same object until a
+  dependency changes.</p>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: new value object every render</p><pre><code class="language-jsx">function ThemeProvider({ children }) {
+  const [theme, setTheme] = useState('light');
+  return (
+    &lt;ThemeContext.Provider value={{ theme, setTheme }}&gt;
+      {children}
+    &lt;/ThemeContext.Provider&gt;
+  );
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: memoised value</p><pre><code class="language-jsx">function ThemeProvider({ children }) {
+  const [theme, setTheme] = useState('light');
+  const value = useMemo(() =&gt; ({ theme, setTheme }), [theme]);
+  return (
+    &lt;ThemeContext.Provider value={value}&gt;
+      {children}
+    &lt;/ThemeContext.Provider&gt;
+  );
+}</code></pre></div>
+  </div>
+
+  <p><code>setTheme</code> from <code>useState</code> is stable (same function every render), so it does
+  not need to be in the dependency list. Functions you define yourself (like <code>login</code>) need
+  <code>useCallback</code> to stay stable; see <a href="#m5-memo-callback">useMemo and
+  useCallback</a>.</p>
+
+  <h4>Splitting a context</h4>
+  <p>If some components only need to <em>change</em> a value (a "Logout" button) and others only
+  <em>read</em> it, use two contexts so the writers do not re-render when the data changes. This is
+  a common pattern for larger state.</p>
+
+<pre data-title="Separate state and actions"><code class="language-jsx">const CartStateContext = createContext(null);
+const CartActionsContext = createContext(null);
+
+export function CartProvider({ children }) {
+  const [items, setItems] = useState([]);
+
+  const actions = useMemo(() =&gt; ({
+    add: (item) =&gt; setItems((prev) =&gt; [...prev, item]),
+    remove: (id) =&gt; setItems((prev) =&gt; prev.filter((i) =&gt; i.id !== id)),
+    clear: () =&gt; setItems([]),
+  }), []);                                  // setItems is stable, so never changes
+
+  return (
+    &lt;CartActionsContext.Provider value={actions}&gt;
+      &lt;CartStateContext.Provider value={items}&gt;{children}&lt;/CartStateContext.Provider&gt;
+    &lt;/CartActionsContext.Provider&gt;
+  );
+}</code></pre>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Approach</th><th>Use when</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>Props</td><td>One or two levels</td><td>Drilling if the tree grows</td></tr>
+      <tr><td>Lift state up</td><td>Siblings share state</td><td>Parent re-renders more</td></tr>
+      <tr><td>Composition (<code>children</code>)</td><td>Avoid passing props through middle layers</td><td>Needs a restructure</td></tr>
+      <tr><td>Context</td><td>Rarely changing global values (user, theme)</td><td>All consumers re-render on change</td></tr>
+      <tr><td>State library</td><td>Large, frequently changing client state</td><td>Another dependency</td></tr>
+      <tr><td>TanStack Query</td><td>Server data</td><td>Another dependency, big win</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: a consumer must be below its provider</p>
+    <p><code>useContext</code> reads the value of the <em>nearest</em> provider above the component in
+    the tree. If there is none, it returns the default passed to <code>createContext</code>. Putting
+    <code>null</code> as the default and throwing in your <code>useXxx</code> hook turns a silent bug
+    into a clear error message. Providers can be nested; the inner one overrides the outer one for its
+    subtree.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>One context per concern (<code>AuthContext</code>, <code>ThemeContext</code>); do not make one
+      giant "AppContext".</li>
+      <li>Export a <code>Provider</code> component and a <code>useXxx</code> hook; do not export the raw
+      context object.</li>
+      <li>Memoise the provider value (<code>useMemo</code>) when it is an object.</li>
+      <li>Split state and dispatch into two contexts if consumers mostly need only one.</li>
+      <li>Keep providers near the top (<code>main.jsx</code>), but put feature-specific ones around only
+      that feature's routes.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Passing a fresh object literal as <code>value={{ user, login }}</code> without memoising —
+      every parent render re-renders all consumers.</li>
+      <li>Reading the context outside its provider and getting <code>null</code> or the default.</li>
+      <li>Putting all server data into context and hand-rolling cache invalidation.</li>
+      <li>Lifting state far higher than needed "just in case".</li>
+      <li>Keeping a copy of context data in local state (<code>useState(user)</code>); the copy goes
+      stale when the context changes. Read it directly.</li>
+      <li>Storing a rapidly changing value (a text field's draft, the scroll position) in a global
+      context, so half the app re-renders on every keystroke.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Context values are compared with <code>Object.is</code>; mutating an object in place and
+      keeping the same reference will not notify consumers. Always create a new object or array.</li>
+      <li>Context does not cross separate React roots, and in tests you must wrap the component in the
+      provider (a small <code>renderWithProviders</code> helper is normal).</li>
+      <li><code>React.memo</code> on a consumer does not stop context-driven re-renders; the context
+      update bypasses it.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>A typical Spring Boot + React app has an <code>AuthProvider</code> (current user and roles),
+    maybe a <code>ThemeProvider</code> and a toast/notification provider. Everything that comes from
+    your REST API (employees, orders) goes through TanStack Query instead, and form drafts stay local.
+    That keeps the contexts small and rarely changing.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Prop drilling, and how do you avoid it?"</p>
+    <ul>
+      <li>Passing props through components that do not use them. Fix with composition, Context, or a
+      state library.</li>
+      <li>Context re-renders all consumers when its value changes, so it is for low-frequency
+      global values; use selectors (Zustand/Redux) for hot state.</li>
+      <li>Lifting state up: the closest common parent owns the state; children receive value and
+      callbacks.</li>
+      <li>Why memoise the provider value? A new object each render makes <code>Object.is</code> see a
+      change and re-renders every consumer.</li>
+      <li>Is Context a replacement for Redux? Not for frequent updates or complex logic; it only
+      transports a value, it does not manage state by itself.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-custom-hooks">
+  <h3>Custom hooks</h3>
+  <p class="tldr">A custom hook is a function whose name starts with <code>use</code> and that calls
+  other hooks, so you can share stateful logic between components without sharing state.</p>
+
+  <h4>Why and how</h4>
+  <p>When two components need the same combination of <code>useState</code>, <code>useEffect</code> and
+  helpers, extract it into a function. The hook must start with <code>use</code> (so React and the
+  linter know the rules of hooks apply) and can call any hook. Each component that calls the hook gets
+  its <strong>own copy</strong> of the state; hooks share logic, not data. Return what the component
+  needs: a value, an array, or an object.</p>
+  <p>If you know Java, a custom hook is closest to a small reusable service class that you create per
+  use, not a singleton: every <code>new</code> gives separate fields. The "fields" are the state and
+  effects inside the hook, and the component that calls it owns them. Nothing is magic: when the hook's
+  state changes, the component that called it re-renders, exactly as if you had written that
+  <code>useState</code> directly in the component.</p>
+
+  <h4>Extracting a hook step by step</h4>
+  <ol class="steps">
+    <li>Spot repeated code: the same <code>useState</code> plus <code>useEffect</code> pair in two
+    components.</li>
+    <li>Cut it into a function named <code>useSomething</code> in <code>src/hooks/</code>.</li>
+    <li>Turn the values that differ (a URL, a key, a delay) into parameters.</li>
+    <li>Return the values and functions the component needs, and replace the old code with one call.</li>
+  </ol>
+
+  <h4>A first, tiny hook: useToggle</h4>
+<pre data-title="src/hooks/useToggle.js"><code class="language-javascript">import { useCallback, useState } from 'react';
+
+export function useToggle(initial = false) {
+  const [on, setOn] = useState(initial);
+  const toggle = useCallback(() =&gt; setOn((v) =&gt; !v), []);   // stable function identity
+  return [on, toggle, setOn];
+}
+
+// Use: const [open, toggleOpen] = useToggle();
+//      &lt;button onClick={toggleOpen}&gt;{open ? 'Hide' : 'Show'} details&lt;/button&gt;</code></pre>
+
+  <h4>useLocalStorage</h4>
+<pre data-title="src/hooks/useLocalStorage.js"><code class="language-javascript">import { useEffect, useState } from 'react';
+
+export function useLocalStorage(key, initialValue) {
+  const [value, setValue] = useState(() =&gt; {
+    try {
+      const stored = localStorage.getItem(key);
+      return stored !== null ? JSON.parse(stored) : initialValue;
+    } catch {
+      return initialValue;       // blocked storage or invalid JSON
+    }
+  });
+
+  useEffect(() =&gt; {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+      // storage full or disabled: ignore
+    }
+  }, [key, value]);
+
+  return [value, setValue];      // same shape as useState
+}
+
+// Use: const [theme, setTheme] = useLocalStorage('theme', 'light');</code></pre>
+
+  <p>Because it returns the real <code>setValue</code> from <code>useState</code>, the functional form
+  also works: <code>setTheme((t) =&gt; (t === 'light' ? 'dark' : 'light'))</code>. The initial value
+  is read once, using a function passed to <code>useState</code> (a <strong>lazy initialiser</strong>),
+  so <code>localStorage</code> is not read on every render. Do not store tokens or secrets here; see the
+  storage trade-offs in <a href="#m6-jwt-flow">JWT login end to end</a>.</p>
+
+  <h4>useDebounce</h4>
+  <p>Debouncing waits until the user stops typing before using the value, which avoids one API call
+  per keystroke.</p>
+
+<pre data-title="src/hooks/useDebounce.js"><code class="language-javascript">import { useEffect, useState } from 'react';
+
+export function useDebounce(value, delayMs = 400) {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() =&gt; {
+    const id = setTimeout(() =&gt; setDebounced(value), delayMs);
+    return () =&gt; clearTimeout(id);       // typing again cancels the pending update
+  }, [value, delayMs]);
+
+  return debounced;
+}</code></pre>
+
+<pre data-title="Search that calls the API 400 ms after the last keystroke"><code class="language-jsx">function EmployeeSearch() {
+  const [text, setText] = useState('');
+  const query = useDebounce(text, 400);
+
+  useEffect(() =&gt; {
+    if (!query) return;
+    const controller = new AbortController();
+    fetch(`/api/employees?q=${encodeURIComponent(query)}`, { signal: controller.signal })
+      .then((r) =&gt; r.json())
+      .then(console.log)
+      .catch(() =&gt; {});
+    return () =&gt; controller.abort();
+  }, [query]);          // runs when the debounced value changes, not on each keystroke
+
+  return &lt;input value={text} onChange={(e) =&gt; setText(e.target.value)} /&gt;;
+}</code></pre>
+
+  <p>The input stays instant because <code>text</code> updates on every keystroke; only the
+  <em>debounced copy</em> is delayed. A debounce hook returns a delayed value; a "debounced function"
+  is a different tool. The server side matters too: your Spring Boot endpoint should still be
+  efficient (an index on the searched column), because debouncing only reduces the number of calls.</p>
+
+  <h4>useFetch</h4>
+  <p>This hook bundles the loading / error / data pattern from <a href="#m5-fetching-data">fetching
+  data</a>, including the cleanup.</p>
+
+<pre data-title="src/hooks/useFetch.js"><code class="language-javascript">import { useEffect, useState } from 'react';
+
+export function useFetch(url) {
+  const [state, setState] = useState({ data: null, error: null, loading: true });
+
+  useEffect(() =&gt; {
+    const controller = new AbortController();
+    setState({ data: null, error: null, loading: true });
+
+    fetch(url, { signal: controller.signal })
+      .then((res) =&gt; {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((data) =&gt; setState({ data, error: null, loading: false }))
+      .catch((error) =&gt; {
+        if (error.name !== 'AbortError') setState({ data: null, error, loading: false });
+      });
+
+    return () =&gt; controller.abort();
+  }, [url]);
+
+  return state;
+}
+
+// Use:
+// const { data: employees, error, loading } = useFetch('/api/employees');</code></pre>
+
+  <p>When <code>url</code> changes (a new page number, a different employee id) the cleanup aborts the
+  old request, so a slow earlier response can never overwrite a newer one: this is the race condition
+  from the fetching article, solved once inside the hook. Components that use it stay short:</p>
+
+<pre data-title="Using useFetch in a component"><code class="language-jsx">function EmployeePage({ id }) {
+  const { data: employee, error, loading } = useFetch(`/api/employees/${id}`);
+
+  if (loading) return &lt;p&gt;Loading…&lt;/p&gt;;
+  if (error) return &lt;p role="alert"&gt;Could not load: {error.message}&lt;/p&gt;;
+  return &lt;h2&gt;{employee.name}&lt;/h2&gt;;
+}</code></pre>
+
+  <p>A production-grade version needs caching, retries, deduplication and refetching — exactly what
+  <a href="#m5-tanstack-query">TanStack Query</a> provides. Write <code>useFetch</code> once to
+  understand the pattern, then prefer the library.</p>
+
+  <h4>Hooks that wrap your domain</h4>
+  <p>The most useful custom hooks in real projects are domain hooks like
+  <code>useEmployees()</code>, <code>useAuth()</code> or <code>useCart()</code>. They hide where data
+  comes from, so components stay small and you can change the implementation (hand-written fetch →
+  TanStack Query) without touching them. This is the same idea as a Spring service interface: callers
+  depend on the contract, not the implementation.</p>
+
+<pre data-title="src/hooks/useEmployees.js"><code class="language-javascript">import { useCallback } from 'react';
+import { useFetch } from './useFetch.js';
+
+export function useEmployees(department) {
+  const url = department
+    ? `/api/employees?department=${encodeURIComponent(department)}`
+    : '/api/employees';
+  const { data, error, loading } = useFetch(url);
+
+  const hasData = data !== null;
+  return { employees: data ?? [], error, loading, hasData };
+}</code></pre>
+
+  <h4>Custom hook vs similar tools</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Tool</th><th>Use it for</th><th>Has its own state?</th></tr></thead>
+    <tbody>
+      <tr><td>Custom hook</td><td>Reusing logic that uses hooks (state, effects, context)</td><td>Yes, one copy per caller</td></tr>
+      <tr><td>Plain function</td><td>Pure logic with no hooks (formatting, validation)</td><td>No</td></tr>
+      <tr><td>Component</td><td>Reusing UI (markup plus logic)</td><td>Yes, per instance</td></tr>
+      <tr><td>Context</td><td>Sharing one value with many distant components</td><td>One shared value</td></tr>
+      <tr><td>Module-level variable</td><td>Rarely right; shared mutable data outside React</td><td>Shared, but not reactive</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for custom hooks</p>
+    <ul>
+      <li>The name starts with <code>use</code>. Without it the linter cannot enforce the rules of
+      hooks inside.</li>
+      <li>Call it only at the top level of a component or another hook: not inside loops, conditions,
+      nested functions, or after an early <code>return</code>. React tracks hooks by call order, so the
+      order must be the same on every render.</li>
+      <li>Call hooks only from React function components or other hooks, never from plain functions or
+      class components.</li>
+      <li>Hooks share logic, not state: two components calling <code>useFetch</code> make two
+      requests.</li>
+      <li>Do not create a hook that does nothing hook-like (no hook calls inside): a normal function is
+      enough.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>One hook per file in <code>src/hooks/</code>, file name equals hook name
+      (<code>useDebounce.js</code>).</li>
+      <li>Return an array for one or two values that callers will rename (like <code>useState</code>),
+      and an object for three or more.</li>
+      <li>Accept simple parameters; for many options take one options object with defaults.</li>
+      <li>Keep a hook focused: "fetch", "debounce", "toggle". Compose small hooks into bigger domain
+      hooks instead of writing one that does everything.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Expecting two components to share data just because they call the same hook. Each call has
+      its own state; for shared state use Context, lifting, or a data library.</li>
+      <li>Passing an object or function created inline into the dependency array of the effect inside
+      the hook (<code>useFetch(url, { headers })</code> with a new <code>headers</code> object each
+      render): the effect re-runs on every render and may loop. Memoise it, depend on its primitive
+      fields, or accept primitives.</li>
+      <li>Forgetting the cleanup (abort, <code>clearTimeout</code>, remove listener) so a stale result
+      or leaked timer arrives after the component has changed.</li>
+      <li>Calling the hook conditionally: <code>if (id) { useFetch(...) }</code> breaks the call order.
+      Call it always and make the hook skip the work (for example, accept an <code>enabled</code>
+      option or a <code>null</code> URL).</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>In development, Strict Mode runs effects twice, so <code>useFetch</code> may send two
+      requests on mount. This is expected and only happens in development; the abort in the cleanup
+      makes it harmless.</li>
+      <li><code>useLocalStorage</code> reads the browser's storage, so it fails during server-side
+      rendering where <code>localStorage</code> does not exist. In a Vite single-page app this does not
+      matter, and the <code>try / catch</code> covers blocked storage.</li>
+      <li>Updates made in one browser tab do not reach <code>useLocalStorage</code> in another tab
+      unless you also listen to the <code>storage</code> event.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: test them too</p>
+    <p>Hooks can be tested with <code>renderHook</code> from React Testing Library (see <a
+    href="#m7-testing">Module 7</a>). Keep logic in hooks and plain functions, and components become
+    thin and easy to test.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a custom hook and why use one?"</p>
+    <ul>
+      <li>A function starting with <code>use</code> that composes built-in hooks to reuse stateful
+      logic (fetching, forms, debouncing, local storage).</li>
+      <li>Each call has isolated state; hooks share logic only.</li>
+      <li>Benefits: no duplicated code, smaller components, testable logic, swap implementations
+      behind a stable interface.</li>
+      <li>Be ready to write <code>useDebounce</code> or <code>useLocalStorage</code> on a whiteboard,
+      and to state the two rules of hooks (top level only; only from components or hooks).</li>
+      <li>Follow-up: "Does a custom hook make two components share state?" No; use Context or lift
+      the state.</li>
+    </ul>
+  </div>
+</article>

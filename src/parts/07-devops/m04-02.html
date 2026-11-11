@@ -1,0 +1,616 @@
+<article class="topic" id="m4-ci-workflow">
+  <h3>A complete CI workflow for a Spring Boot Maven project</h3>
+  <p class="tldr">The CI workflow checks out the code, installs Temurin Java with the Maven cache, runs
+  <code>./mvnw -B verify</code>, and uploads the test reports; add a PostgreSQL service container or
+  Testcontainers for integration tests, and a separate job for the React frontend.</p>
+
+  <h4>The goal</h4>
+  <p>On every pull request to <code>main</code> and every push to <code>main</code>: compile the project, run all
+  tests, and keep the test reports so a failure can be diagnosed without re-running. The build must be quick
+  (dependencies cached) and reproducible (same Java version as production).</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A[Checkout] --> B["Set up Java 21 + Maven cache"]
+  B --> C["./mvnw -B verify"]
+  C --> D[Upload test reports]
+  C --> E[Upload JAR]
+</pre>
+    <figcaption>The steps of the backend CI job</figcaption>
+  </figure>
+
+  <h4>The workflow</h4>
+  <pre data-title=".github/workflows/ci.yml"><code class="language-yaml">name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read                      # least privilege for GITHUB_TOKEN
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true            # a newer push cancels the older run
+
+jobs:
+  backend:
+    name: Backend (Maven)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15               # never let a stuck build run for hours
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21 (Temurin) with Maven cache
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven                # caches ~/.m2, keyed on pom.xml files
+
+      - name: Build and test
+        run: ./mvnw -B -ntp verify
+
+      - name: Upload test reports
+        if: always()                  # also when tests failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: |
+            target/surefire-reports/
+            target/failsafe-reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload the JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+          retention-days: 7</code></pre>
+
+  <h4>Line by line</h4>
+  <dl class="terms">
+    <dt>on: push / pull_request</dt><dd>Run on merges to <code>main</code> and on every PR aimed at it.</dd>
+    <dt>permissions: contents: read</dt><dd>The token can only read the repository. Nothing in CI needs more.</dd>
+    <dt>concurrency</dt><dd>One run per branch; cancels outdated runs. The group includes the workflow name so
+    different workflows do not cancel each other.</dd>
+    <dt>runs-on: ubuntu-latest</dt><dd>A fresh GitHub-hosted Ubuntu VM for this job. It already contains Docker,
+    Git, Node, several JDKs and Maven; we still install our own Java to control the version.</dd>
+    <dt>timeout-minutes</dt><dd>Fails the job if it runs longer than this (the default is 360 minutes, which
+    wastes your free minutes on a hang).</dd>
+    <dt>actions/checkout@v4</dt><dd>Clones your repository into the runner. Without this step the runner has
+    no code. By default it fetches only the commit being built (shallow); add <code>fetch-depth: 0</code> if a
+    tool needs the full history.</dd>
+    <dt>actions/setup-java@v4</dt><dd>Installs the JDK. <code>distribution: temurin</code> is the Eclipse
+    Temurin build; <code>java-version</code> is quoted so YAML keeps it a string. <code>cache: maven</code>
+    restores and saves Maven's local repository, so dependency downloads happen only when a
+    <code>pom.xml</code> changes.</dd>
+    <dt>./mvnw -B -ntp verify</dt><dd>The Maven wrapper pins the Maven version for the project. <code>-B</code>
+    is batch mode, <code>-ntp</code> hides the noisy "downloading…" lines. <code>verify</code> runs the
+    lifecycle through compile, unit tests (Surefire), packaging, and integration tests (Failsafe, if used),
+    so it checks more than <code>test</code>. Use <code>mvn test</code> if you only want unit tests.</dd>
+    <dt>if: always()</dt><dd>The upload step runs even if the build step failed, which is exactly when you need
+    the reports.</dd>
+    <dt>upload-artifact</dt><dd>Stores files with the run; download them from the run's summary page. Set a short
+    <code>retention-days</code> to save storage.</dd>
+  </dl>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: mvnw: Permission denied</p>
+    <p>If the wrapper was committed from Windows, its executable bit may be missing and Linux refuses to run
+    it. Fix once on your machine and commit:
+    <code>git update-index --chmod=+x mvnw &amp;&amp; git commit -m "Make mvnw executable"</code>. Or run
+    <code>sh ./mvnw …</code>, or call <code>mvn</code> directly (Maven is preinstalled on the runner).</p>
+  </div>
+
+  <h4>Integration tests that need PostgreSQL</h4>
+  <p>Two good options exist.</p>
+  <p><strong>Option 1: Testcontainers (recommended).</strong> Your tests start a real PostgreSQL container
+  themselves (see <a href="04-spring-boot.html#m5">Spring Boot · Module 5</a>). GitHub-hosted Ubuntu runners have
+  Docker installed, so it works with no extra workflow lines, and the test behaves the same locally and in
+  CI. This is the preferred approach.</p>
+  <p><strong>Option 2: a service container.</strong> The workflow starts a database next to the job, and your
+  tests connect to it through environment variables.</p>
+  <pre data-title="Job with a PostgreSQL service container"><code class="language-yaml">  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: shop_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: &gt;-
+          --health-cmd "pg_isready -U test -d shop_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/shop_test
+      SPRING_DATASOURCE_USERNAME: test
+      SPRING_DATASOURCE_PASSWORD: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - run: ./mvnw -B -ntp verify</code></pre>
+  <p>Here the job runs directly on the runner, so the database is reached at <code>localhost:5432</code> (the
+  published port). If the job itself ran in a container (<code>container:</code> key), you would use the
+  service name <code>postgres</code> instead — the same localhost rule as in
+  <a href="#m3-networks">Docker networks</a>. The <code>options</code> health check makes GitHub wait until
+  the database is ready before the steps start.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Service container</th><th>Testcontainers</th></tr></thead>
+    <tbody>
+      <tr><td>Defined in</td><td>The workflow YAML</td><td>Your test code</td></tr>
+      <tr><td>Same setup locally?</td><td>No: you must start a database yourself</td><td>Yes: <code>./mvnw verify</code> works anywhere with Docker</td></tr>
+      <tr><td>Isolation</td><td>One database shared by all tests in the job</td><td>A fresh container per test class or suite</td></tr>
+      <tr><td>Best for</td><td>Simple pipelines, other languages</td><td>Spring Boot projects</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A frontend job (React with Vite)</h4>
+  <p>The React app is built and tested in its own job, in parallel with the backend. If the frontend sits in a
+  <code>frontend/</code> folder of the same repository, set the working directory.</p>
+  <pre data-title="Frontend job (add under jobs:)"><code class="language-yaml">  frontend:
+    name: Frontend (React)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci                  # clean, exact install from package-lock.json
+      - run: npm run lint --if-present
+      - run: npm test --if-present
+      - run: npm run build           # fails the job on TypeScript/Vite errors</code></pre>
+  <p><code>npm ci</code> installs exactly what <code>package-lock.json</code> says and fails if the lock file
+  and <code>package.json</code> disagree — which is what you want in CI (<code>npm install</code> may modify the
+  lock file). Choose the Node version your project uses. See
+  <a href="06-frontend.html#m5">Frontend · Module 5</a> for the React side.</p>
+
+  <h4>Showing results</h4>
+  <p>On each pull request the checks appear at the bottom: a green tick or a red cross per job, with a link to
+  the log. Open a failed step, read the last lines of output (Maven prints the failing test name and the
+  assertion), and download the <code>surefire-reports</code> artifact for the full stack traces. Always try to
+  reproduce locally with the same command: <code>./mvnw -B verify</code>.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: one command that CI and developers both run</p>
+    <p>Keep logic in Maven (or a script in the repository), not in long YAML. The workflow becomes "checkout,
+    install tools, run the command". Then "it fails in CI" can be reproduced on a laptop.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and errors</p>
+    <ul>
+      <li><strong>Tests pass locally but fail in CI</strong> — usually time zones (the runner is UTC), file name
+      case (Linux is case-sensitive), line endings, a service that exists only on your laptop, or tests that
+      depend on order.</li>
+      <li><strong>Flaky tests</strong> — fix or quarantine them; do not just re-run until green.</li>
+      <li><strong>Cache never hits</strong> — the key is based on <code>pom.xml</code>; editing it changes the key
+      and rebuilds the cache once. Caches are scoped per branch (a PR can read the default branch's cache).</li>
+      <li><strong>Out of disk or memory</strong> on a hosted runner — a standard runner has limited RAM and disk;
+      keep Testcontainers and test data modest.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Write a CI pipeline for a Spring Boot app."</p>
+    <ul>
+      <li>Trigger on PR and push to main; checkout, setup-java (Temurin 21, <code>cache: maven</code>),
+      <code>./mvnw -B verify</code>, upload reports with <code>if: always()</code>.</li>
+      <li>Integration tests with Testcontainers or a Postgres service container; parallel frontend job with
+      <code>npm ci</code>; least-privilege permissions and concurrency.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-docker-publish">
+  <h3>Building and pushing a Docker image to GHCR or Docker Hub</h3>
+  <p class="tldr">After tests pass, log in to the registry with <code>docker/login-action</code>, let
+  <code>docker/metadata-action</code> compute the tags (git SHA, branch, semver), and build and push with
+  <code>docker/build-push-action</code> using the GitHub Actions cache — to GHCR with the built-in
+  <code>GITHUB_TOKEN</code>.</p>
+
+  <h4>The pieces</h4>
+  <ul>
+    <li><code>docker/setup-buildx-action</code> — sets up Buildx, the modern builder (enables caching and
+    multi-platform builds).</li>
+    <li><code>docker/login-action</code> — logs the runner in to a registry.</li>
+    <li><code>docker/metadata-action</code> — turns the git context into image <strong>tags</strong> and
+    <strong>labels</strong>, so you do not assemble strings by hand.</li>
+    <li><code>docker/build-push-action</code> — runs <code>docker build</code> (using your Dockerfile) and
+    optionally pushes.</li>
+  </ul>
+  <p>Your multi-stage Dockerfile from <a href="#m3-spring-dockerfile">Module 3</a> already builds the JAR
+  inside the image, so this job needs no Maven step.</p>
+
+  <h4>Publishing to GitHub Container Registry</h4>
+  <pre data-title=".github/workflows/docker.yml"><code class="language-yaml">name: Docker image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}      # owner/repo
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write                       # needed to push to GHCR
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max</code></pre>
+
+  <h4>What each part does</h4>
+  <dl class="terms">
+    <dt>permissions: packages: write</dt><dd>Allows the <code>GITHUB_TOKEN</code> to publish packages. Without it
+    you get <em>denied: permission_denied: write_package</em>.</dd>
+    <dt>login-action with GITHUB_TOKEN</dt><dd>No password to store: the automatic token of the run logs in to
+    <code>ghcr.io</code> as the triggering user.</dd>
+    <dt>images: ghcr.io/owner/repo</dt><dd>The image name. GHCR names must be lowercase; the metadata action
+    lowercases the repository name for you. If you build the name by hand with a mixed-case owner, convert it
+    first.</dd>
+    <dt>tags: type=sha</dt><dd>Adds a tag from the commit SHA, in the short form <code>sha-3f9c2ab</code> (the
+    prefix <code>sha-</code> is the default). Every build gets a unique tag.</dd>
+    <dt>type=semver,pattern={{version}}</dt><dd>On a tag push such as <code>v1.2.0</code>, adds the tag
+    <code>1.2.0</code> (without the <code>v</code>).</dd>
+    <dt>type=raw,value=latest,enable=…</dt><dd>Also tags <code>latest</code> on the default branch, for
+    convenience. Do not deploy from it.</dd>
+    <dt>cache-from / cache-to: type=gha</dt><dd>Stores Docker layer cache in the GitHub Actions cache, so
+    unchanged layers (the dependency layer!) are not rebuilt in the next run. <code>mode=max</code> also caches
+    intermediate stages, which matters for multi-stage builds.</dd>
+    <dt>steps.meta.outputs.tags</dt><dd>A step with an <code>id</code> exposes outputs that later steps read as
+    <code>${{ steps.&lt;id&gt;.outputs.&lt;name&gt; }}</code>.</dd>
+  </dl>
+  <p>For pull requests you usually want to <em>build</em> the image (to make sure the Dockerfile works) but not
+  push it. Use <code>push: ${{ github.event_name != 'pull_request' }}</code> and run the workflow on PRs too.</p>
+
+  <h4>Publishing to Docker Hub instead</h4>
+  <p>Create an access token in Docker Hub (Account settings → Security → New access token) and add two
+  repository secrets: <code>DOCKERHUB_USERNAME</code> and <code>DOCKERHUB_TOKEN</code>.</p>
+  <pre data-title="Login and image name for Docker Hub (replace the GHCR parts)"><code class="language-yaml">      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/shop-api</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>GHCR</th><th>Docker Hub</th></tr></thead>
+    <tbody>
+      <tr><td>Credentials in the workflow</td><td>Built-in <code>GITHUB_TOKEN</code></td><td>Your own secrets (token)</td></tr>
+      <tr><td>Permissions needed</td><td><code>packages: write</code></td><td>None in the workflow</td></tr>
+      <tr><td>Image name</td><td><code>ghcr.io/owner/repo</code></td><td><code>user/repo</code></td></tr>
+      <tr><td>Pulling on the server</td><td>Needs <code>docker login ghcr.io</code> if private</td><td>Needs login if private</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Where it fits</h4>
+  <p>Common layouts: one workflow with jobs <code>test → image → deploy</code> chained by
+  <code>needs</code> (shown in the <a href="#m4-cd">CD article</a>), or separate workflows. Having the image
+  job depend on the test job means a broken build is never published.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: build once, deploy that exact image</p>
+    <p>The image you tested is the image you deploy: reference it by the SHA tag. Do not rebuild on the server
+    or build a second time for production.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: denied errors when pushing</p>
+    <ul>
+      <li><em>denied: permission_denied: write_package</em> — the job lacks <code>packages: write</code>, or the
+      package already exists and is linked to another repository, or the organisation restricts token
+      permissions (Settings → Actions → General → Workflow permissions).</li>
+      <li><em>invalid reference format</em> — uppercase letters in the image name, or an empty tag from a
+      mistyped metadata step.</li>
+      <li>Docker Hub login failing — you used your account password instead of an access token, or the secret
+      name is misspelled.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Pull requests from forks cannot push (no secrets, read-only token); build without pushing.</li>
+      <li>The runner is x86-64. To run on ARM servers (AWS Graviton) add
+      <code>docker/setup-qemu-action</code> and <code>platforms: linux/amd64,linux/arm64</code>; the ARM build
+      under emulation is slow.</li>
+      <li>A newly created GHCR package may be private; make it public or give your server a token with
+      <code>read:packages</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How does your pipeline build and publish a Docker image?"</p>
+    <ul>
+      <li>After tests: buildx, login (GHCR with <code>GITHUB_TOKEN</code> and <code>packages: write</code>),
+      metadata for tags (SHA, semver), build-push with the GHA layer cache.</li>
+      <li>Immutable SHA tags; deploy by tag; never push from untrusted PRs.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-cd">
+  <h3>Continuous deployment: SSH to a server, deploy hooks, environments and rollback</h3>
+  <p class="tldr">After the image is pushed, a deploy job logs in to your server over SSH and runs
+  <code>docker compose pull &amp;&amp; docker compose up -d</code> with the new tag — or calls your platform's
+  deploy hook; an <code>environment</code> adds approvals, and rollback is just deploying the previous tag.</p>
+
+  <h4>Option A: deploy over SSH to your own server</h4>
+  <p>The server (for example an EC2 instance from <a href="#m1">Module 1</a>) has Docker, a folder
+  <code>/opt/shop</code> with the production <code>compose.yaml</code> and a <code>.env</code> file with real
+  secrets. The compose file references the image through a variable:</p>
+  <pre data-title="/opt/shop/compose.yaml (api service only)"><code class="language-yaml">services:
+  api:
+    image: ghcr.io/asha/shop-api:${IMAGE_TAG:-latest}
+    env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"          # Nginx on the host proxies to this
+    restart: unless-stopped
+  # postgres, redis ... as in the Compose article</code></pre>
+  <p>One-time setup on the server: create a deploy user, add the CI's <em>public</em> SSH key to
+  <code>~/.ssh/authorized_keys</code>, and log Docker in to GHCR with a token that can read packages
+  (<code>docker login ghcr.io</code>) if the image is private. Generate a dedicated key pair on your laptop
+  (<code>ssh-keygen -t ed25519 -f deploy_key -C "github-actions"</code>) and put the <em>private</em> key into a
+  GitHub secret. Never reuse your personal key.</p>
+  <p>Add these repository (or environment) secrets: <code>SSH_HOST</code>, <code>SSH_USER</code>,
+  <code>SSH_PRIVATE_KEY</code>, and <code>SSH_KNOWN_HOSTS</code> (the output of
+  <code>ssh-keyscan -t ed25519 your.server.ip</code>, which pins the server's identity so a man-in-the-middle
+  cannot impersonate it).</p>
+
+  <h4>The full CI → image → deploy workflow</h4>
+  <p>This is the workflow for your Project 3: tests on every push and PR; on <code>main</code> only, push the
+  image and deploy.</p>
+  <pre data-title=".github/workflows/ci-cd.yml"><code class="language-yaml">name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - run: ./mvnw -B -ntp verify
+
+  image:
+    needs: test
+    if: github.event_name == 'push' &amp;&amp; github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: vars
+        run: echo "tag=sha-${GITHUB_SHA::7}" &gt;&gt; "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=sha
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: image
+    runs-on: ubuntu-latest
+    environment:
+      name: production                  # approvals and environment secrets apply here
+      url: https://shop.example.com
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false         # never cancel a deployment half way
+    steps:
+      - name: Prepare SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" &gt; ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" &gt; ~/.ssh/known_hosts
+
+      - name: Deploy the new image
+        env:
+          TAG: ${{ needs.image.outputs.tag }}
+          TARGET: ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}
+        run: |
+          ssh "$TARGET" "cd /opt/shop &amp;&amp; \
+            IMAGE_TAG=$TAG docker compose pull api &amp;&amp; \
+            IMAGE_TAG=$TAG docker compose up -d api &amp;&amp; \
+            docker image prune -f"
+
+      - name: Smoke test
+        run: |
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS https://shop.example.com/actuator/health; then exit 0; fi
+            sleep 10
+          done
+          echo "Health check failed" &amp;&amp; exit 1</code></pre>
+
+  <h4>How it works</h4>
+  <ul>
+    <li><strong>Job chain.</strong> <code>test</code> runs on PRs and pushes. <code>image</code> and
+    <code>deploy</code> run only for pushes to <code>main</code> (the <code>if</code> on the <code>image</code> job
+    skips it for PRs, and <code>deploy</code> is skipped because its need was skipped).</li>
+    <li><strong>The tag handoff.</strong> The <code>image</code> job exposes <code>tag</code> as a job
+    <code>output</code> (<code>sha-</code> plus the first seven characters of the commit). The metadata action's
+    <code>type=sha</code> produces the same short form, so the deploy job pulls exactly the image just built.</li>
+    <li><strong>SSH.</strong> The private key is written to a file with permission 600 (SSH refuses looser
+    permissions). Secrets are passed in through <code>env</code> and used as shell variables, not pasted into the
+    script text with <code>${{ }}</code>, which keeps them out of the script source and avoids shell injection.
+    <code>known_hosts</code> holds the server's pinned key, so we do not need
+    <code>StrictHostKeyChecking=no</code>.</li>
+    <li><strong>The remote command.</strong> <code>docker compose pull api</code> downloads the new image;
+    <code>up -d api</code> recreates only the API container with it; databases keep running.
+    <code>docker image prune -f</code> removes dangling old layers.</li>
+    <li><strong>Smoke test.</strong> After deployment, call the health URL a few times. A failing smoke test
+    marks the run red so someone notices, instead of "deployed" meaning "started".</li>
+    <li>You can use a ready-made action such as <code>appleboy/ssh-action</code> instead of raw
+    <code>ssh</code>, but any third-party action that receives your key is part of your trusted code; read its
+    README and pin a version.</li>
+  </ul>
+
+  <h4>Option B: deploy hooks and platform integrations</h4>
+  <p>Platforms such as <strong>Render</strong> give each service a <strong>deploy hook</strong>: a secret URL
+  that, when called with <code>POST</code>, starts a deploy. Store the URL as a secret and call it after the
+  tests pass:</p>
+  <pre data-title="Trigger a Render deploy from the pipeline"><code class="language-yaml">  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger deploy
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: curl -fsS -X POST "$HOOK"</code></pre>
+  <p>Railway, Fly.io, Heroku and others have a CLI or API token you call from a step, or can deploy straight
+  from your GitHub repository on every push to <code>main</code>. If the platform builds from GitHub itself, make
+  sure it waits for your CI checks (most have a "wait for CI" setting) so a failing build is not deployed. Read
+  the platform's current documentation for exact commands; they change often. More on these platforms in
+  <a href="#m5">Module 5</a>.</p>
+
+  <h4>Environments, approvals and rollback</h4>
+  <p>A GitHub <strong>environment</strong> (repository Settings → Environments) such as <code>staging</code> or
+  <code>production</code> can have <strong>protection rules</strong>: required reviewers (the job pauses until
+  someone approves), a wait timer, and branch restrictions (only <code>main</code> may deploy). It also has its
+  own secrets, so production credentials are available only to jobs that target the production environment.
+  Required reviewers turn continuous deployment into continuous <em>delivery</em> for production: staging
+  deploys automatically, production waits for a click.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  T[test] --> I[image]
+  I --> S["deploy: staging"]
+  S --> R{"Required reviewer approves?"}
+  R -->|"yes"| P["deploy: production"]
+  R -->|"no"| X[Stopped]
+</pre>
+    <figcaption>An environment with required reviewers gates the production deploy</figcaption>
+  </figure>
+  <p><strong>Rollback.</strong> Because every image has an immutable tag, rolling back means deploying an older
+  one. Add a manual workflow that takes the tag as input (<code>workflow_dispatch</code> with
+  <code>image_tag</code>, see <a href="#m4-triggers">Triggers</a>) and runs the same SSH step with
+  <code>IMAGE_TAG=${{ inputs.image_tag }}</code>. Or revert the bad commit on <code>main</code> and let the
+  pipeline deploy the revert. Database migrations make rollback harder: write backward-compatible migrations
+  (add a column first, remove the old one in a later release).</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes in deployment pipelines</p>
+    <ul>
+      <li>Deploying from <code>latest</code>, so you cannot tell or roll back what is running.</li>
+      <li>Using <code>StrictHostKeyChecking=no</code> and a personal SSH key with full access.</li>
+      <li>Printing secrets with <code>echo</code> or <code>set -x</code> in the deploy script.</li>
+      <li>Deploying without a health check, or two deployments overlapping (use the concurrency group).</li>
+      <li>Putting production secrets at repository level where any workflow or branch can use them.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Replacing a container causes a few seconds of downtime. For zero downtime you need two instances
+      behind a load balancer, or an orchestrator (Kubernetes, ECS) doing rolling updates.</li>
+      <li>If the server's firewall only allows SSH from your IP, GitHub-hosted runners (many changing IPs) cannot
+      connect. Options: a self-hosted runner, a deploy hook/pull-based deploy, or SSM instead of SSH on AWS.</li>
+      <li>If the image on GHCR is private, the server needs credentials; a failed pull shows as
+      <em>unauthorized</em> in the deploy log.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Small teams use exactly this: test, build image, push, SSH or platform deploy, smoke test. Larger teams
+    separate "build" from "deploy": CI publishes a versioned image, and a deployment tool (Argo CD, Spinnaker,
+    AWS CodeDeploy) rolls it out. The idea — immutable artifact, promote the same artifact through
+    environments — stays the same.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How does your code get from a merge to production?"</p>
+    <ul>
+      <li>Merge to <code>main</code> triggers: tests, Docker build and push (SHA tag), deploy job in the
+      <code>production</code> environment (approval optional), SSH <code>compose pull/up</code> or deploy hook,
+      then a smoke test.</li>
+      <li>Rollback: redeploy the previous tag via <code>workflow_dispatch</code> or revert the commit.</li>
+    </ul>
+  </div>
+</article>

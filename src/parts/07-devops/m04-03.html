@@ -1,0 +1,698 @@
+<article class="topic" id="m4-secrets">
+  <h3>Secrets and variables in GitHub Actions, and OIDC instead of long-lived keys</h3>
+  <p class="tldr">Store passwords, tokens and keys as GitHub secrets (repository, environment or organization
+  level) and read them as <code>${{ secrets.NAME }}</code>; GitHub masks them in logs, but you must never echo
+  them, forks do not receive them, and for AWS you should use OIDC to get short-lived credentials instead of
+  stored access keys.</p>
+
+  <h4>Secrets versus variables</h4>
+  <p>A <strong>secret</strong> is encrypted configuration you must not reveal: tokens, SSH keys, passwords.
+  A <strong>variable</strong> is plain configuration that is fine to see: a URL, a region, a Java version. Add
+  them at Settings → Secrets and variables → Actions, or with the GitHub CLI
+  (<code>gh secret set SSH_HOST</code>, <code>gh variable set APP_URL</code>).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Level</th><th>Available to</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td>Repository</td><td>All workflows in this repo</td><td>Registry tokens, shared test settings</td></tr>
+      <tr><td>Environment</td><td>Only jobs that name that environment (and pass its rules)</td><td>Production database URL, deploy key</td></tr>
+      <tr><td>Organization</td><td>Chosen repos in the organization</td><td>A token every project uses</td></tr>
+    </tbody>
+  </table></div>
+  <p>The value is read in the workflow as <code>${{ secrets.NAME }}</code> or
+  <code>${{ vars.NAME }}</code>. Environment-level values override repository-level ones with the same name,
+  which lets <code>staging</code> and <code>production</code> use the same workflow with different credentials.</p>
+  <pre data-title="Using a secret safely"><code class="language-yaml">      - name: Call the API
+        env:
+          API_TOKEN: ${{ secrets.API_TOKEN }}     # pass through env ...
+        run: curl -fsS -H "Authorization: Bearer $API_TOKEN" "${{ vars.APP_URL }}/ping"</code></pre>
+
+  <h4>Rules for handling secrets</h4>
+  <ol class="steps">
+    <li><strong>Never print them.</strong> GitHub masks exact secret values in logs, but masking is not
+    perfect: if you transform a value (base64, split, URL-encode) the result is not masked. Do not
+    <code>echo</code> secrets, do not run with <code>set -x</code> around them, and do not print environment
+    dumps (<code>env</code>, <code>printenv</code>).</li>
+    <li><strong>Pass secrets through <code>env</code></strong> and refer to <code>$NAME</code> in the shell,
+    instead of pasting <code>${{ secrets.X }}</code> into the script text. This avoids quoting bugs and script
+    injection.</li>
+    <li><strong>Least privilege.</strong> Create tokens with the minimum scope (a deploy key that can only SSH
+    as the deploy user; a registry token that can only push one repository). Prefer environment secrets for
+    production so a feature branch cannot use them.</li>
+    <li><strong>Rotate.</strong> If a secret appears in a log, a commit or a screenshot, treat it as stolen:
+    revoke it and create a new one.</li>
+    <li><strong>Do not commit secrets.</strong> Enable GitHub secret scanning and push protection; keep
+    <code>.env</code> in <code>.gitignore</code>.</li>
+    <li><strong>Be careful with third-party actions.</strong> An action runs with access to the secrets you
+    give it. Pin trusted actions to a version or commit SHA, and prefer official or well-known ones.</li>
+  </ol>
+
+  <h4>Pull requests from forks</h4>
+  <p>For a pull request from a <strong>fork</strong> (someone else's copy of your repository), GitHub does
+  <em>not</em> give the workflow your secrets and gives <code>GITHUB_TOKEN</code> read-only access. Otherwise any
+  stranger could open a PR whose workflow prints your secrets. Consequences: tests that need a secret fail on
+  fork PRs, and deploy or push steps must be restricted to pushes on your own branches (for example
+  <code>if: github.event_name == 'push'</code>). Keep CI independent of secrets whenever you can; use
+  Testcontainers and fake values for tests.</p>
+
+  <h4>OIDC to AWS (brief)</h4>
+  <p>Storing an AWS access key in GitHub secrets is a long-lived credential: if it leaks, it works until
+  someone notices. <strong>OpenID Connect (OIDC)</strong> removes it. GitHub issues each workflow run a
+  short-lived signed identity token; AWS is configured to trust tokens from GitHub for a specific
+  repository (and branch or environment), and exchanges the token for temporary AWS credentials that expire
+  in about an hour. Nothing secret is stored in GitHub.</p>
+  <pre data-title="Assume an AWS role with OIDC (no access keys)"><code class="language-yaml">permissions:
+  id-token: write                 # lets the job request the OIDC token
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-deploy
+          aws-region: ap-south-1
+      - run: aws sts get-caller-identity       # shows the assumed role</code></pre>
+  <p>On the AWS side you create an IAM identity provider for <code>token.actions.githubusercontent.com</code>
+  and an IAM role whose trust policy allows only your repository (and, better, only the <code>main</code>
+  branch or the <code>production</code> environment). Follow the current instructions in the GitHub docs
+  ("Configuring OpenID Connect in Amazon Web Services") and the README of the AWS action for the exact trust
+  policy. The same idea works for Google Cloud and Azure.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes with secrets</p>
+    <ul>
+      <li>A multi-line secret (SSH key) pasted with lost line breaks, or missing the final newline: the key
+      fails with <em>invalid format</em>. Paste the whole file including the BEGIN and END lines.</li>
+      <li>Using a secret in a step's <code>if:</code> condition: secrets are not available there; copy it to an
+      <code>env</code> variable first.</li>
+      <li>Giving the whole organisation's admin token to a workflow "to make it work".</li>
+      <li>Checking in a workflow that echoes <code>${{ secrets.X }}</code> "just to debug".</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Secrets are limited in size (a few tens of KB) and cannot be read back in the UI after saving; you can
+      only overwrite them.</li>
+      <li>Dependabot-triggered runs use a separate set of secrets (Dependabot secrets), not the Actions ones.</li>
+      <li>Workflows triggered by <code>pull_request_target</code> run with secrets even for forks; combined with
+      checking out the PR's code this is a known attack path. Avoid it unless you follow GitHub's hardening guide.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you manage secrets in CI/CD?"</p>
+    <ul>
+      <li>GitHub secrets at the right level (environment for production), passed via <code>env</code>, never
+      echoed; masked in logs; not available to fork PRs.</li>
+      <li>Prefer OIDC and short-lived credentials over stored cloud keys; rotate on leak; scan for secrets.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-branch-protection">
+  <h3>Branch protection, required checks and the status badge</h3>
+  <p class="tldr">A branch protection rule (or ruleset) on <code>main</code> requires a pull request, passing
+  status checks and reviews before merging and blocks force pushes — so broken code cannot reach
+  <code>main</code>; add a workflow status badge to the README to show the build state.</p>
+
+  <h4>Why protect main</h4>
+  <p>CI is only useful if its result matters. Without protection, anyone can push straight to
+  <code>main</code>, skip the tests, or force-push and rewrite history. A <strong>branch protection rule</strong>
+  makes the rules enforceable by GitHub itself, for the whole team (including admins if you choose).</p>
+
+  <h4>Setting it up</h4>
+  <ol class="steps">
+    <li>Open the repository → <strong>Settings</strong> → <strong>Branches</strong> → <strong>Add branch
+    protection rule</strong> (or <strong>Rules → Rulesets</strong> → new branch ruleset). Target the branch
+    <code>main</code>.</li>
+    <li>Tick <strong>Require a pull request before merging</strong>; set <em>Required approvals</em> to 1 or
+    more. Optionally dismiss stale approvals when new commits arrive and require review from code owners
+    (a <code>CODEOWNERS</code> file).</li>
+    <li>Tick <strong>Require status checks to pass before merging</strong> and choose the checks by their job
+    name (for example <em>Backend (Maven)</em> and <em>Frontend (React)</em>). A check appears in the list only
+    after it has run at least once in the repository.</li>
+    <li>Tick <strong>Require branches to be up to date before merging</strong>, so the checks ran against the
+    latest <code>main</code>, not an old base.</li>
+    <li>Tick <strong>Require conversation resolution</strong>, <strong>Require linear history</strong> if the team
+    uses squash or rebase merges, and keep <strong>Do not allow force pushes</strong> and <strong>Do not allow
+    deletions</strong> on.</li>
+    <li>Consider <strong>Do not allow bypassing the above settings</strong> so admins follow the rules too.</li>
+  </ol>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Setting</th><th>What it prevents</th></tr></thead>
+    <tbody>
+      <tr><td>Require a pull request</td><td>Direct pushes to <code>main</code></td></tr>
+      <tr><td>Required approvals / code owners</td><td>Unreviewed changes</td></tr>
+      <tr><td>Required status checks</td><td>Merging when tests or build fail</td></tr>
+      <tr><td>Up-to-date branches</td><td>Two PRs that pass alone but break together</td></tr>
+      <tr><td>No force pushes, no deletion</td><td>Rewriting or removing shared history</td></tr>
+      <tr><td>Linear history</td><td>Merge commits (squash or rebase only)</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Branch protection rules</strong> are the classic feature; <strong>rulesets</strong> are the newer,
+  more flexible system (several rulesets can apply, they can target many branches or tags by pattern, and they
+  can be tested in "evaluate" mode first). The checkboxes are similar in both. Some features, such as
+  protection on private repositories, depend on your GitHub plan.</p>
+
+  <h4>What the developer sees</h4>
+  <p>On a pull request, the merge button stays grey with messages like <em>Required statuses must pass before
+  merging</em> until the CI jobs are green and the review is approved. If CI fails, the author pushes a fix to
+  the same branch and the checks run again. Typical flow: branch → PR → CI runs → review → merge. See
+  <a href="01-git-github.html#m3">Git · Module 3</a> for the pull-request workflow.</p>
+
+  <h4>The CI status badge</h4>
+  <p>A <strong>badge</strong> is a small image in the README that shows whether the latest run on a branch
+  passed. GitHub generates it for each workflow: Actions tab → the workflow → <strong>⋯ → Create status
+  badge</strong>, or build the URL yourself:</p>
+  <pre data-title="README.md"><code class="language-markdown"># Shop API
+
+[![CI][badge]][workflow]
+
+Spring Boot REST API for an online shop.
+
+[badge]: https://github.com/asha/shop-api/actions/workflows/ci.yml/badge.svg?branch=main
+[workflow]: https://github.com/asha/shop-api/actions/workflows/ci.yml</code></pre>
+  <p>The pattern is
+  <code>https://github.com/OWNER/REPO/actions/workflows/FILE.yml/badge.svg?branch=main</code>, wrapped in a link
+  to the workflow page. Replace <code>OWNER</code>, <code>REPO</code> and <code>FILE.yml</code> with your own.
+  A green badge in a project README tells recruiters at a glance that your code builds and tests run; a red one
+  tells them to fix it.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: protect main from day one, even on solo projects</p>
+    <p>Working through pull requests on your own repositories builds the habit, produces a visible history of
+    checks, and lets you show the workflow to interviewers. Set the rule once CI has run.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Requiring a check by a name that is never reported (renamed job, or path-filtered workflow that did
+      not run): the PR waits forever. Select the check from the list and keep job names stable.</li>
+      <li>Leaving admins able to bypass the rule, then bypassing it "just this once" before a demo.</li>
+      <li>Requiring approvals on a one-person repository: you can never merge. Use 0 approvals and keep the
+      status checks.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A required check that is skipped (because of an <code>if</code> condition) counts as passed for a job,
+      but a workflow that never starts leaves the check pending.</li>
+      <li>Merge queues (a GitHub feature for busy repositories) re-run checks on the combined result before
+      merging; the workflow then also needs the <code>merge_group</code> trigger.</li>
+      <li>Rules apply to merges done in the UI and to pushes from Git; the deployment workflow's own
+      commits (like version bumps) must go through a PR or be allowed explicitly.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you make sure broken code never reaches main?"</p>
+    <ul>
+      <li>Branch protection or rulesets: PR required, required status checks (the CI jobs), up-to-date branch,
+      at least one review, no force pushes.</li>
+      <li>Developers work on feature branches; CI runs on the PR; merging is blocked until green.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-jenkins">
+  <h3>Jenkins, the Jenkinsfile, and other CI/CD tools</h3>
+  <p class="tldr">Jenkins is a self-hosted automation server (controller plus agents, extended with plugins)
+  whose pipelines are written in a <code>Jenkinsfile</code>; many Indian companies still run it, so you should
+  be able to read a declarative Jenkinsfile even if you use GitHub Actions yourself.</p>
+
+  <h4>What Jenkins is</h4>
+  <p><strong>Jenkins</strong> is an open-source automation server written in Java, first released in 2011 (it
+  grew out of the Hudson project). You install and run it yourself — on a VM, in Docker or on Kubernetes — and
+  connect it to your Git repository. It was the standard CI server of the 2010s, so large enterprises, banks
+  and service companies have years of Jenkins jobs and pipelines in place. That is why interviews in India
+  still ask about it.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  G[Git repository] -->|"webhook / poll"| C["Jenkins controller"]
+  C --> A1["Agent 1 (Linux)"]
+  C --> A2["Agent 2 (Docker)"]
+  C --> A3["Agent 3 (Windows)"]
+  A2 --> R[Registry]
+</pre>
+    <figcaption>The controller schedules work; agents run the builds</figcaption>
+  </figure>
+  <dl class="terms">
+    <dt>Controller</dt><dd>The main Jenkins server: web UI, configuration, job scheduling, plugin management.
+    (Older docs call it the "master".)</dd>
+    <dt>Agent</dt><dd>A machine (or container) that actually runs build steps; the controller sends work to
+    agents (also called nodes). It lets one Jenkins serve many projects and platforms.</dd>
+    <dt>Plugin</dt><dd>Extension that adds features: Git, Pipeline, Docker, credentials, SonarQube, Slack. Jenkins
+    has a very large plugin ecosystem — a strength, and a maintenance burden, because plugins need updates.</dd>
+    <dt>Job / pipeline</dt><dd>A unit of automation. A <strong>Pipeline</strong> job is defined as code.</dd>
+    <dt>Jenkinsfile</dt><dd>A text file in the repository root that defines the pipeline (Pipeline as Code).</dd>
+    <dt>Credentials</dt><dd>Jenkins' encrypted store for passwords, tokens and SSH keys, referenced by id.</dd>
+  </dl>
+
+  <h4>A declarative Jenkinsfile</h4>
+  <p>Jenkins pipelines are written in Groovy, in two styles: <em>declarative</em> (structured, recommended) and
+  <em>scripted</em> (free-form Groovy). Here is a declarative pipeline with the stages you know: checkout,
+  build, test, Docker build and push, deploy.</p>
+  <pre data-title="Jenkinsfile"><code class="language-groovy">pipeline {
+    agent any                               // run on any available agent
+
+    tools {
+        maven 'Maven-3.9'                   // names configured in Jenkins -> Tools
+        jdk   'JDK-21'
+    }
+
+    environment {
+        IMAGE = "registry.example.com/shop-api"
+        TAG   = "${env.GIT_COMMIT.take(7)}"
+    }
+
+    options {
+        timeout(time: 20, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm                // the repository that holds this Jenkinsfile
+            }
+        }
+        stage('Build') {
+            steps {
+                sh 'mvn -B -ntp clean package -DskipTests'
+            }
+        }
+        stage('Test') {
+            steps {
+                sh 'mvn -B -ntp test'
+            }
+            post {
+                always {
+                    junit 'target/surefire-reports/*.xml'   // test results in the UI
+                }
+            }
+        }
+        stage('Docker build and push') {
+            when { branch 'main' }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'registry-creds',
+                        usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')]) {
+                    sh '''
+                        docker build -t $IMAGE:$TAG .
+                        echo "$REG_PASS" | docker login registry.example.com \
+                          -u "$REG_USER" --password-stdin
+                        docker push $IMAGE:$TAG
+                    '''
+                }
+            }
+        }
+        stage('Deploy') {
+            when { branch 'main' }
+            steps {
+                sshagent(credentials: ['deploy-server-key']) {
+                    sh '''
+                        ssh -o StrictHostKeyChecking=yes deploy@server \
+                          "cd /opt/shop &amp;&amp; IMAGE_TAG=$TAG docker compose up -d api"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success { echo 'Build and deploy finished' }
+        failure { echo 'Pipeline failed - notify the team' }   // mail or Slack step in real life
+    }
+}</code></pre>
+  <dl class="terms">
+    <dt>pipeline, agent, stages, stage, steps</dt><dd>The fixed skeleton of the declarative syntax.</dd>
+    <dt>tools / environment</dt><dd>Select configured JDK and Maven; define variables for all stages.</dd>
+    <dt>when { branch 'main' }</dt><dd>Run a stage only for some branches (needs a multibranch pipeline).</dd>
+    <dt>post { always / success / failure }</dt><dd>Actions after the pipeline or a stage, like cleanup,
+    reports and notifications.</dd>
+    <dt>withCredentials / sshagent</dt><dd>Inject stored credentials for a block of steps; the values are
+    masked in the console log.</dd>
+    <dt>sh</dt><dd>Run a shell command on the agent; the same <code>mvn</code> and <code>docker</code> commands
+    you already know.</dd>
+  </dl>
+  <p>Jenkins creates the pipeline job from the repository: a <strong>Multibranch Pipeline</strong> scans the
+  repository, and builds every branch and pull request that has a Jenkinsfile. A GitHub webhook calls Jenkins
+  on each push so the build starts immediately instead of polling.</p>
+
+  <h4>Jenkins versus GitHub Actions versus GitLab CI</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Jenkins</th><th>GitHub Actions</th><th>GitLab CI</th></tr></thead>
+    <tbody>
+      <tr><td>Hosting</td><td>You run and maintain it</td><td>Managed by GitHub (or self-hosted runners)</td><td>GitLab.com or self-managed GitLab</td></tr>
+      <tr><td>Config file</td><td><code>Jenkinsfile</code> (Groovy)</td><td>YAML in <code>.github/workflows</code></td><td><code>.gitlab-ci.yml</code> (YAML)</td></tr>
+      <tr><td>Setup effort</td><td>High: server, plugins, agents, upgrades, security</td><td>Very low: commit a file</td><td>Low if you use GitLab</td></tr>
+      <tr><td>Ecosystem</td><td>Huge plugin list</td><td>Marketplace of actions</td><td>Built-in features, templates</td></tr>
+      <tr><td>Flexibility</td><td>Very high; any network, any hardware</td><td>High; limited by runners and minutes</td><td>High</td></tr>
+      <tr><td>Cost</td><td>Free software; you pay for servers and admin time</td><td>Free tier of minutes, then per minute</td><td>Free tier, then plans</td></tr>
+      <tr><td>Common in</td><td>Large enterprises, on-premises, legacy pipelines</td><td>Open source, startups, GitHub shops</td><td>Teams on GitLab</td></tr>
+    </tbody>
+  </table></div>
+  <p>The ideas are identical: trigger, stages, steps, credentials, artifacts, approvals. If you understand
+  one, you can read the others; only the syntax differs.</p>
+
+  <h4>Other tools in one line each</h4>
+  <ul>
+    <li><strong>GitLab CI/CD</strong> — pipelines built into GitLab, defined in <code>.gitlab-ci.yml</code>.</li>
+    <li><strong>Azure DevOps Pipelines</strong> — Microsoft's CI/CD, common in companies on Azure and .NET.</li>
+    <li><strong>CircleCI</strong> — hosted CI service with YAML config, popular with startups.</li>
+    <li><strong>AWS CodePipeline / CodeBuild</strong> — AWS-native build and release services.</li>
+    <li><strong>Argo CD, Spinnaker</strong> — deployment tools for Kubernetes and multi-cloud releases.</li>
+  </ul>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>At a service company you may inherit a Jenkins server with dozens of pipelines: read the Jenkinsfile,
+    open the console output of a failed build, check the credentials and agents. Many of these teams are slowly
+    migrating to GitHub Actions or GitLab CI because Jenkins needs ongoing care (plugin updates, security
+    patches, agent capacity).</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and problems</p>
+    <ul>
+      <li>An outdated plugin or an exposed Jenkins UI is a frequent security problem; keep Jenkins updated, put
+      it behind HTTPS and authentication, and restrict who can configure jobs.</li>
+      <li>A build that works on one agent and fails on another usually depends on tools installed only on
+      that machine; use Docker agents or the <code>tools</code> block to make it reproducible.</li>
+      <li>"Scripted" pipelines use <code>node { ... }</code> blocks and plain Groovy; they look different from
+      the declarative form but do the same job.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is Jenkins? Jenkins versus GitHub Actions?"</p>
+    <ul>
+      <li>A self-hosted automation server: controller schedules, agents execute, plugins extend; pipelines as
+      code in a declarative <code>Jenkinsfile</code> with stages and steps.</li>
+      <li>Jenkins: maximum control, more maintenance. Actions: hosted, YAML, tight GitHub integration, minimal
+      setup. The concepts are the same.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-ci-best-practices">
+  <h3>CI/CD best practices</h3>
+  <p class="tldr">Keep pipelines fast, fail early, cache dependencies, keep main green, make small pull
+  requests, build reproducibly, and use the same commands locally and in CI.</p>
+
+  <h4>The practices</h4>
+  <ol class="steps">
+    <li><strong>Fast feedback.</strong> Aim for CI under about 10 minutes. Slow pipelines make people stop
+    waiting, batch their changes and ignore failures. Measure the run time and attack the slowest step.</li>
+    <li><strong>Fail fast.</strong> Put the cheapest, most likely-to-fail checks first (compile, lint, unit
+    tests) and the slow ones (integration tests, image build, scans) after them or in parallel jobs. Use
+    <code>needs</code> so expensive jobs do not run when cheap ones failed.</li>
+    <li><strong>Cache dependencies and layers.</strong> <code>cache: maven</code> or <code>cache: npm</code>,
+    and Docker layer cache with <code>type=gha</code>. Order the Dockerfile so dependency layers are reused.</li>
+    <li><strong>Keep main green.</strong> Protect the branch; require passing checks; fix or revert a broken
+    main immediately; do not merge on red.</li>
+    <li><strong>Small pull requests.</strong> A 100-line PR is reviewed in minutes and rarely breaks the build;
+    a 3,000-line PR hides bugs and conflicts. Merge often.</li>
+    <li><strong>Reproducible builds.</strong> Pin tool versions (Maven wrapper, Java 21, locked
+    <code>package-lock.json</code> with <code>npm ci</code>, tagged base images), avoid "latest", and build the
+    artifact once and promote the same one through environments.</li>
+    <li><strong>Same commands locally and in CI.</strong> The workflow should call <code>./mvnw verify</code>,
+    <code>npm ci &amp;&amp; npm run build</code> or a script in the repository. Developers can then reproduce
+    any CI failure on their laptop.</li>
+    <li><strong>Test reliably.</strong> Remove flaky tests or fix their root cause (time, ordering, shared
+    state, sleeps). Prefer Testcontainers to a shared test database.</li>
+    <li><strong>Least privilege and safe secrets.</strong> Minimal <code>permissions</code>, environment
+    secrets for production, OIDC instead of stored keys, scanning for leaked secrets.</li>
+    <li><strong>Make failures easy to read.</strong> Upload test reports, name jobs and steps clearly, set
+    timeouts, and notify the team (GitHub emails the PR author; add Slack if the team uses it).</li>
+    <li><strong>Deploy small and often, with a way back.</strong> Immutable image tags, health checks and smoke
+    tests after deploy, a manual rollback workflow, and backward-compatible database migrations.</li>
+    <li><strong>Keep workflows maintainable.</strong> Reuse with reusable workflows or composite actions, let
+    Dependabot update action versions, and delete old branches and artifacts.</li>
+  </ol>
+
+  <h4>A quick review checklist for any pipeline</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Question</th><th>Good answer</th></tr></thead>
+    <tbody>
+      <tr><td>How long does a PR check take?</td><td>Under ~10 minutes, cached</td></tr>
+      <tr><td>Can I run the same build on my laptop?</td><td>Yes, one command</td></tr>
+      <tr><td>What stops a failing PR from merging?</td><td>Required status checks</td></tr>
+      <tr><td>Which exact artifact is in production?</td><td>An immutable tag (git SHA)</td></tr>
+      <tr><td>Where are the secrets, and who can read them?</td><td>Environment secrets, least privilege</td></tr>
+      <tr><td>How do I roll back?</td><td>Redeploy the previous tag, tested</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: ignoring a flaky red build</p>
+    <p>"Just re-run it" teaches the team that red does not mean broken. Then a real failure is merged. Track
+    flaky tests, fix them, or move them out of the required path.</p>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: pin actions and let Dependabot update them</p>
+    <p>Add <code>.github/dependabot.yml</code> with the <code>github-actions</code> ecosystem (and
+    <code>maven</code>, <code>npm</code>, <code>docker</code>) so version bumps arrive as pull requests that your
+    CI checks. Look at each action's README for the latest major when you write a workflow by hand.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How would you improve a slow, unreliable pipeline?"</p>
+    <ul>
+      <li>Measure; cache Maven/npm and Docker layers; parallelise jobs; run cheap checks first; trim the build
+      context; use path filters carefully.</li>
+      <li>Fix flaky tests, pin versions, add timeouts and good reports, keep main protected and green.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m4-interview">
+  <h3>Interview questions — CI/CD with GitHub Actions</h3>
+
+  <details class="qa">
+    <summary>What is CI/CD? Explain CI, continuous delivery and continuous deployment.</summary>
+    <div class="qa-a">
+      <p>CI builds and tests every change automatically on a clean machine so the main branch always works.
+      Continuous delivery also produces a release-ready artifact and deploys it to staging; production release
+      is a manual approval. Continuous deployment sends every green change to production with no manual step.
+      Together they give fast feedback, small releases and repeatable deployments.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Describe the structure of a GitHub Actions workflow.</summary>
+    <div class="qa-a">
+      <p>A YAML file in <code>.github/workflows</code>. <code>on</code> lists the triggering events;
+      <code>jobs</code> contains named jobs, each with <code>runs-on</code> (the runner) and <code>steps</code>.
+      A step is either <code>run</code> (a shell command) or <code>uses</code> (a reusable action with
+      <code>with</code> inputs). Jobs run in parallel unless ordered with <code>needs</code>; each runs on its
+      own fresh runner.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>GitHub-hosted versus self-hosted runners?</summary>
+    <div class="qa-a">
+      <p>Hosted runners are fresh VMs managed by GitHub (<code>ubuntu-latest</code>): no maintenance, clean
+      every time, but limited resources and no access to your private network. Self-hosted runners are your own
+      machines running the runner agent: custom hardware, private network access and no per-minute fee, but you
+      must secure, update and clean them, and never use them for untrusted fork PRs on public repositories.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do jobs share data, and how do you control their order?</summary>
+    <div class="qa-a">
+      <p><code>needs</code> orders jobs and skips a job if a dependency failed. Because each job has its own
+      machine, files are shared with artifacts (<code>upload-artifact</code>, <code>download-artifact</code>),
+      small values with job <code>outputs</code>, and built images through a registry.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What triggers can you use? How do you run CI only for pull requests and main?</summary>
+    <div class="qa-a">
+      <p><code>on: push: branches: [main]</code> and <code>pull_request: branches: [main]</code>. Other events:
+      <code>workflow_dispatch</code> (manual), <code>schedule</code> (cron in UTC), tag pushes and releases,
+      <code>workflow_call</code> for reusable workflows. Filters <code>paths</code>, <code>branches</code>
+      and <code>tags</code> narrow when it runs.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you speed up a Maven build in GitHub Actions?</summary>
+    <div class="qa-a">
+      <p>Use <code>cache: maven</code> in <code>actions/setup-java</code> (keyed on the POMs), run with
+      <code>-B -ntp</code>, run unit and integration tests in parallel jobs, cancel outdated runs with a
+      concurrency group, and avoid building twice. Docker layer caching with <code>type=gha</code> speeds up
+      the image build.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you handle secrets in GitHub Actions? What about pull requests from forks?</summary>
+    <div class="qa-a">
+      <p>Store them as repository, environment or organization secrets and read
+      <code>${{ secrets.NAME }}</code>, passing them through <code>env</code>. They are masked in logs but
+      never echoed. Forks get no secrets and a read-only token, so deploy and push steps must not run for them.
+      Use environment secrets with required reviewers for production, and OIDC for cloud access.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is OIDC in GitHub Actions and why is it better than stored AWS keys?</summary>
+    <div class="qa-a">
+      <p>GitHub issues each run a short-lived signed token (needs <code>permissions: id-token: write</code>).
+      AWS trusts GitHub as an identity provider and, for a role limited to your repository or branch, exchanges
+      the token for temporary credentials. No long-lived access key sits in GitHub, so there is nothing to leak or
+      rotate.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you build and push a Docker image from a workflow?</summary>
+    <div class="qa-a">
+      <p>After tests: <code>docker/setup-buildx-action</code>, <code>docker/login-action</code> (GHCR using
+      <code>GITHUB_TOKEN</code> with <code>packages: write</code>, or Docker Hub with a token secret),
+      <code>docker/metadata-action</code> for tags (git SHA, semver), and
+      <code>docker/build-push-action</code> with <code>push: true</code> and the GHA cache. Deploy by the SHA tag,
+      not <code>latest</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you deploy automatically to your own server?</summary>
+    <div class="qa-a">
+      <p>A deploy job (after tests and image push, on <code>main</code> only) connects over SSH with a dedicated
+      key stored as a secret and a pinned <code>known_hosts</code>, then runs
+      <code>IMAGE_TAG=… docker compose pull &amp;&amp; docker compose up -d</code> on the server and finishes with
+      a health check. Alternatively call a platform deploy hook URL (Render) or its CLI.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What are GitHub environments and how do they help?</summary>
+    <div class="qa-a">
+      <p>Named deployment targets (<code>staging</code>, <code>production</code>) with their own secrets and
+      protection rules: required reviewers, wait timers, and allowed branches. A job with
+      <code>environment: production</code> pauses for approval and is the only one that can read the production
+      secrets. They also record deployment history.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you roll back a bad deployment?</summary>
+    <div class="qa-a">
+      <p>Because every image has an immutable tag, redeploy the previous tag using a manual
+      <code>workflow_dispatch</code> workflow that takes the tag as input, or revert the commit and let the
+      pipeline redeploy. Keep database migrations backward-compatible so the old version still works with the
+      new schema.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you stop broken code from being merged into main?</summary>
+    <div class="qa-a">
+      <p>Branch protection rules or rulesets on <code>main</code>: require a pull request, required status checks
+      (the CI jobs), up-to-date branches and at least one review; disallow force pushes and deletion. The merge
+      button stays disabled until checks pass. Add a CI badge to the README for visibility.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is Jenkins, and how does it differ from GitHub Actions?</summary>
+    <div class="qa-a">
+      <p>Jenkins is a self-hosted automation server: a controller schedules builds on agents and plugins add
+      features; pipelines are Groovy <code>Jenkinsfile</code>s with stages and steps. You maintain the server,
+      plugins and security. GitHub Actions is hosted, YAML-based and integrated with GitHub, with almost no
+      setup. Concepts (trigger, stages, credentials, artifacts) are the same.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Tests pass on your laptop but fail in CI. What do you check?</summary>
+    <div class="qa-a">
+      <p>Java version and OS differences (Linux is case-sensitive), time zone (runner is UTC), missing services
+      or environment variables, tests depending on order or on files that exist only locally, line endings,
+      and flaky timing. Download the test report artifact, read the first failure, and reproduce with the
+      exact CI command and Java version.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m4-cheatsheet">
+  <h3>Cheat sheet — CI/CD with GitHub Actions</h3>
+  <ul class="cheat">
+    <li><b>CI / delivery / deployment</b> auto build+test / releasable + manual prod / every green change to prod</li>
+    <li><b>Workflow location</b> <code>.github/workflows/name.yml</code> in the repository root</li>
+    <li><b>Skeleton</b> <code>name</code>, <code>on</code>, <code>permissions</code>, <code>jobs.&lt;id&gt;.runs-on</code>, <code>steps</code></li>
+    <li><b>run vs uses</b> shell command vs reusable action (<code>owner/repo@v4</code> with <code>with:</code>)</li>
+    <li><b>Runner</b> <code>ubuntu-latest</code> (hosted, fresh VM) or self-hosted (your machine)</li>
+    <li><b>Job order</b> parallel by default; <code>needs: [a, b]</code> to wait; <code>if:</code> to condition</li>
+    <li><b>Triggers</b> <code>push</code>, <code>pull_request</code> (+ <code>branches</code>, <code>paths</code>), <code>workflow_dispatch</code>, <code>schedule</code> (UTC cron), tags, <code>workflow_call</code></li>
+    <li><b>Contexts</b> <code>${{ github.sha }}</code>, <code>github.ref_name</code>, <code>github.actor</code>, <code>secrets.X</code>, <code>vars.X</code>, <code>matrix.x</code></li>
+    <li><b>Java CI core</b> <code>checkout@v4</code> → <code>setup-java@v4</code> (temurin, 21, <code>cache: maven</code>) → <code>./mvnw -B -ntp verify</code></li>
+    <li><b>Reports</b> <code>upload-artifact</code> with <code>if: always()</code> to keep surefire reports</li>
+    <li><b>DB in CI</b> Testcontainers (Docker is on the runner) or <code>services: postgres</code> with a health check</li>
+    <li><b>Frontend CI</b> <code>setup-node</code> with <code>cache: npm</code>; <code>npm ci</code>, <code>npm test</code>, <code>npm run build</code></li>
+    <li><b>Matrix</b> <code>strategy.matrix.java: [17, 21]</code> runs a job per value</li>
+    <li><b>Concurrency</b> <code>group</code> + <code>cancel-in-progress: true</code> for CI; <code>false</code> for deploys</li>
+    <li><b>Token permissions</b> <code>permissions: contents: read</code> by default; <code>packages: write</code> to push to GHCR</li>
+    <li><b>Docker publish</b> setup-buildx, login (GHCR with <code>GITHUB_TOKEN</code>), metadata (<code>type=sha</code>), build-push (<code>cache-from: type=gha</code>)</li>
+    <li><b>Image names</b> GHCR <code>ghcr.io/owner/repo</code> (lowercase), Docker Hub <code>user/repo</code></li>
+    <li><b>SSH deploy</b> dedicated key in secrets, pinned known_hosts, <code>docker compose pull &amp;&amp; up -d</code>, health check</li>
+    <li><b>Deploy hook</b> <code>curl -fsS -X POST "$HOOK"</code> with the URL stored as a secret</li>
+    <li><b>Environments</b> staging/production with required reviewers, wait timer, own secrets</li>
+    <li><b>Secrets</b> repo / environment / organization; pass via <code>env</code>; never echo; forks get none</li>
+    <li><b>OIDC</b> <code>id-token: write</code> + <code>configure-aws-credentials</code> with <code>role-to-assume</code>; no stored keys</li>
+    <li><b>Branch protection</b> PR required, required status checks, up-to-date branch, reviews, no force push</li>
+    <li><b>Badge</b> <code>https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg?branch=main</code></li>
+    <li><b>Jenkins</b> self-hosted; controller + agents + plugins; declarative <code>Jenkinsfile</code> (pipeline, agent, stages, steps, post)</li>
+    <li><b>Rollback</b> redeploy the previous immutable tag (<code>workflow_dispatch</code> with <code>image_tag</code>)</li>
+    <li><b>Best practices</b> fast, fail early, cache, keep main green, small PRs, reproducible, same commands locally</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m4-practice">
+  <h3>Practice — CI/CD with GitHub Actions</h3>
+  <ol class="steps">
+    <li><strong>Hello workflow.</strong> In a test repository add <code>.github/workflows/hello.yml</code> that
+    prints the commit SHA, branch name and the Java version. Push and read the run in the Actions tab. Done
+    when you can point to the event, job, step and runner in the log.</li>
+    <li><strong>CI on every push and PR.</strong> In Project 2 add <code>ci.yml</code> that runs on push to
+    <code>main</code> and on pull requests: checkout, Temurin 21 with Maven cache, <code>./mvnw -B verify</code>
+    (this runs <code>mvn test</code> and more), and upload the surefire reports as an artifact. Done when a
+    pull request shows a green check, and a deliberately broken test makes it red with a downloadable
+    report.</li>
+    <li><strong>Make it faster.</strong> Compare the run time of the first and second runs to see the Maven
+    cache work. Add a concurrency group and <code>timeout-minutes</code>. Done when a push cancels the older
+    run on the same branch.</li>
+    <li><strong>Test on two Java versions and add the frontend.</strong> Add a matrix for Java 17 and 21 (if
+    your code supports both), and a separate frontend job with <code>npm ci</code> and <code>npm run build</code>.
+    Done when both jobs run in parallel.</li>
+    <li><strong>Protect main and add the badge.</strong> Create a branch protection rule (or ruleset) that
+    requires a pull request and your CI checks and blocks force pushes. Add the CI status badge to the top of
+    the README. Done when you cannot push to <code>main</code> directly, a failing PR cannot be merged, and
+    the badge shows the state.</li>
+    <li><strong>Dockerize and publish.</strong> Add the multi-stage Dockerfile (Module 3) and a job that builds
+    and pushes the image to GHCR on pushes to <code>main</code>, tagged with the short SHA. Done when the
+    package appears under your repository's Packages and <code>docker pull ghcr.io/you/app:sha-…</code>
+    works.</li>
+    <li><strong>CD on merge to main.</strong> Prepare a server (an EC2 instance from Module 1/5 or any VPS) with
+    Docker and the production <code>compose.yaml</code>. Create a dedicated SSH key, store the secrets, add a
+    <code>deploy</code> job in the <code>production</code> environment that pulls the new tag, runs
+    <code>docker compose up -d</code>, and ends with a smoke test. Done when merging a pull request deploys the
+    new version without you touching the server.</li>
+    <li><strong>Approval and rollback.</strong> Add a required reviewer to the <code>production</code>
+    environment, and write a <code>workflow_dispatch</code> workflow that deploys a given image tag. Deploy a
+    "bad" change, then roll back to the previous tag. Done when you can restore the previous version in under
+    five minutes.</li>
+    <li><strong>Document it.</strong> In the README add the CI badge and a "Deployment" section: how the
+    pipeline works (a small diagram or list), the secrets and variables it needs (names only), how to roll
+    back, and how to run the same steps locally. Done when a stranger could set up the pipeline from your
+    README.</li>
+    <li><strong>Read a Jenkinsfile (roadmap goal).</strong> Translate your GitHub Actions pipeline into a
+    declarative Jenkinsfile on paper (stages: checkout, build, test, docker build, deploy). Optionally run
+    Jenkins in Docker and execute it. Done when you can explain every GitHub Actions concept's Jenkins
+    equivalent, and a push to <code>main</code> in your own project runs your tests and deploys
+    automatically.</li>
+  </ol>
+</article>

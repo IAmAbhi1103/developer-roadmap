@@ -1,0 +1,679 @@
+<article class="topic" id="m4-iteration">
+  <h3>Iteration: Iterator, ListIterator and ConcurrentModificationException</h3>
+  <p class="tldr">An Iterator walks a collection one element at a time and is the only safe way to remove elements during a loop; changing a collection behind a running loop's back throws ConcurrentModificationException.</p>
+
+  <p>To visit every element of a collection you have four tools: an index loop (lists only), the enhanced <code>for</code> loop, an explicit <code>Iterator</code>, and <code>forEach</code> with a lambda. Behind the second, third and fourth sits the same idea: the <code>Iterator</code>.</p>
+
+  <h4>Iterator</h4>
+  <p>An <code>Iterator&lt;E&gt;</code> is a cursor that moves through a collection. Every <code>Collection</code> has an <code>iterator()</code> method (it comes from <code>Iterable</code>).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>boolean hasNext()</code></td><td>Is there another element?</td></tr>
+      <tr><td><code>E next()</code></td><td>Return the next element and move forward; <code>NoSuchElementException</code> if none is left</td></tr>
+      <tr><td><code>void remove()</code></td><td>Remove the element last returned by <code>next()</code>; <code>IllegalStateException</code> if <code>next()</code> was not called first, or if you call it twice in a row</td></tr>
+      <tr><td><code>void forEachRemaining(action)</code></td><td>Apply a lambda to all remaining elements</td></tr>
+    </tbody>
+  </table></div>
+  <p>The <strong>enhanced for loop</strong> is syntax sugar. The compiler rewrites it into an iterator loop, which is exactly why the same exceptions appear:</p>
+  <pre data-title="For-each under the hood"><code class="language-java">for (String name : names) {
+    System.out.println(name);
+}
+
+// is compiled to roughly:
+for (Iterator&lt;String&gt; it = names.iterator(); it.hasNext(); ) {
+    String name = it.next();
+    System.out.println(name);
+}</code></pre>
+  <p>Any class that implements <code>Iterable&lt;T&gt;</code> can be used in a for-each loop. You only write <code>iterator()</code>:</p>
+  <pre data-title="Range.java"><code class="language-java">import java.util.Iterator;
+
+public class Range implements Iterable&lt;Integer&gt; {
+    private final int from, to;                 // from inclusive, to exclusive
+
+    public Range(int from, int to) {
+        this.from = from;
+        this.to = to;
+    }
+
+    @Override
+    public Iterator&lt;Integer&gt; iterator() {
+        return new Iterator&lt;&gt;() {
+            private int next = from;
+            @Override public boolean hasNext() { return next &lt; to; }
+            @Override public Integer next() { return next++; }
+        };
+    }
+
+    public static void main(String[] args) {
+        for (int n : new Range(1, 5)) {
+            System.out.print(n + " ");
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">1 2 3 4 </code></pre>
+  <p>An array cannot be used as an <code>Iterable</code> directly, but it works in for-each because the compiler treats arrays specially.</p>
+
+  <h4>ListIterator — both directions, with set and add</h4>
+  <p><code>list.listIterator()</code> returns a <code>ListIterator</code>, available only for lists. It can move backwards (<code>hasPrevious</code>, <code>previous</code>), report positions (<code>nextIndex</code>, <code>previousIndex</code>), and change the list while walking: <code>set(e)</code> replaces the last returned element and <code>add(e)</code> inserts at the cursor. <code>list.listIterator(list.size())</code> starts at the end.</p>
+  <pre data-title="ListIteratorDemo.java"><code class="language-java">List&lt;String&gt; list = new ArrayList&lt;&gt;(List.of("a", "b", "c"));
+
+ListIterator&lt;String&gt; it = list.listIterator();
+while (it.hasNext()) {
+    String s = it.next();
+    if (s.equals("b")) {
+        it.set("B");           // replace the element just returned
+        it.add("b2");          // insert after it
+    }
+}
+System.out.println(list);
+
+ListIterator&lt;String&gt; back = list.listIterator(list.size());
+while (back.hasPrevious()) {
+    System.out.print(back.previous() + " ");     // walk backwards
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[a, B, b2, c]
+c b2 B a </code></pre>
+
+  <h4>Fail-fast iterators and ConcurrentModificationException</h4>
+  <p>Collections such as <code>ArrayList</code>, <code>HashMap</code> and <code>HashSet</code> keep a counter named <code>modCount</code> that goes up on every <strong>structural modification</strong> (add, remove, clear — anything that changes the size; <code>set(i, e)</code> and changing a map value do not count). When an iterator is created it remembers the counter. On every <code>next()</code> it compares the two values. If they differ, someone changed the collection behind the iterator's back, and it throws <code>ConcurrentModificationException</code> (CME) immediately — it <strong>fails fast</strong> instead of returning garbage later.</p>
+  <ol class="steps">
+    <li><code>iterator()</code> stores <code>expectedModCount = modCount</code>.</li>
+    <li>Your loop body calls <code>list.remove(…)</code>, so <code>modCount</code> increases.</li>
+    <li>The next call to <code>it.next()</code> sees <code>modCount != expectedModCount</code> and throws.</li>
+    <li><code>it.remove()</code> removes and then updates <code>expectedModCount</code>, so it never triggers the exception.</li>
+  </ol>
+  <pre data-title="CmeDemo.java"><code class="language-java">List&lt;String&gt; names = new ArrayList&lt;&gt;(List.of("Asha", "Ravi", "Meera", "Kiran"));
+try {
+    for (String n : names) {
+        if (n.equals("Ravi")) {
+            names.remove(n);               // structural change inside the loop
+        }
+    }
+} catch (ConcurrentModificationException e) {
+    System.out.println("CME thrown");
+}
+
+// A surprise: remove the SECOND-TO-LAST element and nothing is thrown
+List&lt;String&gt; three = new ArrayList&lt;&gt;(List.of("Asha", "Ravi", "Meera"));
+for (String n : three) {
+    System.out.println("visiting " + n);
+    if (n.equals("Ravi")) {
+        three.remove(n);
+    }
+}
+System.out.println(three);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">CME thrown
+visiting Asha
+visiting Ravi
+[Asha, Meera]</code></pre>
+  <p>In the second loop, after removing "Ravi" the size drops to 2 and the cursor is also 2, so <code>hasNext()</code> says "finished" and the check in <code>next()</code> never runs — "Meera" is silently skipped. This is why fail-fast is only <strong>best effort</strong>: it helps find bugs, but you must never write code that depends on the exception being thrown.</p>
+
+  <h4>The right ways to remove while iterating</h4>
+  <pre data-title="SafeRemoval.java"><code class="language-java">List&lt;String&gt; base = List.of("Asha", "Ravi", "Meera", "Kiran");
+
+// 1. Iterator.remove() — works for every Collection
+List&lt;String&gt; a = new ArrayList&lt;&gt;(base);
+Iterator&lt;String&gt; it = a.iterator();
+while (it.hasNext()) {
+    if (it.next().startsWith("R")) {
+        it.remove();
+    }
+}
+
+// 2. removeIf(predicate) — the shortest and best (Java 8+)
+List&lt;String&gt; b = new ArrayList&lt;&gt;(base);
+b.removeIf(n -&gt; n.startsWith("R"));
+
+// 3. Build a new list with a stream
+List&lt;String&gt; c = base.stream().filter(n -&gt; !n.startsWith("R")).toList();
+
+// 4. Map: remove through a view
+Map&lt;String, Integer&gt; stock = new HashMap&lt;&gt;(Map.of("pen", 0, "book", 4));
+stock.entrySet().removeIf(e -&gt; e.getValue() == 0);
+
+System.out.println(a + " " + b + " " + c + " " + stock);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[Asha, Meera, Kiran] [Asha, Meera, Kiran] [Asha, Meera, Kiran] {book=4}</code></pre>
+  <p>A fifth way for lists only: loop by index from the end to the start, removing as you go (removing from the end never shifts the indexes you have not visited). It works but <code>removeIf</code> is cleaner.</p>
+
+  <h4>Fail-safe and weakly consistent iterators</h4>
+  <p>The collections in <code>java.util.concurrent</code> never throw CME. They work in two styles (the name "fail-safe" is common in interviews, but the Javadoc does not use it):</p>
+  <ul>
+    <li><code>CopyOnWriteArrayList</code> — every write copies the whole array, and an iterator walks a <strong>snapshot</strong> taken at the time the iterator was created. It never sees later changes. Good for lists that are read a lot and written rarely, such as listener lists. Its iterator does not support <code>remove()</code>.</li>
+    <li><code>ConcurrentHashMap</code>, <code>ConcurrentLinkedQueue</code> — <strong>weakly consistent</strong> iterators. They work on the live structure, may or may not show changes made after creation, and never throw CME.</li>
+  </ul>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Fail-fast (<code>ArrayList</code>, <code>HashMap</code>)</th><th>Snapshot / weakly consistent (concurrent classes)</th></tr></thead>
+    <tbody>
+      <tr><td>Change during iteration</td><td>Throws CME (best effort)</td><td>No exception</td></tr>
+      <tr><td>Sees changes made after creation</td><td>Not applicable — it throws</td><td>Snapshot: never. Weak: maybe</td></tr>
+      <tr><td><code>iterator.remove()</code></td><td>Supported</td><td>Snapshot: not supported. Concurrent map: supported</td></tr>
+      <tr><td>Cost</td><td>None</td><td>Copy cost on every write (<code>CopyOnWriteArrayList</code>)</td></tr>
+    </tbody>
+  </table></div>
+  <p>CME is not only about threads. The example above fails with a single thread. With several threads, a plain <code>ArrayList</code> needs real synchronisation or a concurrent collection (<a href="#m6">Module 6</a>).</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: never structurally modify a collection while iterating it, except through the iterator</p>
+    <p>Use <code>Iterator.remove()</code> (or <code>ListIterator.add/set/remove</code>), <code>removeIf</code>, or build a new collection. Calling <code>list.add</code>/<code>list.remove</code>/<code>map.put</code>/<code>map.remove</code> inside a for-each over the same collection is a bug even when it happens to run.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>ConcurrentModificationException</code> — structural change during iteration, including from <code>subList</code> views whose parent changed, and a <code>get</code> inside a loop over an access-order <code>LinkedHashMap</code>.</li>
+      <li><code>NoSuchElementException</code> — <code>next()</code> after <code>hasNext()</code> returned <code>false</code>.</li>
+      <li><code>IllegalStateException</code> — <code>remove()</code> before the first <code>next()</code>, or twice after one <code>next()</code>.</li>
+      <li><code>UnsupportedOperationException</code> — <code>remove()</code> on the iterator of an immutable collection.</li>
+      <li>Changing the <em>value</em> of an existing map entry (<code>entry.setValue</code>, or <code>map.put</code> for an existing key) during iteration is allowed; adding or removing keys is not.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: counting on the CME</p>
+    <p>Do not write <code>try { for … remove } catch (CME)</code> as flow control. The "second-to-last" case shows the exception is not guaranteed. Fix the loop instead.</p>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: which loop to use</p>
+    <ul>
+      <li>Just reading: for-each. Need the index or going backwards: index loop or <code>ListIterator</code>.</li>
+      <li>Removing: <code>removeIf</code>. Transforming into another collection: streams (<a href="#m5">Module 5</a>).</li>
+      <li>Map: loop over <code>entrySet()</code> or use <code>map.forEach((k, v) -&gt; …)</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is ConcurrentModificationException? How do you avoid it?"</p>
+    <ul>
+      <li>Thrown by fail-fast iterators when the collection's <code>modCount</code> changes during iteration, by anything other than the iterator itself.</li>
+      <li>Avoid with <code>Iterator.remove()</code>, <code>removeIf</code>, a new filtered list, or a concurrent collection (<code>CopyOnWriteArrayList</code>, <code>ConcurrentHashMap</code>).</li>
+      <li>Fail-fast is best effort, not a guarantee (the second-to-last example); the for-each loop is an iterator in disguise.</li>
+      <li>Fail-fast vs fail-safe: concurrent collections give snapshot or weakly consistent iterators.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-comparators">
+  <h3>Comparable vs Comparator: sorting objects</h3>
+  <p class="tldr">Comparable defines the one natural order inside the class itself; Comparator defines any number of orders outside it, and the comparing/thenComparing helpers make sorting by several fields a one-liner.</p>
+
+  <p>Sorting needs a rule for "which of these two comes first". Java gives you two ways to supply the rule.</p>
+
+  <h4>Comparable — the natural order</h4>
+  <p>A class implements <code>Comparable&lt;T&gt;</code> and its single method <code>int compareTo(T other)</code>. The result is <strong>negative</strong> if <code>this</code> comes before <code>other</code>, <strong>zero</strong> if they are equal in order, and <strong>positive</strong> if <code>this</code> comes after. <code>String</code>, all number wrappers, <code>LocalDate</code>, <code>BigDecimal</code> and enums already implement it, so <code>Collections.sort(listOfStrings)</code> just works. Sorted collections (<code>TreeSet</code>, <code>TreeMap</code>, <code>PriorityQueue</code>) and <code>Arrays.sort(Object[])</code> use it when you give no comparator.</p>
+  <p>The <code>compareTo</code> contract:</p>
+  <ul>
+    <li><strong>Antisymmetry</strong> — <code>sign(x.compareTo(y)) == -sign(y.compareTo(x))</code>.</li>
+    <li><strong>Transitivity</strong> — if <code>x &gt; y</code> and <code>y &gt; z</code>, then <code>x &gt; z</code>.</li>
+    <li><strong>Consistency</strong> — if <code>x.compareTo(y) == 0</code>, then <code>x</code> and <code>y</code> sort the same against every other element.</li>
+    <li><strong>Recommended: consistent with equals</strong> — <code>x.compareTo(y) == 0</code> exactly when <code>x.equals(y)</code>. If not, say so in the Javadoc; <code>BigDecimal</code> is the known exception.</li>
+    <li><code>x.compareTo(null)</code> must throw <code>NullPointerException</code>.</li>
+  </ul>
+
+  <h4>Comparator — any order you like, outside the class</h4>
+  <p>A <code>Comparator&lt;T&gt;</code> has one abstract method, <code>int compare(T a, T b)</code>, with the same negative/zero/positive meaning. Because it is a functional interface, you write it as a lambda. You pass it to <code>list.sort(cmp)</code>, <code>Collections.sort(list, cmp)</code>, <code>Arrays.sort(array, cmp)</code>, <code>stream.sorted(cmp)</code>, or the constructors of <code>TreeSet</code>, <code>TreeMap</code> and <code>PriorityQueue</code>. Use it when the class has no natural order, you cannot change the class, or you need several orders.</p>
+
+  <h4>The Comparator helper methods</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>Comparator.comparing(keyExtractor)</code></td><td>Compare by a key taken from each object (the key must be <code>Comparable</code>)</td></tr>
+      <tr><td><code>comparing(keyExtractor, keyComparator)</code></td><td>Same, with a custom comparator for the key</td></tr>
+      <tr><td><code>comparingInt / comparingLong / comparingDouble</code></td><td>Primitive keys, no boxing</td></tr>
+      <tr><td><code>thenComparing(…)</code>, <code>thenComparingInt(…)</code></td><td>Tie-breaker when the first comparison says equal</td></tr>
+      <tr><td><code>reversed()</code></td><td>The opposite order</td></tr>
+      <tr><td><code>Comparator.naturalOrder()</code> / <code>reverseOrder()</code></td><td>The natural order, or its reverse</td></tr>
+      <tr><td><code>Comparator.nullsFirst(cmp)</code> / <code>nullsLast(cmp)</code></td><td>Wrap a comparator so <code>null</code> elements are allowed</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Sorting a list of employees</h4>
+  <pre data-title="SortingDemo.java"><code class="language-java">import java.util.*;
+
+public class SortingDemo {
+    record Employee(int id, String name, String dept, double salary)
+            implements Comparable&lt;Employee&gt; {
+
+        @Override
+        public int compareTo(Employee other) {           // natural order: by id
+            return Integer.compare(this.id, other.id);
+        }
+    }
+
+    static String names(List&lt;Employee&gt; list) {
+        return list.stream().map(Employee::name).toList().toString();
+    }
+
+    public static void main(String[] args) {
+        List&lt;Employee&gt; staff = new ArrayList&lt;&gt;(List.of(
+                new Employee(3, "Ravi", "IT", 90000),
+                new Employee(1, "Asha", "HR", 65000),
+                new Employee(2, "Meera", "IT", 90000),
+                new Employee(4, "Kiran", "HR", 72000)));
+
+        Collections.sort(staff);                            // uses compareTo
+        System.out.println("By id:          " + names(staff));
+
+        staff.sort(Comparator.comparing(Employee::name));
+        System.out.println("By name:        " + names(staff));
+
+        staff.sort(Comparator.comparingDouble(Employee::salary).reversed()
+                .thenComparing(Employee::name));
+        System.out.println("Salary desc, name: " + names(staff));
+
+        staff.sort(Comparator.comparing(Employee::dept)
+                .thenComparing(Employee::salary, Comparator.reverseOrder())
+                .thenComparing(Employee::name));
+        System.out.println("Dept, salary desc: " + names(staff));
+
+        List&lt;String&gt; withNull = new ArrayList&lt;&gt;(Arrays.asList("Ravi", null, "Asha"));
+        withNull.sort(Comparator.nullsFirst(Comparator.naturalOrder()));
+        System.out.println(withNull);
+        withNull.sort(Comparator.nullsLast(Comparator.naturalOrder()));
+        System.out.println(withNull);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">By id:          [Asha, Meera, Ravi, Kiran]
+By name:        [Asha, Kiran, Meera, Ravi]
+Salary desc, name: [Meera, Ravi, Kiran, Asha]
+Dept, salary desc: [Kiran, Asha, Meera, Ravi]
+[null, Asha, Ravi]
+[Asha, Ravi, null]</code></pre>
+  <p>Read the chain like a sentence: "order by department, then by salary descending, then by name". Each <code>thenComparing</code> is used only when all earlier comparators returned zero.</p>
+
+  <h4>Comparable vs Comparator</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>Comparable&lt;T&gt;</code></th><th><code>Comparator&lt;T&gt;</code></th></tr></thead>
+    <tbody>
+      <tr><td>Package</td><td><code>java.lang</code></td><td><code>java.util</code></td></tr>
+      <tr><td>Method</td><td><code>compareTo(T other)</code> — one argument</td><td><code>compare(T a, T b)</code> — two arguments</td></tr>
+      <tr><td>Where it lives</td><td>Inside the class being sorted</td><td>In a separate class, lambda or static constant</td></tr>
+      <tr><td>Number of orders</td><td>One (the natural order)</td><td>As many as you want</td></tr>
+      <tr><td>Change the class?</td><td>Yes — the class must implement it</td><td>No — works with classes you cannot edit</td></tr>
+      <tr><td>Used automatically by</td><td><code>Collections.sort(list)</code>, <code>TreeMap</code>, <code>TreeSet</code></td><td>Only when you pass it in</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The subtraction bug</h4>
+  <p>A very common comparator is <code>(a, b) -&gt; a - b</code>. It is wrong for large values because integer subtraction can <strong>overflow</strong> and flip the sign.</p>
+  <pre data-title="SubtractionBug.java"><code class="language-java">Comparator&lt;Integer&gt; bad = (a, b) -&gt; a - b;
+System.out.println(bad.compare(Integer.MAX_VALUE, -1));          // MAX − (−1) overflows
+System.out.println(Integer.compare(Integer.MAX_VALUE, -1));      // correct
+
+Comparator&lt;Double&gt; alsoBad = (a, b) -&gt; (int) (a - b);
+System.out.println(alsoBad.compare(1.2, 1.0));                   // (int) 0.2 = 0 → "equal"</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">-2147483648
+1
+0</code></pre>
+  <p>The first comparator claims <code>MAX_VALUE</code> is smaller than −1. Always use <code>Integer.compare</code>, <code>Double.compare</code>, <code>Long.compare</code> or <code>Comparator.comparingInt(…)</code>.</p>
+
+  <h4>Other details worth knowing</h4>
+  <ul>
+    <li><strong>Stability.</strong> <code>List.sort</code>, <code>Collections.sort</code> and <code>Arrays.sort(Object[], cmp)</code> use TimSort, which is <strong>stable</strong>: elements that compare equal keep their original relative order. That is why sorting by salary and then by dept is not the same as one chained sort — chaining is the safe way. <code>Arrays.sort(int[])</code> uses dual-pivot quicksort; stability does not matter for primitives.</li>
+    <li><strong>Lambda type inference with <code>reversed()</code>.</strong> <code>Comparator.comparing(Employee::salary).reversed()</code> compiles, but <code>Comparator.comparing(e -&gt; e.salary()).reversed()</code> does not: with a lambda the compiler cannot infer the type of <code>e</code> through the chained call. Use a method reference, write <code>(Employee e) -&gt; …</code>, or use <code>comparing(Employee::salary, Comparator.reverseOrder())</code>.</li>
+    <li><strong>Records can share one comparator.</strong> Keep a <code>static final Comparator&lt;Employee&gt;</code> and call it from <code>compareTo</code> so the rule is written once.</li>
+    <li><strong>Comparison is a total order.</strong> A comparator that is inconsistent (says A &lt; B, B &lt; C, C &lt; A) can make TimSort throw <code>IllegalArgumentException: Comparison method violates its general contract!</code>.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: compare must be antisymmetric, transitive and null-safe by design</p>
+    <p>Handle ties with <code>thenComparing</code>. If you sort by one field and put objects in a <code>TreeSet</code> or use them as <code>TreeMap</code> keys, objects that tie are treated as duplicates. Include a unique field such as the id as the last tie-breaker.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Implement <code>Comparable</code> only when the order is obvious and unique (ids, dates, versions, money). Otherwise write Comparators.</li>
+      <li>Keep reusable comparators as named <code>static final</code> constants: <code>BY_SALARY_DESC</code>.</li>
+      <li>Prefer <code>comparingInt</code>/<code>comparingDouble</code> for primitive fields and <code>Integer.compare</code> over subtraction.</li>
+      <li>Keep <code>compareTo</code> consistent with <code>equals</code> and document it when it is not.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>ClassCastException: class X cannot be cast to class java.lang.Comparable</code> — sorting or adding to a <code>TreeSet</code> objects of a class that does not implement <code>Comparable</code> with no comparator supplied.</li>
+      <li><code>NullPointerException</code> — a <code>null</code> element or a <code>null</code> key (for example a <code>null</code> name in <code>comparing(Employee::name)</code>). Wrap the key comparator with <code>nullsFirst</code> or <code>nullsLast</code>.</li>
+      <li><code>String.compareTo</code> is case-sensitive: uppercase letters sort before lowercase. Use <code>String.CASE_INSENSITIVE_ORDER</code> or a <code>Collator</code> for language-aware sorting.</li>
+      <li><code>Double.compare</code> treats <code>NaN</code> as greater than everything and <code>-0.0</code> as less than <code>0.0</code>, unlike the <code>&lt;</code> operator.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a comparator that cannot handle ties or overflow</p>
+    <p>Returning only <code>-1</code> or <code>1</code> (never <code>0</code>) for equal items, or using subtraction, breaks the contract. Delegate to <code>Integer.compare</code> or the <code>Comparator</code> factory methods.</p>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>Most sorting in a Spring Boot app is done by the database (<code>ORDER BY</code>, Spring Data <code>Sort</code>). Java comparators are used for in-memory lists, stream pipelines (<code>sorted(Comparator.comparing(Order::createdAt).reversed())</code>) and priority queues in schedulers.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Comparable vs Comparator"</p>
+    <ul>
+      <li>Comparable: one natural order, <code>compareTo(T)</code>, inside the class, <code>java.lang</code>. Comparator: many orders, <code>compare(T, T)</code>, outside the class, <code>java.util</code>.</li>
+      <li>Show chaining: <code>Comparator.comparing(Employee::dept).thenComparing(Employee::salary).reversed()</code> — and mention <code>nullsFirst</code>.</li>
+      <li>Mention the subtraction overflow bug and stable sorting (TimSort).</li>
+      <li>"What does a TreeSet do with two objects whose comparator returns 0?" Keeps only one — consistency with <code>equals</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-collections-utils">
+  <h3>The Collections utility class and immutable collections</h3>
+  <p class="tldr">Collections and Arrays hold ready-made static algorithms, and Java gives you five different "read-only-ish" list factories whose differences — view or copy, nulls, fixed size or immutable — are a favourite source of bugs and interview questions.</p>
+
+  <p><code>java.util.Collections</code> (plural, a class of static methods) is the toolbox for the collection types. Remember: <code>Collection</code> is the interface, <code>Collections</code> is the helper class.</p>
+
+  <h4>The methods you will use</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>sort(list)</code>, <code>sort(list, cmp)</code></td><td>Sort a list in place (stable TimSort, O(n log n))</td></tr>
+      <tr><td><code>reverse(list)</code>, <code>shuffle(list)</code>, <code>swap(list, i, j)</code>, <code>rotate(list, d)</code></td><td>Reorder in place; <code>shuffle</code> accepts a seeded <code>Random</code></td></tr>
+      <tr><td><code>max(c)</code>, <code>min(c)</code> (and with a comparator)</td><td>Largest or smallest element; <code>NoSuchElementException</code> on empty</td></tr>
+      <tr><td><code>frequency(c, o)</code></td><td>How many elements equal <code>o</code></td></tr>
+      <tr><td><code>nCopies(n, o)</code></td><td>An immutable list of <code>n</code> copies of one object</td></tr>
+      <tr><td><code>binarySearch(list, key)</code></td><td>Index of the key in a <em>sorted</em> list; <code>−(insertion point) − 1</code> if absent</td></tr>
+      <tr><td><code>unmodifiableList/Set/Map(c)</code></td><td>Read-only <em>view</em> of another collection</td></tr>
+      <tr><td><code>synchronizedList/Set/Map(c)</code></td><td>Thread-safe wrapper with one lock on every method</td></tr>
+      <tr><td><code>emptyList()</code>, <code>emptySet()</code>, <code>emptyMap()</code>, <code>singletonList(x)</code></td><td>Immutable shared empty or single-element collections</td></tr>
+      <tr><td><code>addAll(c, a, b, c…)</code>, <code>disjoint(c1, c2)</code>, <code>fill</code>, <code>reverseOrder()</code></td><td>Add several; true if no common element; overwrite all; reverse comparator</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="CollectionsDemo.java"><code class="language-java">import java.util.*;
+
+public class CollectionsDemo {
+    public static void main(String[] args) {
+        List&lt;Integer&gt; nums = new ArrayList&lt;&gt;(List.of(5, 3, 8, 1));
+
+        Collections.sort(nums);
+        System.out.println(nums);
+        Collections.reverse(nums);
+        System.out.println(nums);
+        Collections.swap(nums, 0, 3);
+        System.out.println(nums);
+        System.out.println(Collections.max(nums) + " " + Collections.min(nums));
+
+        List&lt;Integer&gt; marks = List.of(1, 3, 3, 2);
+        System.out.println(Collections.frequency(marks, 3));
+        System.out.println(Collections.nCopies(3, "ab"));
+
+        List&lt;Integer&gt; sorted = List.of(1, 3, 5, 8);        // binarySearch needs sorted input
+        System.out.println(Collections.binarySearch(sorted, 5));
+        System.out.println(Collections.binarySearch(sorted, 4));   // −(2) − 1
+
+        List&lt;Integer&gt; r = new ArrayList&lt;&gt;(List.of(1, 2, 3, 4, 5));
+        Collections.rotate(r, 2);
+        System.out.println(r);
+
+        Collections.shuffle(nums);                              // different every run
+        Collections.shuffle(nums, new Random(42));              // repeatable with a seed
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[1, 3, 5, 8]
+[8, 5, 3, 1]
+[1, 5, 3, 8]
+8 1
+2
+[ab, ab, ab]
+2
+-3
+[4, 5, 1, 2, 3]</code></pre>
+  <p><code>Collections.sort</code> needs a mutable list. On <code>List.of(…)</code> it throws <code>UnsupportedOperationException</code> because it writes into the list. The <code>Arrays</code> class is the same idea for arrays: <code>Arrays.sort</code>, <code>Arrays.fill</code>, <code>Arrays.copyOf</code>, <code>Arrays.copyOfRange</code>, <code>Arrays.equals</code>, <code>Arrays.toString</code>, <code>Arrays.deepToString</code>, <code>Arrays.binarySearch</code> and <code>Arrays.asList</code>.</p>
+
+  <h4>Immutable, unmodifiable, fixed-size, view, copy — the table</h4>
+  <p>Six ways to get a list look alike but behave very differently:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>add / remove</th><th>set(i, e)</th><th>Nulls</th><th>View or copy</th></tr></thead>
+    <tbody>
+      <tr><td><code>Arrays.asList(array)</code></td><td>Throws (fixed size)</td><td>Allowed</td><td>Allowed</td><td>View of the array: writes go both ways</td></tr>
+      <tr><td><code>List.of(a, b, …)</code> (Java 9)</td><td>Throws</td><td>Throws</td><td>NPE, even in <code>contains(null)</code></td><td>Independent immutable list</td></tr>
+      <tr><td><code>Collections.unmodifiableList(list)</code></td><td>Throws</td><td>Throws</td><td>Allowed</td><td>Read-only <strong>view</strong>; sees changes made to the original</td></tr>
+      <tr><td><code>List.copyOf(collection)</code> (Java 10)</td><td>Throws</td><td>Throws</td><td>NPE</td><td>Immutable <strong>copy</strong> (may return the same instance if already immutable)</td></tr>
+      <tr><td><code>stream.toList()</code> (Java 16)</td><td>Throws</td><td>Throws</td><td>Allowed</td><td>New unmodifiable list</td></tr>
+      <tr><td><code>new ArrayList&lt;&gt;(collection)</code></td><td>Allowed</td><td>Allowed</td><td>Allowed</td><td>Mutable <strong>copy</strong></td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="ImmutableTraps.java"><code class="language-java">String[] arr = {"a", "b", "c"};
+List&lt;String&gt; fixed = Arrays.asList(arr);
+fixed.set(0, "A");                          // allowed, writes through to the array
+System.out.println(arr[0]);
+try {
+    fixed.add("d");                         // fixed size
+} catch (UnsupportedOperationException e) {
+    System.out.println("asList: cannot add");
+}
+
+List&lt;String&gt; src = new ArrayList&lt;&gt;(List.of("x", "y"));
+List&lt;String&gt; view = Collections.unmodifiableList(src);
+List&lt;String&gt; snap = List.copyOf(src);
+src.add("z");
+System.out.println(view);                   // the view shows the change
+System.out.println(snap);                   // the copy does not
+
+try {
+    List.of("a", null);
+} catch (NullPointerException e) {
+    System.out.println("List.of: NPE for null");
+}
+
+int[] prim = {1, 2, 3};
+System.out.println(Arrays.asList(prim).size());   // a List with ONE element: the array</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">A
+asList: cannot add
+[x, y, z]
+[x, y]
+List.of: NPE for null
+1</code></pre>
+  <p>The last line is a classic trap: <code>Arrays.asList(int[])</code> does not box the numbers, because a generic method cannot take a primitive array as <code>T…</code>; it makes a <code>List&lt;int[]&gt;</code> with a single element. Use an <code>Integer[]</code>, <code>List.of(1, 2, 3)</code> or <code>Arrays.stream(prim).boxed().toList()</code>.</p>
+  <p>All immutable collections are only <strong>shallowly</strong> immutable: if the elements are mutable objects (say <code>StringBuilder</code> or your own class with setters), their fields can still change. <code>Set.of</code> and <code>Map.of</code> follow the same rules as <code>List.of</code> (no nulls, immutable, iteration order unspecified).</p>
+
+  <h4>Synchronized wrappers</h4>
+  <p><code>Collections.synchronizedList(list)</code> returns a wrapper where every method is guarded by one lock. Single calls are safe, but a loop over it is not: you must hold the lock yourself.</p>
+  <pre data-title="Iterate a synchronized list"><code class="language-java">List&lt;String&gt; safe = Collections.synchronizedList(new ArrayList&lt;&gt;());
+// ... other threads add to it ...
+synchronized (safe) {                  // required while iterating
+    for (String s : safe) {
+        System.out.println(s);
+    }
+}</code></pre>
+  <p>In new code prefer <code>CopyOnWriteArrayList</code>, <code>ConcurrentHashMap</code> and the other classes from <a href="#m6">Module 6</a>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: know whether you hold a view or a copy</p>
+    <p>A view (<code>unmodifiableList</code>, <code>subList</code>, <code>Arrays.asList</code>, <code>keySet</code>) shares data with its source. A copy (<code>List.copyOf</code>, <code>new ArrayList&lt;&gt;(…)</code>, <code>stream.toList()</code>) does not. If you return a collection from a getter, return a copy or an unmodifiable view, never your internal list.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Constants and small fixed data: <code>List.of(…)</code>, <code>Set.of(…)</code>, <code>Map.of(…)</code>.</li>
+      <li>Defensive copy in constructors and getters: <code>this.items = List.copyOf(items);</code>.</li>
+      <li>Return <code>List.of()</code> or <code>Collections.emptyList()</code>, not <code>null</code>, for "no results".</li>
+      <li>Need a mutable list from a factory: wrap it — <code>new ArrayList&lt;&gt;(List.of(1, 2, 3))</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>UnsupportedOperationException</code> — any mutating call on <code>List.of</code>, <code>List.copyOf</code>, <code>unmodifiableList</code>, <code>stream.toList()</code>, <code>Collections.emptyList()</code>, <code>nCopies</code>, or <code>add/remove</code> on <code>Arrays.asList</code>.</li>
+      <li><code>NullPointerException</code> — <code>List.of</code> / <code>Set.of</code> / <code>Map.of</code> with <code>null</code>; also <code>list.contains(null)</code> on them.</li>
+      <li><code>IllegalArgumentException</code> — duplicate elements in <code>Set.of</code> or duplicate keys in <code>Map.of</code>.</li>
+      <li><code>Collections.unmodifiableList(list)</code> does not protect you if someone else still holds the original and changes it.</li>
+      <li><code>binarySearch</code> on an unsorted list returns a meaningless result without any error.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: sorting or modifying a List.of</p>
+    <p><code>List&lt;String&gt; names = List.of("b", "a"); Collections.sort(names);</code> throws <code>UnsupportedOperationException</code>. Copy first: <code>new ArrayList&lt;&gt;(names)</code>, or use <code>names.stream().sorted().toList()</code>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Arrays.asList vs List.of vs Collections.unmodifiableList"</p>
+    <ul>
+      <li><code>Arrays.asList</code>: fixed size, <code>set</code> allowed, backed by the array. <code>List.of</code>: truly immutable, no nulls. <code>unmodifiableList</code>: read-only view, still changes when the source changes. <code>List.copyOf</code>: immutable snapshot.</li>
+      <li>"How do you make a class immutable if it has a list field?" Copy in the constructor with <code>List.copyOf</code> and return an unmodifiable list from the getter.</li>
+      <li><code>Collections</code> vs <code>Collection</code> vs <code>Arrays</code>; <code>Arrays.asList(int[])</code> pitfall.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-choosing">
+  <h3>Choosing the right collection</h3>
+  <p class="tldr">Ask three questions — key-value or single values, duplicates allowed, and what order or access pattern — and the answer is almost always ArrayList, HashMap, HashSet or ArrayDeque.</p>
+
+  <p>Picking a collection is a design decision, not a habit. The wrong one still compiles, but it can make a loop O(n²) or lose entries silently. Use the flowchart, then check the table of everyday scenarios.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  S["What do you store?"] --> Q1{"Key-value pairs?"}
+  Q1 -->|yes| Q2{"Key order needed?"}
+  Q2 -->|no| HM["HashMap"]
+  Q2 -->|insertion or access order| LHM["LinkedHashMap"]
+  Q2 -->|sorted keys| TM["TreeMap"]
+  Q1 -->|no| Q3{"Duplicates allowed?"}
+  Q3 -->|no| Q4{"Order needed?"}
+  Q4 -->|no| HS["HashSet"]
+  Q4 -->|insertion| LHS["LinkedHashSet"]
+  Q4 -->|sorted| TS["TreeSet"]
+  Q3 -->|yes| Q5{"How will you use it?"}
+  Q5 -->|by index, general purpose| AL["ArrayList"]
+  Q5 -->|first in first out or stack| AD["ArrayDeque"]
+  Q5 -->|always the smallest next| PQ["PriorityQueue"]
+</pre>
+  <figcaption>A decision guide. Shared between threads? Switch to the matching java.util.concurrent class.</figcaption>
+  </figure>
+
+  <h4>Everyday scenarios</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Need</th><th>Use</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Rows returned by a query, a cart's items</td><td><code>ArrayList</code></td><td>Order, index access, cheap iteration</td></tr>
+      <tr><td>Look up a customer by id</td><td><code>HashMap&lt;Long, Customer&gt;</code></td><td>O(1) lookup</td></tr>
+      <tr><td>"Have I seen this id already?"</td><td><code>HashSet</code></td><td>O(1) <code>contains</code>, no duplicates</td></tr>
+      <tr><td>Remove duplicates but keep order</td><td><code>LinkedHashSet</code></td><td>Unique and insertion-ordered</td></tr>
+      <tr><td>Unique values in sorted order</td><td><code>TreeSet</code></td><td>Sorted, with range methods</td></tr>
+      <tr><td>Count words, group by city</td><td><code>HashMap</code> + <code>merge</code> / <code>computeIfAbsent</code></td><td>Counting and grouping idioms</td></tr>
+      <tr><td>LRU cache, "recently viewed"</td><td><code>LinkedHashMap</code> (access order)</td><td>Built-in eviction hook</td></tr>
+      <tr><td>Price slabs, nearest timestamp</td><td><code>TreeMap</code></td><td><code>floorKey</code> / <code>ceilingKey</code></td></tr>
+      <tr><td>Task queue, BFS</td><td><code>ArrayDeque</code></td><td>Fast FIFO, no node objects</td></tr>
+      <tr><td>Undo history, DFS, bracket matching</td><td><code>ArrayDeque</code> as a stack</td><td>Fast LIFO</td></tr>
+      <tr><td>Scheduler, top-K, Dijkstra</td><td><code>PriorityQueue</code></td><td>O(log n) smallest-next</td></tr>
+      <tr><td>Keys are enum constants</td><td><code>EnumMap</code> / <code>EnumSet</code></td><td>Compact and fast</td></tr>
+      <tr><td>Shared between threads</td><td><code>ConcurrentHashMap</code>, <code>CopyOnWriteArrayList</code>, blocking queues</td><td>Safe without manual locks</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Rules of thumb</h4>
+  <ul>
+    <li><strong>Default to <code>ArrayList</code>, <code>HashMap</code>, <code>HashSet</code>, <code>ArrayDeque</code>.</strong> Change only for a clear reason: order, sorting, thread safety or a measured bottleneck.</li>
+    <li><strong>Repeated <code>list.contains(x)</code> on a big list is a red flag.</strong> It is O(n) each time; keep a <code>HashSet</code> next to it, or switch to one.</li>
+    <li><strong>Sorted data needed once?</strong> Sort an <code>ArrayList</code>. <strong>Sorted data with constant inserts and queries?</strong> <code>TreeMap</code>/<code>TreeSet</code>.</li>
+    <li><strong>Need both order and fast lookup?</strong> <code>LinkedHashMap</code>, or a list plus a map.</li>
+    <li>Collections of millions of primitive numbers: consider <code>int[]</code> — boxing makes <code>List&lt;Integer&gt;</code> about four times larger.</li>
+    <li>Expose the interface in public signatures (<code>List</code>, <code>Map</code>) and keep the concrete class inside.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a List used as a lookup table</p>
+    <p>Searching a <code>List&lt;Customer&gt;</code> for an id inside a loop over orders is O(n × m). Build a <code>Map&lt;Long, Customer&gt;</code> once (<code>Collectors.toMap</code>) and look up in O(1).</p>
+  </div>
+
+  <h4 id="m4-choosing-complexity">Cost of the main operations</h4>
+  <p>When two choices both "work", the cost of the operation you repeat most decides. Know this table; interviews ask for it often. (Details are in the neighbouring articles: <a href="#m4-list">lists</a>, <a href="#m4-hashmap-internals">HashMap</a>, <a href="#m4-treemap">TreeMap</a>, <a href="#m4-sets">sets</a>, <a href="#m4-queues-deques">queues and deques</a>.)</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Class</th><th>Get / contains</th><th>Add</th><th>Remove</th></tr></thead>
+    <tbody>
+      <tr><td><code>ArrayList</code></td><td>get(i) O(1); contains O(n)</td><td>End: amortised O(1); middle O(n)</td><td>By index: O(n) shifting</td></tr>
+      <tr><td><code>LinkedList</code></td><td>get(i) O(n); contains O(n)</td><td>Ends O(1); middle O(n) to find the spot</td><td>Ends O(1)</td></tr>
+      <tr><td><code>HashMap</code> / <code>HashSet</code></td><td>O(1) average</td><td>O(1) average</td><td>O(1) average</td></tr>
+      <tr><td><code>TreeMap</code> / <code>TreeSet</code></td><td>O(log n)</td><td>O(log n)</td><td>O(log n)</td></tr>
+      <tr><td><code>ArrayDeque</code></td><td>Peek at an end O(1); contains O(n)</td><td>Either end O(1)</td><td>Either end O(1)</td></tr>
+      <tr><td><code>PriorityQueue</code></td><td>peek O(1); contains O(n)</td><td>O(log n)</td><td>poll O(log n)</td></tr>
+    </tbody>
+  </table></div>
+  <p>"Average" for hash classes assumes a decent <code>hashCode</code>. A bad one pushes many keys into one bucket, and the cost drifts toward O(n) (O(log n) once Java turns a long bucket into a tree).</p>
+
+  <h4>Null, order and thread-safety at a glance</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Class</th><th>Nulls</th><th>Order</th><th>Thread-safe?</th></tr></thead>
+    <tbody>
+      <tr><td><code>ArrayList</code></td><td>Allowed</td><td>Insertion</td><td>No</td></tr>
+      <tr><td><code>HashMap</code>, <code>HashSet</code></td><td>One null key; null values</td><td>None</td><td>No</td></tr>
+      <tr><td><code>LinkedHashMap</code></td><td>Same as HashMap</td><td>Insertion or access</td><td>No</td></tr>
+      <tr><td><code>TreeMap</code>, <code>TreeSet</code></td><td>No null key (natural order)</td><td>Sorted</td><td>No</td></tr>
+      <tr><td><code>ArrayDeque</code>, <code>PriorityQueue</code></td><td>No nulls</td><td>Deque order / priority</td><td>No</td></tr>
+      <tr><td><code>ConcurrentHashMap</code></td><td>No null key or value</td><td>None</td><td>Yes</td></tr>
+      <tr><td><code>List.of</code>, <code>Set.of</code>, <code>Map.of</code></td><td>No nulls</td><td>Fixed (set and map order varies)</td><td>Immutable, so safe to share</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Three worked decisions</h4>
+  <p><strong>1. Duplicate emails in an uploaded file.</strong> You need to know if you have seen a value already, and the order of first appearance for the report. Answer: a <code>LinkedHashSet</code>, or a <code>HashSet</code> for the check plus an <code>ArrayList</code> for the order.</p>
+  <pre data-title="FindDuplicates.java"><code class="language-java">List&lt;String&gt; emails = List.of("a@x.in", "b@x.in", "a@x.in", "c@x.in", "b@x.in");
+Set&lt;String&gt; seen = new HashSet&lt;&gt;();
+Set&lt;String&gt; duplicates = new LinkedHashSet&lt;&gt;();
+for (String e : emails) {
+    if (!seen.add(e)) {              // add returns false when already present
+        duplicates.add(e);
+    }
+}
+System.out.println(duplicates);      // [a@x.in, b@x.in]</code></pre>
+  <p><strong>2. Orders per customer.</strong> Key-value with a list per key: <code>Map&lt;Long, List&lt;Order&gt;&gt;</code>, built with <code>computeIfAbsent(id, k -&gt; new ArrayList&lt;&gt;()).add(order)</code> or <code>Collectors.groupingBy</code>. If the report must list customers in id order, use a <code>TreeMap</code> instead of a <code>HashMap</code>.</p>
+  <p><strong>3. "Next ticket to serve" with priorities (VIP first).</strong> You always want the smallest or largest element next, not a full sort. That is a <code>PriorityQueue</code> with a comparator. A sorted list re-sorted after every insert would cost O(n log n) per ticket.</p>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: LinkedList "because inserts are O(1)"</p><pre><code class="language-java">List&lt;Integer&gt; list = new LinkedList&lt;&gt;();
+for (int i = 0; i &lt; 100_000; i++) list.add(i);
+long sum = 0;
+for (int i = 0; i &lt; list.size(); i++) {
+    sum += list.get(i);          // each get walks the chain: O(n)
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: ArrayList, or iterate with for-each</p><pre><code class="language-java">List&lt;Integer&gt; list = new ArrayList&lt;&gt;();
+for (int i = 0; i &lt; 100_000; i++) list.add(i);
+long sum = 0;
+for (int x : list) {
+    sum += x;                    // O(1) per step
+}</code></pre></div>
+  </div>
+  <p>In practice <code>ArrayList</code> beats <code>LinkedList</code> in nearly every real workload, because its elements sit next to each other in memory and the CPU cache likes that. Reach for <code>ArrayDeque</code> when you want queue behaviour at both ends.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Runtime exceptions that point at a wrong choice</p>
+    <ul>
+      <li><code>UnsupportedOperationException</code> — you called <code>add</code> or <code>remove</code> on <code>List.of(...)</code>, <code>Collections.unmodifiableList</code> or the fixed-size list from <code>Arrays.asList</code>.</li>
+      <li><code>NullPointerException</code> — a <code>null</code> put into <code>List.of</code>, <code>ConcurrentHashMap</code>, <code>ArrayDeque</code>, <code>PriorityQueue</code> or a <code>TreeMap</code> key.</li>
+      <li><code>ConcurrentModificationException</code> — a plain collection changed during iteration or shared across threads without protection. Switch to a concurrent class or fix the loop.</li>
+      <li><code>ClassCastException</code> — elements put into a <code>TreeSet</code> or <code>PriorityQueue</code> that are not <code>Comparable</code> and no comparator was given.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Return <code>List.copyOf(list)</code> or an unmodifiable view from a method that exposes internal state, so callers cannot damage it.</li>
+      <li>Size big collections when you know the size: <code>new ArrayList&lt;&gt;(n)</code>. For a <code>HashMap</code> of <code>n</code> entries, <code>HashMap.newHashMap(n)</code> (Java 19+) picks a table size that avoids resizing.</li>
+      <li>If the key type is an enum, always prefer <code>EnumMap</code>; if the set has a few fixed flags, <code>EnumSet</code>.</li>
+      <li>Choose by the operation you repeat most, then measure only if it is truly the bottleneck.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>A Spring service typically holds a <code>Map&lt;Long, Customer&gt;</code> cache (often <code>ConcurrentHashMap</code>), returns <code>List&lt;OrderDto&gt;</code> from repositories, and uses a <code>Set&lt;String&gt;</code> for allowed roles. Anything heavier, such as caching with expiry or distributed queues, moves to a library (Caffeine, Redis) rather than a hand-made collection.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Which collection would you use for…?"</p>
+    <ul>
+      <li>Answer with the question you ask yourself: key-value? duplicates? order? thread-safety? Then name the class and its complexity.</li>
+      <li>Typical prompts: unique sorted names (<code>TreeSet</code>), first non-repeating character (<code>LinkedHashMap</code>), top-K (min-heap <code>PriorityQueue</code>), LRU cache (<code>LinkedHashMap</code>), undo stack (<code>ArrayDeque</code>).</li>
+    </ul>
+  </div>
+</article>

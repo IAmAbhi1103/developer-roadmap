@@ -1,0 +1,709 @@
+<article class="topic" id="m7-leaks-flags-tools">
+  <h3>Memory leaks, JVM flags and diagnostic tools</h3>
+  <p class="tldr">A Java memory leak means objects that are no longer needed are still reachable; find them with a heap dump, size the JVM with <code>-Xmx</code> and friends, and inspect running processes with <code>jcmd</code>, <code>jstack</code>, <code>jmap</code>, JFR and VisualVM.</p>
+
+  <h4>What is a memory leak in a garbage-collected language?</h4>
+  <p>The GC cannot free an object that is still reachable, even if your program will never use it again. A <strong>leak</strong> in Java is therefore "unintentional reachability": something keeps a reference to dead data. Memory use climbs over hours or days, GC runs more and more often, and finally you see <code>OutOfMemoryError</code>. The symptom on a graph is a saw-tooth whose <em>baseline</em> (heap after each full GC) keeps rising.</p>
+
+  <h4>Common causes</h4>
+  <dl class="terms">
+    <dt>Static collections</dt>
+    <dd>A <code>static Map</code> or <code>List</code> that is only ever added to lives as long as the class. Typical: a hand-made cache or a registry.</dd>
+    <dt>Caches without eviction</dt>
+    <dd>A <code>HashMap</code> used as a cache that grows with every new key (user IDs, request URLs). Use a bounded cache with expiry (Caffeine, Spring's cache abstraction) instead.</dd>
+    <dt>Listeners and callbacks never removed</dt>
+    <dd>Registering an object as an observer or event listener makes the publisher hold it. If you never call <code>remove</code>, the listener — and everything it references — stays.</dd>
+    <dt><code>ThreadLocal</code> in thread pools</dt>
+    <dd>Pool threads live forever, so a value stored in a <code>ThreadLocal</code> and not <code>remove()</code>d lives forever too. In app servers it can also pin the whole web application's class loader.</dd>
+    <dt>Unclosed resources</dt>
+    <dd>Streams, <code>Connection</code>s, <code>ResultSet</code>s, HTTP clients and <code>Scanner</code>s that are not closed leak native memory and OS handles (and sometimes heap). Use try-with-resources.</dd>
+    <dt>Wrong <code>equals</code>/<code>hashCode</code> or mutable keys</dt>
+    <dd>Entries put into a <code>HashMap</code>/<code>HashSet</code> that can never be found again can never be removed (<a href="#m7-equals-hashcode">next articles</a>).</dd>
+    <dt>Inner-class references</dt>
+    <dd>A non-static inner class or an anonymous class silently holds a reference to its outer instance. A long-lived callback created in a short-lived object keeps the outer object alive.</dd>
+    <dt>Unbounded queues and sessions</dt>
+    <dd>A queue whose producers are faster than consumers, or HTTP sessions that never expire.</dd>
+  </dl>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: unbounded static cache</p><pre><code class="language-java">public class PriceService {
+    private static final Map&lt;String, Price&gt; CACHE = new HashMap&lt;&gt;();
+
+    public Price get(String productId) {
+        return CACHE.computeIfAbsent(productId, this::loadFromDb);
+        // grows forever; also not thread-safe
+    }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: bounded and expiring (Caffeine)</p><pre><code class="language-java">public class PriceService {
+    private final Cache&lt;String, Price&gt; cache = Caffeine.newBuilder()
+            .maximumSize(10_000)
+            .expireAfterWrite(Duration.ofMinutes(10))
+            .build();
+
+    public Price get(String productId) {
+        return cache.get(productId, this::loadFromDb);
+    }
+}</code></pre></div>
+  </div>
+  <pre data-title="ThreadLocal in a pool"><code class="language-java">private static final ThreadLocal&lt;UserContext&gt; CONTEXT = new ThreadLocal&lt;&gt;();
+
+void handle(Request req) {
+    CONTEXT.set(new UserContext(req.user()));
+    try {
+        process(req);
+    } finally {
+        CONTEXT.remove();          // always clean up on pooled threads
+    }
+}</code></pre>
+
+  <h4>Finding a leak</h4>
+  <ol class="steps">
+    <li><strong>Confirm the pattern.</strong> Turn on GC logging (<code>-Xlog:gc</code>) or watch a monitoring dashboard. A rising post-GC heap and more frequent full GCs mean a leak (or simply a too-small heap).</li>
+    <li><strong>Capture a heap dump</strong> while memory is high. Automatically on failure with <code>-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps</code>, or on demand with <code>jcmd &lt;pid&gt; GC.heap_dump /tmp/heap.hprof</code>. Take two dumps some time apart to compare.</li>
+    <li><strong>Analyse it</strong> in Eclipse MAT (Memory Analyzer), VisualVM or IntelliJ's profiler. In MAT, run the <em>Leak Suspects</em> report and the <em>Dominator Tree</em>: it shows which objects keep the largest amount of memory alive.</li>
+    <li><strong>Follow the path to GC roots</strong> from the suspicious object ("Path to GC Roots, exclude weak references") to see which static field, thread or collection holds it.</li>
+    <li><strong>Fix and verify</strong>: bound or clear the structure, then watch the post-GC baseline stay flat.</li>
+  </ol>
+  <p>A quick view without a full dump: <code>jmap -histo &lt;pid&gt;</code> (or <code>jcmd &lt;pid&gt; GC.class_histogram</code>) prints how many instances of each class exist. A class whose count only grows is your suspect.</p>
+  <p>Heap dumps contain all data in memory — passwords, tokens, personal data. Treat them as secrets: do not email them or upload them to public tools.</p>
+
+  <h4>Important JVM flags</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>-Xms512m</code></td><td>Initial heap size</td></tr>
+      <tr><td><code>-Xmx2g</code></td><td>Maximum heap size. Without it, the default is about a quarter of the machine's (or container's) memory</td></tr>
+      <tr><td><code>-Xss1m</code></td><td>Stack size of each thread (<code>-XX:ThreadStackSize</code> is the same)</td></tr>
+      <tr><td><code>-XX:MaxRAMPercentage=75.0</code></td><td>Maximum heap as a percent of available RAM; useful in containers instead of a fixed <code>-Xmx</code></td></tr>
+      <tr><td><code>-XX:MaxMetaspaceSize=256m</code></td><td>Upper limit for Metaspace (unlimited by default)</td></tr>
+      <tr><td><code>-XX:+HeapDumpOnOutOfMemoryError</code></td><td>Write a heap dump when an OOM happens</td></tr>
+      <tr><td><code>-XX:HeapDumpPath=/dumps</code></td><td>Where to write it</td></tr>
+      <tr><td><code>-XX:+ExitOnOutOfMemoryError</code></td><td>Terminate the JVM on OOM so the orchestrator can restart it</td></tr>
+      <tr><td><code>-XX:+UseG1GC</code>, <code>-XX:+UseZGC</code>, …</td><td>Select the collector</td></tr>
+      <tr><td><code>-Xlog:gc*</code></td><td>GC logging (Java 9+)</td></tr>
+      <tr><td><code>-XX:+PrintFlagsFinal</code></td><td>Print the final value of every flag</td></tr>
+      <tr><td><code>-agentlib:jdwp=...</code></td><td>Enable remote debugging (<a href="#m8-debugger">Debugger article</a>)</td></tr>
+    </tbody>
+  </table></div>
+  <pre class="out" data-title="Typical production command"><code class="language-shell">$ java -Xms512m -Xmx512m -XX:+HeapDumpOnOutOfMemoryError \
+       -XX:HeapDumpPath=/var/dumps -XX:+ExitOnOutOfMemoryError \
+       -Xlog:gc*:file=/var/log/gc.log -jar app.jar</code></pre>
+  <ul>
+    <li>Setting <code>-Xms</code> equal to <code>-Xmx</code> avoids heap resizing pauses and makes memory use predictable.</li>
+    <li><strong>Containers.</strong> Since Java 10 (and 8u191) the JVM reads the container's memory and CPU limits. Total process memory is more than the heap (Metaspace, thread stacks, code cache, direct buffers), so do not set <code>-Xmx</code> to 100% of the container limit; <code>-XX:MaxRAMPercentage=75.0</code> is a common starting point. A container killed with exit code 137 without a Java <code>OutOfMemoryError</code> usually means the Linux OOM killer ended the process because total memory exceeded the limit.</li>
+    <li>Flags starting with <code>-X</code> are standard-ish and stable; <code>-XX:</code> flags are HotSpot-specific and can change between versions. Check the documentation for your JDK version before adding flags.</li>
+  </ul>
+
+  <h4>Diagnostic tools</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Tool</th><th>What it does</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>jps</code></td><td>Lists running Java processes and their PIDs</td><td><code>jps -l</code></td></tr>
+      <tr><td><code>jcmd</code></td><td>The Swiss-army tool: sends commands to a JVM</td><td><code>jcmd 4242 VM.flags</code>, <code>GC.heap_dump</code>, <code>Thread.print</code></td></tr>
+      <tr><td><code>jstack</code></td><td>Prints all thread stacks (finds deadlocks, stuck threads)</td><td><code>jstack 4242 &gt; threads.txt</code></td></tr>
+      <tr><td><code>jmap</code></td><td>Heap histogram and heap dump</td><td><code>jmap -histo 4242</code></td></tr>
+      <tr><td><code>jstat</code></td><td>Live GC and memory statistics</td><td><code>jstat -gc 4242 1000</code></td></tr>
+      <tr><td>JFR (Java Flight Recorder)</td><td>Low-overhead built-in profiler: CPU, allocation, GC, locks; open the file in JDK Mission Control or IntelliJ</td><td><code>java -XX:StartFlightRecording=duration=60s,filename=rec.jfr -jar app.jar</code> or <code>jcmd 4242 JFR.start</code></td></tr>
+      <tr><td>VisualVM, JConsole</td><td>GUI: heap, threads, CPU, sampling; browse heap dumps</td><td>Attach to a local process</td></tr>
+      <tr><td>Eclipse MAT</td><td>Heap dump analysis (dominator tree, leak suspects)</td><td>Open the <code>.hprof</code> file</td></tr>
+    </tbody>
+  </table></div>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ jps -l
+4242 com.shop.OrderServiceApplication
+$ jcmd 4242 Thread.print | head -5
+$ jcmd 4242 GC.heap_dump /tmp/heap.hprof
+$ jstat -gc 4242 1000 5        # five samples, one per second</code></pre>
+  <p>In production, Spring Boot Actuator exposes heap and GC metrics over HTTP (<a href="04-spring-boot.html#m6">Spring Boot · Module 6</a>). To catch a deadlock, take a thread dump with <code>jstack</code>; it reports "Found one Java-level deadlock" and names the threads and locks involved.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: always run production JVMs with a heap-dump-on-OOM flag and a GC log</p>
+    <p>You usually get one chance to see why a service died. Without <code>-XX:+HeapDumpOnOutOfMemoryError</code> the evidence is gone after the restart.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Treating every <code>OutOfMemoryError</code> as "the heap is too small". Check the message: Metaspace, native threads and heap are different problems.</li>
+      <li>Setting <code>-Xmx</code> equal to the container limit and getting the process killed by the OS.</li>
+      <li>Adding a dozen old <code>-XX</code> flags from an article written for Java 8.</li>
+      <li>Profiling only in the IDE with tiny data: leaks and GC behaviour show up under production-like load.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you find and fix a memory leak in production?"</p>
+    <ul>
+      <li>Symptoms: rising heap after full GC, frequent GCs, eventually OOM.</li>
+      <li>Capture a heap dump (<code>jcmd GC.heap_dump</code> or dump on OOM), open it in Eclipse MAT, read the leak suspects and the dominator tree, follow the path to GC roots.</li>
+      <li>Typical culprits: static collections, unbounded caches, listeners, ThreadLocals, unclosed resources.</li>
+      <li>Fix by bounding or clearing, then confirm with monitoring. Mention JFR and <code>jmap -histo</code> as lighter tools.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m7-class-loading">
+  <h3>Class loading: loaders, delegation and initialization</h3>
+  <p class="tldr">The JVM loads a class the first time it is needed, in three steps — loading, linking (verify, prepare, resolve) and initialization — using a chain of class loaders that always ask their parent first.</p>
+
+  <p>Java does not load all classes at start-up. A class is brought into memory <strong>lazily</strong>, the first time the program needs it. Each class is loaded by a <strong>class loader</strong>, and the pair (class name, loader) identifies the class: the same <code>.class</code> file loaded by two loaders gives two different classes in the JVM.</p>
+
+  <h4>The three phases</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A[Loading] --> V[Verification]
+  V --> P[Preparation]
+  P --> R[Resolution]
+  R --> C[Initialization]
+</pre>
+    <figcaption>Life cycle of a class before your code can use it</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><strong>Loading.</strong> A class loader finds the bytes of the class (from a folder, a JAR, a module or the network) and creates its runtime representation in Metaspace, plus a <code>java.lang.Class</code> object on the heap.</li>
+    <li><strong>Linking</strong>, in three sub-steps:
+      <ul>
+        <li><em>Verification</em> — the bytecode verifier checks the class file is well-formed and safe.</li>
+        <li><em>Preparation</em> — memory for static fields is allocated and set to <strong>default values</strong> (<code>0</code>, <code>false</code>, <code>null</code>), not yet to your assigned values.</li>
+        <li><em>Resolution</em> — symbolic references in the constant pool (names of other classes, methods, fields) are replaced by direct references. HotSpot often does this lazily.</li>
+      </ul>
+    </li>
+    <li><strong>Initialization.</strong> The JVM runs the class's <strong>static initializers</strong>: static field assignments and <code>static { }</code> blocks, in the order they appear in the source. The superclass is initialized first. This happens at most once per class and is thread-safe.</li>
+  </ol>
+
+  <h4>The class loader hierarchy</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Loader</th><th>Loads</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Bootstrap</strong></td><td>Core JDK classes (<code>java.base</code>: <code>java.lang.*</code>, <code>java.util.*</code>, …)</td><td>Built into the JVM, written in native code; <code>getClassLoader()</code> returns <code>null</code> for these classes</td></tr>
+      <tr><td><strong>Platform</strong></td><td>The other JDK platform modules (SQL, XML, logging, …)</td><td>Named "platform"; replaced the "extension" loader of Java 8</td></tr>
+      <tr><td><strong>Application</strong> (system)</td><td>Your classes and libraries from the classpath/module path</td><td>Named "app"; the default loader of your code</td></tr>
+      <tr><td>Custom loaders</td><td>Whatever you write them for</td><td>App servers (Tomcat gives each web app its own), plugin systems, hot reload, OSGi</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="LoaderDemo.java"><code class="language-java">public class LoaderDemo {
+    public static void main(String[] args) {
+        System.out.println(String.class.getClassLoader());          // null: bootstrap
+        ClassLoader app = LoaderDemo.class.getClassLoader();
+        System.out.println(app.getName());                          // app
+        System.out.println(app.getParent().getName());              // platform
+        System.out.println(app.getParent().getParent());            // null: bootstrap
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">null
+app
+platform
+null</code></pre>
+
+  <h4>Parent delegation</h4>
+  <p>When a loader is asked for a class, it does <strong>not</strong> look itself first. It <strong>delegates to its parent</strong>, and the parent to its own parent, up to bootstrap. Only if no parent can load the class does the child try.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A[Application loader] -->|1 ask parent| B[Platform loader]
+  B -->|2 ask parent| C[Bootstrap loader]
+  C -->|3 found, load it| D[Class]
+  C -.->|not found| B
+  B -.->|not found| A
+  A -->|4 search classpath| D
+</pre>
+    <figcaption>Parent-first delegation: the request goes up, and only on failure the search comes back down</figcaption>
+  </figure>
+  <p>Why this design?</p>
+  <ul>
+    <li><strong>Security.</strong> You cannot replace a core class: if someone puts a fake <code>java.lang.String</code> on the classpath, the bootstrap loader finds the real one first and the fake is never used.</li>
+    <li><strong>No duplicates.</strong> A class is loaded once by the loader that "owns" it, so everyone sees the same <code>Object</code> and <code>String</code>.</li>
+    <li><strong>Consistency</strong> for shared types. (Web containers deliberately bend the rule so each webapp can have its own library versions.)</li>
+  </ul>
+
+  <h4>When is a class initialized?</h4>
+  <p>Initialization runs on the first <strong>active use</strong>:</p>
+  <ul>
+    <li>creating an instance with <code>new</code>;</li>
+    <li>calling a static method;</li>
+    <li>reading or writing a static field that is not a compile-time constant;</li>
+    <li><code>Class.forName("pkg.Name")</code> (reflection) — this initializes the class;</li>
+    <li>initializing a subclass (the superclass is initialized first);</li>
+    <li>running the class that contains <code>main</code>.</li>
+  </ul>
+  <p>These do <em>not</em> initialize it: reading a <code>static final</code> primitive or String <strong>constant</strong> (the compiler copies its value into the caller), using <code>Config.class</code>, and declaring an array <code>Config[]</code>.</p>
+  <pre data-title="InitDemo.java"><code class="language-java">class Config {
+    static final int MAX = 10;                 // compile-time constant
+    static int counter = 0;
+    static { System.out.println("Config initialized"); }
+}
+
+class Parent {
+    static { System.out.println("Parent static block"); }
+    Parent() { System.out.println("Parent constructor"); }
+}
+
+class Child extends Parent {
+    static { System.out.println("Child static block"); }
+    Child() { System.out.println("Child constructor"); }
+}
+
+public class InitDemo {
+    public static void main(String[] args) {
+        System.out.println("start");
+        int x = Config.MAX;                    // constant: Config NOT initialized
+        System.out.println(x);
+        Config.counter++;                      // real static access: initialization runs
+        new Child();                           // Parent static, Child static, then constructors
+        new Child();                           // static blocks do not run again
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">start
+10
+Config initialized
+Parent static block
+Child static block
+Parent constructor
+Child constructor
+Parent constructor
+Child constructor</code></pre>
+  <p>If a static initializer throws an exception, the class fails with <code>ExceptionInInitializerError</code>, and every later use of that class throws <code>NoClassDefFoundError: Could not initialize class …</code>. Static initialization order across classes can be tricky: avoid heavy logic and circular dependencies in static blocks.</p>
+
+  <h4>ClassNotFoundException vs NoClassDefFoundError</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>ClassNotFoundException</code></th><th><code>NoClassDefFoundError</code></th></tr></thead>
+    <tbody>
+      <tr><td>Kind</td><td>Checked <code>Exception</code></td><td><code>Error</code> (a <code>LinkageError</code>)</td></tr>
+      <tr><td>Thrown when</td><td>Code explicitly loads a class by name and it is not found: <code>Class.forName("com.x.Driver")</code>, <code>ClassLoader.loadClass</code>, reflection, or a bad class name in config</td><td>A class that was present at compile time is missing at runtime, or its static initialization failed earlier</td></tr>
+      <tr><td>Typical cause</td><td>JAR missing from the classpath; typo in a class-name string (driver, plugin)</td><td>Dependency not packaged, version mismatch, scope <code>provided</code> but not supplied by the server, earlier <code>ExceptionInInitializerError</code></td></tr>
+      <tr><td>Handle it?</td><td>Yes: you must catch it (checked)</td><td>No; fix the packaging or the root cause</td></tr>
+    </tbody>
+  </table></div>
+  <p>Related errors: <code>NoSuchMethodError</code> or <code>NoSuchFieldError</code> (the class exists but a different version of it, without that method, was loaded — a typical "dependency version conflict" symptom, see <a href="#m8-maven">Maven</a>) and <code>UnsupportedClassVersionError</code> (class compiled for a newer Java than the running JVM). Read the <em>first</em> error in the log: a <code>NoClassDefFoundError: Could not initialize class X</code> is only the echo of an earlier failure.</p>
+
+  <h4>Why you should care</h4>
+  <ul>
+    <li><strong>Start-up time</strong>: lazy loading and class verification are part of why a big Spring Boot app takes seconds to start.</li>
+    <li><strong>Metaspace leaks</strong>: redeploying web apps repeatedly creates new class loaders; if anything (a ThreadLocal, a driver, a static) still references an old loader, all its classes stay in Metaspace.</li>
+    <li><strong>JDBC drivers</strong>: older code used <code>Class.forName("org.postgresql.Driver")</code> to load and register the driver. Since JDBC 4 (Java 6) drivers on the classpath register themselves automatically, so this line is no longer needed.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: loaders delegate to the parent first</p>
+    <p>A class with the same name on the classpath cannot override a core JDK class. Order inside the classpath matters for duplicates: the first JAR that contains the class wins.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A compile-time constant is inlined, so changing <code>Config.MAX</code> without recompiling the callers leaves them with the old value.</li>
+      <li><code>static final</code> objects (<code>static final List&lt;String&gt; X = new ArrayList&lt;&gt;()</code>) are not constants and do trigger initialization.</li>
+      <li>With the module system (Java 9+), a class can be on the path but not <em>readable</em> from another module (<code>IllegalAccessError</code>, "module does not export").</li>
+      <li>Instance initializer blocks and constructors run on every <code>new</code>; static blocks run once per class per loader.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain class loading" and "ClassNotFoundException vs NoClassDefFoundError"</p>
+    <ul>
+      <li>Loading, linking (verify, prepare, resolve), initialization. Lazy: first active use.</li>
+      <li>Bootstrap, platform, application loaders; parent delegation for security and uniqueness.</li>
+      <li>Initialization triggers: <code>new</code>, static method or non-constant static field, <code>Class.forName</code>, subclass.</li>
+      <li>CNFE: checked exception from an explicit by-name load. NCDFE: error from implicit linking when a class that existed at compile time is missing or failed to initialize.</li>
+      <li>Output order for parent/child static blocks and constructors is a classic puzzle: statics (parent, child) first, then constructors (parent, child).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m7-equals-hashcode">
+  <h3>== vs equals, and why hashCode must agree with equals</h3>
+  <p class="tldr"><code>==</code> compares primitives by value and objects by reference; <code>equals</code> compares by meaning when a class overrides it, and whenever you override <code>equals</code> you must override <code>hashCode</code> so that equal objects land in the same hash bucket.</p>
+
+  <p>Module 2 introduced the basics (<a href="#m2-equals-hashcode">equals and hashCode in OOP</a>). Here we go deeper: what each comparison really does, the formal contracts, how to write both methods correctly, and exactly what breaks when they disagree.</p>
+
+  <h4><code>==</code> versus <code>equals</code> for each kind of value</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th><code>==</code> does</th><th><code>equals</code> does</th></tr></thead>
+    <tbody>
+      <tr><td>Primitives (<code>int</code>, <code>char</code>, …)</td><td>Compares the values</td><td>Not available (no methods)</td></tr>
+      <tr><td>Wrappers (<code>Integer</code>, …)</td><td>Compares references; true for cached −128…127 only by luck</td><td>Compares the value <em>and</em> the type: <code>Integer.valueOf(1).equals(1L)</code> is false</td></tr>
+      <tr><td><code>String</code></td><td>Same object? (pool trap)</td><td>Compares characters</td></tr>
+      <tr><td>Your class (no override)</td><td>Same object?</td><td>Inherited from <code>Object</code>: same as <code>==</code></td></tr>
+      <tr><td>Your class (with override)</td><td>Same object?</td><td>Whatever you define (usually field values)</td></tr>
+      <tr><td>Arrays</td><td>Same array object?</td><td>Same as <code>==</code>; use <code>Arrays.equals</code></td></tr>
+      <tr><td><code>enum</code></td><td>Correct and null-safe: only one instance per constant</td><td>Same as <code>==</code></td></tr>
+      <tr><td><code>BigDecimal</code></td><td>Same object?</td><td>Same value <em>and scale</em> (<code>2.0</code> ≠ <code>2.00</code>)</td></tr>
+      <tr><td><code>record</code></td><td>Same object?</td><td>Generated: all components equal</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Compare.java"><code class="language-java">int a = 5; long b = 5L; double c = 5.0;
+System.out.println(a == b);                          // true: compared as long
+System.out.println(a == c);                          // true: compared as double
+System.out.println(Integer.valueOf(1).equals(1L));   // false: Long is not Integer
+System.out.println(new int[]{1}.equals(new int[]{1}));        // false: identity
+System.out.println(java.util.Arrays.equals(new int[]{1}, new int[]{1}));   // true
+Object x = new Object(), y = new Object();
+System.out.println((x == y) + " " + x.equals(y));    // false false: default equals is ==</code></pre>
+
+  <h4>The <code>equals</code> contract</h4>
+  <p>The <code>Object.equals</code> documentation requires, for non-null references:</p>
+  <ul>
+    <li><strong>Reflexive:</strong> <code>x.equals(x)</code> is true.</li>
+    <li><strong>Symmetric:</strong> if <code>x.equals(y)</code> is true then <code>y.equals(x)</code> is true.</li>
+    <li><strong>Transitive:</strong> if <code>x.equals(y)</code> and <code>y.equals(z)</code> then <code>x.equals(z)</code>.</li>
+    <li><strong>Consistent:</strong> repeated calls give the same answer while the objects are not modified.</li>
+    <li><strong>Non-null:</strong> <code>x.equals(null)</code> is false (and never throws).</li>
+  </ul>
+  <p>The usual way to break symmetry is comparing with a different kind of object. A class that "helpfully" lets itself equal a plain <code>String</code>: <code>ci.equals("abc")</code> is true, but <code>"abc".equals(ci)</code> is false. Transitivity breaks with subclasses that add a field: <code>Point(1,2)</code> equals <code>ColorPoint(1,2,RED)</code> if the check ignores colour, and equals <code>ColorPoint(1,2,BLUE)</code> too, yet the two colour points are not equal.</p>
+
+  <h4>The <code>hashCode</code> contract</h4>
+  <ul>
+    <li><strong>Consistent:</strong> during one run, if the fields used in <code>equals</code> do not change, <code>hashCode()</code> returns the same int every time. (It may differ between runs.)</li>
+    <li><strong>Equal objects ⇒ equal hash codes:</strong> if <code>x.equals(y)</code>, then <code>x.hashCode() == y.hashCode()</code>. <em>This is the rule that gets broken.</em></li>
+    <li>Unequal objects <em>may</em> have the same hash code (a <strong>collision</strong>), but a good function spreads values evenly because collisions make hash tables slower.</li>
+  </ul>
+  <p>The inverse is false: the same hash code does not imply equal objects. <code>"Aa".hashCode()</code> and <code>"BB".hashCode()</code> are both 2112. The default <code>Object.hashCode()</code> is derived from object identity (often loosely based on a memory address or a random number); it is why two "equal" objects have different hashes unless you override.</p>
+
+  <h4>How a hash collection uses both methods</h4>
+  <ol class="steps">
+    <li><code>hashCode()</code> is called on the key; the result selects a <strong>bucket</strong> (array slot).</li>
+    <li>Inside that bucket, entries are compared with <code>equals()</code> to find the exact key (see <a href="#m4">Module 4</a> for <code>HashMap</code> internals).</li>
+    <li>If <code>equals</code> says two keys are equal but their hash codes differ, the lookup goes to a <em>different bucket</em> and never calls <code>equals</code> — the entry is "lost".</li>
+  </ol>
+
+  <h4>Demo: what breaks when you override only equals</h4>
+  <pre data-title="BrokenKey.java"><code class="language-java">import java.util.*;
+
+public class BrokenKey {
+    static class BadPoint {
+        final int x, y;
+        BadPoint(int x, int y) { this.x = x; this.y = y; }
+
+        @Override
+        public boolean equals(Object o) {                // overridden...
+            if (this == o) return true;
+            if (!(o instanceof BadPoint other)) return false;
+            return x == other.x &amp;&amp; y == other.y;
+        }
+        // ...but hashCode() is NOT overridden: Object's identity hash is used
+    }
+
+    static class GoodPoint {
+        final int x, y;
+        GoodPoint(int x, int y) { this.x = x; this.y = y; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof GoodPoint other)) return false;
+            return x == other.x &amp;&amp; y == other.y;
+        }
+
+        @Override
+        public int hashCode() { return Objects.hash(x, y); }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(new BadPoint(1, 2).equals(new BadPoint(1, 2)));   // true
+
+        Set&lt;BadPoint&gt; bad = new HashSet&lt;&gt;();
+        bad.add(new BadPoint(1, 2));
+        bad.add(new BadPoint(1, 2));
+        System.out.println(bad.size());                                       // 2 (!)
+        System.out.println(bad.contains(new BadPoint(1, 2)));                 // false (!)
+
+        Set&lt;GoodPoint&gt; good = new HashSet&lt;&gt;();
+        good.add(new GoodPoint(1, 2));
+        good.add(new GoodPoint(1, 2));
+        System.out.println(good.size());                                      // 1
+        System.out.println(good.contains(new GoodPoint(1, 2)));               // true
+
+        Map&lt;GoodPoint, String&gt; names = new HashMap&lt;&gt;();
+        names.put(new GoodPoint(0, 0), "origin");
+        System.out.println(names.get(new GoodPoint(0, 0)));                   // origin
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">true
+2
+false
+1
+true
+origin</code></pre>
+  <p>The two <code>BadPoint</code> objects are "equal", yet the set holds both and cannot find a copy. (Very rarely the identity hashes collide by chance, which makes this bug appear and disappear — the worst kind of bug.)</p>
+
+  <h4>Writing equals and hashCode correctly</h4>
+  <pre data-title="Customer.java"><code class="language-java">import java.util.Objects;
+
+public final class Customer {
+    private final String email;       // identity of a customer
+    private final String name;
+
+    public Customer(String email, String name) {
+        this.email = email;
+        this.name = name;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;                          // 1. same reference: fast path
+        if (!(o instanceof Customer other)) return false;    // 2. null or wrong type
+        return Objects.equals(email, other.email)            // 3. compare significant fields
+                &amp;&amp; Objects.equals(name, other.name);         //    null-safe
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(email, name);                    // same fields as equals
+    }
+
+    @Override
+    public String toString() {
+        return "Customer[" + email + ", " + name + "]";
+    }
+}</code></pre>
+  <ul>
+    <li><strong>Use the same fields in both methods.</strong> A field used in <code>equals</code> but not in <code>hashCode</code> is fine for correctness (equal objects still hash equally); a field in <code>hashCode</code> but not in <code>equals</code> breaks the contract.</li>
+    <li><code>Objects.equals(a, b)</code> is null-safe equality. <code>Objects.hash(a, b, c)</code> builds a hash from values using the formula <code>result = 31 * result + hash(element)</code> starting at 1, so <code>Objects.hash(1, 2)</code> is <code>994</code>. It boxes primitives into an array; for hot code compute it by hand with <code>Integer.hashCode</code>, <code>Double.hashCode</code>, and so on.</li>
+    <li>Compare <code>float</code>/<code>double</code> fields with <code>Double.compare(a, b) == 0</code>, not <code>==</code>, to treat <code>NaN</code> correctly. Compare arrays with <code>Arrays.equals</code> and hash them with <code>Arrays.hashCode</code>.</li>
+    <li>You can generate both methods in IntelliJ (<kbd>Alt</kbd>+<kbd>Insert</kbd> → equals() and hashCode()), with Lombok (<code>@EqualsAndHashCode</code>, or <code>@Data</code>), or with a record.</li>
+  </ul>
+
+  <h4><code>instanceof</code> versus <code>getClass()</code></h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Approach</th><th>Behaviour</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td><code>o instanceof Customer</code></td><td>True for subclasses too; keeps symmetry as long as the class is <code>final</code> or subclasses do not change equality</td><td>Final classes, value objects, records; also when equality is defined by an interface</td></tr>
+      <tr><td><code>o == null || getClass() != o.getClass()</code></td><td>Only exactly the same class is equal; safe against symmetry problems with subclasses that add state</td><td>Non-final classes with subclasses that add significant fields</td></tr>
+    </tbody>
+  </table></div>
+  <p>Pick one deliberately. <code>getClass()</code> breaks with runtime proxies (a Hibernate lazy proxy is a generated subclass of your entity, so <code>getClass()</code> differs from the real class), which is one reason many JPA codebases use <code>instanceof</code> (or compare only the id) in entity equality.</p>
+
+  <h4>Mutable keys</h4>
+  <p>If a field used by <code>hashCode</code> changes while the object is inside a <code>HashSet</code> or is a <code>HashMap</code> key, the stored position no longer matches the new hash. The entry is still there but unreachable:</p>
+  <pre data-title="MutableKey.java"><code class="language-java">class Key {
+    int id;
+    Key(int id) { this.id = id; }
+    @Override public boolean equals(Object o) { return o instanceof Key k &amp;&amp; k.id == id; }
+    @Override public int hashCode() { return Integer.hashCode(id); }
+}
+
+Set&lt;Key&gt; set = new HashSet&lt;&gt;();
+Key k = new Key(1);
+set.add(k);
+k.id = 2;                                   // mutated after insertion
+System.out.println(set.contains(k));        // false: looks in the bucket for hash(2)
+System.out.println(set.size());             // 1:     but the entry is still stored (a leak)</code></pre>
+  <p>Use immutable keys (<code>String</code>, <code>Integer</code>, records of immutable fields, enums). That is also why <code>String</code> is a perfect key.</p>
+
+  <h4>Records and enums</h4>
+  <pre data-title="Records.java"><code class="language-java">record Money(long paise, String currency) {}
+
+Money m1 = new Money(49900, "INR");
+Money m2 = new Money(49900, "INR");
+System.out.println(m1.equals(m2));                    // true: generated, component-wise
+System.out.println(m1.hashCode() == m2.hashCode());   // true: generated, consistent
+System.out.println(m1);                               // Money[paise=49900, currency=INR]
+System.out.println(m1 == m2);                         // false</code></pre>
+  <p>A record gets <code>equals</code>, <code>hashCode</code> and <code>toString</code> generated from its components. The exact hash formula is unspecified, but it is consistent with <code>equals</code>. Caution: an array component is compared by identity (<code>record Bag(int[] items)</code>), so two records with equal-content arrays are not equal. Enums inherit identity-based <code>equals</code>/<code>hashCode</code> (final in <code>Enum</code>), which is correct since each constant is a singleton.</p>
+
+  <h4>Related: Comparable and <code>equals</code></h4>
+  <p>Sorted collections (<code>TreeSet</code>, <code>TreeMap</code>) use <code>compareTo</code>/<code>compare</code>, not <code>equals</code>, to decide whether two elements are the same. It is strongly recommended that <code>compareTo(x) == 0</code> agrees with <code>equals(x)</code>. <code>BigDecimal</code> violates this: <code>2.0</code> and <code>2.00</code> are different for <code>equals</code> (a <code>HashSet</code> holds both) but equal for <code>compareTo</code> (a <code>TreeSet</code> holds one).</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: override equals and hashCode together, using the same fields</p>
+    <p>Equal objects must return the same hash code, or <code>HashMap</code>, <code>HashSet</code>, <code>Hashtable</code> and <code>ConcurrentHashMap</code> will not find them. If you only need identity, override neither.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Annotate with <code>@Override</code>; a signature like <code>equals(Customer c)</code> (overload, not override) is silent and never used by collections.</li>
+      <li>Prefer immutable value classes or records; make fields <code>final</code>.</li>
+      <li>Use <code>Objects.equals</code> and <code>Objects.hash</code> unless profiling says otherwise.</li>
+      <li>For JPA entities, base equality on a business key or the id with care for unsaved (null id) objects; do not include lazy collections in <code>equals</code>/<code>hashCode</code> (they trigger database loads).</li>
+      <li>Never use <code>==</code> on strings or wrappers; use <code>Objects.equals(a, b)</code> when either may be null.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>hashCode()</code> may be any int, including negative; the collection maps it to an index internally.</li>
+      <li>A constant <code>hashCode()</code> (<code>return 1;</code>) is legal but turns a hash table into a list (O(n) lookups); modern <code>HashMap</code> converts long buckets into balanced trees if keys are <code>Comparable</code>, but do not rely on it.</li>
+      <li>Calling an overridable method or accessing lazy state inside <code>equals</code> can cause recursion or extra queries.</li>
+      <li>Cyclic references (A has B, B has A) in <code>equals</code>/<code>hashCode</code>/<code>toString</code> produce <code>StackOverflowError</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Overriding only one of the two.</li>
+      <li>Writing <code>equals(MyClass other)</code> instead of <code>equals(Object other)</code>.</li>
+      <li>Using a mutable object (or an object whose hash depends on mutable fields) as a map key.</li>
+      <li>Throwing <code>ClassCastException</code> by casting without checking <code>instanceof</code>/<code>getClass</code>.</li>
+      <li>Comparing <code>Integer</code> values with <code>==</code> (cache trap).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is the contract between equals and hashCode? What if you override only equals?"</p>
+    <ul>
+      <li>If <code>a.equals(b)</code> then <code>a.hashCode() == b.hashCode()</code>; hash codes must be stable while the object is unchanged; unequal objects may collide.</li>
+      <li>Only equals overridden: equal objects get different identity hashes, land in different buckets; <code>HashSet</code> allows duplicates and <code>contains</code>/<code>get</code> fail.</li>
+      <li>The five properties of <code>equals</code>: reflexive, symmetric, transitive, consistent, non-null.</li>
+      <li>How to write them: same fields, <code>Objects.equals</code>, <code>Objects.hash</code>, <code>instanceof</code> or <code>getClass()</code> with the trade-off.</li>
+      <li>Records generate both; keys should be immutable; <code>Integer</code> cache trap for <code>==</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m7-interview">
+  <h3>Interview questions — JVM and memory</h3>
+
+  <details class="qa">
+    <summary>Explain the JVM architecture.</summary>
+    <div class="qa-a">
+      <p>Three main parts. The <strong>class loader subsystem</strong> loads, links and initializes classes. The <strong>runtime data areas</strong>: heap and Metaspace shared by all threads, and per thread a JVM stack of frames, a PC register and a native method stack. The <strong>execution engine</strong>: interpreter, JIT compiler (C1 and C2, tiered) and garbage collector. JNI connects Java to native code.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is stored in the stack and what in the heap?</summary>
+    <div class="qa-a">
+      <p>The stack (one per thread) holds frames with local primitives, local references, parameters and the operand stack; frames disappear when the method returns. The heap (shared) holds all objects and arrays, including instance fields, boxed values and the String pool. A local variable <code>Product p = new Product()</code> keeps the reference on the stack and the object on the heap. Static fields live with the class data, and class metadata lives in Metaspace.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between <code>StackOverflowError</code> and <code>OutOfMemoryError</code>?</summary>
+    <div class="qa-a">
+      <p><code>StackOverflowError</code> means one thread's stack is full, nearly always from runaway recursion; fix the base case or use a loop. <code>OutOfMemoryError</code> means the JVM cannot allocate more memory in the heap (<code>Java heap space</code>), Metaspace, or for a new native thread. It usually comes from a leak, too much data loaded at once, or a heap that is too small. Both are <code>Error</code>s, not exceptions you normally catch.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does garbage collection decide what to remove?</summary>
+    <div class="qa-a">
+      <p>The GC traces from <strong>GC roots</strong> (local variables on thread stacks, static fields, active threads, JNI references) and marks everything reachable. Unreachable objects are garbage, even when they reference each other in a cycle. Memory is reclaimed by sweeping, copying or compacting. Java does not use reference counting.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What are the young and old generations, and what is a minor vs a full GC?</summary>
+    <div class="qa-a">
+      <p>Most objects die young, so the heap is split into a young generation (Eden plus two survivor spaces) and an old generation. New objects go to Eden. A <strong>minor GC</strong> copies the live objects of Eden and one survivor into the other survivor; each survival raises an object's age, and old-enough objects are promoted to the old generation. When the old generation fills, a major GC runs; a <strong>full GC</strong> collects the whole heap and causes the longest stop-the-world pause.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Which garbage collectors do you know and when would you use each?</summary>
+    <div class="qa-a">
+      <p>Serial for tiny heaps and single-CPU containers; Parallel for throughput-oriented batch work; <strong>G1</strong>, the default since Java 9, for balanced pause times and throughput using heap regions and a pause goal; <strong>ZGC</strong> and <strong>Shenandoah</strong> for low-latency services and large heaps with mostly concurrent work. CMS was removed in Java 14. Start with the default, measure with GC logs, and change only for evidence.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Can you force garbage collection? What about <code>finalize()</code>?</summary>
+    <div class="qa-a">
+      <p>No. <code>System.gc()</code> is only a request that the JVM may ignore, and calling it often triggers an expensive full GC. <code>finalize()</code> has no timing guarantee, is slow, and is deprecated for removal since Java 18. Release resources with try-with-resources (<code>AutoCloseable</code>), and use <code>Cleaner</code> as a safety net for native resources.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Can a Java program have memory leaks? Give examples and say how you would find one.</summary>
+    <div class="qa-a">
+      <p>Yes, when unneeded objects stay reachable: static collections that only grow, caches without eviction, listeners never unregistered, <code>ThreadLocal</code> values in pooled threads, unclosed resources, and mutable keys in hash maps. To find one, watch the heap after GC, take heap dumps (<code>jcmd &lt;pid&gt; GC.heap_dump</code> or <code>-XX:+HeapDumpOnOutOfMemoryError</code>), open them in Eclipse MAT or VisualVM, and follow the path to GC roots from the largest retained objects.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What do strong, soft, weak and phantom references mean?</summary>
+    <div class="qa-a">
+      <p>A strong reference is a normal variable and prevents collection. A <code>SoftReference</code> object is cleared only when memory is short, so it suits caches. A <code>WeakReference</code> is cleared at the next GC if no strong reference remains, as used by <code>WeakHashMap</code>. A <code>PhantomReference</code> is enqueued after the object is finalised and is used for cleanup actions; <code>Cleaner</code> builds on it.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Describe class loading and the parent delegation model.</summary>
+    <div class="qa-a">
+      <p>A class is loaded lazily: <em>loading</em> (read bytes, create the class in Metaspace), <em>linking</em> (verify, prepare statics with defaults, resolve references) and <em>initialization</em> (run static initializers once). The loaders are bootstrap (core JDK), platform and application. A loader first delegates to its parent and only loads the class itself if the parent cannot. This prevents applications from replacing core classes like <code>java.lang.String</code> and avoids duplicate loading.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between <code>ClassNotFoundException</code> and <code>NoClassDefFoundError</code>?</summary>
+    <div class="qa-a">
+      <p><code>ClassNotFoundException</code> is a checked exception thrown when code loads a class by name (<code>Class.forName</code>, <code>loadClass</code>) and it is not on the classpath. <code>NoClassDefFoundError</code> is an <code>Error</code> thrown when a class that was available at compile time is missing at runtime, or when its static initialization already failed. Typical fixes: add the dependency to the package, fix scopes, or find the earlier <code>ExceptionInInitializerError</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between <code>==</code> and <code>equals()</code>?</summary>
+    <div class="qa-a">
+      <p>For primitives, <code>==</code> compares values. For objects, <code>==</code> compares references (are they the same object?), while <code>equals()</code> compares by meaning if the class overrides it; the default <code>Object.equals</code> is identical to <code>==</code>. <code>String</code>, wrappers, <code>BigDecimal</code> and records override it. Use <code>equals</code> for content and <code>==</code> only for primitives, enums and identity checks.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why must <code>hashCode()</code> be overridden when you override <code>equals()</code>?</summary>
+    <div class="qa-a">
+      <p>The contract says equal objects must have equal hash codes. Hash collections use the hash code to choose a bucket before they call <code>equals</code>. If two equal objects hash differently, they go to different buckets, so a <code>HashSet</code> can hold "duplicates" and <code>contains</code> or <code>HashMap.get</code> cannot find an equal key. Use the same fields in both methods, via <code>Objects.equals</code> and <code>Objects.hash</code>, or a record.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What are the properties of a correct <code>equals()</code>, and <code>instanceof</code> vs <code>getClass()</code>?</summary>
+    <div class="qa-a">
+      <p>Reflexive, symmetric, transitive, consistent and false for <code>null</code>. <code>instanceof</code> accepts subclasses and works well for final classes and records; <code>getClass()</code> requires exactly the same class and avoids symmetry problems when subclasses add significant state, but fails with runtime proxies such as Hibernate lazy proxies. Choose one on purpose and document it.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What are C1, C2 and escape analysis?</summary>
+    <div class="qa-a">
+      <p>C1 and C2 are HotSpot's JIT compilers: C1 compiles quickly with light optimisation, C2 compiles hot code with deep optimisation (tiered compilation uses both). Escape analysis lets C2 prove that an object never leaves a method, so it can avoid heap allocation (scalar replacement) or remove locks (lock elision). It explains JVM warm-up and why micro-benchmarks need JMH.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m7-cheatsheet">
+  <h3>Cheat sheet — JVM and memory</h3>
+  <ul class="cheat">
+    <li><b>JVM parts</b> class loader subsystem, runtime data areas, execution engine, JNI.</li>
+    <li><b>Per thread</b> JVM stack (frames), PC register, native method stack.</li>
+    <li><b>Shared</b> heap (objects, arrays, String pool, statics) and Metaspace (class metadata, native memory).</li>
+    <li><b>Metaspace</b> replaced PermGen in Java 8; limit with <code>-XX:MaxMetaspaceSize</code>.</li>
+    <li><b>Stack frame</b> local variables, operand stack, constant pool link; popped on return.</li>
+    <li><b>Reference vs object</b> reference on stack (or in a field), object on heap; assignment copies the reference.</li>
+    <li><b>StackOverflowError</b> too deep recursion; fix base case or loop; <code>-Xss</code> sets stack size.</li>
+    <li><b>OutOfMemoryError</b> heap space, Metaspace, GC overhead limit, unable to create native thread.</li>
+    <li><b>GC roots</b> stack locals, statics, active threads, JNI refs.</li>
+    <li><b>Generations</b> Eden + S0/S1 (young), tenured (old); minor GC is cheap, full GC is expensive.</li>
+    <li><b>Generational hypothesis</b> most objects die young.</li>
+    <li><b>Collectors</b> Serial, Parallel (throughput), G1 (default), ZGC, Shenandoah (low pause); CMS removed in 14.</li>
+    <li><b>System.gc()</b> only a hint; <b>finalize()</b> deprecated for removal; use try-with-resources and <code>Cleaner</code>.</li>
+    <li><b>References</b> strong, <code>SoftReference</code> (cache), <code>WeakReference</code> (<code>WeakHashMap</code>), <code>PhantomReference</code>.</li>
+    <li><b>Leak causes</b> static collections, no-eviction caches, listeners, ThreadLocal in pools, unclosed resources, mutable keys.</li>
+    <li><b>Find leaks</b> <code>-XX:+HeapDumpOnOutOfMemoryError</code>, <code>jcmd GC.heap_dump</code>, Eclipse MAT, <code>jmap -histo</code>.</li>
+    <li><b>Flags</b> <code>-Xms</code> <code>-Xmx</code> <code>-Xss</code> <code>-XX:MaxRAMPercentage</code> <code>-Xlog:gc</code>.</li>
+    <li><b>Tools</b> <code>jps</code>, <code>jcmd</code>, <code>jstack</code> (deadlocks), <code>jmap</code>, <code>jstat</code>, JFR, VisualVM.</li>
+    <li><b>JIT</b> interpreter → C1 → C2 (tiered); warm-up; escape analysis can remove allocations.</li>
+    <li><b>Class loading</b> loading → linking (verify, prepare, resolve) → initialization.</li>
+    <li><b>Loaders</b> bootstrap → platform → application; parent first.</li>
+    <li><b>Initialization triggers</b> <code>new</code>, static method, non-constant static field, <code>Class.forName</code>, subclass.</li>
+    <li><b>CNFE vs NCDFE</b> checked exception from by-name load vs error for a missing or failed class at runtime.</li>
+    <li><b>equals contract</b> reflexive, symmetric, transitive, consistent, null → false.</li>
+    <li><b>hashCode contract</b> equal objects ⇒ equal hash codes; stable while fields do not change.</li>
+    <li><b>Write both</b> same fields, <code>Objects.equals</code>, <code>Objects.hash</code>; records do it for you; keys should be immutable.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m7-practice">
+  <h3>Practice — JVM and memory</h3>
+  <ol class="steps">
+    <li><strong>Draw it (easy).</strong> For the <code>Shop</code> example in the stack-vs-heap article, change <code>compute</code> to also take a <code>String</code> and an <code>int[]</code>. Redraw the stack and heap at the deepest point. Done when each primitive, reference, object and array is in the right place.</li>
+    <li><strong>Recursion crash (easy).</strong> Write a recursive method without a base case, catch <code>StackOverflowError</code>, print the depth, then rerun with <code>-Xss512k</code> and <code>-Xss4m</code>. Done when you can explain the three depths you saw.</li>
+    <li><strong>Make an OutOfMemoryError (easy).</strong> Run the heap demo with <code>-Xmx64m -XX:+HeapDumpOnOutOfMemoryError</code> and find the <code>.hprof</code> file. Done when you have the dump file and the error message.</li>
+    <li><strong>Watch the GC (medium).</strong> Run a loop that creates many short-lived objects with <code>-Xlog:gc</code> and with <code>-XX:+UseSerialGC</code>, <code>-XX:+UseParallelGC</code> and <code>-XX:+UseG1GC</code>. Compare the number and length of pauses. Done when you can describe the difference in one paragraph.</li>
+    <li><strong>Plant and find a leak (medium).</strong> Write a service class with a static <code>HashMap</code> cache that grows on every call. Run it under load with <code>-Xmx128m</code>, watch it with <code>jstat -gc</code> or VisualVM, take a dump with <code>jcmd</code>, open it in Eclipse MAT, and find the map. Then fix it with a bounded cache. Done when the post-GC heap stays flat.</li>
+    <li><strong>Weak vs strong (medium).</strong> Reproduce the <code>WeakReference</code>, <code>SoftReference</code> and <code>WeakHashMap</code> demos. Then make the <code>WeakHashMap</code> value strongly refer to its key and observe that the entry never disappears. Done when you can explain why.</li>
+    <li><strong>Class loading experiments (medium).</strong> Print the class loader of <code>String</code>, <code>java.sql.Connection</code> and your own class. Create classes with static blocks and predict the output order for <code>new Child()</code>, for reading a <code>static final int</code> constant, and for <code>Class.forName</code>. Done when all predictions match.</li>
+    <li><strong>Break and fix a HashMap key (medium).</strong> Write the <code>BadPoint</code> class, show that a <code>HashSet</code> contains duplicates, then fix it with <code>equals</code> and <code>hashCode</code>. Add a mutable-key demo and a record version. Done when all four variants print what the article predicts.</li>
+    <li><strong>Contract test (harder).</strong> Write a small test helper <code>assertEqualsContract(a, b, c)</code> that checks reflexive, symmetric, transitive, consistent and null properties plus the hash code rule for three objects. Run it against a correct class, a class with only <code>equals</code>, and a subclass that adds a field with <code>instanceof</code>. Done when it catches both broken cases.</li>
+    <li><strong>Diagnose a crash (harder).</strong> Take any Spring Boot or plain Java app, start it with <code>-Xmx64m</code>, flood it with requests (a loop or a load tool), and write a short diagnosis: the error message, the area (heap, Metaspace, threads), the evidence from a heap dump or <code>jstack</code>, and the fix. Done when your note could be handed to a teammate.</li>
+  </ol>
+</article>

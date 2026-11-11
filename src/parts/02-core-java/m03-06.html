@@ -1,0 +1,460 @@
+<article class="topic" id="m3-java-io">
+  <h3>Classic java.io: streams, readers and writers</h3>
+  <p class="tldr">The old java.io package moves data as streams: byte streams (InputStream/OutputStream) for any data, character streams (Reader/Writer) for text, and small wrapper classes that you stack on top of each other to add buffering and conversion.</p>
+
+  <h4>Why you still need to know it</h4>
+  <p>New code should prefer <code>java.nio.file.Files</code> (see <a href="#m3-files-read-write">reading and writing with Files</a>). But <code>java.io</code> is everywhere: servlet request bodies, socket streams, <code>System.in</code>, <code>ZipInputStream</code>, JDBC <code>Blob</code> and <code>Clob</code>, multipart uploads in Spring (<code>MultipartFile.getInputStream()</code>) and a huge amount of older code. Interviews also like the "byte stream vs character stream" and "decorator" questions. Even the NIO helper <code>Files.newBufferedReader</code> hands you a <code>java.io.BufferedReader</code>.</p>
+  <p>A <strong>stream</strong> is a sequence of data that you read or write one piece after another, without jumping around. You do not hold the whole content in memory; you process it piece by piece. That is why streams work for a 5 GB log file as well as for a 5-byte one.</p>
+
+  <h4>Byte streams vs character streams</h4>
+  <p>A <strong>byte stream</strong> moves raw bytes (values 0 to 255). Use it for anything that is not text: images, PDFs, ZIP files, encrypted data, network packets. The base classes are the abstract <code>InputStream</code> and <code>OutputStream</code>.</p>
+  <p>A <strong>character stream</strong> moves characters. It converts between bytes and characters using a <strong>charset</strong> (a character encoding such as UTF-8). Use it for text files, CSV, JSON and logs. The base classes are the abstract <code>Reader</code> and <code>Writer</code>.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Byte streams</th><th>Character streams</th></tr></thead>
+    <tbody>
+      <tr><td>Base classes</td><td><code>InputStream</code>, <code>OutputStream</code></td><td><code>Reader</code>, <code>Writer</code></td></tr>
+      <tr><td>Unit</td><td><code>byte</code> (<code>read()</code> returns an int 0–255, or -1 at the end)</td><td><code>char</code> (<code>read()</code> returns an int, or -1 at the end)</td></tr>
+      <tr><td>File classes</td><td><code>FileInputStream</code>, <code>FileOutputStream</code></td><td><code>FileReader</code>, <code>FileWriter</code></td></tr>
+      <tr><td>Buffered wrapper</td><td><code>BufferedInputStream</code>, <code>BufferedOutputStream</code></td><td><code>BufferedReader</code>, <code>BufferedWriter</code></td></tr>
+      <tr><td>Use for</td><td>Binary data, copying any file</td><td>Text, line-by-line processing</td></tr>
+      <tr><td>Encoding</td><td>None; you get bytes</td><td>Needs a charset</td></tr>
+    </tbody>
+  </table></div>
+  <p>The <strong>bridge classes</strong> connect the two worlds: <code>InputStreamReader</code> wraps an <code>InputStream</code> and decodes bytes into characters with a charset you give; <code>OutputStreamWriter</code> does the reverse. This is how you read text from a socket or from <code>System.in</code>.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  F[(File on disk)] -->|bytes| FIS[FileInputStream]
+  FIS -->|bytes| ISR["InputStreamReader (UTF-8)"]
+  ISR -->|chars| BR[BufferedReader]
+  BR -->|lines| P[Your code]
+</pre>
+<figcaption>Each wrapper adds one job: read bytes, decode characters, buffer and give lines</figcaption>
+  </figure>
+
+  <h4>Copying a file with byte streams</h4>
+  <p>Reading one byte at a time is slow because every call may go to the operating system. Read into a byte array (a <strong>buffer</strong>) instead. <code>read(byte[])</code> returns how many bytes it actually filled, or -1 at the end of the stream; always use that count when you write.</p>
+  <pre data-title="CopyBytes.java"><code class="language-java">import java.io.*;
+
+public class CopyBytes {
+    public static void main(String[] args) throws IOException {
+        try (InputStream in = new FileInputStream("photo.jpg");
+             OutputStream out = new FileOutputStream("photo-copy.jpg")) {
+
+            byte[] buffer = new byte[8192];     // 8 KB at a time
+            int count;
+            long total = 0;
+            while ((count = in.read(buffer)) != -1) {
+                out.write(buffer, 0, count);    // write only 'count' bytes
+                total += count;
+            }
+            System.out.println("Copied " + total + " bytes");
+        }   // both streams closed here, out first, then in
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Copied 248113 bytes</code></pre>
+  <p>Since Java 9 you can also write <code>in.transferTo(out)</code>, which does the loop for you. And <code>Files.copy(Path, Path)</code> is simpler still. The loop above is what they do inside.</p>
+
+  <h4>Reading and writing text</h4>
+  <p><code>FileReader</code> and <code>FileWriter</code> read and write characters. Wrap them in <code>BufferedReader</code> and <code>BufferedWriter</code>: the buffer cuts the number of disk calls, and <code>BufferedReader</code> adds <code>readLine()</code>, which returns one line without the line break, or <code>null</code> at the end.</p>
+  <pre data-title="TextIo.java"><code class="language-java">import java.io.*;
+import java.nio.charset.StandardCharsets;
+
+public class TextIo {
+    public static void main(String[] args) throws IOException {
+        // Write three lines (UTF-8 chosen explicitly)
+        try (BufferedWriter w = new BufferedWriter(
+                new OutputStreamWriter(new FileOutputStream("orders.txt"),
+                                       StandardCharsets.UTF_8))) {
+            w.write("1001,Asha,499.50");
+            w.newLine();                    // correct line separator for this OS
+            w.write("1002,Ravi,1200.00");
+            w.newLine();
+            w.write("1003,Meera,89.99");
+        }
+
+        // Read them back
+        try (BufferedReader r = new BufferedReader(
+                new InputStreamReader(new FileInputStream("orders.txt"),
+                                      StandardCharsets.UTF_8))) {
+            String line;
+            int n = 0;
+            while ((line = r.readLine()) != null) {
+                n++;
+                System.out.println(n + ": " + line);
+            }
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">1: 1001,Asha,499.50
+2: 1002,Ravi,1200.00
+3: 1003,Meera,89.99</code></pre>
+  <p>In newer code you can shorten the setup: <code>new FileReader("orders.txt", StandardCharsets.UTF_8)</code> (constructor with charset since Java 11) or <code>Files.newBufferedReader(path)</code>, which defaults to UTF-8.</p>
+
+  <div class="co co-version">
+    <p class="co-t">Default charset changed in Java 18</p>
+    <p>Before Java 18, <code>new FileReader("x.txt")</code> used the operating system's default charset (often Windows-1252 on Windows, UTF-8 on Linux), so the same program could read the same file differently on two machines. Since Java 18 the default is UTF-8 almost everywhere (JEP 400). Even so, name the charset in your code. It costs one argument and removes a whole class of bugs.</p>
+  </div>
+
+  <h4>The decorator idea</h4>
+  <p>Notice how the example builds objects by wrapping: <code>new BufferedReader(new InputStreamReader(new FileInputStream(...)))</code>. This is the <strong>decorator pattern</strong>: each class implements the same interface (<code>Reader</code>) and holds another object of that interface. It forwards the calls and adds behaviour. You choose the features you need and stack them, instead of having one giant class like <code>BufferedCompressedEncryptedFileReader</code>. More about the pattern in <a href="08-system-design.html#m2">System Design · Module 2</a>.</p>
+  <figure class="fig">
+<pre class="diagram">
+ your code
+    │ readLine()
+┌───▼────────────────┐   adds: buffering + readLine()
+│ BufferedReader     │
+└───┬────────────────┘
+    │ read(char[])
+┌───▼────────────────┐   adds: bytes → chars (charset)
+│ InputStreamReader  │
+└───┬────────────────┘
+    │ read(byte[])
+┌───▼────────────────┐   knows: how to read a file
+│ FileInputStream    │
+└───┬────────────────┘
+    ▼
+  file.txt
+</pre>
+<figcaption>Decorators: every layer has the same interface and adds one feature</figcaption>
+  </figure>
+  <p>The decorators you will meet most: <code>BufferedInputStream/OutputStream</code> (buffering), <code>DataInputStream/DataOutputStream</code> (read and write primitives like <code>int</code> and <code>double</code> in binary form), <code>ObjectOutputStream</code> (see <a href="#m3-serialization">serialization</a>), <code>GZIPOutputStream</code> (compression), <code>PrintWriter</code> and <code>PrintStream</code> (<code>println</code>, <code>printf</code>; <code>System.out</code> is a <code>PrintStream</code>).</p>
+  <p>When you close the outermost wrapper, <code>close()</code> passes down and closes the inner ones too. With try-with-resources, declaring only the outermost object is enough, but declaring each one is the safer habit (if a middle constructor throws, the earlier resource is still closed).</p>
+
+  <h4>File vs Path</h4>
+  <p><code>java.io.File</code> is the old way to represent a file or directory path. <code>java.nio.file.Path</code> (Java 7) is the modern one. A <code>File</code> is just a path name in an object, even if nothing exists on disk.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>File</code> (java.io)</th><th><code>Path</code> (java.nio.file)</th></tr></thead>
+    <tbody>
+      <tr><td>Introduced</td><td>Java 1.0</td><td>Java 7</td></tr>
+      <tr><td>Operations</td><td>Methods on the object: <code>exists()</code>, <code>delete()</code>, <code>mkdir()</code></td><td>Static helpers in <code>Files</code>; <code>Path</code> only describes the location</td></tr>
+      <tr><td>Failure reporting</td><td>Returns <code>false</code> with no reason (for example <code>delete()</code>)</td><td>Throws a specific <code>IOException</code> subclass</td></tr>
+      <tr><td>Symbolic links, attributes, permissions</td><td>Weak support</td><td>Full support</td></tr>
+      <tr><td>Walking trees, watching folders</td><td>Awkward (<code>listFiles()</code>)</td><td><code>Files.walk</code>, <code>WatchService</code></td></tr>
+      <tr><td>Conversion</td><td><code>file.toPath()</code></td><td><code>path.toFile()</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Use <code>Path</code> in new code. Convert with <code>toPath()</code> / <code>toFile()</code> at the border where a library still wants a <code>File</code>.</p>
+
+  <h4>System.in and Scanner</h4>
+  <p><code>System.in</code> is an <code>InputStream</code> for the keyboard. <code>Scanner</code> parses tokens from it (<code>nextInt()</code>, <code>nextLine()</code>); it is fine for small programs and coding-practice sites. For fast input in DSA problems people use <code>new BufferedReader(new InputStreamReader(System.in))</code> because it is much faster than <code>Scanner</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Always close streams: use try-with-resources. A leaked stream keeps a file handle open (on Windows it can lock the file).</li>
+      <li>Use byte streams for binary data and character streams for text. Never read a PDF or an image through a <code>Reader</code>; the decoding corrupts it.</li>
+      <li>When reading into a buffer, use the count returned by <code>read</code>. The buffer is often only partly filled.</li>
+      <li>Do not mix <code>Scanner</code> and <code>BufferedReader</code> on the same <code>System.in</code>; each buffers input and will "steal" data from the other.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Wrap with a buffer whenever you read or write many small pieces.</li>
+      <li>Name the charset explicitly (<code>StandardCharsets.UTF_8</code>).</li>
+      <li>Prefer <code>Files</code> methods for whole-file or line-by-line work; use streams directly when the data comes from a network, a request body, a ZIP or a database.</li>
+      <li>Use <code>transferTo</code> or <code>Files.copy</code> instead of writing your own copy loop.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>FileNotFoundException</code> — the <code>FileInputStream</code> / <code>FileReader</code> constructor cannot open the file: it does not exist, is a directory or you have no permission. <code>FileOutputStream</code> creates the file if it does not exist, but fails when the folder is missing.</li>
+      <li><code>new FileOutputStream("a.txt")</code> and <code>new FileWriter("a.txt")</code> <strong>truncate</strong> the file. Pass <code>true</code> as the second argument to append.</li>
+      <li><code>IOException</code> from <code>close()</code> in try-with-resources is added to the suppressed list if the body already threw.</li>
+      <li><code>BufferedWriter</code> keeps data in memory. If the program ends without <code>close()</code> or <code>flush()</code>, the last part is lost.</li>
+      <li><code>read()</code> on a closed stream throws <code>IOException</code> ("Stream closed").</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: reading text with a stream and a cast</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: breaks non-ASCII text</p><pre><code class="language-java">int b;
+while ((b = in.read()) != -1) {
+    sb.append((char) b);   // each byte treated as a char
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: decode with a charset</p><pre><code class="language-java">try (var r = new BufferedReader(
+        new InputStreamReader(in, StandardCharsets.UTF_8))) {
+    r.lines().forEach(sb::append);
+}</code></pre></div>
+    </div>
+    <p>In UTF-8, a character like "₹" takes three bytes. Casting each byte to a <code>char</code> gives three wrong characters.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Byte stream vs character stream", "Why BufferedReader?", "File vs Path"</p>
+    <ul>
+      <li>Byte streams move raw bytes; character streams decode bytes to chars with a charset.</li>
+      <li>Buffering reduces expensive system calls and adds <code>readLine()</code>.</li>
+      <li>Decorator pattern: wrappers share an interface and add behaviour; closing the outer one closes the inner.</li>
+      <li><code>Path</code>/<code>Files</code> is the modern API with better errors and attributes.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-serialization">
+  <h3>Serialization: Serializable, transient and serialVersionUID</h3>
+  <p class="tldr">Java serialization turns an object graph into a byte stream and back using ObjectOutputStream and ObjectInputStream; it is fragile and has serious security risks, so use JSON for new work and treat serialization as legacy knowledge you must still understand.</p>
+
+  <h4>What it is</h4>
+  <p><strong>Serialization</strong> converts an object (and everything it references) into a sequence of bytes that you can store in a file, send over a network or keep in a cache. <strong>Deserialization</strong> does the reverse and rebuilds an equivalent object. Java has built-in support: a class opts in by implementing the marker interface <code>java.io.Serializable</code>. A <strong>marker interface</strong> has no methods; it just tells the JVM "this class may be serialized".</p>
+  <pre data-title="Customer.java"><code class="language-java">import java.io.Serializable;
+
+public class Customer implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final String name;
+    private final String email;
+    private transient String sessionToken;   // not saved
+    private static int totalCustomers;       // belongs to the class, not saved
+
+    public Customer(String name, String email, String sessionToken) {
+        this.name = name;
+        this.email = email;
+        this.sessionToken = sessionToken;
+        totalCustomers++;
+    }
+
+    @Override public String toString() {
+        return "Customer[" + name + ", " + email + ", token=" + sessionToken + "]";
+    }
+}</code></pre>
+  <pre data-title="SerializeDemo.java"><code class="language-java">import java.io.*;
+
+public class SerializeDemo {
+    public static void main(String[] args) throws Exception {
+        Customer c = new Customer("Asha", "asha@mail.in", "abc123");
+
+        try (ObjectOutputStream out = new ObjectOutputStream(
+                new FileOutputStream("customer.bin"))) {
+            out.writeObject(c);                       // serialize
+        }
+
+        try (ObjectInputStream in = new ObjectInputStream(
+                new FileInputStream("customer.bin"))) {
+            Customer copy = (Customer) in.readObject();   // deserialize
+            System.out.println(copy);
+            System.out.println(copy == c);                // a new object
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Customer[Asha, asha@mail.in, token=null]
+false</code></pre>
+  <p>The token came back as <code>null</code>, because it is <code>transient</code>. The copy is a different object with the same data. Note that deserialization creates the object <strong>without calling the constructor</strong> of the serializable class.</p>
+
+  <h4>Rules that decide what is saved</h4>
+  <ul>
+    <li><strong>Every field must be serializable</strong> (a primitive, a <code>String</code>, or an object whose class is <code>Serializable</code>), or be marked <code>transient</code>. Otherwise <code>writeObject</code> throws <code>NotSerializableException</code>. Collections like <code>ArrayList</code> and <code>HashMap</code> are serializable, but only if their contents are.</li>
+    <li><code>transient</code> fields are skipped. After deserialization they hold the default value (<code>null</code>, 0, <code>false</code>). Use it for passwords, tokens, caches, threads and anything derived or sensitive.</li>
+    <li><code>static</code> fields are not part of an object's state and are not serialized.</li>
+    <li>The whole <strong>object graph</strong> is saved: if <code>Order</code> refers to <code>Customer</code>, both are written. Shared references stay shared, and cycles are handled.</li>
+    <li>If a parent class is <em>not</em> serializable, its fields are not saved, and on deserialization the parent's <strong>no-argument constructor</strong> runs to initialise them. If the parent has none, you get an <code>InvalidClassException</code>.</li>
+    <li>Subclasses of a serializable class are serializable automatically.</li>
+  </ul>
+
+  <h4>serialVersionUID</h4>
+  <p>Every serializable class has a version number, <code>serialVersionUID</code>, a <code>long</code>. It is written into the byte stream. When you deserialize, Java compares the number in the stream with the number of the class currently loaded. If they differ, it throws <code>InvalidClassException</code> ("local class incompatible"). This protects you from loading old data into a class whose shape has changed.</p>
+  <p>If you do not declare the field, the compiler computes one from the class details (name, fields, methods). Then <em>any</em> small change, even adding a method, gives a new number and breaks old data. So you declare it yourself:</p>
+  <pre data-title="Declaring the version"><code class="language-java">private static final long serialVersionUID = 1L;</code></pre>
+  <p>Rules of thumb: keep the same number when your change is compatible (adding a field is compatible: the old data gives the new field its default value); change the number when the change is incompatible (removing a field, changing a field's type, changing the class hierarchy) and you want old data to be rejected. IDEs can generate the field for you.</p>
+
+  <h4>Customising: readObject, writeObject, Externalizable</h4>
+  <p>A class can define private methods <code>writeObject(ObjectOutputStream)</code> and <code>readObject(ObjectInputStream)</code> to add steps, for example to encrypt a field or to rebuild a transient cache after loading. Call <code>defaultWriteObject()</code> / <code>defaultReadObject()</code> inside to handle the normal fields. <code>Externalizable</code> goes further: you write all the state yourself and need a public no-argument constructor. In practice you will almost never write these.</p>
+  <pre data-title="Rebuilding a transient field"><code class="language-java">private void readObject(ObjectInputStream in)
+        throws IOException, ClassNotFoundException {
+    in.defaultReadObject();        // restore normal fields
+    this.sessionToken = null;      // or recompute a cache here
+    if (email == null) {           // validate: the stream may be hostile
+        throw new InvalidObjectException("email is required");
+    }
+}</code></pre>
+
+  <div class="co co-note">
+    <p class="co-t">Records and enums</p>
+    <p>Enums serialize by name, so the constants stay singletons. A record can implement <code>Serializable</code>; on deserialization Java calls the record's canonical constructor, so the validation in your constructor runs again. That makes records a safer choice than ordinary classes if you must serialize.</p>
+  </div>
+
+  <h4>Why JSON is preferred today</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Java serialization</th><th>JSON (Jackson)</th></tr></thead>
+    <tbody>
+      <tr><td>Readable</td><td>No, binary</td><td>Yes, plain text</td></tr>
+      <tr><td>Other languages</td><td>Java only</td><td>Every language and browser</td></tr>
+      <tr><td>Versioning</td><td>Fragile: <code>serialVersionUID</code>, class shape</td><td>Tolerant: ignore unknown fields, optional fields</td></tr>
+      <tr><td>Security</td><td>Serious risk with untrusted data</td><td>Much smaller risk (still validate input)</td></tr>
+      <tr><td>Constructor and validation</td><td>Constructor skipped</td><td>Normal constructors or builders</td></tr>
+      <tr><td>Size and speed</td><td>Larger, slower than good binary formats</td><td>Text overhead; binary options exist (Protobuf, Avro)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Spring Boot uses Jackson for REST bodies; it turns objects into JSON with <code>ObjectMapper.writeValueAsString(obj)</code> and back with <code>readValue(json, Customer.class)</code>. For a bank-style "save to a file" task you would also use JSON or CSV. Java serialization still shows up in legacy code, in <code>HttpSession</code> replication between servers, and in some caches (Redis with <code>JdkSerializationRedisSerializer</code>, which is why many teams switch Redis to a JSON serializer).</p>
+
+  <h4>The security risk</h4>
+  <p>Deserialization <strong>runs code</strong> chosen by whoever produced the bytes. When your program calls <code>readObject()</code> on data from an untrusted source, an attacker can craft a stream that makes Java build objects from classes already on your classpath (a "gadget chain"), so that a harmless-looking <code>readObject</code> or <code>hashCode</code> call ends up running a system command. This has caused many real remote-code-execution vulnerabilities in widely used Java libraries and servers. The danger exists even if the class you cast to is safe, because the objects are created <em>before</em> the cast.</p>
+  <div class="co co-rule">
+    <p class="co-t">Rule: never deserialize untrusted data with ObjectInputStream</p>
+    <p>If you must read Java-serialized data, restrict it with a serialization filter (<code>ObjectInputFilter</code>, Java 9+; for example set with <code>ObjectInputStream.setObjectInputFilter</code> or the JVM-wide <code>jdk.serialFilter</code> property) that allows only the classes you expect. Better: do not accept Java serialization at all.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>NotSerializableException</code> — a field (or an element inside a collection) is not <code>Serializable</code>. The message names the class.</li>
+      <li><code>InvalidClassException</code> — <code>serialVersionUID</code> mismatch, or a non-serializable parent without a no-arg constructor.</li>
+      <li><code>ClassNotFoundException</code> — the class is not on the classpath of the reader; it is a checked exception of <code>readObject</code>.</li>
+      <li><code>StreamCorruptedException</code> — the file is not a serialization stream, or is damaged.</li>
+      <li>Singletons break: deserializing creates a second instance unless you add <code>readResolve()</code> (or use an enum).</li>
+      <li>Writing the same object twice to one stream writes a back-reference the second time, so changes made between two <code>writeObject</code> calls are not saved (use <code>reset()</code>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: forgetting that the parent class matters</p>
+    <p>You make <code>Manager implements Serializable</code> but its parent <code>Employee</code> does not. The <code>Employee</code> fields (name, salary) silently come back as defaults, because they were never written. Make the parent serializable too.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is serialVersionUID?", "What does transient do?", "Why is serialization risky?"</p>
+    <ul>
+      <li>Serializable is a marker interface; the object graph is written; the constructor is not called.</li>
+      <li><code>transient</code> and <code>static</code> fields are skipped.</li>
+      <li><code>serialVersionUID</code> is a version check; mismatch gives <code>InvalidClassException</code>; declare it yourself.</li>
+      <li>Risks: gadget chains and remote code execution on untrusted input; use filters or, better, JSON.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-properties">
+  <h3>Properties files and the Properties class</h3>
+  <p class="tldr">A .properties file stores simple key=value settings; java.util.Properties loads it into a map-like object so your program can read configuration without hard-coding it.</p>
+
+  <h4>What and why</h4>
+  <p>Settings such as the database URL, a timeout or a feature flag should not live inside your code. A <strong>properties file</strong> is the simplest configuration format in Java: one <code>key=value</code> pair per line. You change the file, not the code, and no recompile is needed. Spring Boot's <code>application.properties</code> is exactly this format (see <a href="04-spring-boot.html#m1">Spring Boot · Module 1</a>), and resource bundles for translations (<code>messages_hi.properties</code>) use it too.</p>
+  <pre data-title="app.properties"><code class="language-properties"># Database settings
+db.url=jdbc:postgresql://localhost:5432/shop
+db.user=shop_app
+# Values may contain spaces; leading spaces are removed
+app.name = Order Service
+app.retries=3
+# Line continuation with a backslash
+app.welcome=Welcome to \
+            the shop
+feature.newCheckout=true</code></pre>
+
+  <h4>File format rules</h4>
+  <ul>
+    <li>Lines starting with <code>#</code> or <code>!</code> are comments.</li>
+    <li>The key ends at the first <code>=</code>, <code>:</code> or whitespace. Spaces around the separator are ignored.</li>
+    <li>A trailing <code>\</code> continues the value on the next line.</li>
+    <li>Everything is a <strong>string</strong>. <code>app.retries=3</code> gives you the text "3"; you convert it with <code>Integer.parseInt</code>.</li>
+    <li>Special characters (<code>\n</code>, <code>\t</code>, <code>\\</code>) use backslash escapes; non-ASCII characters can be written as <code>₹</code>. If you read the file with a UTF-8 <code>Reader</code>, you can type them directly.</li>
+    <li>Quotes are not special: <code>name="Asha"</code> stores the quote characters.</li>
+  </ul>
+
+  <h4>The Properties class</h4>
+  <p><code>Properties</code> extends <code>Hashtable&lt;Object,Object&gt;</code> (an old design choice), but you should only use its String methods.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>load(Reader)</code> / <code>load(InputStream)</code></td><td>Read the pairs from a file or stream. Prefer <code>Reader</code> with UTF-8</td></tr>
+      <tr><td><code>getProperty(key)</code></td><td>Value, or <code>null</code> if the key is missing</td></tr>
+      <tr><td><code>getProperty(key, default)</code></td><td>Value, or the default if the key is missing</td></tr>
+      <tr><td><code>setProperty(key, value)</code></td><td>Add or change a pair in memory</td></tr>
+      <tr><td><code>stringPropertyNames()</code></td><td>All keys as a <code>Set&lt;String&gt;</code></td></tr>
+      <tr><td><code>store(Writer, comments)</code></td><td>Write the pairs to a file, with a header comment</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="ConfigDemo.java"><code class="language-java">import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.Properties;
+
+public class ConfigDemo {
+    public static void main(String[] args) throws IOException {
+        Properties props = new Properties();
+
+        try (Reader reader = Files.newBufferedReader(
+                Path.of("app.properties"), StandardCharsets.UTF_8)) {
+            props.load(reader);
+        }
+
+        String url = props.getProperty("db.url");
+        int retries = Integer.parseInt(props.getProperty("app.retries", "1"));
+        boolean newCheckout =
+                Boolean.parseBoolean(props.getProperty("feature.newCheckout"));
+        String timeout = props.getProperty("db.timeout", "30");   // missing: default
+
+        System.out.println("url        = " + url);
+        System.out.println("retries    = " + retries);
+        System.out.println("checkout   = " + newCheckout);
+        System.out.println("timeout    = " + timeout);
+        System.out.println("welcome    = " + props.getProperty("app.welcome"));
+
+        // Change and save
+        props.setProperty("app.retries", "5");
+        try (Writer writer = Files.newBufferedWriter(
+                Path.of("app-new.properties"), StandardCharsets.UTF_8)) {
+            props.store(writer, "Updated settings");
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">url        = jdbc:postgresql://localhost:5432/shop
+retries    = 3
+checkout   = true
+timeout    = 30
+welcome    = Welcome to the shop</code></pre>
+  <p>The saved file starts with the comment line, then a timestamp comment, then the pairs. The order of the pairs is not guaranteed because the class is hash-based.</p>
+
+  <h4>Reading from the classpath</h4>
+  <p>A file in <code>src/main/resources</code> is packaged inside the JAR, so you cannot open it with a file path in production. Load it from the classpath instead:</p>
+  <pre data-title="Loading a bundled file"><code class="language-java">try (InputStream in = ConfigDemo.class.getResourceAsStream("/app.properties")) {
+    if (in == null) {
+        throw new IllegalStateException("app.properties not found on classpath");
+    }
+    props.load(new InputStreamReader(in, StandardCharsets.UTF_8));
+}</code></pre>
+  <p>The leading <code>/</code> means "from the root of the classpath". <code>getResourceAsStream</code> returns <code>null</code> (not an exception) when the resource is missing, so check it.</p>
+
+  <h4>Layering: defaults, files and environment</h4>
+  <p>Real applications combine several sources: defaults in code, a file in the JAR, an override file on the server, and environment variables or system properties (<code>-Dapp.retries=5</code>, read with <code>System.getProperty</code>; environment variables with <code>System.getenv</code>). <code>new Properties(defaults)</code> accepts another <code>Properties</code> object as fallback. Spring Boot does this layering for you with a clear order of precedence, and <code>@Value</code> or <code>@ConfigurationProperties</code> bind the values to typed fields.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Never commit secrets (passwords, API keys) in a properties file in Git. Read them from environment variables or a secrets manager.</li>
+      <li>Convert strings to the right type yourself, and fail with a clear message when a required key is missing.</li>
+      <li>Use <code>getProperty</code>, not <code>get</code>: <code>get</code> comes from <code>Hashtable</code> and returns an <code>Object</code>, and it does not use the defaults.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>NumberFormatException</code> — the value is not a number (<code>app.retries=three</code>).</li>
+      <li><code>NullPointerException</code> — you call <code>Integer.parseInt(props.getProperty("missing"))</code>; use a default or check for <code>null</code>.</li>
+      <li><code>IllegalArgumentException</code> — <code>load</code> finds a malformed <code>\uXXXX</code> escape.</li>
+      <li><code>load(InputStream)</code> assumes ISO-8859-1. That garbles UTF-8 text; use the <code>Reader</code> version.</li>
+      <li>A key written twice: the last value wins, with no warning.</li>
+      <li>Trailing spaces at the end of a value are kept, a classic cause of "true " not parsing as expected with some libraries.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>You will rarely call <code>Properties.load</code> yourself in a Spring Boot app. You write <code>application.properties</code> (or YAML) and let the framework read it. You will meet <code>Properties</code> directly in plain-Java tools, JDBC driver settings (<code>DriverManager.getConnection(url, props)</code>), Kafka client configuration and test utilities.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you externalise configuration in Java?"</p>
+    <ul>
+      <li>Key=value file loaded with <code>Properties.load</code>; all values are strings.</li>
+      <li>Classpath resources via <code>getResourceAsStream</code>; overrides through system properties and environment variables.</li>
+      <li>In Spring Boot: <code>application.properties</code>/YAML, profiles, <code>@Value</code> and <code>@ConfigurationProperties</code>.</li>
+      <li>Keep secrets out of Git.</li>
+    </ul>
+  </div>
+</article>

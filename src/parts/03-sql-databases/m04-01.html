@@ -1,0 +1,386 @@
+<div class="mintro">
+  <p>Database design is the work you do before you write <code>CREATE TABLE</code>: deciding which tables
+  exist, which columns they have, how they connect and which rules the database must enforce. It matters
+  more than any query trick. A slow query can be rewritten in an afternoon, but a wrong table layout leaks
+  into every query, every JPA entity, every API response and every row already stored, and it gets more
+  expensive to fix each month.</p>
+  <p>This module teaches design as a process: collect requirements, find the entities, draw an ER diagram,
+  turn relationships into foreign keys and join tables, choose keys, normalize to remove redundancy, and pick
+  sensible names and data types. It ends with a complete worked design of a food-delivery app (users,
+  restaurants, menu items, orders, order items, payments) with DDL and the queries it must support. It builds
+  on the tables and constraints from <a href="#m1">Module 1</a> and prepares the ground for indexes and
+  transactions in <a href="#m5">Module 5</a>. The tables you design here become JPA entities in
+  <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>. PostgreSQL syntax is the default; MySQL
+  differences are noted where they matter.</p>
+  <ul>
+    <li>Turn a written requirement into entities, attributes and relationships, and draw them as an ER diagram.</li>
+    <li>Implement one-to-one, one-to-many and many-to-many relationships in SQL, including join tables.</li>
+    <li>Explain every kind of key and choose between surrogate and natural keys, and between BIGINT and UUID.</li>
+    <li>Spot update, insert and delete anomalies, normalize a table step by step to 3NF and BCNF, and decide
+    when to denormalize on purpose.</li>
+    <li>Apply practical patterns: audit columns, soft delete, status columns, money, UTC timestamps, JSONB,
+    trees and multi-tenancy.</li>
+    <li>Name tables and constraints consistently, pick the right data type for each column, and design a
+    complete schema for a real app.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m4-design-process">
+  <h3>The database design process: from requirements to tables</h3>
+  <p class="tldr">Good design is a repeatable process: write down the requirements, find the entities, give
+  them attributes, connect them with relationships, choose keys, normalize, add constraints and indexes, and
+  finally check that your important queries are easy to write.</p>
+
+  <h4>Why design before you create tables</h4>
+  <p>Adding a column later takes a minute. Undoing a wrong <em>shape</em> takes months. Suppose the first
+  version stores an order as one row with a text column <code>items</code> holding
+  <code>'biryani,coke'</code>. Every report, every discount rule and every "how many biryanis did we sell"
+  question now needs string parsing, and a year of data has to be converted by a migration that someone
+  must write carefully. A short design session at the start removes this whole class of pain.</p>
+  <p>Design happens at three levels. The <strong>conceptual</strong> level is the ER diagram: entities and
+  relationships, no data types. The <strong>logical</strong> level is the set of tables, columns, keys and
+  normal forms, still independent of one product. The <strong>physical</strong> level adds data types,
+  indexes, partitioning and engine-specific choices. This module walks through all three in order.</p>
+
+  <h4>The eight steps</h4>
+  <ol class="steps">
+    <li><b>Requirements.</b> Find out what the system must remember and which questions it must answer. Write
+    them as plain sentences.</li>
+    <li><b>Entities.</b> The nouns: the things you keep data about (customer, order, restaurant).</li>
+    <li><b>Attributes.</b> The facts about each entity (name, email, price).</li>
+    <li><b>Relationships.</b> The verbs between entities, with <strong>cardinality</strong> (how many on each
+    side) and <strong>optionality</strong> (is the link compulsory?).</li>
+    <li><b>Keys.</b> Choose a primary key for every table, mark the natural unique identifiers, and place the
+    foreign keys.</li>
+    <li><b>Normalize.</b> Remove redundancy with the normal forms so each fact is stored once
+    (<a href="#m4-fd-anomalies">later in this module</a>).</li>
+    <li><b>Constraints and indexes.</b> Add <code>NOT NULL</code>, <code>UNIQUE</code>, <code>CHECK</code> and
+    foreign keys so bad data cannot get in, then indexes for foreign keys and the main queries.</li>
+    <li><b>Review the queries.</b> Write the ten most important queries. If one needs an awkward chain of
+    joins, or the design cannot answer it, go back and fix the model.</li>
+  </ol>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A["1 Requirements"] --> B["2 Entities"]
+  B --> C["3 Attributes"]
+  C --> D["4 Relationships"]
+  D --> E["5 Keys"]
+  E --> F["6 Normalize"]
+  F --> G["7 Constraints, indexes"]
+  G --> H["8 Review queries"]
+  H -.->|"gaps found"| B
+</pre>
+  <figcaption>Design is a loop: the last step often sends you back to the second</figcaption>
+  </figure>
+
+  <h4>A small example: a library</h4>
+  <p>Start from the requirements, written the way a client would say them:</p>
+<pre data-title="Requirements"><code class="language-plaintext">1. The library has members. Each member has a name, an email and a join date.
+2. The library has books. Each book has a title, an ISBN and one or more authors.
+3. The library owns several physical copies of a book. Each copy has a shelf code.
+4. A member can borrow a copy. We must remember the borrow, due and return dates.
+5. A member may hold at most 5 books at a time.
+6. We must list overdue loans and every book a member has ever borrowed.</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Step</th><th>Result for the library</th></tr></thead>
+    <tbody>
+      <tr><td>Entities</td><td><code>member</code>, <code>book</code>, <code>author</code>, <code>copy</code>,
+      <code>loan</code></td></tr>
+      <tr><td>Attributes</td><td>member (name, email, joined_on); book (title, isbn); copy (shelf_code);
+      loan (borrowed_on, due_on, returned_on)</td></tr>
+      <tr><td>Relationships</td><td>book 1 : N copy; member 1 : N loan; copy 1 : N loan; book M : N author</td></tr>
+      <tr><td>Keys</td><td>a surrogate <code>id</code> on each table; <code>UNIQUE</code> on
+      <code>member.email</code> and <code>book.isbn</code>; <code>book_authors</code> joins books and authors</td></tr>
+      <tr><td>Normalize</td><td>Authors get their own table, not a comma list inside <code>book</code></td></tr>
+      <tr><td>Constraints</td><td><code>CHECK (due_on &gt;= borrowed_on)</code>; foreign keys <code>NOT NULL</code>;
+      indexes on every foreign key</td></tr>
+      <tr><td>Review queries</td><td>Overdue loans: <code>loan</code> where <code>returned_on IS NULL</code> and
+      <code>due_on</code> is in the past. Member history: <code>loan</code> join <code>copy</code> join
+      <code>book</code>. Both are simple.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Finding entities, attributes and relationships</h4>
+  <p><strong>Nouns become entities or attributes.</strong> To decide which, ask: does this thing have facts of
+  its own, or can many other things share it? If yes, it is an entity with its own table. "Author" has a name,
+  a country and many books, so it is an entity. "Email" is just a fact about a member, so it is a column. The
+  tricky case is the address. If a user has exactly one address and you never treat it separately, columns on
+  <code>users</code> are fine. If a user can have several addresses, or an order must remember the address it
+  was sent to, make <code>addresses</code> a table.</p>
+  <p><strong>Verbs become relationships.</strong> Ask the cardinality question in both directions. "Can one
+  member borrow many copies? Can one copy be borrowed by many members?" Over time both answers are yes, which
+  is many-to-many. A relationship that carries its own data (borrow date, due date) becomes a table of its own:
+  that is the <code>loan</code> entity. Ask the optionality question too: must every copy belong to a book?
+  Yes. Must every member have a loan? No.</p>
+  <p><strong>Rules become constraints or code.</strong> "Due date is not before borrow date" is a
+  <code>CHECK</code>. "A member may hold at most 5 books" cannot be written as a simple constraint, because it
+  depends on other rows; it lives in the service layer (often with a lock, see
+  <a href="#m5-locking">Locking</a>) or in a trigger.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: design on paper, review in a pull request</p>
+    <p>Draw the ER diagram first (a whiteboard photo or a Mermaid block in the repository README) and let a
+    teammate review it before anyone writes a migration. It is far cheaper to move a box on a diagram than to
+    move a column in production.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: designing from the screen or from the Java classes</p>
+    <p>A screen shows a mix of facts from several entities, and a class often mirrors one JSON response. If the
+    tables copy them, you get repeated columns and duplicated data.</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: a fixed number of repeated columns</p><pre><code class="language-sql">CREATE TABLE students (
+    id       BIGINT PRIMARY KEY,
+    name     TEXT,
+    course1  TEXT,
+    course2  TEXT,
+    course3  TEXT   -- what about the fourth course?
+);</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: one row per fact in a link table</p><pre><code class="language-sql">CREATE TABLE enrollments (
+    student_id BIGINT REFERENCES students (id),
+    course_id  BIGINT REFERENCES courses (id),
+    PRIMARY KEY (student_id, course_id)
+);</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: write the queries before the DDL</p>
+    <p>List the five to ten most important questions in plain words ("all orders of a customer, newest first",
+    "revenue per restaurant per day"). A good design answers each with a simple join and an index. If a question
+    needs five joins or string parsing, the model is wrong, and finding that out on paper costs nothing.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge case: when to bend the process</p>
+    <p>A throw-away prototype can start with fewer tables, but never without primary keys. Reporting and
+    analytics databases are often shaped differently on purpose (wide, denormalized tables), see
+    <a href="#m4-denormalization">Denormalization</a>. And not every rule belongs in the database: validation
+    that needs an external service, such as checking a GSTIN against a government API, stays in the
+    application.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Design the database for a food-delivery / hotel-booking / library app" is a very common round. A strong
+    answer follows the steps out loud: clarify the requirements, list entities, state each relationship with
+    its cardinality, draw the ER diagram, choose keys, normalize to 3NF, add constraints, mention indexes for
+    the key queries, and name one trade-off (for example a deliberate denormalization such as storing the
+    price on the order line).</p>
+  </div>
+</article>
+
+<article class="topic" id="m4-er-modeling">
+  <h3>ER diagrams: entities, attributes and relationships</h3>
+  <p class="tldr">An ER (entity-relationship) diagram is a picture of the things you store (entities), the facts
+  about them (attributes) and how they connect (relationships), including how many on each side
+  (cardinality) and whether the link is compulsory (optionality).</p>
+
+  <h4>The three building blocks</h4>
+  <dl class="terms">
+    <dt>Entity</dt><dd>A thing you store data about that can be told apart from other things: a customer, an
+    order, a restaurant. An entity type becomes a <em>table</em>; each single customer is a <em>row</em>.
+    Textbooks call the table an "entity set" and the row an "entity".</dd>
+    <dt>Attribute</dt><dd>A fact about an entity: name, email, price. It becomes a <em>column</em>.</dd>
+    <dt>Relationship</dt><dd>An association between entities: a customer <em>places</em> orders; an order
+    <em>contains</em> menu items. It becomes a foreign key or a join table. A relationship can have
+    attributes too, such as <code>quantity</code> on the link between an order and a menu item.</dd>
+  </dl>
+
+  <h4>Kinds of attributes</h4>
+  <p>Textbooks classify attributes, and the classes tell you how to store them.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Kind</th><th>Meaning</th><th>Example</th><th>How you store it</th></tr></thead>
+    <tbody>
+      <tr><td>Simple</td><td>Cannot be divided</td><td><code>email</code>, <code>price</code></td>
+      <td>One column</td></tr>
+      <tr><td>Composite</td><td>Made of parts</td><td>address = street, city, state, pin code</td>
+      <td>One column per part, so you can search by city</td></tr>
+      <tr><td>Multi-valued</td><td>Several values for one entity</td><td>phone numbers, skills</td>
+      <td>A separate table, one row per value; never a comma list</td></tr>
+      <tr><td>Derived</td><td>Calculated from other data</td><td>age from <code>date_of_birth</code>; order total</td>
+      <td>Usually not stored; compute it in the query or a view</td></tr>
+      <tr><td>Key</td><td>Identifies the entity</td><td><code>id</code>, <code>email</code></td>
+      <td>Primary key or <code>UNIQUE</code></td></tr>
+      <tr><td>Optional</td><td>May have no value</td><td>middle name</td><td>A nullable column</td></tr>
+    </tbody>
+  </table></div>
+  <p>Age is the classic derived attribute. If you store <code>age</code> it is wrong the day after the
+  birthday, so store <code>date_of_birth</code> and calculate. Storing a derived value is sometimes right, for
+  speed or as a history snapshot, but then it is a deliberate
+  <a href="#m4-denormalization">denormalization</a>, not an accident.</p>
+
+  <h4>Cardinality and optionality</h4>
+  <p><strong>Cardinality</strong> is the maximum number of related rows on each side: one-to-one (1:1),
+  one-to-many (1:N) or many-to-many (M:N). <strong>Optionality</strong> (also called
+  <strong>participation</strong>) is the minimum: must a related row exist (1) or may it be absent (0)? Put
+  together, each end of a relationship is one of four things: exactly one, zero or one, one or many, zero or
+  many. Say them as sentences:</p>
+  <ul>
+    <li>A restaurant has zero or many menu items. A menu item belongs to exactly one restaurant.</li>
+    <li>A user has zero or one profile. A profile belongs to exactly one user.</li>
+    <li>An order contains one or many items. An item line belongs to exactly one order.</li>
+  </ul>
+  <p>The database enforces the "exactly one" side easily: a foreign key column that is <code>NOT NULL</code>.
+  It cannot enforce "one or many" on the other side with a plain foreign key, because the order row has to
+  exist before its first item row does. "An order must have at least one item" is checked in the service
+  layer, or with a deferred constraint trigger.</p>
+
+  <h4>Two notations: Chen and crow's foot</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Chen notation</th><th>Crow's foot notation</th></tr></thead>
+    <tbody>
+      <tr><td>Entity</td><td>Rectangle; attributes as ellipses around it</td><td>Box that lists the attributes
+      as rows</td></tr>
+      <tr><td>Relationship</td><td>Diamond with a verb between two entities</td><td>A labelled line between
+      boxes</td></tr>
+      <tr><td>Cardinality</td><td><code>1</code>, <code>N</code>, <code>M</code> written on the lines</td>
+      <td>Symbols on the line ends: bar = one, circle = zero, three-pronged "foot" = many</td></tr>
+      <tr><td>Weak entity</td><td>Double rectangle</td><td>Box tied to its owner by a solid (identifying) line</td></tr>
+      <tr><td>Where you meet it</td><td>DBMS textbooks and university exams</td><td>Real projects and tools (pgAdmin,
+      DBeaver, MySQL Workbench, Mermaid)</td></tr>
+    </tbody>
+  </table></div>
+  <figure class="fig">
+<pre class="diagram">
+ (customer_id) (name)                      (order_id) (placed_at)
+        \       /                                \       /
+       ┌─────────────┐  1                  N    ┌─────────────┐
+       │  CUSTOMER   ├────────◇ places ◇────────┤    ORDER    │
+       └─────────────┘                          └─────────────┘
+</pre>
+  <figcaption>Chen notation: ellipses are attributes, the diamond is the relationship, 1 and N give the
+  cardinality</figcaption>
+  </figure>
+  <p>Use crow's foot in real work; it maps straight to tables and every tool draws it. Know Chen as well,
+  because exam questions and some interviewers use it.</p>
+
+  <h4>Reading and writing crow's foot with Mermaid</h4>
+  <p>The notes use Mermaid's <code>erDiagram</code>, which GitHub, GitLab and many editors render. A
+  relationship line is written as two symbols around <code>--</code>:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Left end</th><th>Right end</th><th>Meaning of that end</th></tr></thead>
+    <tbody>
+      <tr><td><code>||</code></td><td><code>||</code></td><td>Exactly one</td></tr>
+      <tr><td><code>|o</code></td><td><code>o|</code></td><td>Zero or one</td></tr>
+      <tr><td><code>}|</code></td><td><code>|{</code></td><td>One or many</td></tr>
+      <tr><td><code>}o</code></td><td><code>o{</code></td><td>Zero or many</td></tr>
+    </tbody>
+  </table></div>
+  <p>The symbol next to an entity tells how many of <em>that</em> entity relate to one row of the other. In
+  the diagram below, <code>customers ||--o{ orders</code> reads "one customer places zero or many orders", and
+  read backwards "each order belongs to exactly one customer".</p>
+  <figure class="fig">
+<pre class="mermaid">
+erDiagram
+  customers ||--o{ orders : "places"
+  orders ||--|{ order_items : "contains"
+  products ||--o{ order_items : "appears in"
+  customers {
+    bigint id PK
+    varchar name
+    varchar email UK
+  }
+  orders {
+    bigint id PK
+    bigint customer_id FK
+    timestamptz placed_at
+  }
+  order_items {
+    bigint order_id PK, FK
+    int line_no PK
+    bigint product_id FK
+    int quantity
+  }
+  products {
+    bigint id PK
+    varchar name
+    numeric price
+  }
+</pre>
+  <figcaption>A small shop in crow's foot notation: each order has one or many item lines</figcaption>
+  </figure>
+  <p>A solid line (<code>--</code>) marks an <strong>identifying</strong> relationship, where the child cannot
+  exist without the parent. A dotted line (<code>..</code>) marks a non-identifying one. In an entity box,
+  <code>PK</code>, <code>FK</code> and <code>UK</code> mark primary, foreign and unique key columns; write the
+  type as a single word (<code>varchar</code>, not <code>varchar(100)</code>).</p>
+
+  <h4>Weak entities</h4>
+  <p>A <strong>weak entity</strong> has no key of its own. It is identified only through an owner (a
+  <strong>strong</strong> entity), and it disappears when the owner does. An order line is the standard case:
+  "line 2" means nothing without saying which order. Its key combines the owner's key with a partial key:
+  <code>PRIMARY KEY (order_id, line_no)</code>, and its foreign key to the owner is usually
+  <code>ON DELETE CASCADE</code>. In practice many teams give weak entities a surrogate <code>id</code> as
+  well (JPA is easier with a single-column key), but the dependency is still visible in the
+  <code>NOT NULL</code> foreign key.</p>
+
+  <h4>From ER diagram to tables</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>In the diagram</th><th>In the database</th></tr></thead>
+    <tbody>
+      <tr><td>Strong entity</td><td>A table with a primary key</td></tr>
+      <tr><td>Simple attribute</td><td>A column</td></tr>
+      <tr><td>Composite attribute</td><td>One column per part (<code>street</code>, <code>city</code>, <code>pin_code</code>)</td></tr>
+      <tr><td>Multi-valued attribute</td><td>A new table with a foreign key back to the owner</td></tr>
+      <tr><td>Derived attribute</td><td>Not stored (query or view), unless denormalized on purpose</td></tr>
+      <tr><td>1:N relationship</td><td>Foreign key column on the "many" side</td></tr>
+      <tr><td>1:1 relationship</td><td>Foreign key column with a <code>UNIQUE</code> constraint</td></tr>
+      <tr><td>M:N relationship</td><td>A join table with a foreign key to each side</td></tr>
+      <tr><td>Weak entity</td><td>A table whose key includes the owner's key</td></tr>
+    </tbody>
+  </table></div>
+  <p>The next two articles show the SQL for each relationship type.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every line has a verb and two cardinality ends</p>
+    <p>A relationship line with no label, or with one end missing its symbol, is ambiguous. Label each line with
+    a verb ("places", "contains") and give both ends a cardinality and an optionality.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: keep diagrams readable</p>
+    <p>Name entities exactly like the tables will be named. On a big diagram list only the key columns and the
+    columns that matter for understanding. Draw the full column list in the DDL, not in the picture. Split a
+    large system into several diagrams, one per area (orders, payments, catalogue).</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: reading the foot on the wrong end</p>
+    <ul>
+      <li>The crow's foot sits at the "many" end: next to <code>orders</code>, not next to
+      <code>customers</code>. Beginners often draw it on the wrong side and then put the foreign key in the
+      wrong table.</li>
+      <li>Drawing a many-to-many line between two tables in the <em>physical</em> model. Databases have no
+      such thing; the join table must be a box on the diagram.</li>
+      <li>Turning "an employee has several phone numbers" into <code>phone1</code>, <code>phone2</code>
+      columns. That is a multi-valued attribute: use a table.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases: recursive, three-way and subtype relationships</p>
+    <ul>
+      <li><b>Recursive:</b> an entity related to itself, such as an employee who manages other employees. One
+      table with <code>manager_id</code> pointing to <code>employees.id</code> (see
+      <a href="#m4-hierarchy-polymorphic-tenancy">Hierarchies</a>).</li>
+      <li><b>Ternary:</b> a fact that links three entities at once, such as a doctor treating a patient at a
+      clinic. Use one join table with three foreign keys.</li>
+      <li><b>Subtype (specialization):</b> a <code>payment</code> that is either a card payment or a UPI payment.
+      Model it with one table plus a <code>type</code> column, or a parent table with one child table per
+      subtype.</li>
+    </ul>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: tools that draw ER diagrams for you</p>
+    <p>pgAdmin 4 has an ERD tool, DBeaver can generate a diagram from an existing schema (very useful when you
+    inherit an unknown database), and MySQL Workbench has EER diagrams. For documentation inside a repository,
+    a Mermaid <code>erDiagram</code> block is version-controlled text.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Entity, attribute, relationship:</b> table, column, foreign key or join table.</li>
+      <li><b>Cardinality vs optionality:</b> cardinality is the maximum (one or many), optionality is the
+      minimum (zero or one).</li>
+      <li><b>What is a weak entity?</b> One that has no key of its own and depends on an owner entity, like an
+      order line; its key includes the owner's key.</li>
+      <li><b>Derived attribute:</b> calculated from others (age from date of birth); normally not stored.</li>
+      <li><b>How do you map a multi-valued attribute?</b> A separate table with a foreign key back to the
+      entity.</li>
+    </ul>
+  </div>
+</article>

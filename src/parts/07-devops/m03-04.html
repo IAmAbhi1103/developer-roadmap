@@ -1,0 +1,500 @@
+<article class="topic" id="m3-secrets">
+  <h3>Environment variables and secrets: never put passwords inside images</h3>
+  <p class="tldr">Configuration and secrets enter a container at run time — through environment variables,
+  an untracked <code>.env</code> file, or Docker/Compose secrets — never through the Dockerfile, because every
+  layer of an image can be read by anyone who can pull it.</p>
+
+  <h4>Why secrets must stay out of images</h4>
+  <p>An image is a stack of layers, and each layer keeps its files forever. If a Dockerfile does
+  <code>COPY .env .</code> and a later step runs <code>rm .env</code>, the file is still inside the earlier
+  layer. <code>docker history</code> shows every <code>ENV</code> and <code>ARG</code> value. Once the image
+  is pushed to a registry (or shared with a friend), the password is out. Rotating the secret is the only fix.
+  The twelve-factor rule applies: <strong>the same image runs in every environment; only the configuration
+  changes.</strong></p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: password baked into the image</p><pre><code class="language-dockerfile">ENV SPRING_DATASOURCE_PASSWORD=SuperSecret123
+ARG GITHUB_TOKEN
+RUN git clone https://${GITHUB_TOKEN}@github.com/org/private.git</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: supplied when the container starts</p><pre><code class="language-shell">$ docker run -d --env-file .env shop-api:1.0
+# or in compose: env_file / environment / secrets</code></pre></div>
+  </div>
+
+  <h4>Ways to pass configuration</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>How</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>-e</code> / <code>environment</code></td><td><code>-e SPRING_PROFILES_ACTIVE=prod</code></td><td>Fine for non-secret settings; secrets stay in shell history</td></tr>
+      <tr><td><code>--env-file</code> / <code>env_file</code></td><td>A file of <code>KEY=value</code> lines</td><td>Keep out of Git; <code>chmod 600</code> on servers</td></tr>
+      <tr><td>Compose <code>.env</code></td><td>Substituted into <code>${VAR}</code> in <code>compose.yaml</code></td><td>Variables for the YAML itself; not automatically passed to containers</td></tr>
+      <tr><td>Mounted config file</td><td><code>-v ./config:/app/config:ro</code></td><td>Spring Boot reads <code>config/application.yml</code></td></tr>
+      <tr><td>Compose / Docker secrets</td><td>Files mounted at <code>/run/secrets/name</code></td><td>Not in <code>docker inspect</code>; app must read the file</td></tr>
+      <tr><td>Platform secret stores</td><td>AWS Secrets Manager, Parameter Store, Vault, Kubernetes Secrets</td><td>Best for production; injected as env or files</td></tr>
+    </tbody>
+  </table></div>
+  <p>A <code>.env</code> file is plain text. Keep it in <code>.gitignore</code> and commit an
+  <code>.env.example</code> with fake values so teammates know which variables exist.</p>
+  <pre data-title=".gitignore and .env.example"><code class="language-plaintext"># .gitignore
+.env
+.env.*
+!.env.example
+
+# .env.example (safe to commit)
+POSTGRES_DB=shop
+POSTGRES_USER=shop
+POSTGRES_PASSWORD=replace-me
+APP_PORT=8080</code></pre>
+
+  <h4>Docker and Compose secrets (brief)</h4>
+  <p>A <strong>secret</strong> in Compose is a file that Docker mounts read-only into the container at
+  <code>/run/secrets/&lt;name&gt;</code>. It does not appear in <code>docker inspect</code> or
+  <code>docker history</code>. Many official images accept <code>*_FILE</code> variables so they read the
+  value from such a file.</p>
+  <pre data-title="compose.yaml (fragment): secret file for PostgreSQL"><code class="language-yaml">services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt   # keep this folder out of Git</code></pre>
+  <p>For Spring Boot, either set <code>spring.config.import=configtree:/run/secrets/</code> (every file in the
+  folder becomes a property named after the file) or read the file in a small start-up script. Check the
+  Spring Boot reference for "Config Tree" to confirm the property naming for your version.</p>
+
+  <h4>Build args are not secret</h4>
+  <p><code>ARG</code> values appear in <code>docker history</code> and in image metadata. For a secret needed
+  only during the build (a token for a private Maven repository), use a BuildKit secret mount, which is
+  never written into a layer:</p>
+  <pre data-title="Build-time secret with BuildKit"><code class="language-dockerfile">RUN --mount=type=secret,id=maven_settings,target=/root/.m2/settings.xml \
+    mvn -B -q package -DskipTests</code></pre>
+  <pre data-title="Pass it when building"><code class="language-shell">$ docker build --secret id=maven_settings,src=$HOME/.m2/settings.xml -t shop-api:1.0 .</code></pre>
+
+  <h4>Finding leaked secrets</h4>
+  <ul>
+    <li>Run a scanner such as <code>gitleaks</code> or <code>trufflehog</code> on the repository (and in CI).
+    GitHub's secret scanning and push protection catch many token formats automatically.</li>
+    <li>Check an image: <code>docker history --no-trunc shop-api:1.0</code> and
+    <code>docker run --rm -it --entrypoint sh shop-api:1.0</code>, then look for <code>.env</code>, key files
+    and passwords.</li>
+    <li>If a secret was ever committed or pushed in an image: <strong>rotate it</strong>. Deleting the file in
+    a later commit does not remove it from history.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: one image, many environments</p>
+    <p>Do not build a "production image" with production settings inside. Build once, tag, and deploy the same
+    image to test and production with different environment variables and secrets.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: committing .env, or a fallback password in application.yml</p>
+    <p>A line like <code>spring.datasource.password=${DB_PASSWORD:admin123}</code> silently ships a default
+    password. Prefer failing at start-up when the variable is missing:
+    <code>${DB_PASSWORD}</code> with no default in production profiles.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Environment variables are visible to anyone who can run <code>docker inspect</code> or read
+      <code>/proc/&lt;pid&gt;/environ</code>, and Spring's Actuator <code>/env</code> endpoint (mask values and
+      never expose it publicly).</li>
+      <li>Do not log the full environment or configuration on start-up.</li>
+      <li>A <code>.env</code> file used by Compose does not pass every variable into the container; only the
+      ones you list under <code>environment</code> (or load with <code>env_file</code>) reach it.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you handle secrets with Docker?"</p>
+    <ul>
+      <li>Never in the Dockerfile, image or Git. Inject at runtime via env vars, env files, Docker secrets or
+      a secret manager.</li>
+      <li>ARG/ENV are visible in <code>docker history</code>; use BuildKit secret mounts for build-time secrets;
+      rotate anything that leaked.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-registries">
+  <h3>Registries: Docker Hub, GHCR, tagging, pushing and image scanning</h3>
+  <p class="tldr">A registry stores images; log in with <code>docker login</code>, tag the image with the
+  registry path and a version or git SHA, then <code>docker push</code> and <code>docker pull</code> — Docker Hub
+  is the public default, GitHub Container Registry (<code>ghcr.io</code>) fits projects hosted on GitHub.</p>
+
+  <h4>Docker Hub versus GitHub Container Registry</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Docker Hub</th><th>GitHub Container Registry (GHCR)</th></tr></thead>
+    <tbody>
+      <tr><td>Address</td><td><code>docker.io</code> (implicit)</td><td><code>ghcr.io</code></td></tr>
+      <tr><td>Image name</td><td><code>username/app:tag</code></td><td><code>ghcr.io/owner/app:tag</code></td></tr>
+      <tr><td>Login in CI</td><td>Docker Hub username + access token</td><td>The workflow's built-in <code>GITHUB_TOKEN</code> (needs <code>packages: write</code>)</td></tr>
+      <tr><td>Visibility</td><td>Public or private repos (free plans have limits)</td><td>Public or private, tied to GitHub permissions</td></tr>
+      <tr><td>Notes</td><td>Where all official base images live; pulls from anonymous users are rate-limited</td><td>Convenient when code and images live together; check GitHub's current storage and bandwidth limits</td></tr>
+    </tbody>
+  </table></div>
+  <p>Other registries you will meet: AWS ECR (see <a href="#m5">Cloud</a>), Google Artifact Registry, Azure
+  Container Registry, and self-hosted ones like Harbor or Nexus. They all speak the same protocol, so the
+  commands are identical.</p>
+
+  <h4>Tagging strategy</h4>
+  <p>Give each build an immutable, traceable tag and optionally move a friendly tag:</p>
+  <ul>
+    <li><code>shop-api:3f9c2ab</code> — the short git commit SHA. Unique per commit; tells you exactly which
+    code runs. Best for CI deploys.</li>
+    <li><code>shop-api:1.2.0</code> — a semantic version for releases. Never overwrite it.</li>
+    <li><code>shop-api:1.2</code>, <code>shop-api:1</code> — movable convenience tags for "latest patch".</li>
+    <li><code>shop-api:latest</code> — optional alias for the newest build; do not deploy production from it.</li>
+  </ul>
+
+  <h4>Login, tag, push, pull</h4>
+  <pre data-title="Push to Docker Hub"><code class="language-shell">$ docker login                        # asks for username and an access token (not your password)
+$ docker build -t shop-api:1.2.0 .
+$ docker tag shop-api:1.2.0 asha/shop-api:1.2.0
+$ docker tag shop-api:1.2.0 asha/shop-api:latest
+$ docker push asha/shop-api:1.2.0
+The push refers to repository [docker.io/asha/shop-api]
+1.2.0: digest: sha256:4f2a... size: 1789
+$ docker pull asha/shop-api:1.2.0    # on the server</code></pre>
+  <pre data-title="Push to GHCR (token with write:packages scope)"><code class="language-shell">$ echo "$GHCR_TOKEN" | docker login ghcr.io -u asha --password-stdin
+$ docker tag shop-api:1.2.0 ghcr.io/asha/shop-api:1.2.0
+$ docker push ghcr.io/asha/shop-api:1.2.0</code></pre>
+  <p><code>docker tag</code> does not copy anything; it adds another name to the same image id.
+  <code>--password-stdin</code> keeps the token out of your shell history and process list. Always use an
+  <strong>access token</strong> (revocable, limited scope) instead of your account password. In CI the
+  workflow logs in with secrets (<a href="#m4-docker-publish">next module</a>).</p>
+
+  <h4>Image scanning (brief)</h4>
+  <p>Images include an OS and libraries, which may contain known vulnerabilities (CVEs). Scanners compare the
+  image contents with vulnerability databases. <strong>Docker Scout</strong> is built into Docker Desktop and
+  the CLI; Trivy and Grype are popular open-source scanners.</p>
+  <pre data-title="Scan an image"><code class="language-shell">$ docker scout quickview shop-api:1.2.0     # summary of CVEs by severity
+$ docker scout cves shop-api:1.2.0          # detailed list
+$ trivy image shop-api:1.2.0                # if Trivy is installed</code></pre>
+  <p>Fix findings by updating the base image tag (rebuild regularly to get patched layers), upgrading
+  dependencies and using smaller bases. Run a scan in CI and fail the build on critical issues that have a
+  fix available.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: tag by SHA in CI, by version on release</p>
+    <p>Pipelines push <code>:&lt;git-sha&gt;</code> on every merge to main; a release tag
+    (<code>v1.2.0</code>) also pushes <code>:1.2.0</code>. Deployments reference the exact tag, which makes
+    rollback a matter of deploying the previous tag.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: denied: requested access to the resource is denied</p>
+    <p>Pushing <code>shop-api:1.0</code> without your namespace tries to write to
+    <code>docker.io/library/shop-api</code>. Tag it as <code>youruser/shop-api:1.0</code>. Also check that
+    you are logged in to the right registry and that the token has write access.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Anonymous pulls from Docker Hub are rate-limited; you may see <em>toomanyrequests</em> on shared CI
+      runners. Log in before pulling, or mirror base images to your own registry.</li>
+      <li>Pushing a tag that already exists silently moves it; the old image becomes untagged ("dangling").</li>
+      <li>A GHCR package that you push from a workflow may be private by default; link it to the repository and
+      set visibility in the package settings.</li>
+      <li><em>exec format error</em> on a server usually means the image was built for another CPU
+      architecture. Build multi-platform with <code>docker buildx build --platform
+      linux/amd64,linux/arm64</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you version and publish Docker images?"</p>
+    <ul>
+      <li>Build once in CI, tag with the git SHA (and semver on release), push to a registry (GHCR/ECR/Hub),
+      deploy by tag; never deploy <code>latest</code>.</li>
+      <li>Log in with a token; scan for CVEs; use digests for strict reproducibility.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-troubleshooting">
+  <h3>Troubleshooting Docker: the usual problems and how to fix them</h3>
+  <p class="tldr">Most Docker problems fall into a few patterns: read the logs first
+  (<code>docker logs</code>), then the exit code and the state (<code>docker inspect</code>), then check
+  ports, names and permissions.</p>
+
+  <h4>A debugging routine</h4>
+  <ol class="steps">
+    <li><code>docker ps -a</code> — is the container running, or did it exit? Note the status and exit code.</li>
+    <li><code>docker logs --tail 100 name</code> — the app's stack trace is usually here.</li>
+    <li><code>docker inspect name</code> — <code>State.ExitCode</code>, <code>State.OOMKilled</code>, the
+    environment, mounts and network.</li>
+    <li><code>docker exec -it name sh</code> — look around inside (if it is still running); try
+    <code>curl</code> to the other service by name.</li>
+    <li>If it will not start: <code>docker run --rm -it --entrypoint sh image</code> to get a shell in a fresh
+    container and run the start command by hand.</li>
+    <li>Compose: <code>docker compose ps</code>, <code>docker compose logs -f</code>,
+    <code>docker compose config</code>.</li>
+  </ol>
+
+  <h4>Troubleshooting table</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>Container exits immediately</td><td>The main process ended: app crashed (see logs), wrong <code>ENTRYPOINT</code>, missing JAR, shell form, or a command that finishes (like <code>bash</code> without <code>-it</code>)</td><td><code>docker logs</code>; check exit code; run with <code>--entrypoint sh</code> to debug</td></tr>
+      <tr><td>Exit code 137</td><td>Killed: out of memory (OOM) or <code>docker kill</code></td><td>Check <code>OOMKilled</code>; raise the limit or reduce <code>MaxRAMPercentage</code></td></tr>
+      <tr><td>Exit code 143</td><td>Stopped with <code>SIGTERM</code> (normal for <code>docker stop</code>)</td><td>Usually fine</td></tr>
+      <tr><td>Port is already allocated / address already in use</td><td>Another process or container uses the host port</td><td>Stop it, or map to another host port (<code>-p 8081:8080</code>); find it with <code>docker ps</code> or <code>netstat</code></td></tr>
+      <tr><td>App cannot reach the database</td><td><code>localhost</code> used instead of service name; different networks; DB not ready; wrong credentials</td><td>Use <code>postgres:5432</code>; same network; healthcheck + <code>service_healthy</code>; check env vars</td></tr>
+      <tr><td>Page not reachable from the browser</td><td>Port not published, app listens on 127.0.0.1 only, firewall or security group</td><td><code>-p</code> / <code>ports</code>; do not set <code>server.address</code> in the container; open the port</td></tr>
+      <tr><td>Permission denied on a volume or bind mount</td><td>Container user (UID) cannot write the host folder; SELinux labels</td><td><code>chown</code> the folder to the container UID; use a named volume; check <code>USER</code></td></tr>
+      <tr><td>The image is huge (1 GB+)</td><td>Single-stage build with JDK and Maven, big base, caches left in layers, no <code>.dockerignore</code></td><td>Multi-stage build, JRE base, <code>.dockerignore</code>, clean in the same <code>RUN</code>; inspect with <code>docker history</code></td></tr>
+      <tr><td>Changes are not picked up</td><td>Old image still used (forgot <code>--build</code>), cache hit on a stale layer, container not recreated, bind mount missing</td><td><code>docker compose up -d --build</code>; <code>docker build --no-cache</code>; check the image id with <code>docker ps</code></td></tr>
+      <tr><td>Build is slow every time</td><td>Source copied before dependencies; huge build context</td><td>Order layers; add <code>.dockerignore</code></td></tr>
+      <tr><td>exec format error</td><td>Image built for another CPU architecture (ARM vs x86)</td><td>Build for the target with <code>--platform</code></td></tr>
+      <tr><td>no space left on device</td><td>Old images, containers and volumes fill the disk</td><td><code>docker system df</code>, then <code>docker system prune</code></td></tr>
+      <tr><td>unhealthy container</td><td>Healthcheck command fails or tool missing (<code>curl</code> not in the image)</td><td><code>docker inspect --format='{{json .State.Health}}' name</code></td></tr>
+      <tr><td>Cannot connect to the Docker daemon</td><td>Docker Desktop not running, or your user is not in the <code>docker</code> group (Linux)</td><td>Start Docker Desktop; <code>sudo usermod -aG docker $USER</code> then log in again</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: keep a throw-away debug container on the network</p>
+    <p><code>docker run --rm -it --network shop-net nicolaka/netshoot</code> (or a plain
+    <code>alpine</code> with <code>apk add curl bind-tools</code>) lets you test DNS and ports from inside the
+    same network: <code>nslookup postgres</code>, <code>nc -zv postgres 5432</code>. Production images
+    often have no such tools, which is why this helps.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: fixing the symptom with --privileged or root</p>
+    <p>Running containers with <code>--privileged</code>, as root, or mounting the Docker socket
+    (<code>/var/run/docker.sock</code>) "to make it work" gives the container control of the host. Find the real
+    cause (usually file ownership or a missing option).</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "A container exits immediately after starting. How do you debug it?"</p>
+    <ul>
+      <li><code>docker ps -a</code> and <code>docker logs</code> for the error; <code>docker inspect</code> for
+      exit code (137 = killed/OOM, 1 = app error).</li>
+      <li>Run the image with a shell entrypoint to start the app manually; check the JAR path, env vars and
+      the Java version.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m3-interview">
+  <h3>Interview questions — Docker</h3>
+
+  <details class="qa">
+    <summary>What is Docker and why do we use containers?</summary>
+    <div class="qa-a">
+      <p>Docker packages an application with its runtime and dependencies into an image that runs the same
+      everywhere as a container. It solves "works on my machine", gives isolation between apps, starts in
+      seconds, and is the standard deployment unit for cloud platforms and Kubernetes.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Container versus virtual machine?</summary>
+    <div class="qa-a">
+      <p>A VM runs a full guest OS with its own kernel on a hypervisor; a container is an isolated process
+      sharing the host kernel. Containers are smaller (MBs), start in about a second and pack more density; VMs
+      isolate more strongly. In the cloud, containers usually run inside VMs.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a container really, at the kernel level?</summary>
+    <div class="qa-a">
+      <p>A normal Linux process with namespaces (own process IDs, network, hostname, mounts) and cgroups
+      (limits for CPU, memory, I/O), running on a layered filesystem created from an image. Docker is a tool
+      that sets these features up.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Image versus container? What are layers and why do they matter?</summary>
+    <div class="qa-a">
+      <p>An image is a read-only template; a container is a running instance with a thin writable layer. Each
+      filesystem-changing Dockerfile instruction creates a layer. Layers are cached and shared, so ordering
+      instructions from least to most frequently changing makes rebuilds fast and downloads small.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain ENTRYPOINT versus CMD, and shell form versus exec form.</summary>
+    <div class="qa-a">
+      <p><code>ENTRYPOINT</code> is the fixed executable; <code>CMD</code> supplies default arguments that
+      <code>docker run image args</code> replaces. Exec form (JSON array) runs the program directly as PID 1 so
+      it gets <code>SIGTERM</code> and can shut down gracefully; shell form wraps it in <code>sh -c</code>, and
+      signals may not reach the app.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you make a Docker image for a Spring Boot app small and fast to build?</summary>
+    <div class="qa-a">
+      <p>Use a multi-stage build: Maven/JDK stage builds the JAR (copy <code>pom.xml</code> and resolve
+      dependencies first so they are cached), runtime stage uses a JRE image and copies only the JAR. Add
+      <code>.dockerignore</code>, run as a non-root user and consider layered JARs. Final images are a few hundred
+      MB instead of 700 MB+.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between COPY and ADD, ARG and ENV, EXPOSE and -p?</summary>
+    <div class="qa-a">
+      <p><code>ADD</code> also extracts local archives and fetches URLs; prefer <code>COPY</code>.
+      <code>ARG</code> exists only at build time; <code>ENV</code> persists into the running container.
+      <code>EXPOSE</code> only documents a port; <code>-p host:container</code> (or compose
+      <code>ports</code>) actually publishes it.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Data in a container disappears when it is removed. How do you persist it?</summary>
+    <div class="qa-a">
+      <p>Mount a named volume at the data directory (<code>-v pgdata:/var/lib/postgresql/data</code>). A bind
+      mount maps a host folder and suits development. <code>tmpfs</code> is memory only. Volumes survive
+      <code>docker rm</code> and <code>docker compose down</code>, but not <code>down -v</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Your Spring Boot container throws "Connection refused" for localhost:5432. Why?</summary>
+    <div class="qa-a">
+      <p><code>localhost</code> inside a container is the container itself, not the host or the database
+      container. Put both on the same user-defined network (Compose does this) and connect to the service name:
+      <code>jdbc:postgresql://postgres:5432/shop</code>. Also make sure the database is healthy before the
+      app starts.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does depends_on do in Compose? How do you wait for the database?</summary>
+    <div class="qa-a">
+      <p>By default only start order: the dependency container has started, not that it accepts connections.
+      Add a <code>healthcheck</code> (<code>pg_isready</code>) to the database and
+      <code>depends_on: postgres: condition: service_healthy</code> to the app so it starts when the database
+      is truly ready.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you handle secrets in Docker?</summary>
+    <div class="qa-a">
+      <p>Never bake them into images or commit <code>.env</code>. Inject at runtime with environment variables,
+      an untracked env file, Docker/Compose secrets (files under <code>/run/secrets</code>) or a secret
+      manager. <code>ENV</code> and <code>ARG</code> are visible in <code>docker history</code>. Use BuildKit
+      secret mounts for build-time secrets and rotate anything that leaked.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does the JVM behave in a container? What is MaxRAMPercentage?</summary>
+    <div class="qa-a">
+      <p>Modern JVMs read cgroup limits for memory and CPUs. The default max heap is 25% of the container
+      memory. <code>-XX:MaxRAMPercentage=75</code> sets it as a share of the limit, leaving room for metaspace,
+      stacks and native memory. Always set a container memory limit; exit code 137 with OOMKilled means the
+      total exceeded it.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>docker stop versus docker kill, and docker run versus docker exec?</summary>
+    <div class="qa-a">
+      <p><code>stop</code> sends <code>SIGTERM</code>, waits 10 seconds by default, then
+      <code>SIGKILL</code>; <code>kill</code> sends <code>SIGKILL</code> immediately. <code>run</code> creates
+      a new container from an image; <code>exec</code> runs an additional process inside an already running
+      container.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why not use the latest tag in production? How do you tag images?</summary>
+    <div class="qa-a">
+      <p><code>latest</code> is a movable label; a rebuild can change the Java version or dependencies
+      without notice, and you cannot tell what is deployed or roll back. Tag with the git SHA and a semantic
+      version, deploy by explicit tag (or digest), and roll back by redeploying the previous tag.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Your image is 1.2 GB. How do you find out why and reduce it?</summary>
+    <div class="qa-a">
+      <p>Run <code>docker history image</code> to see layer sizes. Typical causes: JDK and Maven in the final
+      image, a big base, build output and caches, or a missing <code>.dockerignore</code>. Fix with a
+      multi-stage build, a JRE-only base (or slim/Alpine after testing), cleaning in the same
+      <code>RUN</code> and excluding files from the context.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m3-cheatsheet">
+  <h3>Cheat sheet — Docker</h3>
+  <ul class="cheat">
+    <li><b>Container vs VM</b> shared kernel + namespaces and cgroups vs full guest OS on a hypervisor</li>
+    <li><b>Image / container / registry</b> template / running instance + writable layer / image store</li>
+    <li><b>Layers</b> one per RUN, COPY, ADD; cached by content; a changed layer rebuilds all after it</li>
+    <li><b>Tags</b> <code>name:tag</code>; pin versions, tag with git SHA or semver, avoid <code>latest</code> in prod</li>
+    <li><b>Java base</b> <code>eclipse-temurin:21-jre</code> to run, <code>maven:3.9-eclipse-temurin-21</code> to build</li>
+    <li><b>docker run</b> <code>-d -p 8081:8080 --name n -e K=v --env-file f -v vol:/path --rm --network net --restart unless-stopped</code></li>
+    <li><b>Look</b> <code>docker ps -a</code>, <code>logs -f --tail 100</code>, <code>inspect</code>, <code>stats</code></li>
+    <li><b>Get inside</b> <code>docker exec -it name sh</code>; new container: <code>docker run --rm -it --entrypoint sh image</code></li>
+    <li><b>Stop / remove</b> <code>stop</code> (SIGTERM, 10 s) vs <code>kill</code> (SIGKILL); <code>rm</code>, <code>rmi</code></li>
+    <li><b>Clean up</b> <code>docker system df</code>, <code>system prune</code>; <code>--volumes</code> deletes data</li>
+    <li><b>Build</b> <code>docker build -t name:tag .</code>; <code>--no-cache</code> to ignore the cache</li>
+    <li><b>Dockerfile order</b> FROM, WORKDIR, COPY pom.xml, RUN deps, COPY src, RUN package, then runtime stage</li>
+    <li><b>Exec form</b> <code>ENTRYPOINT ["java","-jar","app.jar"]</code> so Java is PID 1 and gets SIGTERM</li>
+    <li><b>ENTRYPOINT vs CMD</b> fixed executable vs overridable default arguments</li>
+    <li><b>Best practice</b> multi-stage, .dockerignore, non-root USER, one process, no secrets, pinned versions</li>
+    <li><b>JVM</b> <code>-XX:MaxRAMPercentage=75</code>, always set a memory limit; exit 137 + OOMKilled = over limit</li>
+    <li><b>Volumes</b> named volume for data, bind mount for dev files, tmpfs for RAM; <code>down -v</code> deletes volumes</li>
+    <li><b>Networks</b> user-defined bridge gives DNS by name; compose creates one automatically</li>
+    <li><b>localhost trap</b> inside a container localhost is itself; use <code>postgres:5432</code>, not <code>localhost</code></li>
+    <li><b>Ports</b> <code>host:container</code>; containers talk internally without published ports</li>
+    <li><b>Compose</b> <code>up -d --build</code>, <code>ps</code>, <code>logs -f</code>, <code>exec</code>, <code>down</code>, <code>config</code></li>
+    <li><b>Wait for DB</b> <code>healthcheck</code> (<code>pg_isready</code>) + <code>depends_on: condition: service_healthy</code></li>
+    <li><b>Spring env vars</b> <code>SPRING_DATASOURCE_URL</code> = <code>spring.datasource.url</code>; <code>SPRING_DATA_REDIS_HOST</code></li>
+    <li><b>Secrets</b> never in image or Git; env file (untracked), Docker secrets, secret manager; ARG is not secret</li>
+    <li><b>Registry</b> <code>docker login</code>, <code>tag</code>, <code>push</code>, <code>pull</code>; GHCR: <code>ghcr.io/owner/app</code></li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m3-practice">
+  <h3>Practice — Docker</h3>
+  <ol class="steps">
+    <li><strong>First containers.</strong> Install Docker Desktop (WSL2 backend), run
+    <code>hello-world</code>, then <code>docker run --rm -it eclipse-temurin:21-jdk jshell</code>. Run
+    <code>nginx</code> with <code>-p 8081:80</code> and open it in the browser; view its logs, enter it with
+    <code>exec</code>, stop and remove it. Done when you can list, stop and remove containers without looking
+    anything up.</li>
+    <li><strong>Persist a database.</strong> Start PostgreSQL with a named volume, create a table, remove the
+    container, start a new one with the same volume and check that the data is still there. Then run
+    <code>down -v</code> style cleanup and watch it disappear. Done when you can explain which commands delete
+    data.</li>
+    <li><strong>Dockerize Project 2 (single stage first).</strong> Write a simple Dockerfile (JDK image,
+    copy the JAR, <code>ENTRYPOINT</code>) and run it. Note the image size with <code>docker images</code>.
+    Done when the app answers on <code>localhost:8080</code>.</li>
+    <li><strong>Multi-stage build.</strong> Rewrite it as the multi-stage Dockerfile from this module (Maven
+    stage, JRE stage, non-root user, healthcheck) and add a <code>.dockerignore</code>. Compare image size
+    with step 3 and time a second build after changing one line of code to see the cache work. Done when the
+    final image is clearly smaller and the second build skips the dependency download.</li>
+    <li><strong>Break the localhost trap.</strong> Run PostgreSQL and your app in two containers with the
+    datasource URL set to <code>localhost</code>; read the error. Create a network, use the container name,
+    and fix it. Done when you can explain the error to someone in two sentences.</li>
+    <li><strong>Compose the stack.</strong> Write a <code>compose.yaml</code> with the API, PostgreSQL and
+    Redis, a <code>.env</code> file (git-ignored) and <code>.env.example</code>, named volumes and
+    healthchecks with <code>service_healthy</code>. Run <code>docker compose up -d --build</code> and check
+    <code>docker compose ps</code> shows all healthy. Done when a fresh clone plus one command starts the
+    whole app.</li>
+    <li><strong>JVM limits.</strong> Run the container with <code>-m 512m</code> and
+    <code>-XX:MaxRAMPercentage=75</code>, watch <code>docker stats</code>, then try a very low limit
+    (<code>-m 128m</code>) and find the exit code and the <code>OOMKilled</code> flag. Done when you can
+    explain exit code 137.</li>
+    <li><strong>Secrets audit.</strong> Run <code>docker history --no-trunc</code> on your image and look for
+    anything sensitive; scan the repository with <code>gitleaks</code> and the image with
+    <code>docker scout cves</code>. Move any secret to an env file or Compose secret. Done when no password
+    exists in the Dockerfile, the compose file or the image.</li>
+    <li><strong>Publish the image.</strong> Create a Docker Hub (or GHCR) access token, log in with
+    <code>--password-stdin</code>, tag the image with a version and the git SHA, push it, then pull and run it
+    from a different folder or machine. Done when the pulled image runs with only environment variables supplied.</li>
+    <li><strong>Final check (roadmap goal).</strong> Without notes, write a Dockerfile and a
+    <code>docker-compose.yml</code> from scratch for Spring Boot + PostgreSQL, bring it up, and fix one
+    deliberately introduced fault (wrong host name, missing healthcheck or wrong port). Done when you can do
+    this in under 30 minutes.</li>
+  </ol>
+</article>

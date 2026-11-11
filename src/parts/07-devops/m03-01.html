@@ -1,0 +1,400 @@
+<div class="mintro">
+  <p>Docker packages your application together with everything it needs to run — the JRE, libraries,
+  config files — into one unit called an <strong>image</strong>. You start that image as a
+  <strong>container</strong>, and it behaves the same on your laptop, on a teammate's Windows machine, on
+  the CI server and on a cloud VM. This ends the old "it works on my machine" problem, and it is why almost
+  every Java job today expects you to read and write a <code>Dockerfile</code>.</p>
+  <p>This module builds on <a href="#m1">Linux</a> (containers are Linux processes) and
+  <a href="#m2">Networking</a> (ports, DNS, <code>localhost</code>). It feeds directly into
+  <a href="#m4">CI/CD</a>, where the pipeline builds and pushes your image, and into
+  <a href="#m5">Cloud and deployment</a>, where platforms run it for you. The Spring Boot side
+  (profiles, configuration, Actuator health) is in <a href="04-spring-boot.html#m6">Spring Boot · Module 6</a>.</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>Explain containers versus virtual machines, and what a container really is inside the kernel.</li>
+    <li>Run, inspect, debug and clean up containers with the core <code>docker</code> commands.</li>
+    <li>Write a multi-stage Dockerfile for Spring Boot and explain every line, including layer caching.</li>
+    <li>Keep data with volumes, connect containers with networks, and avoid the <code>localhost</code> trap.</li>
+    <li>Run Spring Boot, PostgreSQL and Redis with one <code>docker compose up</code>, with healthchecks.</li>
+    <li>Handle configuration and secrets safely, push images to a registry, and fix common failures.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m3-why-containers">
+  <h3>Why containers: containers vs virtual machines, and Docker's architecture</h3>
+  <p class="tldr">A container is an ordinary Linux process that the kernel isolates (namespaces) and limits
+  (cgroups), started from an image that holds the app and all its dependencies — so it runs the same
+  everywhere, starts in seconds and uses far less memory than a virtual machine.</p>
+
+  <h4>The "works on my machine" problem</h4>
+  <p>You build a Spring Boot app on Windows with Java 21. The server has Java 17, a different
+  <code>PATH</code>, an older PostgreSQL client, and no one remembers which environment variables were set.
+  The app crashes in production but runs fine on your laptop. Every difference between environments —
+  OS, Java version, libraries, config — is a possible bug.</p>
+  <p>A container fixes this by shipping the <em>environment</em> with the app. The unit you deploy is no
+  longer "a JAR, plus instructions for the server"; it is "an image that already contains the JRE, the JAR
+  and the settings". Anyone who runs that image gets the same result. Other benefits:</p>
+  <ul>
+    <li><strong>Consistency.</strong> Dev, test and production run the same image.</li>
+    <li><strong>Isolation.</strong> Two apps that need Java 17 and Java 21 live side by side on one machine.</li>
+    <li><strong>Fast start.</strong> A container starts in about a second plus your app's own start-up time.</li>
+    <li><strong>Easy setup.</strong> A new teammate runs <code>docker compose up</code> and has PostgreSQL,
+    Redis and your app — no installers.</li>
+    <li><strong>Easy deployment.</strong> Every cloud platform (AWS ECS, Kubernetes, Render, Railway,
+    Cloud Run) runs containers. Image in, running service out.</li>
+  </ul>
+
+  <h4>Containers versus virtual machines</h4>
+  <p>A <strong>virtual machine (VM)</strong> emulates a whole computer. A <strong>hypervisor</strong>
+  (VMware, VirtualBox, Hyper-V, KVM) splits the physical machine into several VMs, and each VM runs its
+  own full operating system with its own kernel. Containers skip that: all containers on a host share
+  <em>one</em> kernel, and the kernel keeps them apart.</p>
+  <figure class="fig">
+<pre class="diagram">
+  Virtual machines                        Containers
+┌────────┬────────┬────────┐          ┌────────┬────────┬────────┐
+│  App A │  App B │  App C │          │  App A │  App B │  App C │
+│  Libs  │  Libs  │  Libs  │          │  Libs  │  Libs  │  Libs  │
+│ Guest  │ Guest  │ Guest  │          └────────┴────────┴────────┘
+│  OS    │  OS    │  OS    │          ┌──────────────────────────┐
+├────────┴────────┴────────┤          │ Container engine (Docker)│
+│       Hypervisor         │          ├──────────────────────────┤
+├──────────────────────────┤          │  Host OS (one shared     │
+│    Host OS / hardware    │          │  kernel) and hardware    │
+└──────────────────────────┘          └──────────────────────────┘
+</pre>
+    <figcaption>Each VM carries a whole guest OS; containers share the host kernel</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Virtual machine</th><th>Container</th></tr></thead>
+    <tbody>
+      <tr><td>Contains</td><td>Full guest OS plus app</td><td>App plus its libraries only</td></tr>
+      <tr><td>Kernel</td><td>Its own</td><td>Shared with the host</td></tr>
+      <tr><td>Size</td><td>Gigabytes</td><td>Tens to a few hundred MB</td></tr>
+      <tr><td>Start time</td><td>Tens of seconds to minutes</td><td>Usually about a second</td></tr>
+      <tr><td>Isolation</td><td>Strong (separate kernels)</td><td>Good, but a kernel bug can affect all</td></tr>
+      <tr><td>Typical use</td><td>Running different OSes, strong tenant isolation</td><td>Packaging and running one service</td></tr>
+    </tbody>
+  </table></div>
+  <p>They are not enemies. In the cloud, containers usually run <em>inside</em> VMs: an EC2 instance is a
+  VM, and you run Docker on it.</p>
+
+  <h4>What a container really is</h4>
+  <p>A container is not a tiny VM; it is a normal Linux process with two kernel features applied.
+  <strong>Namespaces</strong> give the process its own view of the system: its own process IDs (it thinks it
+  is PID 1), its own network interfaces and ports, its own hostname, its own mounted filesystem.
+  <strong>cgroups</strong> (control groups) limit how much CPU, memory and I/O the process may use. Add a
+  layered filesystem built from the image, and you have a container. That is why you can see a container's
+  Java process in <code>ps</code> on the host, and why a container needs a Linux kernel.</p>
+
+  <h4>Docker's architecture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  CLI["docker CLI (client)"] -->|"REST API"| D["Docker daemon (dockerd)"]
+  D --> IMG[(Local images)]
+  D --> C1[Container 1]
+  D --> C2[Container 2]
+  D -->|"pull / push"| R[("Registry: Docker Hub, GHCR")]
+</pre>
+    <figcaption>You type docker commands; the daemon does the work and talks to registries</figcaption>
+  </figure>
+  <dl class="terms">
+    <dt>Client</dt><dd>The <code>docker</code> command you type. It only sends requests.</dd>
+    <dt>Daemon</dt><dd><code>dockerd</code>, the background service that builds images and runs containers.</dd>
+    <dt>Image</dt><dd>A read-only template: the files and start-up command for a container.</dd>
+    <dt>Container</dt><dd>A running (or stopped) instance of an image.</dd>
+    <dt>Registry</dt><dd>A server that stores images: Docker Hub, GitHub Container Registry, AWS ECR.</dd>
+  </dl>
+
+  <h4>Docker Desktop on Windows (WSL2 backend)</h4>
+  <p>Containers need a Linux kernel, and Windows does not have one. <strong>Docker Desktop</strong> solves
+  this by running a small Linux environment through <strong>WSL2</strong> (Windows Subsystem for Linux 2) and
+  placing the daemon inside it. You type <code>docker</code> in PowerShell or a WSL terminal and it works as
+  on Linux. Install Docker Desktop, keep "Use the WSL 2 based engine" ticked in Settings → General, and
+  check with <code>docker version</code> and <code>docker run hello-world</code>.</p>
+  <ul>
+    <li>Files inside the WSL2 filesystem (<code>\\wsl$\Ubuntu\home\...</code>) are much faster for bind
+    mounts than files on <code>C:\</code>. Keep big projects there if builds feel slow.</li>
+    <li>WSL2 can take a lot of RAM. Limit it in <code>%UserProfile%\.wslconfig</code> (
+    <code>[wsl2]</code> section, <code>memory=6GB</code>).</li>
+    <li>Docker Desktop has licensing terms for larger companies; on a Linux server you install the free
+    Docker Engine only. Podman is a compatible alternative.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases: containers are not a security boundary like a VM</p>
+    <ul>
+      <li>A Windows or macOS "container" is a Linux container running in a hidden Linux VM.</li>
+      <li>Because the kernel is shared, an image built for ARM (Apple M-series, AWS Graviton) will not run on
+      an x86 server unless it is built for both. Check the architecture if you see
+      <em>exec format error</em>.</li>
+      <li>Running as root inside a container is risky; see the <a href="#m3-dockerfile">Dockerfile article</a>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is the difference between a container and a VM?"</p>
+    <ul>
+      <li>A VM virtualises hardware and runs a full guest OS with its own kernel; a container virtualises the
+      OS: processes share the host kernel and are isolated with namespaces and limited with cgroups.</li>
+      <li>Containers are lighter, start faster and pack denser; VMs isolate more strongly. In practice
+      containers run on VMs.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-images-containers">
+  <h3>Images, layers, tags and the container lifecycle</h3>
+  <p class="tldr">An image is a stack of read-only layers plus start-up metadata; a container is that stack
+  with one thin writable layer on top. Use specific tags (never <code>latest</code> in production), and pick a
+  small, official base image such as <code>eclipse-temurin</code> for Java.</p>
+
+  <h4>Image, container, registry</h4>
+  <p>Think of an image as a class and a container as an object created from it. You can start ten
+  containers from one image. The image never changes; each container gets its own writable layer, which is
+  thrown away when the container is removed. That is why data written inside a container disappears —
+  unless you use a <a href="#m3-volumes">volume</a>.</p>
+  <p>A <strong>registry</strong> stores images so other machines can download them. <strong>Docker Hub</strong>
+  (<code>hub.docker.com</code>) is the default public registry. An image name has the form
+  <code>registry/namespace/repository:tag</code>, and most parts have defaults:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Written as</th><th>Means</th></tr></thead>
+    <tbody>
+      <tr><td><code>postgres</code></td><td><code>docker.io/library/postgres:latest</code> (an official image)</td></tr>
+      <tr><td><code>postgres:16</code></td><td>The official PostgreSQL image, tag <code>16</code></td></tr>
+      <tr><td><code>asha/shop-api:1.2.0</code></td><td>User <code>asha</code>'s repository on Docker Hub</td></tr>
+      <tr><td><code>ghcr.io/asha/shop-api:1.2.0</code></td><td>GitHub Container Registry</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Layers and the build cache</h4>
+  <p>Each instruction in a Dockerfile that changes the filesystem (<code>RUN</code>, <code>COPY</code>,
+  <code>ADD</code>) creates a <strong>layer</strong>: a set of file changes. An image is a stack of layers.
+  Layers are identified by a hash of their content, so they are shared: ten images built on the same
+  <code>eclipse-temurin:21-jre</code> store that base only once on disk and download it once.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Container (running)    ┌──────────────────────────┐  writable, deleted with the container
+ ────────────────────── ├──────────────────────────┤
+ Image (read-only)      │ COPY app.jar             │  layer 3: your JAR (changes often)
+                        │ RUN useradd app          │  layer 2: small change
+                        │ eclipse-temurin:21-jre   │  layer 1..n: base image (rarely changes)
+                        └──────────────────────────┘
+</pre>
+    <figcaption>Layers are stacked; the top writable layer belongs to the container</figcaption>
+  </figure>
+  <p>When you build, Docker reuses a cached layer if the instruction and its inputs are identical. The moment
+  one layer changes, <strong>every layer after it is rebuilt</strong>. This is the most important
+  performance rule in Docker: put things that change rarely (dependencies) before things that change often
+  (your source code). The <a href="#m3-dockerfile">Dockerfile article</a> shows how.</p>
+
+  <h4>Tags and digests</h4>
+  <p>A <strong>tag</strong> is a movable label on an image: <code>postgres:16</code>,
+  <code>eclipse-temurin:21-jre</code>. If you do not write a tag, Docker uses <code>latest</code>, which is
+  just a name, not "the newest safe version". Tags can be moved: <code>postgres:16</code> points to
+  16.x today and a newer 16.y next month. A <strong>digest</strong> is the immutable SHA-256 of the image
+  content: <code>postgres@sha256:…</code>. It always means exactly the same bytes.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Reference</th><th>Stability</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>app:latest</code></td><td>Changes without warning</td><td>Quick local experiments only</td></tr>
+      <tr><td><code>app:1.2.0</code></td><td>Stable if you never overwrite it</td><td>Releases</td></tr>
+      <tr><td><code>app:3f9c2ab</code> (git SHA)</td><td>Unique per commit</td><td>CI builds and deploys</td></tr>
+      <tr><td><code>app@sha256:…</code></td><td>Immutable</td><td>Strict reproducibility</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Official images and choosing a Java base image</h4>
+  <p><strong>Official images</strong> (no username, such as <code>postgres</code>, <code>redis</code>,
+  <code>nginx</code>, <code>eclipse-temurin</code>) are curated, documented and regularly updated. Prefer
+  them over random user images. For Java use <code>eclipse-temurin</code>, the Eclipse Adoptium build of
+  OpenJDK. Its tags are named by version and type:</p>
+  <ul>
+    <li><code>eclipse-temurin:21-jdk</code> — full JDK, for compiling. Large.</li>
+    <li><code>eclipse-temurin:21-jre</code> — runtime only. Right for running a built JAR. The same
+    pattern exists for <code>25</code> (the newest LTS) and <code>17</code>.</li>
+    <li>Variants such as <code>21-jre-alpine</code> (Alpine Linux base) or <code>21-jre-jammy</code>
+    (a named Ubuntu release). Check the image's page on Docker Hub for the exact tag list.</li>
+  </ul>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Base</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody>
+      <tr><td>Debian/Ubuntu (default tags)</td><td>Uses glibc, most compatible, easy debugging tools</td><td>Bigger</td></tr>
+      <tr><td>Alpine</td><td>Very small base</td><td>Uses musl libc; some native libraries (or JNI code) misbehave; fewer tools</td></tr>
+      <tr><td>Distroless (Google)</td><td>No shell or package manager; small attack surface</td><td>Hard to debug with <code>exec</code>; needs care</td></tr>
+    </tbody>
+  </table></div>
+  <p>A sensible default for a Spring Boot service: <code>eclipse-temurin:21-jre</code>. Choose Alpine
+  only when image size really matters and you have tested the app on it.</p>
+
+  <h4>The container lifecycle</h4>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Created: docker create
+  Created --> Running: docker start
+  [*] --> Running: docker run
+  Running --> Paused: docker pause
+  Paused --> Running: docker unpause
+  Running --> Exited: docker stop / process ends
+  Exited --> Running: docker start
+  Exited --> [*]: docker rm
+</pre>
+    <figcaption>States of a container; docker run = create + start</figcaption>
+  </figure>
+  <p>A container lives only as long as its main process (PID 1). When your Java process exits, the
+  container exits. A stopped container still exists, with its writable layer and logs, until you remove it
+  with <code>docker rm</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: pin a version; never rely on latest in production</p>
+    <p>With <code>FROM eclipse-temurin:latest</code> your next build may silently switch to a new Java major
+    version. Use a version tag in Dockerfiles and compose files, and tag your own images with a version or
+    git SHA.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: storing data in the container's writable layer</p>
+    <p>Uploads, database files or logs written inside a container vanish on <code>docker rm</code> and on
+    redeploys. Use volumes, an external database, or object storage.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Image versus container? What are layers?"</p>
+    <ul>
+      <li>Image: read-only template; container: a running instance with a writable layer.</li>
+      <li>Layers: each filesystem-changing instruction creates one; they are cached and shared. Order
+      instructions so rarely changing ones come first.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-commands">
+  <h3>Docker commands: run, ps, logs, exec, stop, rm and friends</h3>
+  <p class="tldr">Learn <code>docker run</code> and its flags, then <code>ps</code>, <code>logs -f</code>,
+  <code>exec -it</code>, <code>stop</code>, <code>rm</code>, <code>images</code> and <code>system prune</code>;
+  these ten commands cover nearly all daily Docker work.</p>
+
+  <h4>Your first container</h4>
+  <pre data-title="Run PostgreSQL in the background"><code class="language-shell">$ docker run -d --name pg -p 5432:5432 \
+    -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=shop \
+    postgres:16
+Unable to find image 'postgres:16' locally
+16: Pulling from library/postgres
+...
+d3c1f6a0b2e4f8a7c5b9e1d2a3f4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2
+$ docker ps
+CONTAINER ID   IMAGE         COMMAND                  STATUS         PORTS                    NAMES
+d3c1f6a0b2e4   postgres:16   "docker-entrypoint.s…"   Up 5 seconds   0.0.0.0:5432-&gt;5432/tcp   pg</code></pre>
+  <p>Docker looked for <code>postgres:16</code> locally, did not find it, pulled it from Docker Hub, created
+  a container named <code>pg</code>, started it in the background and mapped port 5432 of your machine to
+  port 5432 inside. Your Spring Boot app on the host can now use
+  <code>jdbc:postgresql://localhost:5432/shop</code>.</p>
+
+  <h4>docker run flags you must know</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Flag</th><th>Meaning</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>-d</code></td><td>Detached: run in the background and print the container id</td><td><code>docker run -d nginx</code></td></tr>
+      <tr><td><code>-p host:container</code></td><td>Publish a container port on a host port</td><td><code>-p 8081:8080</code></td></tr>
+      <tr><td><code>--name</code></td><td>Give the container a fixed name instead of a random one</td><td><code>--name shop-api</code></td></tr>
+      <tr><td><code>-e KEY=value</code></td><td>Set an environment variable</td><td><code>-e SPRING_PROFILES_ACTIVE=prod</code></td></tr>
+      <tr><td><code>--env-file</code></td><td>Read many variables from a file</td><td><code>--env-file .env</code></td></tr>
+      <tr><td><code>-v</code></td><td>Mount a volume or a host folder</td><td><code>-v pgdata:/var/lib/postgresql/data</code></td></tr>
+      <tr><td><code>--rm</code></td><td>Delete the container automatically when it exits</td><td><code>docker run --rm -it ubuntu bash</code></td></tr>
+      <tr><td><code>--network</code></td><td>Attach to a named network</td><td><code>--network shop-net</code></td></tr>
+      <tr><td><code>--restart</code></td><td>Restart policy: <code>no</code>, <code>on-failure</code>, <code>always</code>, <code>unless-stopped</code></td><td><code>--restart unless-stopped</code></td></tr>
+      <tr><td><code>-it</code></td><td>Interactive terminal (<code>-i</code> keeps stdin open, <code>-t</code> allocates a TTY)</td><td><code>docker run -it alpine sh</code></td></tr>
+      <tr><td><code>-m</code>, <code>--cpus</code></td><td>Memory and CPU limits (cgroups)</td><td><code>-m 512m --cpus 1</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Everything after the image name is the <em>command</em> that overrides the image's default command:
+  <code>docker run --rm ubuntu ls /</code>.</p>
+  <p><strong>Port mapping</strong> reads left to right as <em>host:container</em>. In
+  <code>-p 8081:8080</code> a browser uses <code>localhost:8081</code> and the app inside still listens on
+  8080. Bind only to your own machine with <code>-p 127.0.0.1:5432:5432</code>; plain
+  <code>-p 5432:5432</code> listens on all interfaces, which is risky on a public server.</p>
+
+  <h4>Inspecting and debugging</h4>
+  <pre data-title="Everyday debugging commands"><code class="language-shell">$ docker ps -a                       # all containers, also stopped ones
+$ docker logs pg                     # print the logs
+$ docker logs -f --tail 100 pg       # follow, starting from the last 100 lines
+$ docker exec -it pg psql -U postgres -d shop     # open psql inside the container
+$ docker exec -it pg sh              # a shell inside it (bash if the image has it)
+$ docker inspect pg                  # full JSON: IP address, mounts, env, state
+$ docker inspect -f '{{.State.ExitCode}}' pg      # one field
+$ docker stats                       # live CPU and memory per container
+$ docker top pg                      # processes inside
+$ docker cp pg:/etc/hostname ./      # copy a file out of a container</code></pre>
+  <p><code>exec</code> starts a <em>new</em> process inside a running container; it is how you "log in".
+  <code>docker run -it</code> starts a <em>new container</em>. Do not confuse them.</p>
+
+  <h4>Stopping and removing</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>docker stop pg</code></td><td>Sends <code>SIGTERM</code> so the app can shut down gracefully; after 10 seconds (default) it sends <code>SIGKILL</code></td></tr>
+      <tr><td><code>docker kill pg</code></td><td>Sends <code>SIGKILL</code> at once; no graceful shutdown</td></tr>
+      <tr><td><code>docker start pg</code> / <code>restart pg</code></td><td>Start a stopped container / stop and start</td></tr>
+      <tr><td><code>docker rm pg</code></td><td>Delete a stopped container (<code>-f</code> to force a running one)</td></tr>
+      <tr><td><code>docker rm -f $(docker ps -aq)</code></td><td>Remove every container (bash); be careful</td></tr>
+    </tbody>
+  </table></div>
+  <p>A Spring Boot app handles <code>SIGTERM</code> by finishing in-flight requests if you enable
+  <code>server.shutdown=graceful</code>. This works only if the Java process is PID 1 or receives the signal
+  (see <code>ENTRYPOINT</code> exec form in the next article).</p>
+
+  <h4>Images and cleanup</h4>
+  <pre data-title="Manage images and free disk space"><code class="language-shell">$ docker images                      # list local images
+$ docker pull eclipse-temurin:21-jre # download without running
+$ docker rmi postgres:16             # delete an image (no container may use it)
+$ docker tag shop-api:1.0 asha/shop-api:1.0
+$ docker push asha/shop-api:1.0
+$ docker system df                   # how much space Docker uses
+$ docker system prune                # remove stopped containers, dangling images, unused networks
+$ docker system prune -a --volumes   # also unused images AND unused volumes (dangerous)</code></pre>
+  <p>Disks fill up with old images and containers quickly, especially on CI servers and laptops.
+  <code>docker system prune</code> is safe for most work; the <code>--volumes</code> flag deletes volumes that
+  no container uses, which can include your database data.</p>
+
+  <h4>Restart policies</h4>
+  <p>By default a container that crashes stays down. <code>--restart on-failure</code> restarts it when it
+  exits with an error; <code>unless-stopped</code> restarts it also after a server reboot unless you stopped it
+  by hand; <code>always</code> is similar but also restarts a container you stopped, after the daemon
+  restarts. For a server, <code>unless-stopped</code> is the usual choice.</p>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: name things and clean as you go</p>
+    <p>Use <code>--name</code> so commands are readable, and <code>--rm</code> for throwaway containers
+    (<code>docker run --rm -it eclipse-temurin:21-jdk jshell</code> gives you a JShell with no installation).</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "port is already allocated" and "name already in use"</p>
+    <ul>
+      <li><em>Bind for 0.0.0.0:5432 failed: port is already allocated</em> — a local PostgreSQL or another
+      container already uses that host port. Use <code>-p 5433:5432</code> or stop the other one.</li>
+      <li><em>The container name "/pg" is already in use</em> — remove the old container
+      (<code>docker rm pg</code>) or choose another name.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>-e POSTGRES_PASSWORD=...</code> on the command line is stored in your shell history and visible
+      in <code>docker inspect</code>; use <code>--env-file</code> for anything real.</li>
+      <li>The official PostgreSQL image only reads <code>POSTGRES_PASSWORD</code> and
+      <code>POSTGRES_DB</code> when the data directory is empty. Changing them later has no effect on an
+      existing volume.</li>
+      <li>On Windows PowerShell, line continuation is the backtick (<code>`</code>), not
+      <code>\</code>; Git Bash and WSL use <code>\</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "docker stop versus docker kill? exec versus run?"</p>
+    <ul>
+      <li><code>stop</code> sends SIGTERM, waits (10 s default), then SIGKILL; <code>kill</code> sends SIGKILL at once.</li>
+      <li><code>run</code> creates and starts a new container from an image; <code>exec</code> runs an extra
+      process inside an existing running container.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,529 @@
+<article class="topic" id="m3-auditing">
+  <h3>Auditing fields: createdAt, updatedAt, createdBy</h3>
+  <p class="tldr">Spring Data JPA auditing fills createdAt, updatedAt and createdBy automatically through an entity listener; put the fields in a @MappedSuperclass so every entity gets them.</p>
+
+  <p><strong>Auditing</strong> means recording when a row was created or changed and by whom. Writing <code>entity.setCreatedAt(Instant.now())</code> in every service is repetitive and easy to forget. Two options exist: Spring Data's auditing (portable, supports "who") and Hibernate's own annotations (simpler, time only).</p>
+
+  <h4>Spring Data JPA auditing</h4>
+  <ol class="steps">
+    <li>Enable it once with <code>@EnableJpaAuditing</code> on a configuration class.</li>
+    <li>Add <code>@EntityListeners(AuditingEntityListener.class)</code> to the entity (or to a base class).</li>
+    <li>Annotate fields with <code>@CreatedDate</code>, <code>@LastModifiedDate</code>, <code>@CreatedBy</code>, <code>@LastModifiedBy</code>.</li>
+    <li>For the "by" fields, provide an <code>AuditorAware</code> bean that returns the current user.</li>
+  </ol>
+  <pre data-title="AuditableEntity.java"><code class="language-java">import org.springframework.data.annotation.*;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+@MappedSuperclass
+@EntityListeners(AuditingEntityListener.class)
+public abstract class AuditableEntity extends BaseEntity {
+
+    @CreatedDate
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @LastModifiedDate
+    @Column(name = "updated_at", nullable = false)
+    private Instant updatedAt;
+
+    @CreatedBy
+    @Column(name = "created_by", updatable = false)
+    private Long createdBy;                        // user id
+
+    @LastModifiedBy
+    @Column(name = "updated_by")
+    private Long updatedBy;
+
+    public Instant getCreatedAt() { return createdAt; }
+    public Instant getUpdatedAt() { return updatedAt; }
+}</code></pre>
+  <pre data-title="AuditConfig.java"><code class="language-java">@Configuration
+@EnableJpaAuditing(auditorAwareRef = "auditorProvider")
+public class AuditConfig {
+
+    @Bean
+    AuditorAware&lt;Long&gt; auditorProvider() {
+        return () -&gt; {
+            Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+            if (auth == null || !auth.isAuthenticated()
+                    || auth instanceof AnonymousAuthenticationToken) {
+                return Optional.empty();                // system job or anonymous
+            }
+            return Optional.of(((AppUserDetails) auth.getPrincipal()).getId());
+        };
+    }
+}</code></pre>
+  <p>The <code>AuditorAware</code> body above assumes Spring Security (module 4) and a principal class that carries the user id. Until security exists, return a fixed id or <code>Optional.empty()</code>. Now <code>Job extends AuditableEntity</code>, and <code>jobRepository.save(job)</code> sets both timestamps on insert, and only <code>updatedAt</code>/<code>updatedBy</code> on update.</p>
+  <pre class="out" data-title="SQL (the listener runs before the insert/update)"><code class="language-sql">insert into job (created_at, created_by, updated_at, updated_by, title, ...) values (?,?,?,?,?,...)
+update job set updated_at=?, updated_by=?, vacancies=?, ... where id=?</code></pre>
+  <p>Notes: the listener runs on <code>persist</code> and on flush when the entity is dirty. Entities modified through bulk <code>@Modifying</code> queries are <strong>not</strong> audited. Add <code>updated_at = now()</code> to those queries by hand. <code>@EnableJpaAuditing</code> must not be on the main application class if you use <code>@WebMvcTest</code> slices (it would need the JPA metamodel); put it in a separate configuration class as shown.</p>
+
+  <h4>Hibernate's @CreationTimestamp and @UpdateTimestamp</h4>
+  <pre data-title="Time-only auditing without Spring Data"><code class="language-java">import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+@CreationTimestamp
+@Column(name = "created_at", nullable = false, updatable = false)
+private Instant createdAt;
+
+@UpdateTimestamp
+@Column(name = "updated_at", nullable = false)
+private Instant updatedAt;</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Spring Data auditing</th><th>Hibernate annotations</th><th><code>@PrePersist</code>/<code>@PreUpdate</code></th></tr></thead>
+    <tbody>
+      <tr><td>Setup</td><td>Enable + listener + base class</td><td>Annotation only</td><td>Callback methods</td></tr>
+      <tr><td>Who (user)</td><td>Yes (<code>AuditorAware</code>)</td><td>No</td><td>Manual</td></tr>
+      <tr><td>Portable to other JPA providers</td><td>Yes</td><td>No (Hibernate only)</td><td>Yes (standard JPA)</td></tr>
+      <tr><td>Best for</td><td>Most apps with users</td><td>Quick timestamps</td><td>Custom logic</td></tr>
+    </tbody>
+  </table></div>
+  <p>The Product example in <a href="#m2">module 2</a> used <code>@PrePersist</code>, which is plain JPA and fine for a single field.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Use <code>Instant</code> (UTC) and <code>TIMESTAMPTZ</code>; convert to a zone only for display.</li>
+      <li>Mark <code>createdAt</code> and <code>createdBy</code> as <code>updatable = false</code>.</li>
+      <li>Put the columns in the migration with <code>NOT NULL</code>; set a default for old rows in the migration that adds them.</li>
+      <li>Never expose audit fields as writable in request DTOs.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Forgetting <code>@EnableJpaAuditing</code> or <code>@EntityListeners</code>: the fields stay <code>null</code> and the insert fails on <code>NOT NULL</code>.</li>
+      <li>Expecting history. These columns hold only the latest state. For full history use Hibernate Envers or an audit table.</li>
+      <li>An <code>AuditorAware</code> that throws for system jobs; return <code>Optional.empty()</code> instead.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you add createdAt/updatedAt to all entities?" A <code>@MappedSuperclass</code> with <code>@EntityListeners(AuditingEntityListener.class)</code>, <code>@CreatedDate</code>/<code>@LastModifiedDate</code>, and <code>@EnableJpaAuditing</code>; mention <code>AuditorAware</code> for "who" and Hibernate's timestamps as a lighter alternative.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-flyway">
+  <h3>Schema migrations with Flyway in Spring Boot</h3>
+  <p class="tldr">Flyway runs versioned SQL files (V1__init.sql, V2__...) in order at application startup, records them in flyway_schema_history, and refuses to change a migration that was already applied.</p>
+
+  <p>A database schema changes over time: new columns, new tables, new indexes. A <strong>migration tool</strong> keeps the schema in version control like code, so every environment (your laptop, test, production) reaches the same state by running the same ordered scripts. Without it, teams run SQL by hand and drift apart. <strong>Flyway</strong> is the simplest and most common choice with Spring Boot (Liquibase is the other popular one). Basics of schema design are in <a href="03-sql-databases.html#m4">SQL · Module 4</a>.</p>
+
+  <h4>Setup</h4>
+  <pre data-title="pom.xml (versions are managed by Spring Boot)"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.flywaydb&lt;/groupId&gt;
+    &lt;artifactId&gt;flyway-core&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.flywaydb&lt;/groupId&gt;
+    &lt;artifactId&gt;flyway-database-postgresql&lt;/artifactId&gt;   &lt;!-- PostgreSQL support module --&gt;
+&lt;/dependency&gt;</code></pre>
+  <p>Recent Flyway versions put database support in separate modules: <code>flyway-database-postgresql</code> for PostgreSQL, <code>flyway-mysql</code> for MySQL and MariaDB. Without it you get an error such as <em>"Unsupported Database: PostgreSQL 17"</em>.</p>
+  <div class="co co-version">
+    <p class="co-t">Boot 3.x vs 4.x</p>
+    <p>In Boot 3.x, having <code>flyway-core</code> on the classpath is enough to turn on the auto-configuration. Boot 4 split its auto-configuration into smaller modules; the supported way there is the <code>spring-boot-starter-flyway</code> starter (plus the database module above). Check the Boot 4 migration notes for your exact version.</p>
+  </div>
+
+  <h4>Where files go and how they are named</h4>
+  <pre class="out" data-title="src/main/resources"><code class="language-plaintext">db/migration/
+    V1__init.sql
+    V2__add_tags.sql
+    V3__add_job_version_column.sql
+    R__job_search_view.sql</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Name pattern</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td>Versioned</td><td><code>V&lt;version&gt;__&lt;description&gt;.sql</code> (two underscores)</td><td>Runs once, in version order</td></tr>
+      <tr><td>Repeatable</td><td><code>R__&lt;description&gt;.sql</code></td><td>Re-runs whenever its checksum changes (views, functions)</td></tr>
+      <tr><td>Java-based</td><td>class implementing <code>JavaMigration</code> / <code>BaseJavaMigration</code></td><td>For data fixes that SQL cannot express</td></tr>
+    </tbody>
+  </table></div>
+  <p>Versions sort numerically (<code>V2</code> before <code>V10</code>), and may contain dots: <code>V1_1__...</code> or <code>V2.1__...</code>. In teams, many use timestamps like <code>V20261110_1430__add_tags.sql</code> to avoid two developers both creating <code>V7</code>.</p>
+
+  <h4>What happens at startup</h4>
+  <ol class="steps">
+    <li>Boot creates the <code>DataSource</code>; the Flyway auto-configuration runs <strong>before</strong> JPA's <code>EntityManagerFactory</code> is created (Boot orders this for you).</li>
+    <li>Flyway creates the table <code>flyway_schema_history</code> if it does not exist.</li>
+    <li>It scans <code>classpath:db/migration</code>, compares file names and checksums with the history table.</li>
+    <li>It validates already applied migrations (checksum unchanged) and runs the pending ones in order, each in a transaction where the database supports transactional DDL (PostgreSQL does; MySQL does not roll back DDL).</li>
+    <li>Hibernate starts; with <code>ddl-auto=validate</code> it checks that entities match the schema Flyway built.</li>
+  </ol>
+  <pre class="out" data-title="Startup log"><code class="language-plaintext">Flyway Community Edition ... by Redgate
+Database: jdbc:postgresql://localhost:5432/jobs (PostgreSQL 17.x)
+Successfully validated 3 migrations (execution time 00:00.015s)
+Creating Schema History table "public"."flyway_schema_history" ...
+Migrating schema "public" to version "1 - init"
+Migrating schema "public" to version "2 - add tags"
+Successfully applied 2 migrations to schema "public", now at version v2</code></pre>
+  <p>The full <code>V1__init.sql</code> for the job portal is in the <a href="#m3-relationships-example">relationships example</a>. A follow-up migration:</p>
+  <pre data-title="V2__add_tags_and_version.sql"><code class="language-sql">CREATE TABLE tag (
+    id   BIGSERIAL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL UNIQUE
+);
+
+CREATE TABLE job_tag (
+    job_id BIGINT NOT NULL REFERENCES job (id),
+    tag_id BIGINT NOT NULL REFERENCES tag (id),
+    PRIMARY KEY (job_id, tag_id)
+);
+
+ALTER TABLE job ADD COLUMN version BIGINT NOT NULL DEFAULT 0;</code></pre>
+
+  <h4>Settings (spring.flyway.*)</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Property</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>spring.flyway.enabled</code></td><td>Turn Flyway on/off (default true when on the classpath)</td></tr>
+      <tr><td><code>spring.flyway.locations</code></td><td>Where scripts are (default <code>classpath:db/migration</code>); can add a vendor folder such as <code>classpath:db/migration/postgres</code></td></tr>
+      <tr><td><code>spring.flyway.baseline-on-migrate</code></td><td>Baseline an existing, non-empty database on first run (see below)</td></tr>
+      <tr><td><code>spring.flyway.baseline-version</code></td><td>Version assigned to the baseline (default 1)</td></tr>
+      <tr><td><code>spring.flyway.validate-on-migrate</code></td><td>Validate checksums before migrating (default true; keep it)</td></tr>
+      <tr><td><code>spring.flyway.out-of-order</code></td><td>Allow a lower version to run after a higher one was applied (default false)</td></tr>
+      <tr><td><code>spring.flyway.url</code>, <code>user</code>, <code>password</code></td><td>Use a separate DB account with DDL rights; by default Flyway uses the app's datasource</td></tr>
+      <tr><td><code>spring.flyway.clean-disabled</code></td><td>Flyway's <code>clean</code> drops everything; it is disabled by default in current versions. Never enable in production.</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="application.properties"><code class="language-properties">spring.flyway.enabled=true
+spring.flyway.locations=classpath:db/migration
+spring.jpa.hibernate.ddl-auto=validate</code></pre>
+
+  <h4>Baseline: adding Flyway to an existing database</h4>
+  <p>If the database already has tables created by hand or by Hibernate, <code>V1__init.sql</code> would fail with "table already exists". A <strong>baseline</strong> tells Flyway "treat the current state as version N; only run migrations above N". Dump the current schema into <code>V1__init.sql</code> (for new environments), then on the existing database set <code>spring.flyway.baseline-on-migrate=true</code> and <code>spring.flyway.baseline-version=1</code>. Flyway records version 1 as already applied and runs V2 onwards. Turn the baseline option off afterwards, because on an empty database it would skip V1.</p>
+
+  <h4>The golden rule: never edit an applied migration</h4>
+  <div class="co co-rule">
+    <p class="co-t">Rule: applied migrations are immutable</p>
+    <p>Flyway stores a checksum of every applied script. If you edit it later, the next startup fails with <code>FlywayValidateException: Migration checksum mismatch for migration version 2</code> (the app refuses to start). To change the schema, add a <strong>new</strong> migration (<code>V4__fix_...sql</code>). Fix a migration freely only while it exists on your branch and has never run anywhere shared. On a dev database you may delete the database and start again. <code>flyway repair</code> fixes checksums but should be a conscious choice, not a habit.</p>
+  </div>
+
+  <h4>Migrations that are safe in production</h4>
+  <ul>
+    <li><strong>Add, do not rename.</strong> To rename a column on a running system: add the new column, deploy code that writes both, backfill, switch reads, then drop the old column in a later release (expand and contract).</li>
+    <li>Adding a <code>NOT NULL</code> column to a big table needs a default or a backfill first; check lock time.</li>
+    <li>Build large indexes with <code>CREATE INDEX CONCURRENTLY</code> in PostgreSQL (it cannot run inside a transaction; use the per-script non-transactional setting) to avoid blocking writes.</li>
+    <li>Keep one logical change per file, and give constraints and indexes explicit names.</li>
+    <li>Run the whole migration chain on an empty database in CI so mistakes surface before release.</li>
+  </ul>
+
+  <h4>Flyway + ddl-auto=validate</h4>
+  <p>The pairing means: Flyway owns the schema, Hibernate only checks it. If a developer adds a field to an entity and forgets the migration, the app fails at startup with <code>Schema-validation: missing column</code> in dev and CI instead of failing in production on the first query. For tests with Testcontainers PostgreSQL, run the same migrations; avoid H2 with different SQL.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Single underscore in <code>V1_init.sql</code> (needs two): the file is ignored or rejected.</li>
+      <li>Putting migrations outside the scanned folder, or in <code>src/test/resources</code> only.</li>
+      <li>Keeping <code>ddl-auto=update</code> next to Flyway: two tools changing the schema.</li>
+      <li>Merging two branches that both created <code>V5__...</code>; rename one before merging.</li>
+      <li>Using application credentials with DDL rights in production; use a separate migration user via <code>spring.flyway.user</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions</p>
+    <ul>
+      <li><code>FlywayValidateException</code> — checksum mismatch, or a migration missing from the folder that is in the history.</li>
+      <li><code>FlywayException: Found non-empty schema ... without schema history table</code> — existing database, no baseline.</li>
+      <li><code>FlywayException: Detected resolved migration not applied to database</code> — an older version appeared after a newer one ran (<code>out-of-order</code>).</li>
+      <li><code>SQLException</code> in a script — the migration is marked failed. On PostgreSQL it rolls back; on MySQL part of it may remain, requiring manual cleanup.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you manage database changes?" Versioned migrations in source control, run automatically at startup (or in the CI/CD pipeline), history table, checksums, never edit applied scripts, <code>validate</code> in Hibernate. Follow-up: "How to rename a column with zero downtime?" Expand and contract over two releases.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-datasource-hikari">
+  <h3>Datasource, HikariCP, SQL logging, batching and PostgreSQL in Docker</h3>
+  <p class="tldr">Configure the JDBC URL, user and password (from environment variables), tune the HikariCP pool, log SQL with parameters via logger levels, and enable JDBC batching with an id strategy that allows it.</p>
+
+  <h4>PostgreSQL and MySQL connection</h4>
+  <p>Add the driver as a runtime dependency (<code>org.postgresql:postgresql</code> or <code>com.mysql:mysql-connector-j</code>). Boot reads <code>spring.datasource.*</code> and builds a pooled <code>DataSource</code>. The driver class is detected from the URL; setting <code>driver-class-name</code> is optional.</p>
+  <pre data-title="application.properties (PostgreSQL)"><code class="language-properties">spring.datasource.url=jdbc:postgresql://localhost:5432/jobs
+spring.datasource.username=${DB_USER:jobs_user}
+spring.datasource.password=${DB_PASSWORD}
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.open-in-view=false</code></pre>
+  <pre data-title="application.properties (MySQL)"><code class="language-properties">spring.datasource.url=jdbc:mysql://localhost:3306/jobs?serverTimezone=UTC
+spring.datasource.username=${DB_USER:jobs_user}
+spring.datasource.password=${DB_PASSWORD}</code></pre>
+  <ul>
+    <li><code>${DB_PASSWORD}</code> reads an environment variable; <code>${DB_USER:jobs_user}</code> uses a default when it is missing. Never commit real passwords. Because of Boot's relaxed binding, setting the environment variable <code>SPRING_DATASOURCE_PASSWORD</code> overrides the property with no file change, which is how containers and cloud platforms inject secrets.</li>
+    <li>Use one profile file per environment (<code>application-dev.properties</code>, <code>application-prod.properties</code>); see <a href="#m1">module 1</a>.</li>
+    <li>MySQL differences to remember: no sequences (use <code>IDENTITY</code>), DDL is not transactional, default isolation is <code>REPEATABLE READ</code>, identifiers are case-sensitive on Linux, and the dialect is detected automatically in current Hibernate (older code set <code>hibernate.dialect</code> by hand; you rarely need it now).</li>
+  </ul>
+
+  <h4>HikariCP: the connection pool</h4>
+  <p>Opening a database connection costs milliseconds (TCP, authentication). A <strong>connection pool</strong> opens a fixed set once and lends them to requests. Spring Boot uses <strong>HikariCP</strong> by default. A request borrows a connection when its transaction starts and returns it at the end, so the transaction length decides how long the connection is busy.</p>
+  <pre data-title="Common Hikari settings"><code class="language-properties">spring.datasource.hikari.pool-name=jobs-pool
+spring.datasource.hikari.maximum-pool-size=10
+spring.datasource.hikari.minimum-idle=10
+spring.datasource.hikari.connection-timeout=30000
+spring.datasource.hikari.idle-timeout=600000
+spring.datasource.hikari.max-lifetime=1800000
+spring.datasource.hikari.leak-detection-threshold=20000</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Setting</th><th>Default</th><th>Meaning and advice</th></tr></thead>
+    <tbody>
+      <tr><td><code>maximum-pool-size</code></td><td>10</td><td>Max connections. Bigger is not faster; see below</td></tr>
+      <tr><td><code>minimum-idle</code></td><td>same as max</td><td>Idle connections kept ready. Leave at default (fixed-size pool)</td></tr>
+      <tr><td><code>connection-timeout</code></td><td>30000 ms</td><td>How long a caller waits for a free connection before <code>SQLTransientConnectionException</code></td></tr>
+      <tr><td><code>idle-timeout</code></td><td>600000 ms</td><td>Idle connections above <code>minimum-idle</code> are retired</td></tr>
+      <tr><td><code>max-lifetime</code></td><td>1800000 ms</td><td>Retire connections after this age; keep it a few minutes shorter than any database/firewall limit</td></tr>
+      <tr><td><code>leak-detection-threshold</code></td><td>0 (off)</td><td>Logs a warning with a stack trace if a connection is held longer than this</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Sizing.</strong> A database can only do so much in parallel; a small pool (often 10–20 per application instance) usually gives better throughput than a huge one, because extra connections just queue inside the database. Remember the total: <code>instances × pool size</code> must stay below the database's <code>max_connections</code> (PostgreSQL default 100). Many teams tune from monitoring: pool wait time and active connections (see <a href="#m1">module 1</a> and the actuator metrics in module 6).</p>
+  <p>Symptoms of pool problems: <code>HikariPool-1 - Connection is not available, request timed out after 30000ms</code> means all connections are busy, usually because of long transactions, OSIV, a leak, or a slow query, not a pool that is "too small". Fix the cause first.</p>
+
+  <h4>SQL logging done right</h4>
+  <pre data-title="Development logging"><code class="language-properties">logging.level.org.hibernate.SQL=debug
+logging.level.org.hibernate.orm.jdbc.bind=trace
+spring.jpa.properties.hibernate.format_sql=true</code></pre>
+  <pre class="out" data-title="Example log"><code class="language-plaintext">select a1_0.id,a1_0.status from application a1_0 where a1_0.job_id=?
+binding parameter (1:BIGINT) &lt;- [7]</code></pre>
+  <ul>
+    <li><code>org.hibernate.SQL=debug</code> logs each statement through your logging framework (so levels, timestamps and files work). Add the bind logger to see parameter values; in Hibernate 5 and older this logger was <code>org.hibernate.type.descriptor.sql.BasicBinder=trace</code>.</li>
+    <li><code>spring.jpa.show-sql=true</code> prints with <code>System.out</code>: no log levels, no parameters, no routing to log files. Avoid it, and never use either option in production (volume, performance, and bound values can include personal data).</li>
+    <li>Counting statements: <code>spring.jpa.properties.hibernate.generate_statistics=true</code> and <code>logging.level.org.hibernate.stat=debug</code> help to spot N+1 (<a href="#m3-n-plus-one">N+1</a>).</li>
+    <li>For a production-friendly view use APM tools or <code>pg_stat_statements</code> on PostgreSQL instead of application logs.</li>
+  </ul>
+
+  <h4>Batch inserts and updates</h4>
+  <p>Saving 1,000 jobs normally sends 1,000 <code>INSERT</code> statements, each a network round trip. With <strong>JDBC batching</strong> Hibernate groups them into a few batches.</p>
+  <pre data-title="application.properties"><code class="language-properties">spring.jpa.properties.hibernate.jdbc.batch_size=50
+spring.jpa.properties.hibernate.order_inserts=true
+spring.jpa.properties.hibernate.order_updates=true</code></pre>
+  <ul>
+    <li><code>jdbc.batch_size</code> is the number of statements per batch.</li>
+    <li><code>order_inserts</code> / <code>order_updates</code> sort statements by entity type so identical statements sit together; without them, saving a parent and its children alternately breaks the batch.</li>
+    <li><strong>The id strategy must allow it:</strong> <code>IDENTITY</code> disables insert batching (<a href="#m3-id-ddl">ID strategies</a>). Use <code>SEQUENCE</code> on PostgreSQL.</li>
+    <li>For PostgreSQL you can add the driver option <code>reWriteBatchedInserts=true</code> to the JDBC URL (multi-row inserts); for MySQL, <code>rewriteBatchedStatements=true</code>.</li>
+  </ul>
+  <pre data-title="Chunked import: flush and clear"><code class="language-java">@Transactional
+public void importJobs(List&lt;Job&gt; jobs) {
+    int i = 0;
+    for (Job job : jobs) {
+        em.persist(job);
+        if (++i % 50 == 0) {
+            em.flush();        // send the batch
+            em.clear();        // free memory, stop dirty checking old entities
+        }
+    }
+}</code></pre>
+  <p>Without <code>clear()</code> the persistence context keeps every entity and the job slows down and may run out of memory. For millions of rows, think about <code>JdbcClient</code> batch updates or the database's bulk loader (<code>COPY</code>) instead.</p>
+
+  <h4>Running PostgreSQL in Docker for development</h4>
+  <pre data-title="One command"><code class="language-bash">docker run --name jobs-db -d -p 5432:5432 \
+  -e POSTGRES_DB=jobs -e POSTGRES_USER=jobs_user -e POSTGRES_PASSWORD=dev_password \
+  -v jobs-data:/var/lib/postgresql/data \
+  postgres:17</code></pre>
+  <pre data-title="compose.yaml (docker compose up -d)"><code class="language-yaml">services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: jobs
+      POSTGRES_USER: jobs_user
+      POSTGRES_PASSWORD: dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - jobs-data:/var/lib/postgresql/data
+volumes:
+  jobs-data:</code></pre>
+  <p>Then set <code>DB_PASSWORD=dev_password</code> in your run configuration. The named volume keeps data across container restarts; <code>docker rm -v</code> or removing the volume resets the database. Boot also offers Docker Compose support (<code>spring-boot-docker-compose</code> dependency) that starts the <code>compose.yaml</code> services with the app and wires the connection details automatically in development. Docker itself is covered in the DevOps page.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Committing <code>application.properties</code> with a real password.</li>
+      <li>Raising <code>maximum-pool-size</code> to 200 to fix timeouts that come from long transactions.</li>
+      <li>Leaving <code>show-sql</code> or <code>bind=trace</code> on in production.</li>
+      <li>Setting <code>batch_size</code> but using <code>IDENTITY</code>: no batching happens, and no error tells you.</li>
+      <li>Connecting to <code>localhost</code> from inside a container; use the service name (<code>db</code>) as host.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions</p>
+    <ul>
+      <li><code>CannotCreateTransactionException</code> / <code>PSQLException: Connection refused</code> — database not running or wrong host/port.</li>
+      <li><code>PSQLException: FATAL: password authentication failed</code> — wrong credentials (check the environment variable is set in the run configuration).</li>
+      <li><code>Failed to determine a suitable driver class</code> — no URL, or the driver dependency is missing.</li>
+      <li><code>HikariPool ... Connection is not available</code> — pool exhausted (above).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is connection pooling and which pool does Boot use?" Reuse of expensive connections; HikariCP; mention <code>maximum-pool-size</code> and why bigger is not better. "How do you see the SQL Hibernate runs?" The <code>org.hibernate.SQL</code> and bind loggers, not <code>show-sql</code> in production. "How do you speed up bulk inserts?" JDBC batching, SEQUENCE ids, ordered inserts, flush-and-clear.</p>
+  </div>
+</article>
+
+<article class="topic recap" id="m3-interview">
+  <h3>Interview questions — Data access with Spring Data JPA</h3>
+
+  <details class="qa">
+    <summary>What are JPA, Hibernate and Spring Data JPA, and how do they relate?</summary>
+    <div class="qa-a">
+      <p>JPA is a specification: annotations, the <code>EntityManager</code> interface and JPQL. Hibernate is an implementation of that specification; it tracks entities and generates SQL. Spring Data JPA is a layer on top that creates repository implementations from interfaces and calls the <code>EntityManager</code> underneath. You code against Spring Data and JPA; Hibernate does the work.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the persistence context, and what are the entity states?</summary>
+    <div class="qa-a">
+      <p>It is the per-transaction first-level cache and identity map that tracks managed entities. States: transient (new, unknown to JPA), managed (tracked; changes saved at flush), detached (has an id, but the context is closed), removed (scheduled for deletion). Within one context a given row is always the same Java object.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is dirty checking? Why does my update work without calling save()?</summary>
+    <div class="qa-a">
+      <p>Hibernate keeps a snapshot of each managed entity. At flush (before commit) it compares the entity with the snapshot and issues an <code>UPDATE</code> for changes. So inside <code>@Transactional</code>, loading an entity and calling a setter is enough. Without a transaction the entity is detached and the change is lost.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does <code>save()</code> decide between INSERT and UPDATE?</summary>
+    <div class="qa-a">
+      <p>It calls <code>isNew</code>: a null id (or a null wrapper <code>@Version</code>) means new, so <code>persist</code>; otherwise <code>merge</code>, which first runs a SELECT. With ids that you assign yourself, the id is never null, so every save does a needless SELECT; add a <code>@Version</code> field or implement <code>Persistable</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>IDENTITY vs SEQUENCE vs UUID?</summary>
+    <div class="qa-a">
+      <p>IDENTITY lets the database auto-increment; Hibernate must INSERT immediately to learn the id, which disables batching. SEQUENCE asks a database sequence in blocks (<code>allocationSize</code>, default 50), so inserts can be delayed and batched; MySQL lacks sequences. UUID is generated in Java, needs no round trip and is not guessable, but it is larger and random, which hurts index locality.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does <code>ddl-auto</code> do and what should production use?</summary>
+    <div class="qa-a">
+      <p>It controls schema generation at startup: <code>none</code>, <code>validate</code>, <code>update</code>, <code>create</code>, <code>create-drop</code>. Production uses <code>validate</code> (or <code>none</code>) with Flyway migrations. <code>update</code> cannot rename or drop and leaves no history; <code>create</code> drops all data.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain the owning side and <code>mappedBy</code>.</summary>
+    <div class="qa-a">
+      <p>In a bidirectional relationship the owning side is the entity whose table holds the foreign key (the <code>@ManyToOne</code> side). Only changes on the owning side write the FK. The inverse side uses <code>mappedBy = "fieldOnOwner"</code> and is a read-only mirror. So you must set both sides in memory; use helper methods like <code>addJob</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What are the default fetch types and what do you recommend?</summary>
+    <div class="qa-a">
+      <p>ToOne (<code>@ManyToOne</code>, <code>@OneToOne</code>) is EAGER; ToMany is LAZY. Recommendation: make everything LAZY, and load needed data per use case with <code>JOIN FETCH</code>, <code>@EntityGraph</code>, batch fetching or DTO projections. Eager mappings cannot be turned off per query and cause hidden extra queries.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the N+1 problem and how do you fix it?</summary>
+    <div class="qa-a">
+      <p>One query loads N parents, then lazy loading fires one query for each parent's relation: 1 + N queries. Detect it with the SQL log, Hibernate statistics or query-count tests. Fix with <code>JOIN FETCH</code>, <code>@EntityGraph</code>, <code>hibernate.default_batch_fetch_size</code> (turns N into N/size), or a DTO projection. Beware of join-fetching a collection with pagination (done in memory) and <code>MultipleBagFetchException</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What causes <code>LazyInitializationException</code> and how do you solve it properly?</summary>
+    <div class="qa-a">
+      <p>A lazy association is read after the session closed, usually in the controller or during JSON serialization. Solve it by mapping to a DTO inside the service transaction, or by fetching the data in the query. Do not make it EAGER and do not rely on Open Session in View; set <code>spring.jpa.open-in-view=false</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does <code>@Transactional</code> work, and why might it not apply?</summary>
+    <div class="qa-a">
+      <p>Spring wraps the bean in a proxy; the interceptor starts a transaction through the transaction manager, binds the connection to the thread, calls the method and commits or rolls back. It does nothing on self-invocation (<code>this.method()</code> skips the proxy), on private or final methods, or on objects not managed by Spring. It rolls back only for unchecked exceptions and errors unless <code>rollbackFor</code> says otherwise.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>REQUIRED vs REQUIRES_NEW vs NESTED?</summary>
+    <div class="qa-a">
+      <p>REQUIRED joins the existing transaction or creates one; a failure anywhere marks the whole thing rollback-only. REQUIRES_NEW suspends the outer transaction and runs independently on another connection (use it for an audit record that must persist even if the caller rolls back). NESTED runs in a savepoint inside the outer transaction, so only the inner part rolls back.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is <code>UnexpectedRollbackException</code>?</summary>
+    <div class="qa-a">
+      <p>An inner method taking part in the outer transaction threw a runtime exception, which marked the transaction rollback-only. The outer code caught the exception and continued, then tried to commit; Spring throws because the transaction can only roll back. Let the exception propagate, or run the inner call in REQUIRES_NEW or NESTED.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Optimistic vs pessimistic locking?</summary>
+    <div class="qa-a">
+      <p>Optimistic: add a <code>@Version</code> column; the UPDATE includes <code>where version=?</code>, and the loser gets <code>ObjectOptimisticLockingFailureException</code> (return 409, reload, retry). No locks are held. Pessimistic: <code>@Lock(PESSIMISTIC_WRITE)</code> issues <code>SELECT ... FOR UPDATE</code> and others wait; use for heavy contention like stock or seats, with a timeout. For simple counters an atomic <code>update ... set n = n - 1 where n &gt; 0</code> is enough.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you manage schema changes in a Spring Boot project?</summary>
+    <div class="qa-a">
+      <p>Flyway migrations in <code>db/migration</code> (<code>V1__init.sql</code>, <code>V2__...</code>), applied at startup and recorded in <code>flyway_schema_history</code> with checksums. Applied files are never edited; a change is a new file. Hibernate runs with <code>ddl-auto=validate</code> so a missing migration fails fast. Existing databases are adopted with a baseline.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m3-cheatsheet">
+  <h3>Cheat sheet — Data access with Spring Data JPA</h3>
+  <ul class="cheat">
+    <li><b>JPA / Hibernate / Spring Data</b> specification / implementation / generated repositories on top</li>
+    <li><b>Entity rules</b> <code>@Entity</code>, <code>@Id</code>, protected no-arg constructor, not final</li>
+    <li><b>Enums</b> always <code>@Enumerated(EnumType.STRING)</code></li>
+    <li><b>Money</b> <code>BigDecimal</code> with <code>precision</code> and <code>scale</code>; time as <code>Instant</code></li>
+    <li><b>equals/hashCode</b> id non-null and equal; constant <code>hashCode</code>; never Lombok <code>@Data</code> on entities</li>
+    <li><b>Entity states</b> transient → managed → detached / removed</li>
+    <li><b>Dirty checking</b> changed managed entities are UPDATEd at flush; no <code>save()</code> needed in a transaction</li>
+    <li><b>Flush</b> before commit, before queries, on <code>flush()</code>; it is not a commit</li>
+    <li><b>save()</b> new → persist, else merge (extra SELECT); use the returned object</li>
+    <li><b>getReferenceById</b> lazy proxy with the id only; <b>findById</b> runs a SELECT</li>
+    <li><b>IDENTITY</b> no insert batching; <b>SEQUENCE</b> allocationSize 50, batching; <b>UUID</b> no round trip</li>
+    <li><b>ddl-auto</b> production: <code>validate</code> or <code>none</code> + Flyway</li>
+    <li><b>Derived queries</b> <code>findBy</code>, <code>And</code>, <code>Or</code>, <code>Between</code>, <code>Containing</code>, <code>In</code>, <code>OrderBy…Desc</code>, <code>Top5</code>, <code>existsBy</code>, <code>countBy</code></li>
+    <li><b>Return types</b> <code>Optional</code> (one), <code>List</code>, <code>Page</code> (with count), <code>Slice</code> (no count), <code>Stream</code></li>
+    <li><b>@Query</b> JPQL uses entity and field names; bind with <code>:name</code> + <code>@Param</code>; <code>nativeQuery = true</code> for SQL</li>
+    <li><b>@Modifying</b> bulk update/delete in a transaction; <code>clearAutomatically = true</code></li>
+    <li><b>Projections</b> interface or record; selects only needed columns</li>
+    <li><b>Specifications</b> <code>JpaSpecificationExecutor</code>, combine with <code>and</code>/<code>or</code> for optional filters</li>
+    <li><b>Owning side</b> the side with the FK (<code>@ManyToOne</code>); <code>mappedBy</code> on the other; sync both sides</li>
+    <li><b>Cascade</b> only parent → owned children; never REMOVE on ManyToMany or ManyToOne</li>
+    <li><b>ManyToMany</b> use <code>Set</code>; extra columns → explicit join entity</li>
+    <li><b>Fetching</b> make all associations LAZY; <code>spring.jpa.open-in-view=false</code></li>
+    <li><b>N+1</b> fix with <code>JOIN FETCH</code>, <code>@EntityGraph</code>, <code>default_batch_fetch_size</code>, DTO projection</li>
+    <li><b>Fetch pitfalls</b> collection join fetch + paging = in memory; two bags = <code>MultipleBagFetchException</code></li>
+    <li><b>@Transactional</b> proxy-based; service layer; public methods; no self-invocation</li>
+    <li><b>Rollback</b> unchecked and Error only; <code>rollbackFor = Exception.class</code> for checked</li>
+    <li><b>Propagation</b> REQUIRED (default), REQUIRES_NEW (independent), NESTED (savepoint), MANDATORY, NEVER, SUPPORTS, NOT_SUPPORTED</li>
+    <li><b>readOnly = true</b> on query-only service methods</li>
+    <li><b>Locking</b> <code>@Version</code> → 409 on conflict; <code>@Lock(PESSIMISTIC_WRITE)</code> → <code>FOR UPDATE</code></li>
+    <li><b>Auditing</b> <code>@EnableJpaAuditing</code> + <code>AuditingEntityListener</code> + <code>@CreatedDate</code>/<code>@LastModifiedDate</code></li>
+    <li><b>Flyway</b> <code>db/migration/V1__init.sql</code>; never edit applied files; baseline for existing DBs</li>
+    <li><b>HikariCP</b> <code>maximum-pool-size</code> default 10; keep pools small; watch long transactions</li>
+    <li><b>SQL logging</b> <code>org.hibernate.SQL=debug</code> + <code>org.hibernate.orm.jdbc.bind=trace</code> in dev only</li>
+    <li><b>Batching</b> <code>hibernate.jdbc.batch_size</code>, <code>order_inserts</code>, SEQUENCE ids, flush and clear</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m3-practice">
+  <h3>Practice — Data access with Spring Data JPA</h3>
+  <ol class="steps">
+    <li><strong>Local database (easy).</strong> Start PostgreSQL in Docker, connect the Product API from module 2 with environment-variable credentials, and set <code>ddl-auto=validate</code>. Done when the app starts and the Product endpoints still work against the Docker database.</li>
+    <li><strong>First migration (easy).</strong> Write <code>V1__init.sql</code> for <code>company</code>, <code>app_user</code>, <code>job</code> and <code>application</code> (use the SQL in the relationships example as a starting point), add Flyway, and start the app. Done when <code>flyway_schema_history</code> has one row. Then edit V1 on purpose, restart, and read the checksum error.</li>
+    <li><strong>Project 2 entities (medium).</strong> Map <code>User</code>, <code>Company</code>, <code>Job</code> and <code>Application</code> with all ManyToOne relations LAZY, enums as STRING, <code>BaseEntity</code> with safe <code>equals</code>/<code>hashCode</code>, and a unique constraint on (job, user). Done when Hibernate <code>validate</code> passes and an integration test saves one of each.</li>
+    <li><strong>Repositories and pagination (medium).</strong> Add derived queries (<code>findByEmail</code>, <code>existsByJobIdAndApplicantId</code>), a paged <code>findByStatus</code>, and a Specification-based search (city, text, minimum salary) returning <code>Page&lt;JobCard&gt;</code>. Done when a controller serves <code>GET /api/v1/jobs?city=Pune&amp;page=0&amp;size=10</code> with correct totals.</li>
+    <li><strong>Fourth related entity (medium).</strong> Add <code>Tag</code> with a many-to-many to <code>Job</code> using <code>Set</code> and helper methods, in a new migration <code>V2</code>. Done when assigning tags creates rows only in <code>job_tag</code>, and removing one deletes exactly one row (check the SQL log).</li>
+    <li><strong>Auditing and versioning (medium).</strong> Create <code>AuditableEntity</code> with <code>createdAt</code>/<code>updatedAt</code>, enable auditing, and add <code>@Version</code> to <code>Job</code>. Done when two parallel updates of the same job make the second fail with <code>ObjectOptimisticLockingFailureException</code>, returned as HTTP 409.</li>
+    <li><strong>Find and fix an N+1 (hard).</strong> Write an endpoint "applicants of a job" that returns applicant name per application, with <code>open-in-view=false</code> and lazy mappings. First write it badly, enable SQL logging and count the queries for 20 applications. Then fix it with <code>JOIN FETCH</code>, then with <code>@EntityGraph</code>, then with a DTO projection, and finally set <code>default_batch_fetch_size</code>. Done when you can show the query counts before (21) and after (1 or 2) for each fix.</li>
+    <li><strong>Transaction experiments (hard).</strong> (a) Call a <code>REQUIRES_NEW</code> method from the same class and show with logging that it does not start a new transaction; fix it with a second bean. (b) Throw a checked exception from a <code>@Transactional</code> method, show the commit, then add <code>rollbackFor</code>. (c) Reproduce <code>UnexpectedRollbackException</code>. Done when each behaviour is visible in the SQL log or the exception output.</li>
+    <li><strong>Batch import (hard).</strong> Import 10,000 jobs with <code>SEQUENCE</code> ids, <code>batch_size=50</code> and <code>order_inserts=true</code>; compare statement counts and time with <code>IDENTITY</code>. Done when the log shows batched inserts for SEQUENCE and single inserts for IDENTITY.</li>
+  </ol>
+</article>

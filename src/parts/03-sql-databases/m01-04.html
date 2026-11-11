@@ -1,0 +1,381 @@
+<article class="topic" id="m1-filters-logic">
+  <h3>Filters: AND, OR, NOT, IN and BETWEEN</h3>
+  <p class="tldr">Combine conditions with <code>AND</code>, <code>OR</code> and <code>NOT</code>, remembering that
+  <code>AND</code> binds tighter than <code>OR</code>, so use parentheses. <code>IN</code> replaces a chain of
+  <code>OR</code>s, and <code>BETWEEN</code> is inclusive at both ends, which is a trap for timestamps.</p>
+
+  <h4>AND, OR and NOT</h4>
+  <p><code>WHERE</code> accepts any condition that is TRUE, FALSE or UNKNOWN (see
+  <a href="#m1-null-logic">NULL and three-valued logic</a>). You build bigger conditions from smaller ones:</p>
+  <ul>
+    <li><code>a AND b</code>: both must be true.</li>
+    <li><code>a OR b</code>: at least one must be true.</li>
+    <li><code>NOT a</code>: reverses a condition (<code>NOT (dept_id = 1)</code>).</li>
+  </ul>
+
+  <h4>Precedence: AND before OR</h4>
+  <p>Like multiplication before addition in maths, SQL evaluates <code>NOT</code> first, then
+  <code>AND</code>, then <code>OR</code>. Comparison operators (<code>=</code>, <code>&gt;</code>,
+  <code>IN</code>, <code>BETWEEN</code>, <code>LIKE</code>) bind tighter than all three. The famous bug:
+  you want employees of Engineering or Sales who earn more than 100000.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: read as dept 1, OR (dept 2 AND salary &gt; 100000)</p><pre><code class="language-sql">SELECT first_name, dept_id, salary
+FROM employees
+WHERE dept_id = 1 OR dept_id = 2 AND salary &gt; 100000
+ORDER BY emp_id;</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: parentheses say what you mean</p><pre><code class="language-sql">SELECT first_name, dept_id, salary
+FROM employees
+WHERE (dept_id = 1 OR dept_id = 2)
+  AND salary &gt; 100000
+ORDER BY emp_id;</code></pre></div>
+  </div>
+  <pre class="out" data-title="Wrong query: 7 rows (Divya earns only 90000 but slipped in)"><code class="language-plaintext"> first_name | dept_id |  salary
+------------+---------+-----------
+ Vikram     |       1 | 220000.00
+ Ananya     |       2 | 150000.00
+ Priya      |       1 | 150000.00
+ Rahul      |       1 | 150000.00
+ Arjun      |       1 | 110000.00
+ Divya      |       1 |  90000.00
+ Karan      |       2 | 160000.00
+(7 rows)</code></pre>
+  <pre class="out" data-title="Right query: 6 rows"><code class="language-plaintext"> first_name | dept_id |  salary
+------------+---------+-----------
+ Vikram     |       1 | 220000.00
+ Ananya     |       2 | 150000.00
+ Priya      |       1 | 150000.00
+ Rahul      |       1 | 150000.00
+ Arjun      |       1 | 110000.00
+ Karan      |       2 | 160000.00
+(6 rows)</code></pre>
+  <p>Whenever a <code>WHERE</code> mixes <code>AND</code> and <code>OR</code>, add parentheses even if you are
+  sure about the precedence. The next reader will not be. To rewrite a negated condition use De Morgan's laws:
+  <code>NOT (a AND b)</code> is <code>NOT a OR NOT b</code>, and <code>NOT (a OR b)</code> is
+  <code>NOT a AND NOT b</code>.</p>
+
+  <h4>IN: a list of allowed values</h4>
+  <p><code>x IN (1, 3)</code> is the same as <code>x = 1 OR x = 3</code>, shorter and harder to get wrong.
+  <code>NOT IN</code> is the opposite.</p>
+  <pre data-title="IN and NOT IN"><code class="language-sql">SELECT first_name, dept_id FROM employees WHERE dept_id IN (1, 3) ORDER BY emp_id;
+
+SELECT first_name, dept_id FROM employees WHERE dept_id NOT IN (1, 3) ORDER BY emp_id;</code></pre>
+  <pre class="out" data-title="Output of both queries"><code class="language-plaintext"> first_name | dept_id
+------------+---------
+ Vikram     |       1
+ Sunita     |       3
+ Priya      |       1
+ Rahul      |       1
+ Arjun      |       1
+ Divya      |       1
+ Farhan     |       3
+ Isha       |       3
+(8 rows)
+
+ first_name | dept_id
+------------+---------
+ Ananya     |       2
+ Karan      |       2
+ Neha       |       2
+(3 rows)</code></pre>
+  <p>Count the second result: 12 employees, 8 in departments 1 and 3, so you may expect 4 others. Meera is
+  missing, because <code>NULL NOT IN (1, 3)</code> is UNKNOWN. To include her write
+  <code>WHERE dept_id NOT IN (1, 3) OR dept_id IS NULL</code>. <code>IN</code> also takes a subquery:
+  <code>dept_id IN (SELECT dept_id FROM departments WHERE location = 'Pune')</code> (see
+  <a href="#m2-subqueries">Subqueries</a>).</p>
+
+  <h4>BETWEEN: an inclusive range</h4>
+  <p><code>x BETWEEN a AND b</code> means <code>x &gt;= a AND x &lt;= b</code>. <strong>Both ends are
+  included</strong>. It works for numbers, dates and text.</p>
+  <pre data-title="BETWEEN with numbers and dates"><code class="language-sql">SELECT first_name, salary
+FROM employees
+WHERE salary BETWEEN 90000 AND 150000
+ORDER BY salary DESC, emp_id;
+
+SELECT order_id, order_date
+FROM orders
+WHERE order_date BETWEEN '2026-03-01' AND '2026-03-31'
+ORDER BY order_id;</code></pre>
+  <pre class="out" data-title="Output of both queries"><code class="language-plaintext"> first_name |  salary
+------------+-----------
+ Ananya     | 150000.00
+ Priya      | 150000.00
+ Rahul      | 150000.00
+ Sunita     | 120000.00
+ Arjun      | 110000.00
+ Divya      |  90000.00
+(6 rows)
+
+ order_id | order_date
+----------+------------
+        6 | 2026-03-08
+        7 | 2026-03-21
+        8 | 2026-03-30
+(3 rows)</code></pre>
+  <p>Divya (exactly 90000) and the three employees at exactly 150000 are in the result, because the ends are
+  included. Three more details:</p>
+  <ul>
+    <li><strong>Put the smaller value first.</strong> <code>BETWEEN 150000 AND 90000</code> returns no rows,
+    with no error. PostgreSQL has <code>BETWEEN SYMMETRIC</code>, which swaps the bounds for you.</li>
+    <li><code>NOT BETWEEN a AND b</code> means <code>x &lt; a OR x &gt; b</code>.</li>
+    <li>NULL is never between anything, so NULL rows are dropped (as with every comparison).</li>
+  </ul>
+
+  <h4>The BETWEEN trap with timestamps</h4>
+  <p>The order query above is safe because <code>order_date</code> is a <code>DATE</code>. If the column is a
+  <code>TIMESTAMP</code>, the literal <code>'2026-03-31'</code> means <code>2026-03-31 00:00:00</code>, so
+  everything that happened later on March 31 is outside the range:</p>
+  <pre data-title="An order placed on 31 March at 3:30 pm"><code class="language-sql">SELECT TIMESTAMP '2026-03-31 15:30:00'
+       BETWEEN DATE '2026-03-01' AND DATE '2026-03-31' AS in_march;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> in_march
+----------
+ f
+(1 row)</code></pre>
+  <p>For dates with a time part, use a half-open range: <code>&gt;= '2026-03-01' AND &lt; '2026-04-01'</code>.
+  It also keeps working when someone changes the column from <code>DATE</code> to <code>TIMESTAMP</code>. See
+  <a href="#m2-date-ranges-time-zones">Date ranges and time zones</a>.</p>
+
+  <h4>Putting it together</h4>
+  <p>A realistic filter: staff of Engineering or Sales, paid between 100000 and 160000, who joined in 2020 or
+  later.</p>
+  <pre data-title="Several conditions at once"><code class="language-sql">SELECT first_name, dept_id, salary, hire_date
+FROM employees
+WHERE dept_id IN (1, 2)
+  AND salary BETWEEN 100000 AND 160000
+  AND hire_date >= '2020-01-01'
+ORDER BY emp_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name | dept_id |  salary   | hire_date
+------------+---------+-----------+------------
+ Rahul      |       1 | 150000.00 | 2020-03-02
+ Arjun      |       1 | 110000.00 | 2022-08-16
+ Karan      |       2 | 160000.00 | 2021-05-24
+(3 rows)</code></pre>
+  <p>Priya is out (hired 2019), Vikram earns too much, Ananya was hired in 2017, and Divya and Neha earn too
+  little. Each condition is on its own line, so you can comment one out to see its effect.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: NOT, then AND, then OR</p>
+    <p>If a condition mixes <code>AND</code> and <code>OR</code>, use parentheses. The precedence is the same
+    in PostgreSQL and MySQL, but nobody should have to remember it.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: OR with a bare value</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: the second operand is a number, not a condition</p><pre><code class="language-sql">SELECT * FROM employees WHERE dept_id = 1 OR 2;
+-- PostgreSQL: ERROR:  argument of OR must be type boolean, not type integer
+-- MySQL: runs, treats 2 as TRUE, and returns every row</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: repeat the column, or use IN</p><pre><code class="language-sql">SELECT * FROM employees WHERE dept_id = 1 OR dept_id = 2;
+SELECT * FROM employees WHERE dept_id IN (1, 2);</code></pre></div>
+    </div>
+    <p>Another beginner error is <code>salary &gt; 100000 AND &lt; 200000</code>: each condition needs its own
+    column, <code>salary &gt; 100000 AND salary &lt; 200000</code>, or use <code>BETWEEN</code> when both ends
+    are inclusive.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Combining NULL checks with other filters needs parentheses too:
+      <code>WHERE dept_id = 1 OR dept_id IS NULL</code> returns the five Engineering employees and the CEO.</li>
+      <li>An empty list is a syntax error: <code>IN ()</code> fails. When a Java program builds the list, handle
+      the empty case before sending the query.</li>
+      <li>Very long <code>IN</code> lists are slow to plan and a statement can carry only a limited number of
+      bind parameters. Put big lists in a temporary table or a subquery. In PostgreSQL you can also pass a
+      single array parameter: <code>WHERE id = ANY (?)</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: one condition per line</p>
+    <p>Start each continuation line with <code>AND</code> or <code>OR</code>. When a result looks wrong, comment
+    out conditions one at a time and watch the row count change.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Which is evaluated first, <code>AND</code> or <code>OR</code>?</b> <code>AND</code>. Show the
+      <code>a OR b AND c</code> example and fix it with parentheses.</li>
+      <li><b>Is <code>BETWEEN</code> inclusive?</b> Yes, both ends. Mention the timestamp trap and the half-open
+      range fix.</li>
+      <li><b><code>IN</code> versus several <code>OR</code>s?</b> Same result, <code>IN</code> is shorter. The
+      difference appears with <code>NOT IN</code> and NULL.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-like-patterns">
+  <h3>Pattern matching: LIKE, ILIKE and case sensitivity</h3>
+  <p class="tldr"><code>LIKE</code> matches text against a pattern where <code>%</code> means "any characters" and
+  <code>_</code> means "exactly one character". It is case-sensitive in PostgreSQL (use <code>ILIKE</code> for
+  case-insensitive) and case-insensitive by default in MySQL.</p>
+
+  <h4>The two wildcards</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Wildcard</th><th>Matches</th><th>Example</th><th>Matches</th></tr></thead>
+    <tbody>
+      <tr><td><code>%</code></td><td>zero or more characters</td><td><code>'A%'</code></td><td>starts with A</td></tr>
+      <tr><td><code>%</code></td><td>zero or more characters</td><td><code>'%a'</code></td><td>ends with a</td></tr>
+      <tr><td><code>%</code></td><td>zero or more characters</td><td><code>'%cable%'</code></td><td>contains "cable"</td></tr>
+      <tr><td><code>_</code></td><td>exactly one character</td><td><code>'_r%'</code></td><td>second letter is r</td></tr>
+      <tr><td>none</td><td>exact match, like <code>=</code></td><td><code>'Pune'</code></td><td>exactly Pune</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Starts with, ends with, contains"><code class="language-sql">SELECT first_name FROM employees WHERE first_name LIKE 'A%' ORDER BY emp_id;
+
+SELECT first_name FROM employees WHERE first_name LIKE '%a' ORDER BY emp_id;
+
+SELECT first_name FROM employees WHERE first_name LIKE '_r%' ORDER BY emp_id;
+
+SELECT name, price FROM products WHERE name LIKE '%Cable%';</code></pre>
+  <pre class="out" data-title="Output of the four queries"><code class="language-plaintext"> first_name
+------------
+ Ananya
+ Arjun
+(2 rows)
+
+ first_name
+------------
+ Meera
+ Ananya
+ Sunita
+ Priya
+ Divya
+ Neha
+ Isha
+(7 rows)
+
+ first_name
+------------
+ Priya
+ Arjun
+(2 rows)
+
+    name     | price
+-------------+--------
+ USB-C Cable | 299.00
+(1 row)</code></pre>
+  <p><code>NOT LIKE</code> reverses the test. Remember that <code>LIKE</code> on a NULL value is UNKNOWN, so
+  <code>NOT LIKE</code> also drops NULL rows.</p>
+
+  <h4>Case sensitivity</h4>
+  <p>This is where PostgreSQL and MySQL differ, and it surprises people who move between them.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Question</th><th>PostgreSQL</th><th>MySQL</th></tr></thead>
+    <tbody>
+      <tr><td><code>'abc' = 'ABC'</code></td><td>false</td><td>true (default collation <code>utf8mb4_0900_ai_ci</code>:
+      case- and accent-insensitive)</td></tr>
+      <tr><td><code>first_name LIKE 'a%'</code> finds Ananya?</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Case-insensitive search</td><td><code>ILIKE</code>, or <code>LOWER(col) LIKE LOWER(x)</code></td>
+      <td>plain <code>LIKE</code></td></tr>
+      <tr><td>Force case-sensitive</td><td>default behaviour</td>
+      <td><code>LIKE BINARY 'A%'</code> or <code>COLLATE utf8mb4_bin</code></td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="PostgreSQL: LIKE versus ILIKE"><code class="language-sql">SELECT first_name FROM employees WHERE first_name LIKE 'a%';    -- 0 rows
+SELECT first_name FROM employees WHERE first_name ILIKE 'a%';   -- Ananya, Arjun
+
+SELECT name FROM products WHERE name ILIKE '%mouse%';           -- Wireless Mouse</code></pre>
+  <p><code>ILIKE</code> is a PostgreSQL extension, not standard SQL. The portable way is
+  <code>LOWER(first_name) LIKE 'a%'</code>, which works everywhere. Another PostgreSQL option is the
+  <code>citext</code> extension, a text type that compares case-insensitively; people use it for email
+  columns.</p>
+
+  <h4>Escaping % and _ with ESCAPE</h4>
+  <p>What if you need to find a real underscore or percent sign? The underscore in <code>'SAVE_10'</code> is a
+  wildcard, so the pattern also matches <code>SAVEX10</code> and <code>SAVE-10</code>. Put an escape character
+  before the wildcard and tell SQL which character it is with <code>ESCAPE</code>:</p>
+  <pre data-title="A real underscore"><code class="language-sql">SELECT code
+FROM (VALUES ('SAVE_10'), ('SAVEX10'), ('SAVE-10')) AS t(code)
+WHERE code LIKE 'SAVE_10';                    -- _ is a wildcard: all 3 match
+
+SELECT code
+FROM (VALUES ('SAVE_10'), ('SAVEX10'), ('SAVE-10')) AS t(code)
+WHERE code LIKE 'SAVE!_10' ESCAPE '!';        -- !_ means a literal underscore</code></pre>
+  <pre class="out" data-title="Output of both queries"><code class="language-plaintext">  code
+---------
+ SAVE_10
+ SAVEX10
+ SAVE-10
+(3 rows)
+
+  code
+---------
+ SAVE_10
+(1 row)</code></pre>
+  <p>The default escape character is a backslash in both databases, but backslashes are also special in some
+  string literals (MySQL treats <code>\</code> as an escape inside every string). Choosing your own character
+  with <code>ESCAPE</code> avoids that confusion.</p>
+
+  <h4>Regular expressions</h4>
+  <p>When <code>LIKE</code> is too weak, PostgreSQL has POSIX regular expressions and MySQL has
+  <code>REGEXP</code>.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Task</th><th>PostgreSQL</th><th>MySQL</th></tr></thead>
+    <tbody>
+      <tr><td>Matches regex</td><td><code>first_name ~ '^[AE]'</code></td><td><code>first_name REGEXP '^[AE]'</code></td></tr>
+      <tr><td>Case-insensitive regex</td><td><code>first_name ~* '^a'</code></td><td>default (collation decides)</td></tr>
+      <tr><td>Does not match</td><td><code>!~</code> and <code>!~*</code></td><td><code>NOT REGEXP</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Regular expressions are slower than <code>LIKE</code> and cannot use a normal index. Use them for
+  validation-style checks and occasional searches, not for hot queries.</p>
+
+  <h4>LIKE and indexes</h4>
+  <p>A search for names that start with a prefix (<code>LIKE 'Ana%'</code>) can use an index in principle. A
+  search with a leading wildcard (<code>LIKE '%nya'</code> or <code>'%cable%'</code>) cannot use a normal B-tree
+  index, so the database reads the whole table. In PostgreSQL a plain index also helps prefix searches only if
+  the database uses the <code>C</code> collation or you create the index with
+  <code>text_pattern_ops</code>. For "contains" searches on large tables, use a trigram index
+  (<code>pg_trgm</code> extension) or full-text search; indexes are covered in
+  <a href="#m5">Module 5</a>.</p>
+
+  <h4>Searching from Java</h4>
+  <p>Never glue the user's text into the SQL string. Pass the whole pattern as a parameter:</p>
+  <pre data-title="JDBC (fragment)"><code class="language-java">String sql = "SELECT name, price FROM products WHERE name ILIKE ?";
+try (PreparedStatement ps = connection.prepareStatement(sql)) {
+    ps.setString(1, "%" + term + "%");      // the % signs are part of the parameter
+    try (ResultSet rs = ps.executeQuery()) {
+        while (rs.next()) {
+            System.out.println(rs.getString("name"));
+        }
+    }
+}</code></pre>
+  <p>The parameter stops SQL injection (see <a href="02-core-java.html#m8">Core Java · Module 8</a>), but a
+  <code>%</code> or <code>_</code> typed by the user still acts as a wildcard; escape them if that matters.
+  Spring Data JPA derives the query for you from method names such as
+  <code>findByNameContainingIgnoreCase</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the pattern must match the whole value</p>
+    <p><code>LIKE</code> is not a "contains" search by itself. <code>name LIKE 'Cable'</code> matches only the
+    exact text <code>Cable</code>. Add <code>%</code> where text may appear before or after.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: expecting MySQL behaviour in PostgreSQL</p>
+    <p>A search for <code>WHERE email = 'Priya.Menon@Example.com'</code> finds the row in MySQL and returns
+    nothing in PostgreSQL, because the stored value is lowercase. Normalise on input (store emails in
+    lowercase) or compare with <code>LOWER(email) = LOWER(?)</code>. A unique index on
+    <code>LOWER(email)</code> then stops duplicates that differ only by case.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>LIKE '%'</code> matches every non-NULL value; a NULL value never matches any pattern.</li>
+      <li>Wrapping the column in a function (<code>LOWER(name) LIKE …</code>) stops a normal index on
+      <code>name</code> from being used. Create an index on the expression, or use <code>ILIKE</code> with a
+      trigram index.</li>
+      <li>MySQL's default collation also ignores accents (<code>a</code> equals <code>á</code>); PostgreSQL does
+      not unless you use the <code>unaccent</code> extension.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>What do <code>%</code> and <code>_</code> mean?</b> Any number of characters, and exactly one
+      character.</li>
+      <li><b>How do you search without caring about case in PostgreSQL?</b> <code>ILIKE</code>, or compare
+      <code>LOWER()</code> on both sides.</li>
+      <li><b>Why can <code>LIKE '%abc'</code> be slow?</b> A leading wildcard cannot use a B-tree index, so the
+      table is scanned.</li>
+      <li><b>How do you match a literal <code>%</code>?</b> Use <code>ESCAPE</code> and put the escape character
+      before it.</li>
+    </ul>
+  </div>
+</article>

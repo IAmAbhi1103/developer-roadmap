@@ -1,0 +1,1010 @@
+<article class="topic" id="m2-builder">
+  <h3>Builder: telescoping constructors, immutable objects and Lombok</h3>
+  <p class="tldr">Builder constructs a complex object step by step with named, readable calls and produces a finished (usually immutable) object, which avoids constructors with many parameters.</p>
+
+  <p><strong>Intent:</strong> separate the construction of a complex object from its representation, so that you can build it step by step and get a valid, usually immutable, result.</p>
+
+  <h4>The problem: telescoping constructors</h4>
+  <p>An email message has two required values (recipient, subject) and many optional ones (cc, bcc, body, reply-to, attachments, priority). With constructors you end up with a "telescope":</p>
+  <pre data-title="Telescoping.java"><code class="language-java">public class EmailMessage {
+    public EmailMessage(String to, String subject) { /* ... */ }
+    public EmailMessage(String to, String subject, String body) { /* ... */ }
+    public EmailMessage(String to, String subject, String body, String cc) { /* ... */ }
+    public EmailMessage(String to, String subject, String body, String cc, String bcc,
+                        String replyTo, boolean highPriority) { /* ... */ }
+}
+
+// What does this call mean? Which string is cc, which is bcc?
+new EmailMessage("a@x.com", "Hi", "Body", null, "boss@x.com", null, true);</code></pre>
+  <p>Problems: you cannot tell what each argument means, swapping two strings compiles fine, you pass <code>null</code> for the optional ones, and you need a constructor for every combination. The other common escape, a no-argument constructor plus setters (the JavaBeans style), leaves the object half-built and mutable between calls, so it cannot be immutable or thread-safe.</p>
+
+  <h4>Structure</h4>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class EmailMessage {
+    -String to
+    -String subject
+    -String body
+    -List~String~ cc
+    -EmailMessage(Builder b)
+    +builder(String to, String subject) Builder$
+  }
+  class Builder {
+    +body(String) Builder
+    +cc(String) Builder
+    +highPriority() Builder
+    +build() EmailMessage
+  }
+  EmailMessage *-- Builder : nested
+  Builder ..> EmailMessage : creates
+</pre>
+    <figcaption>A nested Builder collects values and then calls the private constructor of the product</figcaption>
+  </figure>
+
+  <h4>A hand-written builder for an immutable class</h4>
+  <p>The product has a private constructor and only <code>final</code> fields. The nested <code>Builder</code> takes the required values in its constructor, offers one method per optional value (each returns <code>this</code>, so you can chain), and checks the rules in <code>build()</code>.</p>
+  <pre data-title="EmailMessage.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public final class EmailMessage {
+    private final String to;
+    private final String subject;
+    private final String body;
+    private final List&lt;String&gt; cc;
+    private final boolean highPriority;
+
+    private EmailMessage(Builder b) {
+        this.to = b.to;
+        this.subject = b.subject;
+        this.body = b.body;
+        this.cc = List.copyOf(b.cc);                   // immutable copy
+        this.highPriority = b.highPriority;
+    }
+
+    public static Builder builder(String to, String subject) {   // required values
+        return new Builder(to, subject);
+    }
+
+    public String to() { return to; }
+    public String subject() { return subject; }
+    public String body() { return body; }
+    public List&lt;String&gt; cc() { return cc; }
+    public boolean highPriority() { return highPriority; }
+
+    @Override public String toString() {
+        return "EmailMessage{to=" + to + ", subject=" + subject + ", cc=" + cc
+             + ", highPriority=" + highPriority + "}";
+    }
+
+    public static final class Builder {
+        private final String to;                       // required
+        private final String subject;                  // required
+        private String body = "";                      // optional, with a default
+        private final List&lt;String&gt; cc = new ArrayList&lt;&gt;();
+        private boolean highPriority;
+
+        private Builder(String to, String subject) {
+            this.to = to;
+            this.subject = subject;
+        }
+
+        public Builder body(String body) { this.body = body; return this; }
+        public Builder cc(String address) { this.cc.add(address); return this; }
+        public Builder highPriority() { this.highPriority = true; return this; }
+
+        public EmailMessage build() {
+            if (to == null || !to.contains("@")) {
+                throw new IllegalStateException("A valid recipient is required");
+            }
+            if (subject == null || subject.isBlank()) {
+                throw new IllegalStateException("Subject is required");
+            }
+            return new EmailMessage(this);              // validated, then frozen
+        }
+    }
+
+    public static void main(String[] args) {
+        EmailMessage m = EmailMessage.builder("asha@example.com", "Your invoice")
+                .body("Please find it attached.")
+                .cc("accounts@example.com")
+                .highPriority()
+                .build();
+        System.out.println(m);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">EmailMessage{to=asha@example.com, subject=Your invoice, cc=[accounts@example.com], highPriority=true}</code></pre>
+  <p>Each call reads like a sentence. Required values cannot be forgotten because they are in the factory method. The finished object is immutable and always valid, because validation runs once in <code>build()</code>.</p>
+
+  <h4>Lombok @Builder</h4>
+  <p>Lombok (a code-generation library, annotation processor) writes the builder for you. You add it as a dependency and your IDE needs the plugin.</p>
+  <pre data-title="Customer.java"><code class="language-java">import lombok.Builder;
+import lombok.Singular;
+import lombok.Value;
+
+@Value                     // all fields private final, getters, equals/hashCode/toString
+@Builder(toBuilder = true) // generates CustomerBuilder, plus customer.toBuilder()
+public class Customer {
+    String name;
+    String email;
+    @Builder.Default String country = "IN";
+    @Singular java.util.List&lt;String&gt; phones;     // generates phone("..") and phones(..)
+}
+
+// Customer c = Customer.builder().name("Asha").email("a@x.com").phone("98100").build();
+// Customer moved = c.toBuilder().country("US").build();     // copy with one change</code></pre>
+  <p>Lombok's builder does not make required fields mandatory: a forgotten field is just <code>null</code>, unless you add checks (for example <code>@NonNull</code> on a field, which generates a null check in the constructor). Hand-written builders force required values in the entry point.</p>
+
+  <h4>Builders with records</h4>
+  <p>A record with two or three components needs no builder; call the constructor. With many optional components, a record can still have a hand-written builder, or you can use "wither" methods that return a changed copy: <code>p.withCity("Pune")</code>. Libraries such as RecordBuilder and the IDE can generate builders for records.</p>
+
+  <h4>Builders in the JDK and Spring</h4>
+  <ul>
+    <li><code>StringBuilder</code> builds a string by appending; strictly a builder in the everyday sense, though without a separate product type.</li>
+    <li><code>HttpClient.newBuilder()</code> and <code>HttpRequest.newBuilder()</code> (Java 11+) are textbook builders:</li>
+  </ul>
+  <pre data-title="HttpBuilders.java"><code class="language-java">import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.time.Duration;
+
+HttpClient client = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(5))
+        .followRedirects(HttpClient.Redirect.NORMAL)
+        .build();
+
+HttpRequest request = HttpRequest.newBuilder()
+        .uri(URI.create("https://api.example.com/orders/42"))
+        .header("Accept", "application/json")
+        .GET()
+        .build();</code></pre>
+  <ul>
+    <li>Others: <code>Stream.builder()</code>, <code>Locale.Builder</code>, <code>ProcessBuilder</code>, <code>java.util.stream.Collectors</code> (not a builder), and in Spring <code>UriComponentsBuilder</code>, <code>RestClient.builder()</code>, <code>WebClient.builder()</code>, <code>SpringApplicationBuilder</code> and <code>User.withUsername(...)</code> in Spring Security.</li>
+  </ul>
+
+  <h4>Director (the classic GoF variant)</h4>
+  <p>The GoF description adds a <strong>Director</strong> class that knows a recipe (the order of build steps), such as "build a standard welcome mail". In practice a static helper does that: <code>EmailTemplates.welcome(user)</code> returns a pre-configured builder. You do not need a separate Director class in everyday Java.</p>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Readable call sites with named values.</li>
+      <li>Immutable objects without a huge constructor.</li>
+      <li>Validation in one place before the object exists.</li>
+      <li>Same builder can make different representations or presets.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>More code (a second class), unless Lombok generates it.</li>
+      <li>Fields are duplicated in the builder and the product.</li>
+      <li>A builder can be used incorrectly: not calling a required method is only caught at run time (unless required values are in the entry point).</li>
+    </ul></div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to use a Builder</p>
+    <ul>
+      <li>For a class with two or three fields: a constructor, static factory or record is simpler (<a href="#m1-dry-kiss-yagni">KISS</a>).</li>
+      <li>When all fields are required and there are few of them.</li>
+      <li>Builders and JPA entities mix badly: entities need a no-argument constructor and frameworks set fields by reflection. Use builders for DTOs, commands and value objects.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Reusing one builder after <code>build()</code> without copying its lists, so two products share a mutable list. Copy collections in the constructor (<code>List.copyOf</code>).</li>
+      <li>Putting validation in the builder methods only. Validate in <code>build()</code>, where all fields are known.</li>
+      <li>Building the object without the invariants (a "builder" that just calls setters on a mutable object).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: Builder</p>
+    <ul>
+      <li><b>What problem does Builder solve?</b> Telescoping constructors and half-built mutable objects. You get readable, step-by-step construction and an immutable, valid result.</li>
+      <li><b>Builder vs Factory?</b> Factory chooses <em>which</em> class to create in one call; Builder assembles <em>one complex object</em> over many calls.</li>
+      <li><b>Where have you seen Builder?</b> <code>StringBuilder</code>, <code>HttpRequest.newBuilder()</code>, Lombok <code>@Builder</code>, <code>UriComponentsBuilder</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-adapter">
+  <h3>Adapter: making incompatible interfaces work together</h3>
+  <p class="tldr">Adapter wraps an existing class with an incompatible interface and translates calls, so your code can use it through the interface it expects, without changing either side.</p>
+
+  <p><strong>Intent:</strong> convert the interface of a class into another interface that clients expect, so classes with incompatible interfaces can work together.</p>
+
+  <h4>The problem</h4>
+  <p>Your shop code talks to a <code>PaymentGateway</code> interface that you designed. Now the business signs a contract with a provider whose SDK is a jar you cannot change. Its method names, parameter types and result codes are all different: it takes rupees as a <code>double</code>, a card number as a <code>String</code>, and returns an <code>int</code> status code. If you call the SDK directly from the order code, the vendor's API spreads across your system, and changing the vendor later hurts. Like a travel plug adapter, you wrap the foreign socket in a shape your plug fits.</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class PaymentGateway {
+    &lt;&lt;interface&gt;&gt;
+    +pay(PaymentRequest) PaymentResult
+  }
+  class CheckoutService
+  class FastPaySdkAdapter {
+    -FastPaySdk sdk
+    +pay(PaymentRequest) PaymentResult
+  }
+  class FastPaySdk {
+    +makePayment(String, double, String) int
+  }
+  CheckoutService --> PaymentGateway
+  PaymentGateway &lt;|.. FastPaySdkAdapter
+  FastPaySdkAdapter --> FastPaySdk : wraps
+</pre>
+    <figcaption>The adapter implements the target interface and holds the adaptee (the SDK)</figcaption>
+  </figure>
+
+  <h4>Implementation</h4>
+  <pre data-title="PaymentAdapter.java"><code class="language-java">// --- Target: what our application expects ---
+record PaymentRequest(String cardToken, long amountInPaise, String orderId) { }
+record PaymentResult(boolean success, String reference, String message) { }
+
+interface PaymentGateway {
+    PaymentResult pay(PaymentRequest request);
+}
+
+// --- Adaptee: the third-party SDK, which we cannot change ---
+class FastPaySdk {
+    // returns 0 on success, 101 = declined, 500 = server error
+    public int makePayment(String card, double rupees, String currency) {
+        return rupees &lt; 50_000 ? 0 : 101;
+    }
+    public String lastTransactionId() { return "FP-" + System.nanoTime(); }
+}
+
+// --- Adapter: translates our interface to the SDK ---
+class FastPayAdapter implements PaymentGateway {
+    private final FastPaySdk sdk;
+
+    FastPayAdapter(FastPaySdk sdk) { this.sdk = sdk; }
+
+    @Override
+    public PaymentResult pay(PaymentRequest request) {
+        double rupees = request.amountInPaise() / 100.0;                  // paise to rupees
+        int code = sdk.makePayment(request.cardToken(), rupees, "INR");   // call the SDK
+        return switch (code) {                                            // map the result
+            case 0   -&gt; new PaymentResult(true, sdk.lastTransactionId(), "Approved");
+            case 101 -&gt; new PaymentResult(false, null, "Declined by bank");
+            default  -&gt; new PaymentResult(false, null, "Gateway error " + code);
+        };
+    }
+}
+
+// --- Client: knows only the target interface ---
+class CheckoutService {
+    private final PaymentGateway gateway;
+    CheckoutService(PaymentGateway gateway) { this.gateway = gateway; }
+
+    String checkout(String orderId, long paise, String token) {
+        PaymentResult r = gateway.pay(new PaymentRequest(token, paise, orderId));
+        return r.success() ? "Paid, ref " + r.reference() : "Failed: " + r.message();
+    }
+}
+
+public class AdapterDemo {
+    public static void main(String[] args) {
+        CheckoutService service = new CheckoutService(new FastPayAdapter(new FastPaySdk()));
+        System.out.println(service.checkout("O-1", 129900, "tok_abc"));
+        System.out.println(service.checkout("O-2", 9_000_000, "tok_abc"));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (reference differs)"><code class="language-plaintext">Paid, ref FP-123456789
+Failed: Declined by bank</code></pre>
+  <p>The vendor's names, the <code>double</code> rupees and the integer codes stay inside <code>FastPayAdapter</code>. Switching to another provider is a new adapter class (say <code>RazorpayAdapter</code>) with no change to <code>CheckoutService</code>. In tests, use a fake <code>PaymentGateway</code>.</p>
+
+  <h4>Object adapter vs class adapter</h4>
+  <p>The version above is an <strong>object adapter</strong>: it holds the adaptee in a field (composition). A <strong>class adapter</strong> would inherit from the adaptee and implement the target interface at the same time. Java has single class inheritance, so class adapters are rare and need the target to be an interface. Prefer the object adapter: it works with any subclass of the adaptee and keeps the coupling loose (<a href="#m1-composition-inheritance">composition over inheritance</a>).</p>
+
+  <h4>Anti-corruption layer</h4>
+  <p>In larger systems, an adapter that shields your domain from a foreign model (a legacy system, a partner API, another microservice) is called an <strong>anti-corruption layer</strong>. It translates not just method names but concepts and error handling, so the foreign model does not leak into yours.</p>
+
+  <h4>Adapters in the JDK and Spring</h4>
+  <ul>
+    <li><code>Arrays.asList(array)</code> adapts an array to the <code>List</code> interface (writes go through to the array).</li>
+    <li><code>InputStreamReader</code> adapts a byte <code>InputStream</code> to a character <code>Reader</code>; <code>OutputStreamWriter</code> does the reverse.</li>
+    <li><code>Collections.enumeration(c)</code> and <code>Enumeration.asIterator()</code> convert between old and new iteration styles.</li>
+    <li><code>Executors.callable(runnable)</code> adapts a <code>Runnable</code> to a <code>Callable</code>.</li>
+    <li>Spring MVC: <code>HandlerAdapter</code> lets <code>DispatcherServlet</code> call any kind of handler (annotated controllers, <code>HttpRequestHandler</code>s, functional endpoints) in the same way. Spring has adapters such as <code>MessageListenerAdapter</code> in its messaging modules too.</li>
+    <li>Spring Data repositories and <code>HttpMessageConverter</code>s also translate between your types and external representations.</li>
+  </ul>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Reuses existing code without changing it.</li>
+      <li>Keeps vendor-specific code in one class (SRP).</li>
+      <li>Easy to replace a vendor or fake it in tests (DIP, OCP).</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>An extra class and one more call per operation.</li>
+      <li>When the two interfaces are very different, the adapter becomes complicated.</li>
+      <li>Some features of the adaptee may not map to the target interface.</li>
+    </ul></div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to use an Adapter</p>
+    <ul>
+      <li>When you control both sides: change the interface instead of wrapping it.</li>
+      <li>When a method reference or lambda is enough, for example turning a <code>Function</code> into a <code>Comparator</code> with <code>Comparator.comparing</code>.</li>
+      <li>Do not let the adapter grow business logic. It only translates.</li>
+    </ul>
+  </div>
+    <h4>Why the pattern exists</h4>
+  <p>Software rarely starts from a blank page. You integrate a payment SDK, a legacy billing module, a partner's SOAP service or an open-source library, and none of them was written against <em>your</em> interfaces. You cannot edit them (they are a jar, or owned by another team), and you do not want to edit your own clients either (they are many and stable). The only place left for the translation code is a new class in the middle. That class is the Adapter. It exists so that foreign ideas stop at the boundary: your domain keeps its own language, and the translation is written once and tested once.</p>
+
+  <h4>The call flow</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as CheckoutService
+  participant A as FastPayAdapter
+  participant S as FastPaySdk
+  C->>A: pay(PaymentRequest)
+  A->>A: paise to rupees
+  A->>S: makePayment(card, rupees, "INR")
+  S-->>A: int code
+  A->>A: map code to PaymentResult
+  A-->>C: PaymentResult
+</pre>
+    <figcaption>The client sees only target-interface types; units and codes are converted inside the adapter</figcaption>
+  </figure>
+
+  <h4>A second example: file storage</h4>
+  <p>Your app stores invoices through a <code>FileStore</code> interface. In development you use the local disk; a legacy partner system only offers a client that works with <code>(host, path, byte[])</code> and throws its own checked exception. Two adapters make both look the same.</p>
+  <pre data-title="FileStoreAdapters.java"><code class="language-java">import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+interface FileStore {
+    void save(String name, byte[] content);
+    byte[] load(String name);
+}
+
+// Adapter 1: java.nio.file.Files already does the job, we only change the shape
+class LocalDiskStore implements FileStore {
+    private final Path root;
+    LocalDiskStore(Path root) { this.root = root; }
+    public void save(String name, byte[] content) {
+        try { Files.write(root.resolve(name), content); }
+        catch (IOException e) { throw new UncheckedIOException(e); }
+    }
+    public byte[] load(String name) {
+        try { return Files.readAllBytes(root.resolve(name)); }
+        catch (IOException e) { throw new UncheckedIOException(e); }
+    }
+}
+
+// The adaptee: a legacy client we cannot change (fragment, class assumed)
+class LegacyArchiveClient {
+    void put(String host, String path, byte[] data) throws ArchiveException { /* ... */ }
+    byte[] get(String host, String path) throws ArchiveException { return new byte[0]; }
+}
+class ArchiveException extends Exception { }
+
+// Adapter 2: translates names and exceptions
+class ArchiveStore implements FileStore {
+    private final LegacyArchiveClient client;
+    private final String host;
+    ArchiveStore(LegacyArchiveClient client, String host) {
+        this.client = client;
+        this.host = host;
+    }
+    public void save(String name, byte[] content) {
+        try { client.put(host, "/invoices/" + name, content); }
+        catch (ArchiveException e) { throw new IllegalStateException("Archive save failed", e); }
+    }
+    public byte[] load(String name) {
+        try { return client.get(host, "/invoices/" + name); }
+        catch (ArchiveException e) { throw new IllegalStateException("Archive load failed", e); }
+    }
+}</code></pre>
+  <p>Note the two jobs an adapter really has: <strong>shape translation</strong> (names, units, argument order) and <strong>error translation</strong> (a vendor's checked exception becomes your own exception, so no vendor type leaks to callers).</p>
+
+  <h4>Adapter in one line: lambdas and method references</h4>
+  <p>When the target is a functional interface, a lambda is an adapter written inline. <code>Comparator.comparing(Employee::name)</code> adapts a "key extractor" to the comparison role, and <code>executor.submit(() -&gt; legacy.run())</code> adapts a call to <code>Runnable</code>. Write a full class only when the translation has state, several methods, or needs its own tests.</p>
+
+  <h4>Adapter or something else?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pattern</th><th>Interface changes?</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td>Adapter</td><td>Yes: A to B</td><td>Make an existing class fit the interface you need</td></tr>
+      <tr><td><a href="#m2-decorator">Decorator</a></td><td>No, same</td><td>Add behaviour</td></tr>
+      <tr><td><a href="#m2-facade">Facade</a></td><td>Yes: many classes to one simple API</td><td>Hide a subsystem</td></tr>
+      <tr><td><a href="#m2-proxy">Proxy</a></td><td>No, same</td><td>Control access (lazy, remote, security)</td></tr>
+    </tbody>
+  </table></div>
+  <p>A quick test: "I have class X and need it to look like interface Y" is Adapter. "I want X plus logging" is Decorator. "I want one simple call over five classes" is Facade. The full table is in <a href="#m2-structural-compare">Adapter vs Decorator vs Proxy vs Facade</a>.</p>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: vendor types leak through</p><pre><code class="language-java">class FastPayAdapter implements PaymentGateway {
+    // returns the SDK's int code to the caller
+    public int pay(PaymentRequest r) throws FastPayException {
+        return sdk.makePayment(r.cardToken(),
+                               r.amountInPaise() / 100.0, "INR");
+    }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: only domain types cross the boundary</p><pre><code class="language-java">class FastPayAdapter implements PaymentGateway {
+    public PaymentResult pay(PaymentRequest r) {
+        try {
+            int code = sdk.makePayment(r.cardToken(),
+                                       r.amountInPaise() / 100.0, "INR");
+            return map(code);                   // own result type
+        } catch (RuntimeException e) {
+            return new PaymentResult(false, null, "Gateway unavailable");
+        }
+    }
+}</code></pre></div>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>The adapter implements the interface the <em>client</em> owns. The target interface should not mention vendor concepts.</li>
+      <li>Convert units, ids and error types inside the adapter. Document the mapping (for example, which vendor code means "declined").</li>
+      <li>One adapter per adaptee. If you need two vendors, write two adapters and pick one by configuration.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Name it after the adaptee: <code>FastPayAdapter</code>, <code>ArchiveStore</code>. Keep adapters in an <code>infrastructure</code> or <code>adapter</code> package, away from the domain (this is the "ports and adapters" style, also called hexagonal architecture).</li>
+      <li>Test the adapter with a fake adaptee, and test the client with a fake target.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Lossy mapping:</strong> a <code>double</code> rupee amount can lose precision (<code>0.1 + 0.2</code>). Compute from integer paise as late as possible, or use <code>BigDecimal</code>.</li>
+      <li><strong>Unmappable features:</strong> if the target has <code>refund</code> and the adaptee cannot, do not throw silently; split the interface (<a href="#m1-isp">ISP</a>) so the adapter implements only what it can.</li>
+      <li><strong>Timeouts and retries</strong> belong to the adapter or a decorator around it, not to the business code.</li>
+      <li><strong>Two-way adapter:</strong> one class implementing both interfaces so two systems can call each other. It is rare; avoid it unless needed.</li>
+    </ul>
+  </div>
+<div class="co co-interview">
+    <p class="co-t">Interview: Adapter</p>
+    <ul>
+      <li><b>What is Adapter?</b> A wrapper that converts one interface to another so that incompatible classes can work together. Give the payment SDK example.</li>
+      <li><b>Name JDK examples.</b> <code>InputStreamReader</code>, <code>Arrays.asList</code>.</li>
+      <li><b>Adapter vs Decorator?</b> Adapter <em>changes</em> the interface; Decorator keeps the same interface and adds behaviour. See the <a href="#m2-structural-compare">comparison table</a>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: harder Adapter questions</p>
+    <ul>
+      <li><b>Where would you use it in a real project?</b> Wrapping each payment, SMS or email vendor behind your own interface, and as the anti-corruption layer towards legacy systems.</li>
+      <li><b>Class adapter vs object adapter in Java?</b> Object adapter (composition); Java has single inheritance, so a class adapter is limited.</li>
+      <li><b>Is Spring's <code>HandlerAdapter</code> really an Adapter?</b> Yes: <code>DispatcherServlet</code> works with the <code>HandlerAdapter</code> interface, and one implementation exists per handler type.</li>
+      <li><b>How does it support OCP?</b> A new vendor is a new adapter; the client is not edited.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-decorator">
+  <h3>Decorator: adding behaviour by wrapping</h3>
+  <p class="tldr">Decorator wraps an object that has the same interface and adds behaviour before or after delegating to it, so you can stack features (caching, logging, retries) at run time without subclassing.</p>
+
+  <p><strong>Intent:</strong> attach additional responsibilities to an object dynamically, as a flexible alternative to subclassing.</p>
+
+  <h4>The problem</h4>
+  <p>A <code>PriceService</code> loads product prices from a database. You need logging, then caching, then retry on failure, and sometimes you want only some of these. If you use inheritance (<code>CachedLoggingPriceService</code>, <code>LoggingRetryingPriceService</code>, ...) the classes multiply, as in <a href="#m1-composition-inheritance">the inheritance explosion</a>. A decorator is a class that implements the same interface, holds another object of that interface, and adds one concern. You stack them like layers.</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class PriceService {
+    &lt;&lt;interface&gt;&gt;
+    +priceOf(String sku) long
+  }
+  class DbPriceService
+  class PriceServiceDecorator {
+    &lt;&lt;abstract&gt;&gt;
+    #PriceService delegate
+  }
+  class LoggingPriceService
+  class CachingPriceService
+  PriceService &lt;|.. DbPriceService
+  PriceService &lt;|.. PriceServiceDecorator
+  PriceServiceDecorator &lt;|-- LoggingPriceService
+  PriceServiceDecorator &lt;|-- CachingPriceService
+  PriceServiceDecorator o-- PriceService : wraps
+</pre>
+    <figcaption>A decorator is-a PriceService and has-a PriceService</figcaption>
+  </figure>
+
+  <h4>Implementation</h4>
+  <pre data-title="PriceDecorators.java"><code class="language-java">import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+interface PriceService {
+    long priceOf(String sku);
+}
+
+class DbPriceService implements PriceService {            // the real component
+    public long priceOf(String sku) {
+        System.out.println("  DB query for " + sku);
+        return 49900;
+    }
+}
+
+abstract class PriceServiceDecorator implements PriceService {
+    protected final PriceService delegate;
+    protected PriceServiceDecorator(PriceService delegate) { this.delegate = delegate; }
+}
+
+class LoggingPriceService extends PriceServiceDecorator {
+    LoggingPriceService(PriceService delegate) { super(delegate); }
+
+    public long priceOf(String sku) {
+        long start = System.nanoTime();
+        long price = delegate.priceOf(sku);                       // call the wrapped object
+        System.out.println("priceOf(" + sku + ") = " + price + " in "
+                + (System.nanoTime() - start) / 1000 + " us");
+        return price;
+    }
+}
+
+class CachingPriceService extends PriceServiceDecorator {
+    private final Map&lt;String, Long&gt; cache = new ConcurrentHashMap&lt;&gt;();
+    CachingPriceService(PriceService delegate) { super(delegate); }
+
+    public long priceOf(String sku) {
+        return cache.computeIfAbsent(sku, delegate::priceOf);     // only calls on a miss
+    }
+}
+
+public class DecoratorDemo {
+    public static void main(String[] args) {
+        PriceService service =
+            new LoggingPriceService(new CachingPriceService(new DbPriceService()));
+        service.priceOf("SKU-1");
+        service.priceOf("SKU-1");
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (times vary)"><code class="language-plaintext">  DB query for SKU-1
+priceOf(SKU-1) = 49900 in 812 us
+priceOf(SKU-1) = 49900 in 15 us</code></pre>
+  <p>The second call did not hit the database, and the logging decorator on the outside saw both calls. The <em>order</em> of wrapping matters: logging outside caching logs every call; caching outside logging would log only the cache misses. The client holds a <code>PriceService</code> and cannot tell how many layers there are.</p>
+  <p>Note: <code>computeIfAbsent</code> on <code>ConcurrentHashMap</code> must not modify the map from inside the mapping function. A single database call is fine.</p>
+
+  <h4>Decorator in Java I/O</h4>
+  <p>The classic JDK example is the I/O stream family. <code>InputStream</code> is the component interface; <code>FileInputStream</code> is the concrete component; <code>BufferedInputStream</code>, <code>GZIPInputStream</code> and <code>DataInputStream</code> are decorators.</p>
+  <pre data-title="IoDecorators.java"><code class="language-java">import java.io.*;
+import java.util.zip.GZIPInputStream;
+
+try (BufferedReader reader = new BufferedReader(          // adds line reading + buffering
+        new InputStreamReader(                            // adapter: bytes to chars
+            new GZIPInputStream(                          // adds decompression
+                new FileInputStream("orders.csv.gz")),    // the real source
+            java.nio.charset.StandardCharsets.UTF_8))) {
+    String line;
+    while ((line = reader.readLine()) != null) {
+        System.out.println(line);
+    }
+}</code></pre>
+  <p>Each layer adds one feature and delegates the rest. You can see both Decorator (buffer, gzip) and Adapter (<code>InputStreamReader</code>) in this one line.</p>
+
+  <h4>Other uses</h4>
+  <ul>
+    <li><strong>JDK:</strong> <code>Collections.unmodifiableList</code>, <code>Collections.synchronizedMap</code> and <code>Collections.checkedList</code> wrap a collection and add a behaviour (read-only, locking, type checks) behind the same interface.</li>
+    <li><strong>Servlets:</strong> <code>HttpServletRequestWrapper</code> and <code>HttpServletResponseWrapper</code> let a filter alter a request; Spring has <code>ContentCachingRequestWrapper</code>.</li>
+    <li><strong>Spring WebFlux:</strong> <code>ServerHttpRequestDecorator</code>.</li>
+    <li><strong>Annotation-driven decoration:</strong> <code>@Cacheable</code>, <code>@Transactional</code>, <code>@Retryable</code> add behaviour around a bean through proxies (the mechanism is the <a href="#m2-proxy">Proxy pattern</a>, the effect is Decorator-like).</li>
+    <li>In Spring you can declare a decorator as a bean: mark the real one <code>@Primary</code> or inject it by qualifier into the wrapper.</li>
+  </ul>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Adds behaviour without changing the original class (OCP).</li>
+      <li>Combine features in any order at run time; no class explosion.</li>
+      <li>Each decorator has one concern (SRP).</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>Many small objects; stack traces become deep and harder to read.</li>
+      <li>The order of decorators matters and is easy to get wrong.</li>
+      <li>You cannot tell from the interface which decorators are inside, and removing one from the middle is awkward.</li>
+      <li>A wide interface forces each decorator to forward every method.</li>
+    </ul></div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to use a Decorator</p>
+    <ul>
+      <li>When the concern is cross-cutting for many classes (logging, security, transactions). Use AOP: one aspect instead of a decorator per class.</li>
+      <li>When the interface is huge (20 methods). Forwarding every method is painful.</li>
+      <li>When code depends on the concrete type (<code>instanceof</code> or casts); wrapping breaks it.</li>
+      <li>For a single fixed variation, a plain subclass or a parameter is simpler.</li>
+    </ul>
+  </div>
+    <h4>Why the pattern exists</h4>
+  <p>Subclassing adds behaviour at <em>compile time</em> and for <em>all</em> instances of the subclass. Real systems need the opposite: this one call should be logged, that one retried, and in tests neither. If every combination needs a class, you get the explosion described in <a href="#m1-composition-inheritance">Composition over inheritance</a>. The Decorator answers with a simple trick: the wrapper has the <em>same type</em> as the thing it wraps, so a client cannot tell the difference, and wrappers can be stacked like layers of clothing. The same idea is behind <code>@Transactional</code> and <code>@Cacheable</code> in Spring.</p>
+
+  <h4>How a call travels through the stack</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant R as Retrying
+  participant A as Auditing
+  participant G as RealGateway
+  C->>R: charge(order, paise)
+  R->>A: charge(order, paise)
+  A->>G: charge(order, paise)
+  G-->>A: reference
+  A-->>R: reference
+  R-->>C: reference
+</pre>
+    <figcaption>Each decorator does its extra work before and/or after delegating to the next layer</figcaption>
+  </figure>
+
+  <h4>A second example: payments, and why order matters</h4>
+  <pre data-title="GatewayDecorators.java"><code class="language-java">interface Gateway { String charge(String orderId, long paise); }
+
+class RealGateway implements Gateway {            // fails twice, then works
+    private int calls = 0;
+    public String charge(String orderId, long paise) {
+        if (++calls &lt; 3) throw new IllegalStateException("timeout");
+        return "PAY-" + orderId;
+    }
+}
+
+class Retrying implements Gateway {
+    private final Gateway next;
+    private final int max;
+    Retrying(Gateway next, int max) { this.next = next; this.max = max; }
+    public String charge(String orderId, long paise) {
+        for (int attempt = 1; ; attempt++) {
+            try { return next.charge(orderId, paise); }
+            catch (IllegalStateException e) { if (attempt &gt;= max) throw e; }
+        }
+    }
+}
+
+class Auditing implements Gateway {
+    private final Gateway next;
+    Auditing(Gateway next) { this.next = next; }
+    public String charge(String orderId, long paise) {
+        System.out.println("charge " + orderId + " " + paise);
+        String ref = next.charge(orderId, paise);
+        System.out.println("ok " + ref);
+        return ref;
+    }
+}
+
+public class DecoratorOrderDemo {
+    public static void main(String[] args) {
+        System.out.println("-- retry outside audit");
+        new Retrying(new Auditing(new RealGateway()), 3).charge("O-1", 1000);
+        System.out.println("-- audit outside retry");
+        new Auditing(new Retrying(new RealGateway(), 3)).charge("O-1", 1000);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">-- retry outside audit
+charge O-1 1000
+charge O-1 1000
+charge O-1 1000
+ok PAY-O-1
+-- audit outside retry
+charge O-1 1000
+ok PAY-O-1</code></pre>
+  <p>Same decorators, different order, different behaviour: the first stack logs every attempt, the second logs the business call once. Always decide the order on purpose and write it down where the stack is assembled (a configuration class or factory method). A real payment retry also needs an idempotency key so a retry cannot charge twice; see <a href="#m2-command">Command</a> and the queue articles for that idea.</p>
+
+  <h4>A reusable base class</h4>
+  <p>When the interface has several methods, put the forwarding in an abstract decorator once, and let each concrete decorator override only the method it changes. The existing <code>PriceServiceDecorator</code> above is this pattern. Most IDEs can also generate the forwarding methods ("delegate methods") so you do not type them by hand.</p>
+
+  <h4>Decorator, inheritance, proxy and AOP</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Approach</th><th>Chosen when</th><th>Weak point</th></tr></thead>
+    <tbody>
+      <tr><td>Subclass</td><td>One fixed extension</td><td>Explosion; fixed at compile time</td></tr>
+      <tr><td>Decorator</td><td>Optional, stackable features for one interface</td><td>Order sensitivity; forwarding code</td></tr>
+      <tr><td><a href="#m2-proxy">Proxy</a></td><td>Controlling access to the same object (lazy load, remote, security)</td><td>Same shape, different intent</td></tr>
+      <tr><td>AOP (<code>@Aspect</code>)</td><td>One concern across many beans</td><td>Magic; harder to debug</td></tr>
+    </tbody>
+  </table></div>
+  <p>Decorator and Proxy have the same structure. The difference is intent: a decorator <em>adds</em> a responsibility chosen by the client; a proxy <em>controls access</em> and usually creates or locates the real object itself. See <a href="#m2-structural-compare">the structural comparison</a>.</p>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: the decorator forgets to delegate one method</p><pre><code class="language-java">class Auditing implements Gateway {
+    public String charge(String id, long paise) {
+        return log(next.charge(id, paise));
+    }
+    public void refund(String ref) {
+        // forgot: next.refund(ref) -- refund silently does nothing
+    }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: every method forwards</p><pre><code class="language-java">class Auditing implements Gateway {
+    public String charge(String id, long paise) {
+        return log(next.charge(id, paise));
+    }
+    public void refund(String ref) {
+        log("refund " + ref);
+        next.refund(ref);
+    }
+}</code></pre></div>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>A decorator implements the same interface as the wrapped object and holds one reference to it.</li>
+      <li>Forward <em>every</em> method; add behaviour only where intended. Do not change the meaning of the contract (<a href="#m1-lsp">LSP</a>).</li>
+      <li>A decorator must be usable wherever the plain object is, and must not need to know what is inside.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Name by the feature: <code>Retrying</code>, <code>Caching</code>, <code>Auditing</code> (or a suffix such as <code>CachingPriceService</code>).</li>
+      <li>Assemble the stack in one place and keep the order visible. In Spring, use a <code>@Configuration</code> class with explicit <code>@Bean</code> methods.</li>
+      <li>Keep each decorator small and independently tested with a fake inner object.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Identity:</strong> <code>decorated == original</code> is false, and <code>instanceof</code> checks on the concrete type fail. Program to the interface.</li>
+      <li><strong>Exceptions:</strong> a decorator that catches and swallows exceptions (a retry that returns <code>null</code> at the end) hides failures. Rethrow the last one.</li>
+      <li><strong>State:</strong> a caching decorator shared by threads needs a thread-safe store, as the <code>ConcurrentHashMap</code> note above says.</li>
+      <li><strong>Streams:</strong> closing the outermost wrapper closes the inner ones (<code>BufferedReader.close()</code>), so close only the outer.</li>
+    </ul>
+  </div>
+<div class="co co-interview">
+    <p class="co-t">Interview: Decorator</p>
+    <ul>
+      <li><b>What is Decorator?</b> A wrapper with the same interface that adds behaviour and delegates to the wrapped object.</li>
+      <li><b>JDK example?</b> <code>new BufferedReader(new FileReader(...))</code>; each layer adds a feature.</li>
+      <li><b>Decorator vs inheritance?</b> Decorator adds features at run time and in any combination; inheritance fixes them at compile time and multiplies classes.</li>
+      <li><b>Decorator vs Proxy?</b> Similar structure; Decorator adds responsibilities chosen by the client, Proxy controls access to the object. See the <a href="#m2-structural-compare">comparison</a>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: harder Decorator questions</p>
+    <ul>
+      <li><b>Decorator vs inheritance?</b> Decorator adds behaviour per object at run time and can be stacked; inheritance is static and per class.</li>
+      <li><b>Decorator vs Proxy?</b> Same structure; decorator adds responsibility, proxy controls access.</li>
+      <li><b>Does order matter?</b> Yes. Show the retry and audit example.</li>
+      <li><b>Where in Spring?</b> Request wrappers in servlet filters, and annotation behaviour (<code>@Cacheable</code>, <code>@Transactional</code>) which Spring implements with proxies.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-facade">
+  <h3>Facade: one simple door to a complex subsystem</h3>
+  <p class="tldr">Facade provides one simple, high-level interface to a group of classes, so clients make one call instead of coordinating five collaborators and learning how they fit together.</p>
+
+  <p><strong>Intent:</strong> provide a unified, simpler interface to a set of interfaces in a subsystem.</p>
+
+  <h4>The problem</h4>
+  <p>Placing an order in an e-commerce app needs five collaborators in the right order: check stock, reserve stock, charge the payment, create the shipment, send the confirmation. If the web controller, the mobile API, the admin tool and the batch job each coordinate these steps themselves, the sequence (and its failure handling) is copied four times and any change touches four places. A facade holds that coordination once.</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class OrderController
+  class OrderFacade {
+    +placeOrder(PlaceOrderCommand) OrderConfirmation
+  }
+  class InventoryService
+  class PaymentService
+  class ShippingService
+  class NotificationService
+  OrderController --> OrderFacade
+  OrderFacade --> InventoryService
+  OrderFacade --> PaymentService
+  OrderFacade --> ShippingService
+  OrderFacade --> NotificationService
+</pre>
+    <figcaption>Clients talk to the facade; the facade talks to the subsystem</figcaption>
+  </figure>
+
+  <h4>Implementation</h4>
+  <pre data-title="OrderFacade.java"><code class="language-java">import java.util.List;
+
+record Line(String sku, int qty) { }
+record PlaceOrderCommand(String customerEmail, List&lt;Line&gt; lines, String cardToken) { }
+record OrderConfirmation(String orderId, String trackingNumber) { }
+
+// --- subsystem classes (each has its own API) ---
+class InventoryService {
+    boolean reserve(List&lt;Line&gt; lines) { /* ... */ return true; }
+    void release(List&lt;Line&gt; lines)    { /* ... */ }
+}
+class PaymentService {
+    long priceOf(List&lt;Line&gt; lines)         { return 129900; }
+    String charge(String token, long paise) { return "PAY-1001"; }
+}
+class ShippingService {
+    String createShipment(String email, List&lt;Line&gt; lines) { return "TRK-77"; }
+}
+class NotificationService {
+    void orderConfirmed(String email, String orderId) { /* ... */ }
+}
+
+// --- the facade: ONE method for the whole use case ---
+public class OrderFacade {
+    private final InventoryService inventory;
+    private final PaymentService payments;
+    private final ShippingService shipping;
+    private final NotificationService notifications;
+
+    public OrderFacade(InventoryService inventory, PaymentService payments,
+                       ShippingService shipping, NotificationService notifications) {
+        this.inventory = inventory;
+        this.payments = payments;
+        this.shipping = shipping;
+        this.notifications = notifications;
+    }
+
+    public OrderConfirmation placeOrder(PlaceOrderCommand cmd) {
+        if (!inventory.reserve(cmd.lines())) {
+            throw new IllegalStateException("Out of stock");
+        }
+        try {
+            long total = payments.priceOf(cmd.lines());
+            String paymentId = payments.charge(cmd.cardToken(), total);
+            String tracking = shipping.createShipment(cmd.customerEmail(), cmd.lines());
+            notifications.orderConfirmed(cmd.customerEmail(), paymentId);
+            return new OrderConfirmation(paymentId, tracking);
+        } catch (RuntimeException e) {
+            inventory.release(cmd.lines());                  // compensate on failure
+            throw e;
+        }
+    }
+}</code></pre>
+  <p>A controller now writes <code>orderFacade.placeOrder(cmd)</code> and nothing else. Notice that a facade does not <em>forbid</em> direct access: advanced code may still use the subsystem classes. It just offers a convenient default path. In Spring this class is a normal <code>@Service</code> (often called an application service or use-case service).</p>
+
+  <h4>Facades in the JDK and Spring</h4>
+  <ul>
+    <li><strong>SLF4J</strong> is literally the "Simple Logging Facade for Java": one API (<code>LoggerFactory.getLogger(...)</code>) in front of Logback, Log4j 2 or java.util.logging.</li>
+    <li><strong><code>JdbcTemplate</code></strong> hides the connection, statement, result set and exception handling of raw JDBC behind calls such as <code>query</code> and <code>update</code> (it is also a Template Method, see <a href="#m2-template-method">below</a>).</li>
+    <li><strong><code>EntityManager</code> / <code>JpaRepository</code></strong> fronts a large persistence subsystem.</li>
+    <li><strong>JDK:</strong> <code>java.net.URL.openStream()</code> hides socket and protocol handling; <code>Files.readAllLines(path)</code> hides stream creation and closing; <code>HttpClient</code> hides low-level networking.</li>
+    <li><strong>Spring Boot's</strong> <code>SpringApplication.run(...)</code> is a facade over context creation, auto-configuration and server start.</li>
+  </ul>
+  <pre data-title="JdbcTemplateFacade.java"><code class="language-java">// With raw JDBC: connection, statement, result set, try/catch/finally for 15 lines
+// With the facade:
+List&lt;String&gt; names = jdbcTemplate.query(
+        "SELECT name FROM employees WHERE dept_id = ?",
+        (rs, rowNum) -&gt; rs.getString("name"),
+        10);</code></pre>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Simple API for the common use case; clients learn one class.</li>
+      <li>Reduces coupling: clients do not know the subsystem classes.</li>
+      <li>One place for the orchestration and its failure handling.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>The facade can grow into a god object that knows too much (keep it thin; one facade per use-case area).</li>
+      <li>It adds a layer; for a two-class subsystem it is noise.</li>
+      <li>Hides capabilities. Clients needing the fine detail must bypass it.</li>
+    </ul></div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to use a Facade</p>
+    <ul>
+      <li>When the subsystem is already simple, or when the facade would only forward one call to one class.</li>
+      <li>When the "facade" starts holding business rules and state. Then it is a service with too many responsibilities; split it (<a href="#m1-srp">SRP</a>).</li>
+      <li>In distributed systems, a facade over many remote services needs timeouts and failure policy; see the API gateway and orchestration patterns in <a href="#m6">Module 6</a>.</li>
+    </ul>
+  </div>
+    <h4>Why the pattern exists</h4>
+  <p>As a system grows, a use case such as "register a user" or "place an order" needs several collaborators in a fixed order. Without a facade, every caller (REST controller, mobile API, batch job, test) repeats that sequence. The sequences drift apart, one caller forgets the step that sends the email, and a change to the order of steps means editing five places. A Facade moves the sequence into one class and gives callers one meaningful method. It also reduces <strong>coupling</strong>: callers know one class, not five, so the subsystem can change behind the facade.</p>
+
+  <h4>Where a facade sits</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  C1[REST controller] --> F[OnboardingFacade]
+  C2[Admin batch job] --> F
+  F --> U[UserService]
+  F --> W[WalletService]
+  F --> M[MailService]
+  F --> A[AuditService]
+</pre>
+    <figcaption>Several clients, one entry point; the facade coordinates four subsystem services</figcaption>
+  </figure>
+
+  <h4>A second example: user onboarding</h4>
+  <p>Registering a user creates the account, opens a wallet and sends a welcome email. The facade owns the sequence and the transaction boundary; each service stays focused on its own area.</p>
+  <pre data-title="OnboardingFacade.java"><code class="language-java">record SignUp(String name, String email) { }
+record Onboarded(long userId, long walletId) { }
+
+interface UserService   { long create(String name, String email); }
+interface WalletService { long open(long userId); }
+interface MailService   { void sendWelcome(String email); }
+
+class OnboardingFacade {
+    private final UserService users;
+    private final WalletService wallets;
+    private final MailService mail;
+
+    OnboardingFacade(UserService users, WalletService wallets, MailService mail) {
+        this.users = users;
+        this.wallets = wallets;
+        this.mail = mail;
+    }
+
+    Onboarded register(SignUp request) {
+        long userId = users.create(request.name(), request.email());
+        long walletId = wallets.open(userId);
+        try {
+            mail.sendWelcome(request.email());        // nice to have: do not fail signup
+        } catch (RuntimeException e) {
+            System.out.println("Welcome mail failed, will retry later");
+        }
+        return new Onboarded(userId, walletId);
+    }
+}</code></pre>
+  <p>In a Spring Boot app you would annotate the facade method with <code>@Transactional</code> so the user and the wallet are saved together or not at all. The mail call is deliberately outside the "must succeed" path: the facade is the place where such policy decisions live. For a mail that must not be lost, publish an event and let a listener send it (see <a href="#m2-observer">Observer</a>).</p>
+
+  <h4>Facade, service layer and application service</h4>
+  <p>In a typical Spring app the class you call a "service" often <em>is</em> a facade over repositories and other services. Names vary between teams (<code>OrderFacade</code>, <code>OrderApplicationService</code>, <code>OrderService</code>). What matters is the role: a thin coordinating layer with no business rules of its own. Business rules (price calculation, eligibility) stay in domain objects or domain services, which the facade calls.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pattern</th><th>Goal</th><th>Number of classes behind it</th></tr></thead>
+    <tbody>
+      <tr><td>Facade</td><td>Simplify use of a subsystem</td><td>Many</td></tr>
+      <tr><td><a href="#m2-adapter">Adapter</a></td><td>Convert one interface to another</td><td>Usually one</td></tr>
+      <tr><td><a href="#m2-decorator">Decorator</a></td><td>Add behaviour, same interface</td><td>One (wrapped)</td></tr>
+      <tr><td>Mediator</td><td>Let peers talk through a hub; peers know the hub</td><td>Many, which also call back</td></tr>
+    </tbody>
+  </table></div>
+  <p>The one-way knowledge is the key difference from a Mediator: subsystem classes do not know the facade exists, while Mediator colleagues talk to the mediator. Compare all structural patterns in <a href="#m2-structural-compare">the comparison article</a>.</p>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: business rules inside the facade</p><pre><code class="language-java">Onboarded register(SignUp r) {
+    if (r.email().endsWith("@gmail.com")
+            &amp;&amp; r.name().length() &gt; 3) {   // rules leak in
+        // ... 40 lines of eligibility and pricing logic
+    }
+    long id = users.create(r.name(), r.email());
+    return new Onboarded(id, wallets.open(id));
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: facade coordinates, domain decides</p><pre><code class="language-java">Onboarded register(SignUp r) {
+    eligibility.check(r);                  // rule lives in its own class
+    long id = users.create(r.name(), r.email());
+    return new Onboarded(id, wallets.open(id));
+}</code></pre></div>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>A facade <strong>coordinates</strong>; it does not hold business rules. If an <code>if</code> expresses a business decision, it belongs in a domain class.</li>
+      <li>The facade's methods use the client's vocabulary (<code>register</code>, <code>placeOrder</code>), not the subsystem's (<code>createRow</code>).</li>
+      <li>Subsystem classes must not depend on the facade, or you create a cycle.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>One facade per use-case area (orders, onboarding, reporting), not one giant <code>SystemFacade</code>.</li>
+      <li>Accept and return simple request/response objects (records), not subsystem entities.</li>
+      <li>Put the transaction boundary and the failure policy in the facade, and document it.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Partial failure:</strong> if the wallet step fails after the user was created and there is no shared transaction (two microservices), you need a compensating action or a saga (<a href="#m6">Module 6</a>).</li>
+      <li><strong>Bypass:</strong> a facade should not forbid direct use of the subsystem. If a rare caller needs fine control, let it use the services.</li>
+      <li><strong>Testing:</strong> unit test the facade with mocked services to check the order and the failure path; test each service separately.</li>
+      <li><strong>Facade over a remote system:</strong> each call is a network call; add timeouts and keep the facade stateless.</li>
+    </ul>
+  </div>
+<div class="co co-interview">
+    <p class="co-t">Interview: Facade</p>
+    <ul>
+      <li><b>What is Facade?</b> A single simple interface in front of a complicated subsystem. Example: <code>OrderFacade.placeOrder</code>.</li>
+      <li><b>Facade vs Adapter?</b> Facade simplifies many classes into a new, easier interface; Adapter converts one interface into the one a client already expects. See the <a href="#m2-structural-compare">comparison</a>.</li>
+      <li><b>Name a Facade in Java.</b> SLF4J, <code>JdbcTemplate</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: harder Facade questions</p>
+    <ul>
+      <li><b>Facade vs Adapter?</b> A facade simplifies many classes and defines a new interface; an adapter makes an existing class match an interface that already exists.</li>
+      <li><b>Is a Spring <code>@Service</code> a facade?</b> Often yes, when it coordinates repositories and other services. It stops being one when it is full of business rules.</li>
+      <li><b>How do you stop a facade becoming a god class?</b> Split by use-case area and push rules into domain classes.</li>
+      <li><b>Give a JDK or library example.</b> SLF4J, <code>JdbcTemplate</code>, <code>Files.readAllLines</code>.</li>
+    </ul>
+  </div>
+</article>

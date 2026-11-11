@@ -1,0 +1,285 @@
+<article class="topic" id="m4-estimation">
+  <h3>Back-of-the-envelope estimation</h3>
+  <p class="tldr">Estimation means turning "10 million users" into requests per second, storage per year
+  and bandwidth using round numbers (a day is about 10<sup>5</sup> seconds), so you can decide how many
+  servers, how much disk and which components the design needs.</p>
+
+  <h4>Why estimate at all</h4>
+  <p>The numbers decide the design. A system with 50 requests per second runs on one small server and
+  one database. A system with 50,000 requests per second needs caching, replicas and probably sharding.
+  Interviewers do not want exact answers; they want to see a calm, structured calculation that lands
+  within the right power of ten. A <strong>back-of-the-envelope estimate</strong> is exactly that: quick
+  arithmetic on the back of an envelope.</p>
+
+  <h4>The method</h4>
+  <ol class="steps">
+    <li><strong>State assumptions</strong> clearly (users, actions per user, size of each item). Ask
+    the interviewer or pick sensible numbers and say them aloud.</li>
+    <li><strong>Round hard.</strong> Use 86,400 ≈ 100,000 seconds per day, 1 month ≈ 2.5 million seconds,
+    1 year ≈ 30 million seconds (about 3 × 10<sup>7</sup>).</li>
+    <li><strong>Compute average RPS</strong> = requests per day ÷ 86,400.</li>
+    <li><strong>Compute peak RPS</strong> = average × a peak factor (2x to 5x; use 3x if unsure).</li>
+    <li><strong>Compute storage</strong> = items per day × size per item × days kept × replication
+    factor.</li>
+    <li><strong>Compute bandwidth</strong> = RPS × size per request (in and out separately).</li>
+    <li><strong>Sanity-check</strong> and convert to servers, disks and cache size. Write units
+    on every line.</li>
+  </ol>
+
+  <h4>Numbers to memorise</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Power</th><th>Value</th><th>Name</th><th>Handy meaning</th></tr></thead>
+    <tbody>
+      <tr><td>2<sup>10</sup></td><td>1,024</td><td>1 KB</td><td>about a thousand</td></tr>
+      <tr><td>2<sup>20</sup></td><td>about 1 million</td><td>1 MB</td><td>a photo thumbnail</td></tr>
+      <tr><td>2<sup>30</sup></td><td>about 1 billion</td><td>1 GB</td><td>a movie, or RAM on a phone</td></tr>
+      <tr><td>2<sup>40</sup></td><td>about 1 trillion</td><td>1 TB</td><td>one cheap disk</td></tr>
+      <tr><td>2<sup>50</sup></td><td>about 1 quadrillion</td><td>1 PB</td><td>a large company's data</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li>Seconds: 1 day ≈ 86,400 ≈ 10<sup>5</sup>; 1 year ≈ 3 × 10<sup>7</sup>.</li>
+    <li>Rule of thumb: 1 million requests per day ≈ 12 requests per second (1,000,000 ÷ 86,400).</li>
+    <li>Typical sizes: a character is 1 byte in ASCII (1–4 in UTF-8); a tweet-like post is a few hundred
+    bytes; a row of metadata is about 1 KB; a compressed photo is 200 KB–2 MB; a minute of video is
+    tens of MB at standard quality.</li>
+    <li>Network: 1 Gbps ≈ 125 MB per second. A bit is one eighth of a byte; do not mix up Mbps and MB/s.</li>
+    <li>Availability and capacity heuristics: one typical Spring Boot instance serves a few hundred to a
+    couple of thousand simple requests per second; a single well-tuned relational database handles a few
+    thousand to some tens of thousands of simple queries per second; Redis handles on the order of
+    100,000 simple operations per second per node. Treat all of these as rough, and say so.</li>
+  </ul>
+
+  <h4>A fully worked example: a photo-sharing app</h4>
+  <p><strong>Assumptions</strong> (stated aloud): 10 million daily active users (DAU). Each user makes
+  about 20 requests per day (opening the feed, scrolling, liking, posting). Read-heavy: 90% reads,
+  10% writes. On average each user uploads 0.1 photos per day, so 1 million photos per day. Average
+  stored photo: 500 KB. Metadata per photo and per other write: about 1 KB. Photos are kept for 5 years.
+  Replication factor 3. Peak traffic is 3x the average.</p>
+
+  <h5>Step 1: requests per second</h5>
+  <pre data-title="Traffic estimate"><code class="language-plaintext">Requests per day  = 10,000,000 users × 20 = 200,000,000
+Average RPS       = 200,000,000 / 86,400 ≈ 2,315  → about 2,300 RPS
+Peak RPS (3x)     ≈ 7,000 RPS
+Reads  (90%)      ≈ 6,300 RPS at peak
+Writes (10%)      ≈ 700 RPS at peak</code></pre>
+  <p>Using 10<sup>5</sup> seconds the average is 2,000 RPS; it is fine to round either way. What the
+  number tells you: 7,000 RPS is far above one database's comfort for complex queries, but a handful of
+  app servers and a cache can handle it.</p>
+
+  <h5>Step 2: how many app servers</h5>
+  <pre data-title="Servers"><code class="language-plaintext">Assume one instance handles ~700 RPS comfortably (it does real work: DB + cache).
+Peak 7,000 / 700 = 10 instances
+Keep headroom for failures and spikes (run at ~50% of capacity): ~20 instances
+Spread across 2–3 availability zones so one zone loss still leaves capacity.</code></pre>
+
+  <h5>Step 3: storage</h5>
+  <pre data-title="Storage estimate"><code class="language-plaintext">Photos per day    = 1,000,000 × 500 KB = 500 GB/day
+Photos per year   = 500 GB × 365 ≈ 182 TB  → about 180 TB/year
+Five years        ≈ 0.9 PB, ×3 replicas ≈ 2.7 PB (object storage, e.g. S3)
+
+Writes per day    = 10% × 200M = 20M rows (photos, likes, comments)
+Metadata per day  = 20M × 1 KB = 20 GB/day
+Metadata per year = 20 GB × 365 ≈ 7.3 TB/year
+Five years        ≈ 36 TB, ×3 replicas ≈ 110 TB (database cluster)</code></pre>
+  <p>Insight: the photos dominate storage by far (about 25x the metadata), so photos go to object
+  storage and only a URL goes into the database. And 36 TB of metadata in five years does not fit one
+  database server comfortably, which is a signal to plan for sharding (<a href="#m5-sharding">Sharding</a>).</p>
+
+  <h5>Step 4: bandwidth</h5>
+  <pre data-title="Bandwidth estimate"><code class="language-plaintext">Ingress (uploads): 500 GB/day / 86,400 s ≈ 5.8 MB/s ≈ 46 Mbps average
+Egress (reads): assume an average response (JSON + media via CDN) of 100 KB
+  Average: 2,300 RPS × 100 KB ≈ 230 MB/s ≈ 1.8 Gbps
+  Peak (3x): ≈ 5.5 Gbps
+Most egress bytes are images and should be served by a CDN, not your servers.</code></pre>
+  <p>Egress is about 40x ingress, so this is a read-heavy system and a CDN pays for itself.</p>
+
+  <h5>Step 5: cache size</h5>
+  <pre data-title="Cache estimate"><code class="language-plaintext">Rule of thumb (80/20): 20% of the data serves 80% of reads.
+Hot metadata read per day: 180M reads, assume 1 KB each = 180 GB/day of reads
+Cache the hot 20% of daily reads: ≈ 36 GB
+→ A few Redis nodes with 16–32 GB each, or one large node plus a replica.</code></pre>
+
+  <div class="co co-note">
+    <p class="co-t">Reading the result</p>
+    <p>Average 2,300 RPS and peak 7,000 RPS means: a stateless app tier of about 20 instances behind a
+    load balancer, a cache tier of a few tens of GB, a primary database with read replicas now and a
+    sharding plan for later, object storage in the petabyte range, and a CDN for images. You designed the
+    shape of the system before drawing a single box.</p>
+  </div>
+
+  <h4>More estimates you will be asked</h4>
+  <ul>
+    <li><strong>URL shortener:</strong> 100 million new URLs per month ≈ 40 writes per second;
+    with a 10:1 read ratio ≈ 400 reads per second. A record is about 500 bytes, so 100 million × 500 B =
+    50 GB per month, about 3 TB over 5 years. Tiny. A single database plus a cache is enough; the real
+    interview content is the key generation.</li>
+    <li><strong>Chat app:</strong> 50 million DAU, 40 messages per user per day = 2 billion messages per
+    day ≈ 23,000 per second; at 100 bytes each ≈ 200 GB per day. Concurrent WebSocket connections might be
+    10 million, so at 50,000 connections per server you need about 200 gateway servers.</li>
+    <li><strong>Video streaming:</strong> 1 million concurrent viewers × 3 Mbps = 3 Tbps of egress. That
+    is only possible with a CDN and edge caches; it shows how bandwidth, not CPU, drives the cost.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Mixing bits and bytes (Mbps vs MB/s) and being off by 8x.</li>
+      <li>Using the average as the design target and forgetting the peak.</li>
+      <li>Forgetting replication, indexes and growth when sizing storage.</li>
+      <li>Spending ten minutes on exact arithmetic. Round and move on; the order of magnitude is the
+      answer.</li>
+      <li>Not saying what the number means for the design.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: keep a tidy block on the whiteboard</p>
+    <p>Write DAU, requests per user, size per item and retention at the top, then derive RPS, storage and
+    bandwidth below. If the interviewer changes an assumption, you change one line and redo the chain.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"Let me assume 10 million DAU with 20 requests each; that is 200 million per day, roughly
+      2,300 per second on average and about 7,000 at peak."</li>
+      <li>Always finish with "so the design needs X", for example "so a single database will not hold the
+      write load and I plan for sharding".</li>
+      <li>Practice prompts: Twitter timeline reads, WhatsApp messages per second, YouTube storage per day,
+      Zomato peak orders at 8 pm, UPI transactions per second at festival peak.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-scaling">
+  <h3>Vertical vs horizontal scaling, and stateless services</h3>
+  <p class="tldr">Scaling up (vertical) means a bigger machine and is simple but capped and a single
+  point of failure; scaling out (horizontal) means more machines behind a load balancer and needs stateless
+  services, so keep session state in a shared store or in a token, not in server memory.</p>
+
+  <h4>Two ways to add capacity</h4>
+  <p><strong>Vertical scaling (scale up)</strong> means giving one machine more CPU, RAM, disk or faster
+  hardware. <strong>Horizontal scaling (scale out)</strong> means adding more machines and sharing the
+  work between them.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Scale up (vertical)</th><th>Scale out (horizontal)</th></tr></thead>
+    <tbody>
+      <tr><td>How</td><td>Bigger server or instance type</td><td>More servers behind a load balancer</td></tr>
+      <tr><td>Code changes</td><td>None</td><td>Service must be stateless; data must be shared or partitioned</td></tr>
+      <tr><td>Upper limit</td><td>Hard: biggest machine you can buy</td><td>Practically very high</td></tr>
+      <tr><td>Cost curve</td><td>Gets steeply expensive at the top end</td><td>Roughly linear with commodity machines</td></tr>
+      <tr><td>Failure</td><td>One machine is a single point of failure</td><td>Survives losing a node</td></tr>
+      <tr><td>Downtime to scale</td><td>Often a restart</td><td>None: add nodes live</td></tr>
+      <tr><td>Complexity</td><td>Low</td><td>Higher: load balancing, consistency, deployment</td></tr>
+      <tr><td>Best for</td><td>Early stage, databases (first step)</td><td>Stateless app tiers, caches, queues, shards</td></tr>
+    </tbody>
+  </table></div>
+  <p>A sensible path: start vertical because it is cheap in engineering time, then scale out the
+  stateless tiers first, and treat the database last because it is the hardest to scale out
+  (<a href="#m5-db-scaling-ladder">Database scaling ladder</a>).</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  U[Users] --> LB[Load balancer]
+  LB --> A1[App 1]
+  LB --> A2[App 2]
+  LB --> A3[App 3]
+  A1 --> S[(Shared session store)]
+  A2 --> S
+  A3 --> S
+  A1 --> DB[(Database)]
+  A2 --> DB
+  A3 --> DB
+</pre>
+    <figcaption>Any app instance can serve any request because state lives outside the instances</figcaption>
+  </figure>
+
+  <h4>What makes a service stateless</h4>
+  <p>A <strong>stateless</strong> service keeps no information about a client between requests inside
+  its own memory or disk. Each request carries what is needed (a token, parameters), or the service
+  fetches it from a shared store. The result: any instance can handle any request, so you can add,
+  remove, restart or replace instances freely, and a crashed instance loses nothing important.</p>
+  <p>A <strong>stateful</strong> service remembers things locally: a logged-in user in an
+  <code>HttpSession</code>, an uploaded file on local disk, a counter in a static field, a local in-memory
+  cache that must match other instances. Those are the typical blockers to scaling out.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Hidden state</th><th>Why it breaks scale-out</th><th>Move it to</th></tr></thead>
+    <tbody>
+      <tr><td>HTTP session in memory</td><td>Next request may reach another instance</td><td>Redis session store, or a JWT</td></tr>
+      <tr><td>Files on local disk</td><td>Other instances cannot see them</td><td>Object storage (S3)</td></tr>
+      <tr><td>Scheduled job in each instance</td><td>Runs N times</td><td>One scheduler with a lock (ShedLock) or a queue</td></tr>
+      <tr><td>In-memory counters / locks</td><td>Each instance has its own value</td><td>Redis or the database</td></tr>
+      <tr><td>Local cache</td><td>Instances disagree on stale values</td><td>Distributed cache, or short TTL on local ones</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Where does session state go?</h4>
+  <p>Users log in once and expect to stay logged in. There are three common answers.</p>
+  <h5>1. Sticky sessions</h5>
+  <p>The load balancer remembers which instance served a user (via a cookie or the client IP) and keeps
+  sending them there, so the in-memory session works. It is easy but weak: load becomes uneven, a crash
+  logs out everyone on that instance, and scaling in or rolling deploys drop sessions. Use it only as a
+  temporary fix.</p>
+  <h5>2. A shared session store (Redis)</h5>
+  <p>The session lives in Redis, and every instance reads it by session id (cookie). With Spring, add
+  <code>spring-session-data-redis</code> and the framework replaces the servlet session with a
+  Redis-backed one; your controllers do not change. Cost: one extra network hop (about a millisecond) per
+  request and Redis becomes a dependency that must itself be highly available. Benefit: sessions can be
+  revoked instantly (delete the key).</p>
+  <h5>3. Stateless tokens (JWT)</h5>
+  <p>The server puts the identity and claims into a signed <strong>JSON Web Token</strong> and gives it to
+  the client; the client sends it on every request; any instance verifies the signature with a key, with no
+  lookup. Best for scale and for service-to-service calls. Cost: you cannot easily revoke a token before it
+  expires (use short lifetimes, refresh tokens or a deny-list), tokens are larger than a session id, and
+  you must never put secrets in the payload (it is only encoded, not encrypted). See
+  <a href="04-spring-boot.html#m4">Spring Boot · Module 4</a> for the JWT flow.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Option</th><th>Server lookup</th><th>Revocation</th><th>Weak point</th></tr></thead>
+    <tbody>
+      <tr><td>Sticky sessions</td><td>None (in memory)</td><td>Easy</td><td>Uneven load, lost on crash</td></tr>
+      <tr><td>Redis session store</td><td>One Redis read</td><td>Instant</td><td>Redis must be highly available</td></tr>
+      <tr><td>JWT</td><td>None (signature check)</td><td>Hard until expiry</td><td>Token theft, size, revocation</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Stateless is for the app tier; state has to live somewhere</h4>
+  <p>State does not disappear; you push it to specialised systems that are built to hold it: the database
+  (durable data), Redis (sessions, cache), object storage (files), the queue (pending work). Those systems
+  scale by their own rules (replication, sharding), which module 5 covers. After this change a load
+  balancer in front of N identical instances is enough to scale the app tier. See
+  <a href="#m5-load-balancers">Load balancers</a>.</p>
+
+  <h4>Auto-scaling and the limits of scale-out</h4>
+  <p>Cloud platforms can add and remove instances automatically based on CPU, request count or queue
+  length (<a href="07-devops.html#m5">DevOps · Module 5</a>). Stateless instances start in seconds and
+  are disposable. But scale-out is not magic: the shared pieces behind it (one database, one Redis) can
+  become the new bottleneck, and adding app instances then <em>increases</em> pressure on them (more
+  connections, more queries). Always ask what is the next bottleneck after scaling the app tier.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: design every app instance to be disposable</p>
+    <p>If killing any instance at any moment causes data loss or logged-out users, the service is not
+    ready to scale out. Write data to a shared store before replying, and keep nothing important in
+    memory or on local disk.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistake: a static HashMap as a "database"</p>
+    <p>A <code>static Map</code> of carts or tokens works on your laptop and fails the moment two
+    instances run: each has its own map. This is the number one reason a monolith cannot be scaled out
+    without a rewrite.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"I keep the app tier stateless so I can add instances behind the load balancer. Session data
+      goes to Redis, or we use JWTs for stateless auth."</li>
+      <li>Explain the sticky-session downside in one line: uneven load and sessions lost on a crash.</li>
+      <li>Mention that databases usually scale up first and out later, because scaling them out brings
+      consistency problems.</li>
+    </ul>
+  </div>
+</article>

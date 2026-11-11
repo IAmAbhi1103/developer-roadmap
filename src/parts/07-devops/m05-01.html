@@ -1,0 +1,403 @@
+<div class="mintro">
+  <p>This module takes the application you built, tested and containerised in the earlier modules and puts it
+  on the public internet. You will learn what "the cloud" really is (rented computers, billed by use), the core
+  AWS services a backend developer needs (EC2, RDS, S3, IAM), and the simpler platforms (Render, Railway,
+  Vercel, Netlify) that hide most of the work. You will also learn how to point your own domain at the app and
+  serve it over HTTPS.</p>
+  <p>The first rule of the cloud is not technical: set up account safety and a billing alert before you create
+  anything. A forgotten server or a leaked access key is the most common way students get a surprise bill. This
+  module starts with that, then builds up to a full deployment runbook with exact commands. It connects to
+  <a href="#m1">Linux</a> (SSH, systemd), <a href="#m2">Networking</a> (DNS, TLS, Nginx),
+  <a href="#m3">Docker</a> and <a href="#m4">CI/CD</a>.</p>
+  <ul>
+    <li>Explain IaaS, PaaS and SaaS, regions and availability zones, and the shared-responsibility model.</li>
+    <li>Protect an AWS account (MFA, non-root user, least privilege) and set a budget alert on day one.</li>
+    <li>Launch an EC2 server, SSH in, and deploy a Spring Boot container behind Nginx with HTTPS.</li>
+    <li>Use RDS for PostgreSQL and S3 (including presigned URLs) safely, with IAM roles instead of keys.</li>
+    <li>Deploy a backend to Render or Railway and a React app to Vercel or Netlify.</li>
+    <li>Connect a domain with DNS records, choose a deployment strategy, and follow a production checklist.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m5-cloud-basics">
+  <h3>Cloud basics: IaaS, PaaS, SaaS and pay-as-you-go</h3>
+  <p class="tldr">The cloud means renting computing (servers, storage, databases, networks) from a provider over
+  the internet and paying only for what you use; IaaS rents raw machines, PaaS rents a ready platform for your
+  code, SaaS rents finished software.</p>
+
+  <h4>What the cloud is</h4>
+  <p>Before the cloud, a company that wanted to run a website bought servers, put them in a room, hired people to
+  look after them, and paid for the peak load all year. In the <strong>cloud</strong>, a provider such as Amazon,
+  Microsoft or Google owns huge data centres. You rent a slice of them through a web console or an API, in
+  minutes, and stop paying when you delete the slice.</p>
+  <p>Every provider sells the same building blocks:</p>
+  <dl class="terms">
+    <dt>Compute</dt><dd>Machines that run your code: virtual servers (EC2), containers (ECS, Kubernetes) or
+    functions (Lambda).</dd>
+    <dt>Storage</dt><dd>Object storage for files (S3), block disks attached to a server (EBS), file shares.</dd>
+    <dt>Managed databases</dt><dd>A database the provider installs, backs up and patches for you (RDS for
+    PostgreSQL/MySQL, DynamoDB).</dd>
+    <dt>Networking</dt><dd>Private networks (VPC), load balancers, DNS, firewalls (security groups).</dd>
+    <dt>Identity</dt><dd>Users, roles and permissions: who may do what (IAM).</dd>
+  </dl>
+
+  <h4>IaaS vs PaaS vs SaaS</h4>
+  <p>The three <strong>service models</strong> differ in how much the provider manages for you. Think of getting
+  a pizza: IaaS is buying the flour and using their oven, PaaS is ordering the base and adding your own
+  toppings, SaaS is eating the finished pizza.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Model</th><th>You manage</th><th>Provider manages</th><th>Examples</th></tr></thead>
+    <tbody>
+      <tr><td><strong>IaaS</strong> (Infrastructure as a Service)</td><td>OS, runtime, patches, app, data, firewall rules</td><td>Hardware, network, virtualisation</td><td>AWS EC2, Azure Virtual Machines, Google Compute Engine</td></tr>
+      <tr><td><strong>PaaS</strong> (Platform as a Service)</td><td>Your code (or container) and its settings</td><td>OS, runtime, scaling, TLS, deploys</td><td>Render, Railway, Heroku, Elastic Beanstalk, Vercel, Netlify</td></tr>
+      <tr><td><strong>SaaS</strong> (Software as a Service)</td><td>Your data and users</td><td>Everything else</td><td>Gmail, Slack, Jira, Zoho, Salesforce, GitHub</td></tr>
+    </tbody>
+  </table></div>
+  <p>There is also <strong>FaaS</strong> (Function as a Service, "serverless"): you upload a function and pay per
+  call, for example AWS Lambda. As a backend developer you mostly choose between IaaS and PaaS for your own
+  apps, and use SaaS tools (GitHub, Jira, Slack) every day.</p>
+  <p>The trade-off is always <em>control versus effort</em>. On IaaS you can install anything and tune
+  everything, but you must patch Linux, configure Nginx and renew certificates. On PaaS you push code and get a
+  URL, but you accept the platform's rules, and costs can be higher at scale. This module teaches both, because
+  interviews ask about EC2 and real jobs use both.</p>
+
+  <h4>Pay-as-you-go</h4>
+  <p>Cloud billing is <strong>pay-as-you-go</strong>: there is no purchase, you are metered. Servers are billed
+  for the time they run, storage for the gigabytes kept, data leaving the provider for the gigabytes sent out,
+  and many services per request. Good effects: no big upfront cost, you can try an idea for a few hours, and you
+  can scale up for a sale and back down after. Bad effect: <em>a mistake costs money immediately</em>. A
+  server you forget about keeps billing, and a loop that calls a paid API can bill fast. That is why the next two
+  articles are about account safety and billing alerts.</p>
+  <p>Providers also offer cheaper long-term options, for example committing to steady usage for one or three
+  years (Savings Plans, Reserved Instances) or using spare capacity that can be taken back (Spot). You do not
+  need them while learning; just know the names. Never trust a price you read in an old blog post: always check
+  the provider's current pricing page.</p>
+
+  <h4>The shared-responsibility model</h4>
+  <p>Security in the cloud is split. The provider is responsible for the security <strong>of</strong> the cloud:
+  buildings, hardware, network, and the virtualisation layer. You are responsible for security
+  <strong>in</strong> the cloud: your data, your accounts and permissions, your firewall rules, and, depending
+  on the service, your operating system and application.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Service</th><th>Provider handles</th><th>You handle</th></tr></thead>
+    <tbody>
+      <tr><td>EC2 (IaaS)</td><td>Hardware, hypervisor</td><td>OS patches, Nginx/Docker, app, security groups, SSH keys, backups</td></tr>
+      <tr><td>RDS (managed)</td><td>OS and database patching, backups, failover</td><td>Database users and passwords, network access, schema, queries</td></tr>
+      <tr><td>S3</td><td>Durability, hardware</td><td>Bucket policies, public-access settings, what you upload</td></tr>
+      <tr><td>Render / Vercel (PaaS)</td><td>OS, runtime, TLS, scaling</td><td>Your code, secrets, dependencies, access to your account</td></tr>
+    </tbody>
+  </table></div>
+  <p>The practical meaning: when a company's S3 bucket leaks customer data, it is almost always because the
+  customer made it public, not because AWS was hacked.</p>
+
+  <h4>The big three, in one line each</h4>
+  <ul>
+    <li><strong>AWS</strong> (Amazon Web Services): the oldest and largest, the widest range of services and the
+    most job listings; this module uses it.</li>
+    <li><strong>Microsoft Azure</strong>: strong in enterprises that already use Microsoft products (Windows,
+    Active Directory, .NET), also popular for Java.</li>
+    <li><strong>Google Cloud (GCP)</strong>: strong in data, machine learning and Kubernetes, which Google
+    created.</li>
+  </ul>
+  <p>The ideas (virtual machine, object storage, managed database, IAM, load balancer) are the same everywhere,
+  with different names. Learn them on AWS and the others become a vocabulary exercise.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "the cloud is secure by default, so I need not worry"</p>
+    <p>Providers secure the data centre, not your configuration. A public bucket, an SSH port open to the whole
+    internet, or an access key in a public GitHub repository are your mistakes, and bots find them within
+    minutes.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain IaaS, PaaS and SaaS with examples."</p>
+    <ul>
+      <li>IaaS: raw machines (EC2); you manage OS upwards. PaaS: you bring code (Render, Elastic Beanstalk).
+      SaaS: finished software (Gmail, Jira).</li>
+      <li>Add the trade-off (control versus effort) and the shared-responsibility model.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-regions-azs">
+  <h3>Regions and availability zones (Mumbai and Hyderabad)</h3>
+  <p class="tldr">A region is a geographic area with several isolated availability zones; you pick the region
+  nearest your users (Mumbai <code>ap-south-1</code> or Hyderabad <code>ap-south-2</code> for India) and spread
+  across zones to survive a data-centre failure.</p>
+
+  <h4>Regions</h4>
+  <p>An AWS <strong>region</strong> is a physical area of the world where AWS runs a cluster of data centres,
+  such as Mumbai or Frankfurt. Each region has a name and a code. For India you will use:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Region</th><th>Code</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Asia Pacific (Mumbai)</td><td><code>ap-south-1</code></td><td>The older, most complete Indian region</td></tr>
+      <tr><td>Asia Pacific (Hyderabad)</td><td><code>ap-south-2</code></td><td>Newer; may need to be enabled in your account, and some services may be missing, so check</td></tr>
+      <tr><td>US East (N. Virginia)</td><td><code>us-east-1</code></td><td>The oldest and largest; several global features are managed from here</td></tr>
+    </tbody>
+  </table></div>
+  <p>Regions are <strong>independent</strong>. A server, a database or a bucket you create lives in one region.
+  Switching the region in the top-right menu of the console shows a different, empty set of resources. This
+  causes the classic panic "my server has disappeared": you simply looked at the wrong region. Some services are
+  <em>global</em> (IAM users and roles, Route 53 DNS, CloudFront), so they do not belong to a region.</p>
+
+  <h4>How to choose a region</h4>
+  <ul>
+    <li><strong>Latency.</strong> Data travels at finite speed; a user in Pune is faster served from Mumbai than
+    from Virginia. Choose the region closest to most users.</li>
+    <li><strong>Rules about data.</strong> Some companies and sectors (banking, health, government) require data
+    to stay in India. Check the rules that apply to you.</li>
+    <li><strong>Service availability.</strong> New services and instance types arrive first in a few big regions.
+    Check that the services you need exist in your region.</li>
+    <li><strong>Price.</strong> The same service can cost differently in different regions. Check the current
+    pricing page.</li>
+    <li><strong>Keep related things together.</strong> Your EC2 server, RDS database and S3 bucket should be in
+    the same region. Cross-region traffic is slower and is billed as data transfer.</li>
+  </ul>
+
+  <h4>Availability zones</h4>
+  <p>A region is split into several <strong>availability zones (AZs)</strong>, normally three or more in the
+  bigger regions. An AZ is one or more data centres with its own power, cooling and network, close enough to
+  others in the region for very low latency, but separate enough that a fire or power cut in one does not take
+  down the others. Zone names look like <code>ap-south-1a</code>, <code>ap-south-1b</code>,
+  <code>ap-south-1c</code>. (AWS maps these letters to physical zones differently per account, so your "1a" may
+  be someone else's "1b"; the zone ID such as <code>aps1-az1</code> is the stable name.)</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  R["Region ap-south-1 (Mumbai)"] --> A["AZ ap-south-1a"]
+  R --> B["AZ ap-south-1b"]
+  R --> C["AZ ap-south-1c"]
+  A --> A1["App server 1"]
+  A --> A2["RDS primary"]
+  B --> B1["App server 2"]
+  B --> B2["RDS standby"]
+</pre>
+    <figcaption>One region, several zones: two app servers and a database with a standby in another zone</figcaption>
+  </figure>
+
+  <h4>Why zones matter for your design</h4>
+  <p>One server in one zone is a <strong>single point of failure</strong>: if that zone has a problem, your app
+  is down. The standard fix is to run at least two copies in different zones behind a load balancer
+  (<a href="#m5-aws-glossary">ELB/ALB</a>), and to turn on <strong>Multi-AZ</strong> for the database
+  (<a href="#m5-rds">RDS</a> keeps a standby copy in another zone and fails over automatically). Subnets (slices
+  of your private network) are tied to one AZ, so "use two AZs" means "create subnets in two zones".</p>
+  <p>For learning and for small apps, one EC2 instance in one zone is fine, and it is cheaper. For a business
+  system that must stay up, use at least two zones. Even then, a whole-region outage is rare but possible;
+  multi-region designs exist and cost much more, so they are used only when the business needs them.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: create all related resources in one region</p>
+    <p>Pick the region first, keep the console on it, and set the same region in the AWS CLI
+    (<code>aws configure</code>) and in your code (for example <code>Region.AP_SOUTH_1</code>). A mismatch gives
+    errors such as "bucket not found" or an empty list.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>An EBS disk can only be attached to a server in the <em>same AZ</em>.</li>
+      <li>An S3 bucket name is global across all of AWS, but the bucket's data lives in one region.</li>
+      <li>Some regions are "opt-in": you must enable them in your account settings before use. If Hyderabad is
+      not in your region list, this is why.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is the difference between a region and an availability zone?"</p>
+    <ul>
+      <li>Region = a geographic area; AZ = an isolated group of data centres inside it. Zones in a region are
+      connected by fast links.</li>
+      <li>Use multiple AZs for high availability (load balancer + Multi-AZ database); use the region closest to
+      users and legal needs.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-account-safety">
+  <h3>AWS account safety first: root MFA, daily-use users, least privilege and keys</h3>
+  <p class="tldr">Protect the root user with MFA and never use it daily; do your work as an IAM Identity Center
+  or IAM user with only the permissions you need, and never put access keys in code, Git or an image.</p>
+
+  <h4>Why this comes before any server</h4>
+  <p>Bots scan GitHub for AWS keys all day. A leaked key can be used within minutes to start expensive servers
+  for crypto-mining, and you receive the bill. Spending an hour on the steps below prevents that.</p>
+
+  <h4>Step 1: secure the root user</h4>
+  <p>When you create an AWS account, you sign up with an email and password. That identity is the
+  <strong>root user</strong>. It can do everything, including closing the account and changing billing, and its
+  permissions cannot be limited. So:</p>
+  <ol class="steps">
+    <li>Use a strong, unique password from a password manager, and a mailbox you control.</li>
+    <li>Turn on <strong>MFA</strong> (multi-factor authentication) for the root user: in the console, open your
+    account menu → Security credentials → Assign MFA device. Use an authenticator app or a passkey/security key.
+    Save recovery details safely.</li>
+    <li>Do <strong>not</strong> create access keys for the root user. If any exist, delete them.</li>
+    <li>Use the root user only for the few tasks that need it (changing the account email, closing the
+    account, some billing settings). Sign out afterwards.</li>
+  </ol>
+
+  <h4>Step 2: create an identity for daily work</h4>
+  <p>You have two good options. Check the current AWS "Getting started" guidance, because the console changes.</p>
+  <ul>
+    <li><strong>IAM Identity Center</strong> (AWS's recommended way for people): you create a user, assign a
+    permission set, and sign in through a portal URL. It gives <em>temporary</em> credentials, so there are no
+    long-lived keys on your laptop. Best choice when you can use it.</li>
+    <li><strong>An IAM user</strong> (simpler, fine for learning): create a user such as
+    <code>asha-admin</code>, tick console access, enable MFA for it too, and attach permissions through a
+    <strong>group</strong>. For a personal account you may attach the managed policy
+    <code>AdministratorAccess</code> to a group, but prefer narrower policies as soon as you know what you need.
+    See <a href="#m5-iam">IAM</a>.</li>
+  </ul>
+  <p>From now on, sign in with this identity, not root. The sign-in URL for IAM users contains your account ID
+  or alias; bookmark it.</p>
+
+  <h4>Step 3: least privilege</h4>
+  <p>The <strong>principle of least privilege</strong> means each user, application and server gets only the
+  permissions it needs for its job. An app that uploads photos needs <code>s3:PutObject</code> on one bucket,
+  not <code>AdministratorAccess</code>. If the app is ever compromised, the damage is limited to that bucket.</p>
+
+  <h4>Step 4: handle access keys carefully</h4>
+  <p>An <strong>access key</strong> is a pair (access key ID plus secret access key) that lets a program or the
+  AWS CLI act as a user. It is a password in another form.</p>
+  <div class="co co-rule">
+    <p class="co-t">Rules for access keys</p>
+    <ul>
+      <li>Never commit keys to Git, even in a private repository, and never put them in a Dockerfile, an image,
+      a React app (everything in frontend code is public), a screenshot or a chat message.</li>
+      <li>Prefer no keys at all: use IAM Identity Center on your laptop and an
+      <a href="#m5-iam">instance role</a> on EC2.</li>
+      <li>If you must use keys, store them with <code>aws configure</code> (it writes
+      <code>~/.aws/credentials</code> outside any repository), give the user minimal permissions, and rotate or
+      delete unused keys.</li>
+      <li>Add <code>.env</code> and credential files to <code>.gitignore</code> before the first commit.</li>
+    </ul>
+  </div>
+  <p>Check which identity the CLI is using at any time:</p>
+  <pre data-title="Terminal"><code class="language-shell">$ aws sts get-caller-identity
+{
+    "UserId": "AIDAEXAMPLEUSERID",
+    "Account": "123456789012",
+    "Arn": "arn:aws:iam::123456789012:user/asha-admin"
+}</code></pre>
+
+  <h4>If a key leaks</h4>
+  <ol class="steps">
+    <li>Deactivate and then delete the key immediately (IAM → Users → Security credentials).</li>
+    <li>Look for anything you did not create: instances in every region, new IAM users, new keys. CloudTrail
+    (the audit log) shows what the key did.</li>
+    <li>Delete unknown resources, then check the billing page. AWS often emails you about exposed keys; follow
+    its instructions and contact AWS Support if you see charges you did not make.</li>
+    <li>Remove the secret from Git history (rotating the key matters more than rewriting history, because
+    anyone may already have copied it).</li>
+  </ol>
+
+  <h4>The free tier</h4>
+  <p>AWS has offered a <strong>free tier</strong> for new accounts: some services free up to a limit for a
+  period, some free always, and some as trials. The terms, limits, durations and even the structure of the
+  programme have changed over the years, and they differ by account creation date. So do not rely on a number
+  from a blog or this page. Open the current "AWS Free Tier" page, read the exact terms for your account, and
+  note which services and instance types qualify. "Free tier" never means "unlimited": going over the limit,
+  using a non-eligible instance type, or running in a way the tier does not cover creates a normal bill.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: one account for learning, tags on everything</p>
+    <p>Use a separate account for experiments. Give resources a tag such as <code>project=shop</code> so you can
+    find and delete them later. Real companies use separate accounts for development and production.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you secure a new AWS account?"</p>
+    <ul>
+      <li>MFA on root, no root keys, root unused; IAM Identity Center or IAM users with groups and least
+      privilege; roles instead of keys for servers; billing alerts; CloudTrail on.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-billing-alerts">
+  <h3>Billing alerts, AWS Budgets and the surprise-cost list</h3>
+  <p class="tldr">Create a monthly budget with email alerts on day one, learn to read the bill by service and
+  region, and know the usual surprise costs: running instances, forgotten disks, public IPs, NAT gateways, data
+  transfer and idle databases.</p>
+
+  <h4>Create a budget, step by step</h4>
+  <p>AWS <strong>Budgets</strong> watches your spending (actual and forecast) against a number you choose and
+  emails you at thresholds. The console layout changes now and then, so treat the labels below as a guide.</p>
+  <ol class="steps">
+    <li>Sign in as the root user (or an admin). By default, IAM users cannot see billing pages. As root, open
+    Account → "IAM user and role access to Billing information" and activate it if you want your admin user to
+    see billing.</li>
+    <li>Open <strong>Billing and Cost Management</strong> → <strong>Billing preferences</strong> and turn on the
+    email alerts offered there, for example free-tier usage alerts, and set the email addresses.</li>
+    <li>Open <strong>Budgets</strong> → <strong>Create budget</strong>. For a first budget choose a template such
+    as "Zero spend budget" (alerts as soon as you spend anything) or "Monthly cost budget" (you enter an
+    amount).</li>
+    <li>Enter a name, the monthly amount you are comfortable with, and your email address. Create the
+    budget.</li>
+    <li>Optionally, make a second, customised cost budget with several alerts: for example at 50% and 80% of the
+    amount on <em>actual</em> spend, and at 100% on <em>forecasted</em> spend (the forecast warns you before
+    you cross the line).</li>
+    <li>Confirm the email subscription if AWS sends a confirmation message, then check that alert emails do not
+    go to spam.</li>
+    <li>Open <strong>Cost Explorer</strong> and enable it (it may take a day to fill). It shows cost by service,
+    by region and over time.</li>
+  </ol>
+
+  <div class="co co-exc">
+    <p class="co-t">Limits of budget alerts</p>
+    <ul>
+      <li>A budget <strong>alerts, it does not stop</strong> spending. (Advanced "budget actions" can apply a
+      restrictive policy automatically, but they need setup and care.)</li>
+      <li>Billing data lags by hours, so an alert can arrive after the cost happened. Alerts are a smoke
+      detector, not a fire brigade; the real protection is cleaning up when you finish.</li>
+      <li>Look into Cost Anomaly Detection as well; it flags unusual spikes by service.</li>
+    </ul>
+  </div>
+
+  <h4>Reading the bill</h4>
+  <p>Open Billing → <strong>Bills</strong> to see the current month, grouped by service, with a view by region.
+  The region view quickly shows the mistake "I created a server in a region I forgot". Make it a weekly habit
+  for the first months: two minutes, once a week.</p>
+
+  <h4>The usual surprise costs</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Surprise</th><th>Why it happens</th><th>What to do</th></tr></thead>
+    <tbody>
+      <tr><td>Running EC2 instances</td><td>They bill while running, even when idle</td><td>Stop or terminate when you finish; check every region</td></tr>
+      <tr><td>Unattached EBS volumes and old snapshots</td><td>Disks bill for their size even when no server uses them; terminating a server may not delete extra volumes</td><td>Delete unused volumes and snapshots; check "delete on termination"</td></tr>
+      <tr><td>Elastic IPs and public IPv4 addresses</td><td>AWS charges for public IPv4 addresses, and an Elastic IP not attached to a running instance is a classic waste</td><td>Release IPs you do not use; check the current IPv4 pricing</td></tr>
+      <tr><td>NAT gateways</td><td>Billed per hour plus per GB processed, which is a common shock in "private subnet" tutorials</td><td>Avoid for learning; delete after labs</td></tr>
+      <tr><td>Data transfer</td><td>Data going out to the internet, or between regions and zones, is billed</td><td>Keep resources in one region; use CloudFront for heavy downloads</td></tr>
+      <tr><td>RDS left running</td><td>A database bills all day, plus storage and backups; stopped RDS instances restart automatically after a number of days</td><td>Delete test databases (take a final snapshot only if needed)</td></tr>
+      <tr><td>Load balancers</td><td>Bill per hour while they exist, even with no traffic</td><td>Delete after experiments</td></tr>
+      <tr><td>Big S3 buckets, logs</td><td>Storage and requests add up; CloudWatch logs grow without limit by default</td><td>Lifecycle rules; set log retention</td></tr>
+    </tbody>
+  </table></div>
+  <p>Do not memorise prices. Memorise the habit: <em>everything that exists in the console may be billed, so
+  when a lab ends, delete what you created</em>.</p>
+
+  <h4>A cleanup routine after every lab</h4>
+  <ol class="steps">
+    <li>Terminate EC2 instances you do not need (stopping keeps the disk, which is still billed).</li>
+    <li>Delete the leftover EBS volumes and snapshots; release Elastic IPs.</li>
+    <li>Delete RDS instances, load balancers, NAT gateways.</li>
+    <li>Empty and delete S3 buckets used for tests.</li>
+    <li>Look at Bills → by region next day to confirm nothing is still running.</li>
+  </ol>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: use tags and a "delete me" day</p>
+    <p>Tag lab resources with <code>purpose=learning</code>. When you search resources by tag, you can delete
+    them all together. For repeatable labs, write them as Terraform (<a href="#m6-terraform">Module 6</a>) and run
+    <code>terraform destroy</code>.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: setting up alerts to an email you never read</p>
+    <p>An alert nobody sees is useless. Use an address you check daily, add a second recipient, and test by
+    creating a tiny "zero spend" budget.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you keep cloud costs under control?"</p>
+    <ul>
+      <li>Budgets and alerts, Cost Explorer, tags, right-sizing, shutting down non-production at night, deleting
+      unused resources, committing to Savings Plans for steady load, and reviewing the bill regularly.</li>
+    </ul>
+  </div>
+</article>

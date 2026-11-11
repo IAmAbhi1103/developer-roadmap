@@ -1,0 +1,546 @@
+<article class="topic" id="m2-state">
+  <h3>State: behaviour that changes with the object's state</h3>
+  <p class="tldr">State moves the state-dependent behaviour of an object into separate state classes, so the object delegates to its current state and changes state by swapping that object, which replaces large if/else blocks on a status field.</p>
+
+  <p><strong>Intent:</strong> allow an object to alter its behaviour when its internal state changes; the object will appear to change its class.</p>
+
+  <h4>The problem</h4>
+  <p>An e-commerce order moves through states: <code>NEW → PAID → SHIPPED → DELIVERED</code>, and it can be cancelled in some states but not others. The first version uses an enum and checks it in every method:</p>
+  <pre data-title="OrderNoState.java"><code class="language-java">class Order {
+    private OrderStatus status = OrderStatus.NEW;
+
+    void pay() {
+        if (status == OrderStatus.NEW) status = OrderStatus.PAID;
+        else throw new IllegalStateException("Cannot pay in " + status);
+    }
+    void ship() {
+        if (status == OrderStatus.PAID) status = OrderStatus.SHIPPED;
+        else throw new IllegalStateException("Cannot ship in " + status);
+    }
+    void cancel() {
+        if (status == OrderStatus.NEW || status == OrderStatus.PAID) status = OrderStatus.CANCELLED;
+        else throw new IllegalStateException("Cannot cancel in " + status);
+    }
+    // deliver(), refund(), ... each with its own chain of ifs
+}</code></pre>
+  <p>With 5 states and 6 actions you have up to 30 combinations spread across many <code>if</code> blocks. A new state touches every method. The rules of the state machine are hidden in conditions.</p>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> New
+  New --> Paid : pay
+  New --> Cancelled : cancel
+  Paid --> Shipped : ship
+  Paid --> Cancelled : cancel
+  Shipped --> Delivered : deliver
+  Delivered --> [*]
+  Cancelled --> [*]
+</pre>
+    <figcaption>The order life cycle; each box can become a class</figcaption>
+  </figure>
+
+  <h4>Structure and implementation</h4>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class Order {
+    -OrderState state
+    +pay() void
+    +ship() void
+    +cancel() void
+    ~setState(OrderState s) void
+  }
+  class OrderState {
+    &lt;&lt;interface&gt;&gt;
+    +pay(Order o) void
+    +ship(Order o) void
+    +cancel(Order o) void
+  }
+  class NewState
+  class PaidState
+  class ShippedState
+  Order o--> OrderState
+  OrderState &lt;|.. NewState
+  OrderState &lt;|.. PaidState
+  OrderState &lt;|.. ShippedState
+</pre>
+    <figcaption>The context delegates every action to its current state object</figcaption>
+  </figure>
+  <pre data-title="StateDemo.java"><code class="language-java">interface OrderState {
+    default void pay(Order o)    { throw new IllegalStateException("Cannot pay in " + name()); }
+    default void ship(Order o)   { throw new IllegalStateException("Cannot ship in " + name()); }
+    default void cancel(Order o) { throw new IllegalStateException("Cannot cancel in " + name()); }
+    String name();
+}
+
+class NewState implements OrderState {
+    public void pay(Order o)    { o.setState(new PaidState()); }
+    public void cancel(Order o) { o.setState(new CancelledState()); }
+    public String name() { return "NEW"; }
+}
+class PaidState implements OrderState {
+    public void ship(Order o)   { o.setState(new ShippedState()); }
+    public void cancel(Order o) { o.setState(new CancelledState()); }     // refund here
+    public String name() { return "PAID"; }
+}
+class ShippedState implements OrderState {
+    public String name() { return "SHIPPED"; }          // pay/ship/cancel not allowed
+}
+class CancelledState implements OrderState {
+    public String name() { return "CANCELLED"; }
+}
+
+class Order {
+    private OrderState state = new NewState();           // initial state
+
+    void pay()    { state.pay(this); }                   // delegate
+    void ship()   { state.ship(this); }
+    void cancel() { state.cancel(this); }
+    void setState(OrderState s) { this.state = s; }
+    String status() { return state.name(); }
+}
+
+public class StateDemo {
+    public static void main(String[] args) {
+        Order order = new Order();
+        order.pay();
+        order.ship();
+        System.out.println(order.status());      // SHIPPED
+        order.cancel();                          // throws IllegalStateException
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">SHIPPED
+Exception in thread "main" java.lang.IllegalStateException: Cannot cancel in SHIPPED</code></pre>
+  <p>Each state class contains only the rules for that state, in one place. Illegal actions fall back to the default method that throws. A new state (for example <code>RETURNED</code>) is a new class and changes only the states that can lead to it. The transitions are visible and testable.</p>
+  <p>Variations: states can be stateless singletons (shared instances or enum constants) to avoid creating objects; an <strong>enum with abstract methods per constant</strong> is a compact Java form of State when the states carry no data; and for big workflows the <em>Spring State Machine</em> project or a workflow engine provides a ready framework.</p>
+
+  <h4>State vs Strategy</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>State</th><th>Strategy</th></tr></thead>
+    <tbody>
+      <tr><td>Who changes the object?</td><td>The object itself (or its states) as events happen</td><td>The client, usually at set-up</td></tr>
+      <tr><td>Do they know each other?</td><td>Often: a state knows its next state</td><td>No, they are independent</td></tr>
+      <tr><td>Runtime change</td><td>Frequent, part of the design</td><td>Rare</td></tr>
+      <tr><td>Question it answers</td><td>"What can I do now?"</td><td>"How do I do this task?"</td></tr>
+      <tr><td>Example</td><td>Order life cycle, vending machine, TCP connection</td><td>Payment method, sort order</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>State in the JDK and Spring</h4>
+  <ul>
+    <li><code>Thread.State</code> is an enum of states, but the thread's behaviour is inside the JVM, not State classes.</li>
+    <li>Spring State Machine (a separate project) and workflow engines such as Camunda implement the idea at framework level.</li>
+    <li>JDBC <code>Connection</code> (open, in transaction, closed), TCP sockets and media players are classic state-driven objects.</li>
+    <li>The Java 17+ sealed interface with records and a pattern-matching <code>switch</code> is a modern, compact alternative for immutable state: each state is a record, and a pure function <code>next(state, event)</code> returns the new state.</li>
+  </ul>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Removes big status conditionals; one class per state (SRP, OCP).</li>
+      <li>Transitions are explicit and easy to test.</li>
+      <li>Illegal operations are handled in one default place.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>Many small classes, even for a simple life cycle.</li>
+      <li>Transition rules are spread across state classes; the whole picture needs a diagram.</li>
+      <li>States need access to the context, adding coupling between them.</li>
+    </ul></div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to use State</p>
+    <ul>
+      <li>When there are two or three states with a few simple rules: an enum and a <code>switch</code> are clearer.</li>
+      <li>When the status is just data stored in a database and no behaviour changes with it.</li>
+      <li>When the workflow is long, configurable, or owned by the business: use a workflow engine.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Order, payment, ticket, loan and shipment life cycles are all state machines. Whichever way you code them, also enforce the rule in the database (a status column with allowed values) and protect transitions from concurrent updates (optimistic locking with <code>@Version</code>), or two requests can move the same order in conflicting ways.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: State</p>
+    <ul>
+      <li><b>What problem does State solve?</b> Large if/else or switch blocks on a status field, repeated in every method.</li>
+      <li><b>State vs Strategy?</b> Same shape. State changes itself over time and knows transitions; Strategy is chosen by the client and is independent.</li>
+      <li><b>How would you model a vending machine or an order life cycle?</b> State pattern or a state machine; draw the state diagram first.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-chain-of-responsibility">
+  <h3>Chain of Responsibility: pass a request along a chain of handlers</h3>
+  <p class="tldr">Chain of Responsibility links handlers in a sequence; each one either handles the request, changes it, or passes it to the next, so the sender does not know which handler will act; servlet filters and the Spring Security filter chain work this way.</p>
+
+  <p><strong>Intent:</strong> avoid coupling the sender of a request to its receiver by giving more than one object a chance to handle the request.</p>
+
+  <h4>The problem</h4>
+  <p>Before an order is accepted, it must pass several checks: the cart is not empty, the customer is not blocked, stock is available, the payment limit is not exceeded, and the pincode is serviceable. Putting everything in one method gives a long list of <code>if</code>s that you cannot reorder, reuse or test one by one. Some checks apply only to some orders, and new checks arrive often. A chain turns each check into a handler with one job.</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class OrderCheck {
+    &lt;&lt;abstract&gt;&gt;
+    -OrderCheck next
+    +linkWith(OrderCheck next) OrderCheck
+    +check(OrderRequest r) void
+    #doCheck(OrderRequest r) void*
+  }
+  class NonEmptyCartCheck
+  class CustomerActiveCheck
+  class StockCheck
+  class PaymentLimitCheck
+  OrderCheck &lt;|-- NonEmptyCartCheck
+  OrderCheck &lt;|-- CustomerActiveCheck
+  OrderCheck &lt;|-- StockCheck
+  OrderCheck &lt;|-- PaymentLimitCheck
+  OrderCheck --> OrderCheck : next
+</pre>
+    <figcaption>Each handler holds a reference to the next one</figcaption>
+  </figure>
+
+  <h4>Implementation: a validation pipeline</h4>
+  <pre data-title="ChainDemo.java"><code class="language-java">import java.util.List;
+
+record OrderRequest(String customerId, List&lt;String&gt; skus, long totalPaise,
+                    boolean customerBlocked) { }
+
+class ValidationException extends RuntimeException {
+    ValidationException(String message) { super(message); }
+}
+
+abstract class OrderCheck {
+    private OrderCheck next;
+
+    OrderCheck linkWith(OrderCheck next) {            // returns next, so links can be chained
+        this.next = next;
+        return next;
+    }
+
+    final void check(OrderRequest request) {
+        doCheck(request);                              // may throw to stop the chain
+        if (next != null) next.check(request);         // otherwise pass it on
+    }
+
+    protected abstract void doCheck(OrderRequest request);
+}
+
+class NonEmptyCartCheck extends OrderCheck {
+    protected void doCheck(OrderRequest r) {
+        if (r.skus().isEmpty()) throw new ValidationException("Cart is empty");
+    }
+}
+class CustomerActiveCheck extends OrderCheck {
+    protected void doCheck(OrderRequest r) {
+        if (r.customerBlocked()) throw new ValidationException("Customer is blocked");
+    }
+}
+class PaymentLimitCheck extends OrderCheck {
+    private static final long LIMIT_PAISE = 10_000_000;       // Rs 1,00,000
+    protected void doCheck(OrderRequest r) {
+        if (r.totalPaise() &gt; LIMIT_PAISE) throw new ValidationException("Above payment limit");
+    }
+}
+
+public class ChainDemo {
+    public static void main(String[] args) {
+        OrderCheck chain = new NonEmptyCartCheck();
+        chain.linkWith(new CustomerActiveCheck()).linkWith(new PaymentLimitCheck());
+
+        chain.check(new OrderRequest("C1", List.of("SKU-1"), 50000, false));   // passes
+        System.out.println("First order OK");
+        try {
+            chain.check(new OrderRequest("C2", List.of("SKU-2"), 20_000_000, false));
+        } catch (ValidationException e) {
+            System.out.println("Rejected: " + e.getMessage());
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">First order OK
+Rejected: Above payment limit</code></pre>
+  <p>Order matters: put cheap checks first and expensive ones (database, remote calls) last. This example is a <em>validation</em> chain, where every handler runs unless one fails. There are two styles of chain:</p>
+  <ul>
+    <li><strong>First-handler-wins</strong> (classic GoF): the request is passed on until one handler handles it and stops. Examples: exception handling (the first matching <code>catch</code>), a support escalation (agent, then manager, then director), approval by amount.</li>
+    <li><strong>Pipeline</strong> (everyone participates): each handler does its part and passes on, possibly modifying the request or the response. Examples: servlet filters, middleware, validation.</li>
+  </ul>
+
+  <h4>A list-based version</h4>
+  <p>The linked-node chain is the textbook form. In day-to-day Java, a <code>List</code> of handlers is often simpler, and Spring will inject it for you in <code>@Order</code>:</p>
+  <pre data-title="ListChain.java"><code class="language-java">public interface OrderValidator {
+    void validate(OrderRequest request);                  // throws ValidationException
+}
+
+@Service
+class OrderValidationService {
+    private final List&lt;OrderValidator&gt; validators;        // every @Component, in @Order
+
+    OrderValidationService(List&lt;OrderValidator&gt; validators) { this.validators = validators; }
+
+    void validate(OrderRequest request) {
+        validators.forEach(v -&gt; v.validate(request));
+    }
+}</code></pre>
+
+  <h4>Chain of Responsibility in the JDK and Spring</h4>
+  <ul>
+    <li><strong>Servlet filters:</strong> <code>Filter.doFilter(request, response, chain)</code>; each filter calls <code>chain.doFilter(...)</code> to continue, or returns without calling it to stop the request (for example, when authentication fails).</li>
+    <li><strong>Spring Security:</strong> a <code>SecurityFilterChain</code> is an ordered chain of filters (CORS, CSRF, authentication, authorization, ...); the request passes through each, and any filter can reject it. <code>FilterChainProxy</code> holds the chains. See <a href="04-spring-boot.html#m4">Security</a>.</li>
+    <li><strong>Spring MVC:</strong> <code>HandlerInterceptor</code>s run in order before and after a controller.</li>
+    <li><strong>Java:</strong> a series of <code>catch</code> blocks; <code>java.util.logging</code> handlers and parent loggers; class loader delegation to the parent class loader first.</li>
+    <li>Middleware in Express, ASP.NET and API gateways follow the same structure.</li>
+  </ul>
+  <pre data-title="MyFilter.java"><code class="language-java">@Component
+public class RequestTimingFilter extends OncePerRequestFilter {
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+                                    FilterChain chain)
+            throws ServletException, IOException {
+        long start = System.nanoTime();
+        try {
+            chain.doFilter(request, response);            // pass to the next handler
+        } finally {
+            long ms = (System.nanoTime() - start) / 1_000_000;
+            log.info("{} {} took {} ms", request.getMethod(), request.getRequestURI(), ms);
+        }
+    }
+}</code></pre>
+  <p>(Imports and a <code>log</code> field omitted; <code>jakarta.servlet</code> packages in Boot 3.x and 4.x.)</p>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Decouples sender from receivers; the sender needs one entry point.</li>
+      <li>Each handler has one job; add, remove or reorder handlers freely (SRP, OCP).</li>
+      <li>Easy to test each handler alone.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>No guarantee that a request is handled (first-wins chains may fall off the end).</li>
+      <li>Hard to debug: the flow is spread across many classes.</li>
+      <li>A mis-ordered chain gives wrong behaviour; a handler that forgets to call <code>next</code> silently cuts the chain.</li>
+      <li>Long chains add per-request cost.</li>
+    </ul></div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to use Chain of Responsibility</p>
+    <ul>
+      <li>When there are only two or three fixed checks: sequential statements are clearer.</li>
+      <li>When you need a known, unique receiver: call it directly.</li>
+      <li>When all checks must be reported together (show all validation errors): run a list of validators and collect results, not a chain that stops at the first failure.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: Chain of Responsibility</p>
+    <ul>
+      <li><b>What is it, and where is it in Spring?</b> A chain of handlers where each may handle or forward; servlet filters and the Spring Security filter chain.</li>
+      <li><b>What happens if a filter does not call <code>chain.doFilter</code>?</b> The request stops there; the target servlet or controller is never reached (used on purpose to reject).</li>
+      <li><b>Chain vs Decorator?</b> Both wrap/forward to a next object. A decorator always delegates and adds behaviour; a chain handler may stop the flow.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-template-method">
+  <h3>Template Method: a fixed skeleton with steps that subclasses fill in</h3>
+  <p class="tldr">Template Method defines the steps of an algorithm in a base class method and lets subclasses supply some of the steps, so the order is fixed and shared while the details vary; Spring's JdbcTemplate applies the same idea with callbacks.</p>
+
+  <p><strong>Intent:</strong> define the skeleton of an algorithm in an operation, deferring some steps to subclasses, so subclasses can redefine certain steps without changing the algorithm's structure.</p>
+
+  <h4>The problem</h4>
+  <p>You export reports as CSV, Excel and PDF. Every export does the same things in the same order: fetch the data, filter it, build the header, write each row, write the footer, close the output. Only the format-specific steps differ. If each exporter is written separately, the common steps are copy-pasted and a fix in one is missed in the others (a <a href="#m1-dry-kiss-yagni">DRY</a> failure). Template Method keeps the order in one place.</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class ReportExporter {
+    &lt;&lt;abstract&gt;&gt;
+    +export(List~Row~ rows) String
+    #header() String*
+    #formatRow(Row r) String*
+    #footer(int count) String
+  }
+  class CsvExporter
+  class HtmlExporter
+  ReportExporter &lt;|-- CsvExporter
+  ReportExporter &lt;|-- HtmlExporter
+</pre>
+    <figcaption>export() is the template; header() and formatRow() are the steps subclasses fill in</figcaption>
+  </figure>
+
+  <h4>Implementation</h4>
+  <pre data-title="TemplateMethodDemo.java"><code class="language-java">import java.util.List;
+
+record Row(String name, long amountPaise) { }
+
+abstract class ReportExporter {
+
+    public final String export(List&lt;Row&gt; rows) {         // the template method: final!
+        StringBuilder out = new StringBuilder();
+        out.append(header()).append('\n');
+        int count = 0;
+        for (Row row : selectRows(rows)) {                 // step with a default
+            out.append(formatRow(row)).append('\n');
+            count++;
+        }
+        out.append(footer(count));
+        return out.toString();
+    }
+
+    protected abstract String header();                    // must be provided
+    protected abstract String formatRow(Row row);          // must be provided
+
+    protected List&lt;Row&gt; selectRows(List&lt;Row&gt; rows) {      // hook: optional override
+        return rows;
+    }
+    protected String footer(int count) {                   // hook with a default
+        return "Total rows: " + count;
+    }
+}
+
+class CsvExporter extends ReportExporter {
+    protected String header() { return "name,amount"; }
+    protected String formatRow(Row r) { return r.name() + "," + r.amountPaise() / 100.0; }
+}
+
+class PositiveOnlyHtmlExporter extends ReportExporter {
+    protected String header() { return "&lt;tr&gt;&lt;th&gt;Name&lt;/th&gt;&lt;th&gt;Amount&lt;/th&gt;&lt;/tr&gt;"; }
+    protected String formatRow(Row r) {
+        return "&lt;tr&gt;&lt;td&gt;" + r.name() + "&lt;/td&gt;&lt;td&gt;" + r.amountPaise() / 100.0 + "&lt;/td&gt;&lt;/tr&gt;";
+    }
+    @Override protected List&lt;Row&gt; selectRows(List&lt;Row&gt; rows) {          // override a hook
+        return rows.stream().filter(r -&gt; r.amountPaise() &gt; 0).toList();
+    }
+}
+
+public class TemplateMethodDemo {
+    public static void main(String[] args) {
+        List&lt;Row&gt; rows = List.of(new Row("Asha", 150000), new Row("Ravi", -5000));
+        System.out.println(new CsvExporter().export(rows));
+        System.out.println(new PositiveOnlyHtmlExporter().export(rows));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">name,amount
+Asha,1500.0
+Ravi,-50.0
+Total rows: 2
+&lt;tr&gt;&lt;th&gt;Name&lt;/th&gt;&lt;th&gt;Amount&lt;/th&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;Asha&lt;/td&gt;&lt;td&gt;1500.0&lt;/td&gt;&lt;/tr&gt;
+Total rows: 1</code></pre>
+  <p>Three kinds of steps appear in a template: <strong>abstract</strong> steps that every subclass must implement, <strong>hooks</strong> with a default that a subclass may override, and <strong>fixed</strong> steps in the base class. Declare the template method <code>final</code> so that subclasses cannot change the order. This is the <strong>Hollywood principle</strong>: "don't call us, we'll call you". The base class calls the subclass, not the other way round.</p>
+
+  <h4>Callback style: Spring's templates</h4>
+  <p>Inheritance is not the only way. Spring's <code>JdbcTemplate</code>, <code>TransactionTemplate</code>, <code>RestTemplate</code> and <code>JmsTemplate</code> use the same idea with <em>callbacks</em> (lambdas or small objects) instead of subclasses: the template owns the boring, error-prone skeleton (open connection, create statement, handle exceptions, close resources) and your callback supplies the variable part.</p>
+  <pre data-title="JdbcTemplateCallbacks.java"><code class="language-java">// The template does: get connection, prepare statement, run it, loop the result set,
+// translate SQLException, close everything. You provide only the row mapping:
+List&lt;Employee&gt; list = jdbcTemplate.query(
+        "SELECT id, name, salary FROM employees WHERE dept_id = ?",
+        (rs, rowNum) -&gt; new Employee(rs.getLong("id"), rs.getString("name"),
+                                     rs.getLong("salary")),     // RowMapper callback
+        10);
+
+// TransactionTemplate: begin, run your code, commit or roll back
+Long id = transactionTemplate.execute(status -&gt; {
+    repository.save(order);
+    return order.id();
+});</code></pre>
+  <p>The callback version is a Strategy-like design (composition), but the structure "fixed skeleton plus a variable step" is Template Method. Compare: inheritance-based Template Method uses <code>extends</code>; callback-based uses a lambda passed in.</p>
+
+  <h4>Template Method in the JDK and frameworks</h4>
+  <ul>
+    <li><code>AbstractList</code>, <code>AbstractMap</code>, <code>AbstractSet</code>: you implement <code>get(int)</code> and <code>size()</code> (for an <code>AbstractList</code>) and the class gives you <code>iterator()</code>, <code>indexOf</code>, <code>equals</code>, <code>hashCode</code> and more, written in terms of those steps. This is a very common interview example.</li>
+    <li><code>InputStream.read(byte[])</code> is built on the single abstract <code>read()</code>; <code>Reader</code> and <code>Writer</code> likewise.</li>
+    <li><code>HttpServlet.service()</code> inspects the HTTP method and calls <code>doGet</code>, <code>doPost</code>, etc., which you override.</li>
+    <li><code>AbstractApplicationContext.refresh()</code> in Spring is a famous template method; <code>JdbcTemplate</code>, <code>JmsTemplate</code>, <code>OncePerRequestFilter.doFilter</code> (calls your <code>doFilterInternal</code>) and <code>AbstractController</code> do the same.</li>
+    <li>JUnit's <code>@BeforeEach</code> / test / <code>@AfterEach</code> life cycle is a template method run by the framework.</li>
+  </ul>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Removes duplicated skeleton code (DRY).</li>
+      <li>The framework controls the order; subclasses cannot break it.</li>
+      <li>Easy way to offer extension points (hooks).</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>Uses inheritance: subclasses are tied to the base class (fragile base class; Liskov must hold).</li>
+      <li>The more steps and hooks, the harder to know what to override.</li>
+      <li>One parent only; you cannot combine two templates.</li>
+      <li>Hard to read: the control flow jumps between base and subclass.</li>
+    </ul></div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to use Template Method</p>
+    <ul>
+      <li>When the variation can be a Strategy passed in (composition): it is more flexible and avoids inheritance. Many modern designs replace Template Method with Strategy or callbacks.</li>
+      <li>When there is only one implementation.</li>
+      <li>When the subclass would need to change the order of steps. The skeleton is then not really fixed.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Forgetting <code>final</code> on the template method, so a subclass overrides the whole algorithm.</li>
+      <li>Calling an overridable method from a base-class <em>constructor</em>: the subclass method runs before the subclass fields are initialised.</li>
+      <li>Too many abstract methods: the subclass becomes a form to fill in. Prefer a few steps plus hooks with defaults.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: Template Method</p>
+    <ul>
+      <li><b>What is it?</b> A base class fixes the algorithm's steps; subclasses override some steps. Example: report exporter, <code>AbstractList</code>.</li>
+      <li><b>Template Method vs Strategy?</b> Template Method varies <em>steps</em> through inheritance (compile time); Strategy varies the <em>whole algorithm</em> through composition (run time).</li>
+      <li><b>Which Spring classes use it?</b> <code>JdbcTemplate</code>, <code>TransactionTemplate</code>, <code>AbstractApplicationContext.refresh</code>.</li>
+      <li><b>What is the Hollywood principle?</b> "Don't call us, we'll call you": the framework calls your code.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-structural-compare">
+  <h3>Adapter vs Decorator vs Proxy vs Facade</h3>
+  <p class="tldr">All four wrap other objects, but they differ in intent: Adapter changes an interface, Decorator adds behaviour, Proxy controls access, and Facade simplifies a whole subsystem.</p>
+
+  <p>These four structural patterns look alike in a class diagram: one class holds a reference to another and forwards calls. Interviewers ask for the difference because the <em>structure</em> is the same and only the <em>intent</em> separates them. The fastest way to decide is to ask what the wrapper does to the interface and to the behaviour.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Adapter</th><th>Decorator</th><th>Proxy</th><th>Facade</th></tr></thead>
+    <tbody>
+      <tr><td>Intent</td><td>Make an incompatible interface fit</td><td>Add responsibilities</td><td>Control access</td><td>Simplify a subsystem</td></tr>
+      <tr><td>Interface of the wrapper</td><td>Different from the wrapped object</td><td>Same</td><td>Same</td><td>New, simpler</td></tr>
+      <tr><td>Wraps</td><td>One object</td><td>One object (can stack)</td><td>One object</td><td>Many objects</td></tr>
+      <tr><td>Who creates the wrapped object?</td><td>Passed in</td><td>Passed in</td><td>Often the proxy itself (lazy) or the framework</td><td>Usually created or injected into the facade</td></tr>
+      <tr><td>Behaviour added?</td><td>Translation only</td><td>Yes, new features</td><td>Access, caching, laziness, security, transactions</td><td>Orchestration</td></tr>
+      <tr><td>Client aware?</td><td>Uses the target interface</td><td>Chooses the layers</td><td>Usually unaware</td><td>Calls the facade on purpose</td></tr>
+      <tr><td>Example</td><td><code>InputStreamReader</code>, payment SDK wrapper</td><td><code>BufferedInputStream</code>, caching service</td><td><code>@Transactional</code> bean, Hibernate lazy entity</td><td><code>OrderFacade</code>, SLF4J, <code>JdbcTemplate</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>How to choose</h4>
+  <ol class="steps">
+    <li>Do you need to call a class whose interface does not match what your code expects, and you cannot change it? <strong>Adapter</strong>.</li>
+    <li>Do you want to add a feature (logging, caching, compression) to a class while keeping its interface, in combinations that the caller picks? <strong>Decorator</strong>.</li>
+    <li>Do you want to control whether, when or how the real object is reached (lazy, permission, remote, transaction), without the caller knowing? <strong>Proxy</strong>.</li>
+    <li>Do you have many classes and want one easy entry point for a common job? <strong>Facade</strong>.</li>
+  </ol>
+
+  <h4>The same problem, four ways</h4>
+  <p>Imagine a payment library:</p>
+  <ul>
+    <li><strong>Adapter:</strong> the vendor's method is <code>makePayment(card, rupees, currency)</code>; you wrap it as <code>pay(PaymentRequest)</code>.</li>
+    <li><strong>Decorator:</strong> a <code>LoggingGateway</code> and a <code>RetryingGateway</code> that implement <code>PaymentGateway</code> and wrap another gateway, stacked as you like.</li>
+    <li><strong>Proxy:</strong> a <code>FraudCheckingGatewayProxy</code> that decides whether the call goes through at all, or a Spring proxy that opens a transaction around it.</li>
+    <li><strong>Facade:</strong> a <code>CheckoutFacade.checkout(cart)</code> that calls inventory, payment and shipping.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Blurry borders</p>
+    <ul>
+      <li>Decorator and Proxy have the same structure. A decorator is usually built by the <em>client</em> to add a feature; a proxy is often hidden from the client, and it often creates or finds the real object itself.</li>
+      <li>A caching wrapper can be called either a caching proxy or a caching decorator. Name it after the dominant reason: "adds a feature" or "controls access".</li>
+      <li>A Spring AOP proxy that adds behaviour around a call is a proxy in mechanism and a decorator in effect.</li>
+      <li>An adapter that also wraps several objects starts to look like a facade. Keep adapters one-to-one.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: the four-way question</p>
+    <ul>
+      <li>Answer in one line each: Adapter converts, Decorator enhances, Proxy controls, Facade simplifies.</li>
+      <li>Give one JDK or Spring example each: <code>InputStreamReader</code>, <code>BufferedReader</code>, <code>@Transactional</code> proxy, SLF4J or <code>JdbcTemplate</code>.</li>
+      <li>Add that Decorator and Proxy have the same structure and differ in intent.</li>
+    </ul>
+  </div>
+</article>

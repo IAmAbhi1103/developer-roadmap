@@ -1,0 +1,464 @@
+<div class="mintro">
+  <p>An <strong>operating system (OS)</strong> is the software that sits between your programs and the hardware. Every Java program you run, every Spring Boot server and every Docker container depends on it for CPU time, memory, files and network. Operating systems is also the most-asked CS-fundamentals subject in campus and product-company interviews: process vs thread, scheduling, deadlock, mutex vs semaphore, paging and virtual memory come up again and again.</p>
+  <p>These notes keep the theory at interview level and always connect it to code you already write. Threads, <code>synchronized</code> and deadlock in Java code live in <a href="02-core-java.html#m6">Core Java · Module 6</a>, and JVM memory (heap, stack, garbage collection) in <a href="02-core-java.html#m7">Core Java · Module 7</a>. Here you get the OS ideas underneath them. The networking side (sockets, TCP) is in <a href="#m2">Module 2</a>, and database transactions and locking in <a href="#m3">Module 3</a>.</p>
+  <p>Every scheduling, deadlock, paging and page-replacement example in this module has its numbers worked out and double-checked, so you can reproduce them on paper in an interview.</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>Explain what an OS does, kernel mode vs user mode, and what happens in a system call.</li>
+    <li>Describe a process (memory layout, PCB, states, context switch) and compare it with a thread.</li>
+    <li>Solve CPU-scheduling problems (FCFS, SJF, SRTF, Priority, Round Robin, MLQ, MLFQ) with Gantt charts, waiting and turnaround times.</li>
+    <li>Explain race conditions, the critical-section problem, mutex vs semaphore, monitors and the classic synchronization problems.</li>
+    <li>State the four deadlock conditions, draw a resource allocation graph and run the Banker's algorithm.</li>
+    <li>Translate logical addresses with paging, compute effective access time, and compare FIFO, Optimal and LRU on one reference string.</li>
+    <li>Explain virtual memory, page faults, Belady's anomaly and thrashing, and recognise file-system, disk and I/O basics.</li>
+    <li>Connect all of this to thread pools, connection pools, container memory limits and the OOM killer.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m1-os-overview">
+  <h3>What an operating system does: kernel, modes and system calls</h3>
+  <p class="tldr">An OS is a resource manager and an abstraction layer: its kernel runs in privileged mode, shares the CPU, memory and devices among programs safely, and offers system calls as the only door through which user programs ask for those services.</p>
+
+  <h4>The three jobs of an OS</h4>
+  <p>A bare computer is a CPU, some RAM and devices. Writing every program against raw hardware would be painful and unsafe. The OS does three jobs:</p>
+  <ul>
+    <li><strong>Resource manager.</strong> The CPU, memory, disk and network card are limited, and many programs want them at once. The OS decides who gets what, and when (scheduling, memory allocation, disk and network queues).</li>
+    <li><strong>Abstraction.</strong> It hides ugly hardware details behind clean ideas: a <em>process</em> instead of "CPU registers and memory areas", a <em>file</em> instead of "disk sectors", a <em>socket</em> instead of "network card registers". Your <code>FileInputStream</code> works the same on any disk.</li>
+    <li><strong>Protection.</strong> One buggy or malicious program must not read another program's memory, corrupt the disk or hog the CPU forever. The OS, with help from the hardware, enforces this.</li>
+  </ul>
+
+  <h4>Types of operating systems</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Idea in one line</th></tr></thead>
+    <tbody>
+      <tr><td>Batch</td><td>Jobs are collected and run one after another with no user interaction (old mainframes).</td></tr>
+      <tr><td>Multiprogramming</td><td>Several jobs stay in memory; when one waits for I/O, the CPU runs another, so the CPU is rarely idle.</td></tr>
+      <tr><td>Multitasking / time-sharing</td><td>The CPU switches between jobs so fast (every few milliseconds) that each user feels they have the machine; gives good response time.</td></tr>
+      <tr><td>Multiprocessor</td><td>Several CPUs or cores run jobs truly in parallel under one OS.</td></tr>
+      <tr><td>Real-time</td><td>Correctness depends on meeting deadlines. <em>Hard</em> real-time must never miss (airbag controller); <em>soft</em> real-time can occasionally slip (video playback).</td></tr>
+      <tr><td>Distributed / network</td><td>Many machines cooperate and look like one system.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Windows, Linux, macOS and Android are all multitasking, multiprocessor systems. Servers that run your Spring Boot app are almost always Linux.</p>
+
+  <h4>The kernel and the two modes</h4>
+  <p>The <strong>kernel</strong> is the core of the OS: the part that is always in memory and has full control of the hardware. It contains the scheduler, memory manager, file system, device drivers and network stack. Everything else (your shell, browser, JVM) is a <strong>user program</strong>.</p>
+  <p>The CPU has at least two privilege levels, selected by a <strong>mode bit</strong>:</p>
+  <ul>
+    <li><strong>Kernel mode</strong> (supervisor mode): can run every instruction, touch any memory, talk to devices, change the page tables.</li>
+    <li><strong>User mode</strong>: can run only safe instructions and touch only its own memory. A privileged instruction (such as "disable interrupts" or "write to an I/O port") raises a trap, and the kernel typically kills the program.</li>
+  </ul>
+  <p>This split is the foundation of protection. A crash in user mode kills one program; a crash in kernel mode (a driver bug) can bring down the whole machine (a "blue screen" or "kernel panic").</p>
+
+  <h4>System calls: the only door into the kernel</h4>
+  <p>A user program cannot read a file itself. It asks the kernel through a <strong>system call (syscall)</strong>. Libraries such as the C library, and the JVM on top of it, wrap syscalls so you rarely see them directly.</p>
+  <figure class="fig">
+<pre class="diagram">
+ User mode                               Kernel mode
+┌───────────────────────┐              ┌───────────────────────────┐
+│ Java: in.read(buf)    │              │                           │
+│   └► JVM / libc       │              │  syscall table            │
+│       read(fd,buf,n) ─┼── trap ────► │   └► sys_read(): check    │
+│                       │  (mode bit   │      permission, find the │
+│ continues here  ◄─────┼── = kernel)  │      file, copy the data  │
+│ (mode bit = user)     │ ◄─ return ───┤                           │
+└───────────────────────┘              └───────────────────────────┘
+</pre>
+    <figcaption>A system call switches to kernel mode, runs kernel code, and switches back</figcaption>
+  </figure>
+  <ol class="steps">
+    <li>The program puts the syscall number and arguments in registers and executes a special <strong>trap</strong> instruction (a software interrupt; <code>syscall</code> on modern x86-64).</li>
+    <li>The CPU switches to kernel mode and jumps to a fixed kernel entry point.</li>
+    <li>The kernel checks the arguments and permissions, does the work (possibly blocking the process while the disk works), and stores the result.</li>
+    <li>The CPU switches back to user mode and the program continues after the call.</li>
+  </ol>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Group</th><th>Examples (POSIX / Linux)</th><th>What they do</th></tr></thead>
+    <tbody>
+      <tr><td>Process control</td><td><code>fork</code>, <code>exec</code>, <code>wait</code>, <code>exit</code>, <code>kill</code></td><td>Create, replace, wait for, end and signal processes</td></tr>
+      <tr><td>File management</td><td><code>open</code>, <code>read</code>, <code>write</code>, <code>close</code>, <code>stat</code></td><td>Work with files and devices as byte streams</td></tr>
+      <tr><td>Memory</td><td><code>mmap</code>, <code>brk</code>, <code>munmap</code></td><td>Get or release memory</td></tr>
+      <tr><td>Communication</td><td><code>pipe</code>, <code>socket</code>, <code>send</code>, <code>recv</code></td><td>Talk to other processes or machines</td></tr>
+      <tr><td>Information</td><td><code>getpid</code>, <code>time</code></td><td>Ask the kernel about the system</td></tr>
+    </tbody>
+  </table></div>
+  <p>You can watch the syscalls of any program on Linux with <code>strace</code>:</p>
+  <pre data-title="Watching syscalls"><code class="language-shell">$ strace -e trace=openat,read,write,close cat hello.txt
+openat(AT_FDCWD, "hello.txt", O_RDONLY) = 3
+read(3, "Hello, OS\n", 131072)          = 10
+write(1, "Hello, OS\n", 10)             = 10
+read(3, "", 131072)                     = 0
+close(3)                                = 0</code></pre>
+  <p>The numbers (file descriptor 3, the buffer size) vary by system; the pattern is what matters. Descriptor 1 is standard output.</p>
+
+  <h4>Monolithic kernel vs microkernel</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Monolithic kernel</th><th>Microkernel</th></tr></thead>
+    <tbody>
+      <tr><td>Idea</td><td>Almost all OS services run inside the kernel</td><td>Only the minimum (scheduling, memory, IPC) in the kernel; drivers and file systems run as user-mode servers</td></tr>
+      <tr><td>Speed</td><td>Fast: services call each other directly</td><td>Slower: services talk through message passing</td></tr>
+      <tr><td>Reliability</td><td>A faulty driver can crash the kernel</td><td>A faulty driver crashes only its own server</td></tr>
+      <tr><td>Examples</td><td>Linux (monolithic, with loadable modules), traditional Unix</td><td>MINIX, QNX; Windows NT and macOS are <em>hybrid</em> designs</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: user programs never run privileged code directly</p>
+    <p>Every request that touches hardware or another process goes through a system call, and the kernel validates it. This is what makes isolation possible.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A system call is not a normal function call: it costs a mode switch (and often a copy of data between user and kernel memory), so many tiny <code>read</code>/<code>write</code> calls are slow. That is why Java wraps streams in <code>BufferedInputStream</code>.</li>
+      <li>An <strong>interrupt</strong> (from hardware, such as a timer or a network packet) and a <strong>trap</strong> (from software, such as a syscall or a divide-by-zero) both move the CPU into kernel mode; they differ in who raised them.</li>
+      <li>"Operating system" and "kernel" are not the same thing: Linux is a kernel; Ubuntu is an OS built around it with tools and libraries.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a system call? What happens when a program calls read()?"</p>
+    <ul>
+      <li>It is the controlled entry point to the kernel; the user program traps into kernel mode, the kernel does the work and returns.</li>
+      <li>Mention the mode bit, the trap instruction, argument checking and the return to user mode.</li>
+      <li>Say why: protection, since user code cannot touch devices or other processes' memory directly.</li>
+      <li>Give examples: <code>fork</code>, <code>exec</code>, <code>open</code>, <code>read</code>, <code>write</code>, <code>mmap</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-processes">
+  <h3>Processes: memory layout, PCB, states and context switching</h3>
+  <p class="tldr">A process is a program in execution with its own address space and resources; the OS tracks each one in a Process Control Block, moves it through the states new, ready, running, waiting and terminated, and saves and restores its CPU state on every context switch.</p>
+
+  <h4>Program vs process</h4>
+  <p>A <strong>program</strong> is a passive file on disk (your <code>app.jar</code> or the <code>java</code> binary). A <strong>process</strong> is a running instance of it: code plus data plus the current position in the code plus the resources it holds. Start the same program twice and you get two processes, each with its own <strong>PID</strong> (process id).</p>
+
+  <h4>Memory layout of a process</h4>
+  <figure class="fig">
+<pre class="diagram">
+ High addresses
+┌────────────────────────┐
+│ Stack                  │  function calls, local variables, return
+│         │              │  addresses. Grows downward.
+│         ▼              │
+│                        │
+│   (free space)         │
+│                        │
+│         ▲              │
+│         │              │
+│ Heap                   │  dynamic memory (malloc / Java objects).
+│                        │  Grows upward.
+├────────────────────────┤
+│ Data (globals, statics)│  initialised and uninitialised (BSS) globals
+├────────────────────────┤
+│ Text (code)            │  the machine instructions, read-only
+└────────────────────────┘
+ Low addresses
+</pre>
+    <figcaption>Layout of one process in its own address space</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Text:</strong> the compiled instructions. Read-only and shareable between processes running the same program.</li>
+    <li><strong>Data:</strong> global and static variables.</li>
+    <li><strong>Heap:</strong> memory requested at run time. Forgetting to free it in C is a leak; in Java the garbage collector does it (see <a href="02-core-java.html#m7">JVM memory</a>).</li>
+    <li><strong>Stack:</strong> one frame per active function call. A runaway recursion fills the stack and ends in a stack overflow (<code>StackOverflowError</code> in Java).</li>
+  </ul>
+
+  <h4>Process Control Block (PCB)</h4>
+  <p>The kernel keeps one <strong>PCB</strong> (also called the task control block) per process. It is the OS's record card for that process:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>PCB field</th><th>Holds</th></tr></thead>
+    <tbody>
+      <tr><td>PID, parent PID</td><td>Identity and family tree</td></tr>
+      <tr><td>Process state</td><td>new, ready, running, waiting, terminated</td></tr>
+      <tr><td>Program counter and CPU registers</td><td>Where to resume; saved when the process is not running</td></tr>
+      <tr><td>Scheduling information</td><td>Priority, queue pointers, time used</td></tr>
+      <tr><td>Memory-management information</td><td>Page-table pointer, segment limits</td></tr>
+      <tr><td>I/O and accounting</td><td>Open file table, devices held, CPU time used, user id</td></tr>
+    </tbody>
+  </table></div>
+  <p>In Linux the PCB is a structure called <code>task_struct</code>. The ready queue and device wait queues are lists of PCBs.</p>
+
+  <h4>Process states</h4>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> New
+  New --> Ready : admitted
+  Ready --> Running : scheduler dispatch
+  Running --> Ready : time slice over or preempted
+  Running --> Waiting : waits for I/O or an event
+  Waiting --> Ready : I/O or event completed
+  Running --> Terminated : exit
+  Terminated --> [*]
+</pre>
+    <figcaption>The five-state process model</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>State</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>New</td><td>Being created; the PCB is being set up.</td></tr>
+      <tr><td>Ready</td><td>Has everything except the CPU; waiting in the ready queue.</td></tr>
+      <tr><td>Running</td><td>Executing on a CPU. At most one process per core.</td></tr>
+      <tr><td>Waiting (blocked)</td><td>Cannot continue until an event happens, such as a disk read finishing or a lock being released.</td></tr>
+      <tr><td>Terminated</td><td>Finished; resources are being reclaimed.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Notice what is <em>not</em> allowed: a waiting process never goes straight to running (it must become ready and wait for the scheduler), and a ready process never goes to waiting by itself. Real systems add <em>suspended</em> states for processes swapped out of memory. Do not confuse the OS "waiting" state with Java's <code>Thread.State</code> names (<code>BLOCKED</code>, <code>WAITING</code>, <code>TIMED_WAITING</code>), which describe the same idea at JVM level.</p>
+
+  <h4>Context switching</h4>
+  <p>A <strong>context switch</strong> is when the CPU stops running one process and starts another. The kernel saves the old process's <strong>context</strong> (program counter, registers, stack pointer, and memory-mapping information) into its PCB, picks the next process, and loads that process's saved context.</p>
+  <ol class="steps">
+    <li>A timer interrupt, a blocking syscall or a higher-priority arrival enters the kernel.</li>
+    <li>The kernel saves the running process's registers and program counter into its PCB and sets its state (ready or waiting).</li>
+    <li>The scheduler picks the next ready process.</li>
+    <li>The kernel switches the address space (page-table pointer) and loads the new process's registers from its PCB.</li>
+    <li>The CPU returns to user mode and continues the new process exactly where it stopped.</li>
+  </ol>
+  <p>Switching is <strong>pure overhead</strong>: no user work is done while it happens. The direct cost is the saving and loading of state. The bigger, hidden cost is that the new process finds the CPU caches and the TLB (the address-translation cache, see <a href="#m1-tlb-multilevel-segmentation">TLB</a>) full of the old process's data, so it runs slowly at first. Switching between <em>threads of the same process</em> is cheaper because the address space stays the same.</p>
+
+  <h4>Creating processes: fork() and exec()</h4>
+  <p>On Unix, <code>fork()</code> creates a child that is a copy of the parent. It returns <strong>0 in the child</strong>, the child's PID in the parent, and -1 on failure. Modern kernels use <strong>copy-on-write</strong>: parent and child share the same physical pages until one of them writes, and only then is that page copied. Then the child usually calls <code>exec()</code>, which replaces its memory with a new program. The parent can call <code>wait()</code> to collect the child's exit status.</p>
+  <pre data-title="fork_demo.c"><code class="language-plaintext">pid = fork();
+if (pid == 0) {
+    execlp("ls", "ls", "-l", NULL);   /* child: become the ls program */
+} else if (pid &gt; 0) {
+    wait(NULL);                         /* parent: wait for the child */
+} else {
+    perror("fork failed");
+}</code></pre>
+  <p>Shells work exactly like this: type <code>ls</code> and the shell forks, the child execs <code>ls</code>, and the shell waits. In Java you do the same thing with <code>ProcessBuilder</code>, which hides the fork/exec.</p>
+
+  <h4>Zombie and orphan processes</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Kind</th><th>What happened</th><th>How it ends</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Zombie</strong></td><td>The child has finished, but the parent has not called <code>wait()</code>. The kernel keeps its PCB entry (PID and exit status) so the parent can still read it. It uses no CPU or memory except that entry. <code>ps</code> shows state <code>Z</code>.</td><td>The parent calls <code>wait()</code>, or the parent dies and the zombie is adopted and reaped by init.</td></tr>
+      <tr><td><strong>Orphan</strong></td><td>The parent finished first while the child is still running.</td><td>The child is adopted by the init process (PID 1, such as systemd), which reaps it when it ends.</td></tr>
+    </tbody>
+  </table></div>
+  <p>A zombie cannot be killed with <code>kill -9</code> because it is already dead; only its parent can clear it. Thousands of zombies can exhaust the PID table.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: a running process belongs to exactly one state at a time</p>
+    <p>Only the scheduler moves a process from ready to running. A process moves to waiting only by its own action (a blocking call). Remember: ready → running → (ready | waiting | terminated), and waiting → ready.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "a process waiting for I/O is using the CPU"</p>
+    <p>A waiting process uses no CPU at all; it sits in a wait queue until the device raises an interrupt. This is exactly why multiprogramming raises CPU utilisation: the CPU runs someone else meanwhile.</p>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>A Docker container is, to the kernel, just a group of ordinary processes with isolated views of the system. If your container's main process (PID 1) does not reap children, zombies pile up; tools like <code>tini</code> (or <code>docker run --init</code>) exist for this reason. See <a href="07-devops.html#m3">DevOps · Docker</a>.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain process states and what a context switch does"</p>
+    <ul>
+      <li>Draw the five states and label every arrow (admitted, dispatch, preempt, wait, wake-up, exit).</li>
+      <li>Context switch: save registers and PC into the old PCB, load them from the new PCB, switch address space. Overhead, no useful work.</li>
+      <li>Add the hidden cost: cold cache and TLB.</li>
+      <li>Zombie = finished, not yet reaped; orphan = parent gone, adopted by init.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-ipc">
+  <h3>Inter-process communication (IPC)</h3>
+  <p class="tldr">Because processes have separate address spaces, they need OS-provided channels to exchange data: pipes, shared memory, message queues, sockets and signals, each with its own trade-off between speed, ease and how far apart the processes may be.</p>
+
+  <h4>Why IPC is needed</h4>
+  <p>Process isolation means process A cannot read process B's variables. Yet real systems need cooperation: a shell connects <code>cat</code> to <code>grep</code>, a web server talks to a database, a browser talks to its renderer processes. IPC is the set of mechanisms the kernel offers for this. They fall into two models:</p>
+  <ul>
+    <li><strong>Shared memory:</strong> the kernel maps one region into both address spaces. Processes read and write it like normal memory. Very fast (no copying), but you must synchronise access yourself.</li>
+    <li><strong>Message passing:</strong> processes send and receive messages through the kernel. Slower (data is copied and every message costs a syscall), but simpler and safe, and it extends naturally to different machines.</li>
+  </ul>
+  <figure class="fig">
+<pre class="diagram">
+ Shared memory                          Message passing
+
+ ┌───────────┐     ┌───────────┐        ┌───────────┐     ┌───────────┐
+ │ Process A │     │ Process B │        │ Process A │     │ Process B │
+ └─────┬─────┘     └─────┬─────┘        └─────┬─────┘     └─────▲─────┘
+       │  read/write     │                send │                 │ receive
+       ▼                 ▼                     ▼                 │
+   ┌─────────────────────────┐            ┌─────────────────────────┐
+   │ shared region (user)    │            │   kernel: queue / pipe  │
+   └─────────────────────────┘            └─────────────────────────┘
+   kernel only sets it up                 kernel handles every message
+</pre>
+    <figcaption>Two IPC models: share a region, or pass messages through the kernel</figcaption>
+  </figure>
+
+  <h4>The common mechanisms</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Mechanism</th><th>Model</th><th>Key points</th></tr></thead>
+    <tbody>
+      <tr><td>Unnamed pipe</td><td>Message passing (byte stream)</td><td>One-way, between related processes (parent and child). The shell's <code>a | b</code>. Created with <code>pipe()</code>.</td></tr>
+      <tr><td>Named pipe (FIFO)</td><td>Message passing</td><td>A pipe with a name in the file system, so unrelated processes can use it. <code>mkfifo</code>.</td></tr>
+      <tr><td>Message queue</td><td>Message passing</td><td>The kernel stores discrete, often typed, messages until the receiver reads them. Survives short sender-receiver timing gaps.</td></tr>
+      <tr><td>Shared memory</td><td>Shared region</td><td>Fastest; needs a semaphore or mutex. Used by databases such as PostgreSQL for their buffer cache.</td></tr>
+      <tr><td>Socket</td><td>Message passing</td><td>Two-way; works on one machine (Unix domain socket) or across the network (TCP/UDP). The basis of all client-server software. See <a href="#m2">Computer networks</a>.</td></tr>
+      <tr><td>Signal</td><td>Notification only</td><td>A tiny asynchronous event with no data, such as <code>SIGTERM</code> (please stop), <code>SIGKILL</code> (cannot be caught), <code>SIGINT</code> (Ctrl+C).</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="A pipe in the shell"><code class="language-shell">$ cat access.log | grep " 500 " | wc -l
+37</code></pre>
+  <p>Here the shell creates two pipes and three processes. <code>cat</code> writes into the first pipe, <code>grep</code> reads from it and writes into the second, and <code>wc</code> reads that. The kernel buffers the bytes; if the pipe is full the writer blocks, and if it is empty the reader blocks (a built-in producer–consumer, see <a href="#m1-classic-problems">classic problems</a>).</p>
+
+  <h4>Signals in practice</h4>
+  <p>When Kubernetes or <code>docker stop</code> stops your Spring Boot app, it first sends <code>SIGTERM</code>. The JVM runs its shutdown hooks (Spring closes the context, finishes in-flight requests, closes pools) and exits. If the app is still alive after a grace period, <code>SIGKILL</code> ends it instantly with no cleanup. Handling <code>SIGTERM</code> properly is called <strong>graceful shutdown</strong>.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Signal</th><th>Number (Linux)</th><th>Default action</th><th>Can the program catch it?</th></tr></thead>
+    <tbody>
+      <tr><td><code>SIGINT</code></td><td>2</td><td>Terminate (Ctrl+C)</td><td>Yes</td></tr>
+      <tr><td><code>SIGKILL</code></td><td>9</td><td>Terminate immediately</td><td>No</td></tr>
+      <tr><td><code>SIGTERM</code></td><td>15</td><td>Terminate politely</td><td>Yes</td></tr>
+      <tr><td><code>SIGSEGV</code></td><td>11</td><td>Terminate with core dump (invalid memory access)</td><td>Yes (rarely wise)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Choosing a mechanism</h4>
+  <ul>
+    <li>Parent and child streaming bytes: <strong>pipe</strong>.</li>
+    <li>Very large data on one machine, speed matters: <strong>shared memory</strong> plus a semaphore.</li>
+    <li>Separate services, possibly on different machines: <strong>sockets</strong> (HTTP, gRPC and database drivers all run over them).</li>
+    <li>Just "wake up" or "stop": <strong>signal</strong>.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: shared memory needs synchronization, message passing does not</p>
+    <p>With shared memory two processes can write the same bytes at once, which is a race condition (see <a href="#m1-sync-critical-section">critical section</a>). A pipe or queue is synchronised by the kernel.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Writing to a pipe whose read end is closed raises <code>SIGPIPE</code> (or an <code>EPIPE</code> error); a read from a pipe whose write end is closed returns end-of-file.</li>
+      <li><code>SIGKILL</code> and <code>SIGSTOP</code> can never be caught, blocked or ignored.</li>
+      <li>Pipes have a limited buffer; a writer faster than the reader will block.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>Between your microservices the IPC is sockets (HTTP/gRPC) or a broker such as Kafka. Inside one machine, PostgreSQL's backend processes coordinate through shared memory. Java itself has no direct pipe-between-processes API beyond <code>Process</code> streams, but <code>java.nio</code> offers <code>MappedByteBuffer</code> (memory-mapped files, which can be shared).</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What are the ways processes communicate?"</p>
+    <ul>
+      <li>Two models: shared memory (fast, needs synchronization) and message passing (simpler, copies data).</li>
+      <li>Name pipes, named pipes, message queues, shared memory, sockets, signals, and when each fits.</li>
+      <li>Pipes are one-way byte streams between related processes; sockets work across machines.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-threads">
+  <h3>Threads and process vs thread</h3>
+  <p class="tldr">A thread is a unit of execution inside a process; threads of one process share code, data, heap and open files but each has its own stack and registers, which makes them cheap to create and switch but easy to corrupt through shared data.</p>
+
+  <h4>What a thread is</h4>
+  <p>A <strong>thread</strong> is a single path of execution. A classic process has one thread. A <strong>multithreaded</strong> process has several, all running inside the same address space. Think of a Swiggy server process handling 200 customers: one process, many threads, each thread serving one request at a time.</p>
+  <figure class="fig">
+<pre class="diagram">
+  One process, three threads
+
+ ┌──────────────────────────────────────────────────────────┐
+ │ SHARED: code (text) · global data · heap · open files    │
+ │         · address space · process id                     │
+ ├────────────────┬────────────────┬────────────────────────┤
+ │ Thread 1       │ Thread 2       │ Thread 3               │
+ │  registers, PC │  registers, PC │  registers, PC         │
+ │  own stack     │  own stack     │  own stack             │
+ └────────────────┴────────────────┴────────────────────────┘
+</pre>
+    <figcaption>What threads share and what each one owns</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Shared by all threads of a process</th><th>Private to each thread</th></tr></thead>
+    <tbody>
+      <tr><td>Code and global/static data</td><td>Program counter and registers</td></tr>
+      <tr><td>The heap (all objects)</td><td>The stack (local variables, call frames)</td></tr>
+      <tr><td>Open files and sockets, signal handlers</td><td>Thread id, thread state, priority</td></tr>
+      <tr><td>The address space and page table</td><td>Thread-local storage (<code>ThreadLocal</code> in Java)</td></tr>
+    </tbody>
+  </table></div>
+  <p>This matches the JVM: all threads share the heap (objects), but each has its own stack for local variables. See <a href="02-core-java.html#m7">JVM memory</a>.</p>
+
+  <h4>Process vs thread</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Process</th><th>Thread</th></tr></thead>
+    <tbody>
+      <tr><td>Definition</td><td>A program in execution with its own resources</td><td>A unit of execution inside a process</td></tr>
+      <tr><td>Address space</td><td>Own, isolated</td><td>Shared with the other threads of the process</td></tr>
+      <tr><td>Creation and termination</td><td>Heavy (new address space, PCB, tables)</td><td>Light (new stack and registers only)</td></tr>
+      <tr><td>Context switch</td><td>Expensive (change address space, flush TLB, cold caches)</td><td>Cheaper (same address space)</td></tr>
+      <tr><td>Communication</td><td>IPC needed (pipes, sockets, shared memory)</td><td>Just read and write shared variables (needs locks)</td></tr>
+      <tr><td>Fault isolation</td><td>Strong: one crash leaves others alone</td><td>Weak: a crash or an unhandled error can take the whole process down</td></tr>
+      <tr><td>Memory</td><td>More: each has its own copy of resources</td><td>Less: most resources shared</td></tr>
+      <tr><td>Example</td><td>Chrome tabs (many processes), two JVMs</td><td>Tomcat request threads inside one JVM</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Benefits and problems of multithreading</h4>
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Benefits</p><ul>
+      <li><strong>Responsiveness:</strong> a UI or server keeps working while one thread waits for I/O.</li>
+      <li><strong>Resource sharing:</strong> no IPC needed for shared data.</li>
+      <li><strong>Economy:</strong> cheaper to create and switch than processes.</li>
+      <li><strong>Scalability:</strong> threads run in parallel on multiple cores.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Problems</p><ul>
+      <li><strong>Race conditions</strong> on shared data, needing locks (<a href="#m1-sync-critical-section">synchronization</a>).</li>
+      <li><strong>Deadlock</strong> and starvation (<a href="#m1-deadlock-basics">deadlock</a>).</li>
+      <li>One buggy thread can crash or corrupt the entire process.</li>
+      <li>Hard to debug: bugs depend on timing.</li>
+    </ul></div>
+  </div>
+
+  <h4>User threads vs kernel threads</h4>
+  <p><strong>Kernel threads</strong> are known to and scheduled by the OS kernel; the kernel can run different threads of one process on different cores, and when one blocks the others keep running. <strong>User threads</strong> are managed by a library in user space; creating and switching them needs no system call and is very fast, but the kernel sees only one thread, so one blocking syscall can stall them all, and they cannot use several cores by themselves.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Model</th><th>Mapping</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>Many-to-one</td><td>Many user threads → one kernel thread</td><td>Cheap, but no parallelism; a blocking call blocks all.</td></tr>
+      <tr><td>One-to-one</td><td>Each user thread → one kernel thread</td><td>True parallelism, blocking is isolated; costs one kernel thread each. Linux and Windows use this.</td></tr>
+      <tr><td>Many-to-many</td><td>Many user threads → a smaller pool of kernel threads</td><td>Flexible, more complex to build.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Java threads and virtual threads</h4>
+  <p>A normal Java <code>Thread</code> (a <strong>platform thread</strong>) is one-to-one with an OS kernel thread, so each one costs a kernel thread plus a stack (the default is typically about 1 MB of reserved stack space on 64-bit Linux, set with <code>-Xss</code>). A few thousand are fine; hundreds of thousands are not. Since Java 21 you can use <strong>virtual threads</strong>: lightweight threads scheduled by the JVM on top of a small pool of carrier OS threads, which is an M:N, many-to-many idea. When a virtual thread blocks on I/O, the JVM parks it and the carrier thread runs another virtual thread. They let a "one thread per request" server handle very many concurrent blocking requests. Thread creation, states, <code>synchronized</code> and pools are in <a href="02-core-java.html#m6">Core Java · Module 6</a>.</p>
+  <pre data-title="ThreadModels.java"><code class="language-java">public class ThreadModels {
+    public static void main(String[] args) throws InterruptedException {
+        Thread platform = new Thread(() -&gt; System.out.println("platform thread"));
+        Thread virtual = Thread.ofVirtual().start(() -&gt; System.out.println("virtual thread"));
+        platform.start();
+        platform.join();
+        virtual.join();
+    }
+}</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: threads share memory, so shared mutable state needs protection</p>
+    <p>Every variable on the heap that more than one thread writes must be guarded by a lock, an atomic or a concurrent class. Local variables on a thread's own stack are safe by default.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>After <code>fork()</code> in a multithreaded process, only the calling thread exists in the child; locks held by other threads stay locked forever. This is why fork in threaded programs is risky.</li>
+      <li>More threads than CPU cores does not mean more speed for CPU-bound work: the extra threads only add context switches.</li>
+      <li>A process ends when its last non-daemon thread ends (in Java) or when any thread calls <code>exit()</code> (in C).</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "threads are always faster than processes"</p>
+    <p>They are cheaper to create and share data easily, but a single lock that every thread fights for makes a threaded program slower than a single thread. Separate processes can be the better design when isolation matters (a plugin crashing must not kill the server).</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Process vs thread" (the most asked OS question)</p>
+    <ul>
+      <li>Process: own address space and resources, heavy, isolated. Thread: execution unit inside a process, shares code, data, heap and files, owns stack and registers.</li>
+      <li>Thread creation and context switching are cheaper; communication is easier but unsafe without synchronization.</li>
+      <li>A thread crash can kill the process; a process crash does not affect other processes.</li>
+      <li>Close with a Java link: platform threads map 1:1 to OS threads; virtual threads (Java 21) are scheduled by the JVM.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,488 @@
+<div class="mintro">
+  <p>Relational databases are the right default, but they are not the only tool. Some jobs, such as caching
+  a product page for 60 seconds, counting page views at 50,000 per second, storing flexible documents, or
+  searching text, fit other kinds of stores better. This module is a tour of the "beyond relational" world: what
+  the main NoSQL families are, how Redis and MongoDB work, what the CAP theorem really says, how databases copy
+  and split data across servers, and how you change a schema safely over time with Flyway or Liquibase.</p>
+  <p>You do not need to master every tool. The goal is to choose well, speak about the trade-offs in an interview,
+  and use Redis and MongoDB at a working level. Redis caching connects to Spring's cache abstraction in
+  <a href="04-spring-boot.html#m6">Spring Boot · Module 6</a>; replication and sharding return as system design
+  topics in <a href="08-system-design.html#m5">System Design · Module 5</a>; and migrations are part of every
+  Spring Boot project with a database (<a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>). It builds
+  on the relational basics of <a href="#m1">Modules 1–3</a>, the design rules of <a href="#m4">Module 4</a> and the
+  transaction ideas of <a href="#m5">Module 5</a>.</p>
+  <ul>
+    <li>Compare SQL and NoSQL families and pick a store for a given workload.</li>
+    <li>Use Redis strings, hashes, lists, sets and sorted sets, expiry, and the main caching patterns.</li>
+    <li>Model and query documents in MongoDB, including embedding versus referencing and a basic aggregation.</li>
+    <li>Explain CAP, PACELC and eventual consistency without mixing them up with ACID.</li>
+    <li>Describe replication, replication lag, partitioning and sharding, and choose a shard key.</li>
+    <li>Manage schema changes with Flyway migrations, and release them safely.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m6-sql-vs-nosql">
+  <h3>SQL vs NoSQL, and when to use each</h3>
+  <p class="tldr">NoSQL is a family of non-relational stores (key-value, document, wide-column, graph, search)
+  that trade some relational features, such as joins and strict schemas, for scale, flexibility or speed; start
+  with a relational database and add a NoSQL store when a specific need justifies it.</p>
+
+  <h4>What "NoSQL" means</h4>
+  <p><strong>NoSQL</strong> ("not only SQL") is a loose label for databases that do not use the relational
+  model of tables, rows and joins. They appeared because some workloads (web-scale traffic, huge write volumes,
+  flexible data, caching) were awkward or expensive to run on one relational server. Different NoSQL databases
+  have little in common except that they are not relational, so always ask "which family?"</p>
+
+  <h4>The main families</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Family</th><th>Model</th><th>Examples</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Key-value</strong></td><td>Key to opaque value</td><td>Redis, DynamoDB, Memcached</td>
+      <td>Cache, sessions, counters, rate limits</td></tr>
+      <tr><td><strong>Document</strong></td><td>JSON-like documents in collections</td><td>MongoDB, Couchbase</td>
+      <td>Catalogues, user profiles, content, flexible records</td></tr>
+      <tr><td><strong>Wide-column</strong></td><td>Rows with many sparse columns, partitioned by key</td>
+      <td>Cassandra, HBase</td><td>Huge write volumes, time series, event logs</td></tr>
+      <tr><td><strong>Graph</strong></td><td>Nodes and relationships</td><td>Neo4j</td><td>Social graphs,
+      recommendations, fraud rings</td></tr>
+      <tr><td><strong>Search</strong></td><td>Inverted index over documents</td><td>Elasticsearch, OpenSearch</td>
+      <td>Full-text search, log analytics</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>ACID vs BASE</h4>
+  <p>Relational databases promise <strong>ACID</strong> (<a href="#m5-transactions-acid">Module 5</a>). Many
+  distributed NoSQL systems relax it to <strong>BASE</strong>: <em>Basically Available</em> (the system keeps
+  answering even when parts fail), <em>Soft state</em> (data may change without input while copies converge) and
+  <em>Eventually consistent</em> (if writes stop, all copies become equal after some time). BASE is a
+  description of the trade-off, not a standard. Note that several NoSQL stores now offer transactions
+  (MongoDB multi-document transactions, DynamoDB transactions), and PostgreSQL scales further than most people
+  expect, so the line is blurrier than the slogans.</p>
+
+  <h4>SQL vs NoSQL: a decision table</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Question</th><th>Relational (PostgreSQL, MySQL)</th><th>NoSQL</th></tr></thead>
+    <tbody>
+      <tr><td>Data shape</td><td>Structured, related, known upfront</td><td>Varied, nested, changing, or simple key lookups</td></tr>
+      <tr><td>Relationships and joins</td><td>First class: foreign keys, joins</td><td>Weak or absent; you embed or denormalize</td></tr>
+      <tr><td>Transactions</td><td>Strong multi-row ACID</td><td>Varies: often single-record only</td></tr>
+      <tr><td>Ad-hoc queries</td><td>Flexible: any column, any join, reports</td><td>Fast only along the access patterns
+      you designed for</td></tr>
+      <tr><td>Schema</td><td>Enforced by the database</td><td>Flexible; the application enforces it</td></tr>
+      <tr><td>Scaling</td><td>Scale up easily; scale out needs effort (replicas, sharding)</td><td>Many are built to
+      scale out</td></tr>
+      <tr><td>Consistency</td><td>Strong by default</td><td>Often tunable or eventual</td></tr>
+      <tr><td>Maturity and skills</td><td>Decades of tools and experience</td><td>Varies by product</td></tr>
+    </tbody>
+  </table></div>
+  <p>Practical rules:</p>
+  <ul>
+    <li><strong>Money, orders, inventory, anything with relationships and correctness rules:</strong> relational.</li>
+    <li><strong>Cache, sessions, rate limiting, leaderboards:</strong> Redis next to your main database.</li>
+    <li><strong>Documents read and written as a whole, with changing fields:</strong> a document store
+    (or PostgreSQL <code>JSONB</code>, which is often enough).</li>
+    <li><strong>Massive append-only writes with a known access pattern:</strong> wide-column.</li>
+    <li><strong>Search with ranking and typo tolerance:</strong> a search engine, fed from the main database.</li>
+    <li><strong>Deep relationship queries (friends of friends):</strong> a graph database.</li>
+  </ul>
+
+  <h4>Polyglot persistence</h4>
+  <p><strong>Polyglot persistence</strong> means using several databases in one system, each for what it does
+  best. A food-delivery platform might keep orders and payments in PostgreSQL (the source of truth), cache menus
+  and sessions in Redis, search restaurants in Elasticsearch, and store the rider location stream in a
+  wide-column store. The price is real: more systems to run, monitor, back up and keep consistent. A copy in
+  another store is a derived copy; the relational database stays the source of truth, and the copies are rebuilt
+  from it (via events or change data capture). Add each new store only when a measured need appears.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: default to PostgreSQL, justify every addition</p>
+    <p>A single PostgreSQL gives you transactions, joins, <code>JSONB</code>, full-text search and decent queue
+    support. Many products never need anything else. Add Redis when caching or counters demand it, and others
+    only with a clear reason.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: choosing NoSQL "because it scales" or "to avoid schema design"</p>
+    <p>A schema-less store moves the schema into your code and your data, where it is harder to check.
+    Teams that start with a document database and later need joins and transactions face a painful migration.
+    Choose by access patterns and consistency needs, not fashion.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>SQL vs NoSQL?</b> Relational: structured, relationships, ACID, flexible queries. NoSQL: specific
+      models (key-value, document, wide-column, graph, search) for scale, flexibility or speed on known access
+      patterns, often with weaker consistency.</li>
+      <li><b>ACID vs BASE?</b> Strict transactional guarantees versus availability and eventual convergence.</li>
+      <li><b>Which database for X?</b> Name the family and justify with the access pattern and the consistency
+      need; mention that the relational database stays the source of truth.</li>
+      <li><b>What is polyglot persistence?</b> Several stores, each for its strength, with one source of truth.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-redis">
+  <h3>Redis: an in-memory data structure store</h3>
+  <p class="tldr">Redis keeps data in memory and offers rich types (strings, lists, hashes, sets, sorted sets)
+  with sub-millisecond commands, key expiry and optional persistence; it is mostly used as a cache, session
+  store, rate limiter or leaderboard next to the main database.</p>
+
+  <h4>What Redis is</h4>
+  <p><strong>Redis</strong> (Remote Dictionary Server) is a key-value store where values are data structures.
+  All data lives in RAM, so reads and writes take well under a millisecond, and a single server can handle
+  hundreds of thousands of operations per second. Keys are strings; values can be several types, each with its own
+  commands.</p>
+  <ul>
+    <li><strong>Mostly single-threaded command execution.</strong> One thread runs commands one at a time, so every
+    command is atomic and there are no locks or race conditions inside a command. Recent versions use extra threads
+    for network I/O, but commands still execute serially. The consequence: one slow command (such as
+    <code>KEYS *</code> on millions of keys) blocks everyone.</li>
+    <li><strong>Memory is the limit.</strong> Data must fit in RAM (or you set a limit and an eviction policy).</li>
+    <li><strong>Persistence is optional</strong> (below).</li>
+  </ul>
+
+  <h4>Run Redis in Docker and connect</h4>
+<pre data-title="Start Redis and open the CLI"><code class="language-bash">$ docker run -d --name redis -p 6379:6379 redis:7
+$ docker exec -it redis redis-cli
+127.0.0.1:6379&gt; PING
+PONG</code></pre>
+
+  <h4>Strings, expiry and counters</h4>
+<pre data-title="redis-cli: strings"><code class="language-shell">127.0.0.1:6379&gt; SET greeting "hello"
+OK
+127.0.0.1:6379&gt; GET greeting
+"hello"
+127.0.0.1:6379&gt; SET session:abc123 "user:42" EX 60       # expire after 60 seconds
+OK
+127.0.0.1:6379&gt; TTL session:abc123
+(integer) 58
+127.0.0.1:6379&gt; EXPIRE greeting 300                      # set or change expiry
+(integer) 1
+127.0.0.1:6379&gt; SET lock:order:7 "worker-1" EX 30 NX     # NX: only set if the key does not exist
+OK
+127.0.0.1:6379&gt; SET lock:order:7 "worker-2" EX 30 NX
+(nil)
+127.0.0.1:6379&gt; INCR page:views                          # atomic counter
+(integer) 1
+127.0.0.1:6379&gt; INCR page:views
+(integer) 2
+127.0.0.1:6379&gt; DEL greeting
+(integer) 1</code></pre>
+  <p>A key with no expiry lives forever. <code>TTL</code> returns remaining seconds, <code>-1</code> if there is no
+  expiry and <code>-2</code> if the key does not exist. <code>SET key value EX 60 NX</code> is one atomic command:
+  create only if absent, with an expiry. It is the basis of simple locks and of "do this only once" checks.</p>
+
+  <h4>Data types</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>What it is</th><th>Key commands</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td><strong>String</strong></td><td>Text, number or bytes (up to 512 MB)</td><td><code>SET GET INCR EXPIRE</code></td>
+      <td>Cached JSON, counters, flags</td></tr>
+      <tr><td><strong>List</strong></td><td>Ordered list (linked)</td><td><code>LPUSH RPUSH LPOP RPOP LRANGE</code></td>
+      <td>Simple queues, recent items</td></tr>
+      <tr><td><strong>Hash</strong></td><td>Field-value map under one key</td><td><code>HSET HGET HGETALL HINCRBY</code></td>
+      <td>Objects: user profile, cart</td></tr>
+      <tr><td><strong>Set</strong></td><td>Unordered unique members</td><td><code>SADD SMEMBERS SISMEMBER SINTER</code></td>
+      <td>Tags, unique visitors, "who liked this"</td></tr>
+      <tr><td><strong>Sorted set</strong></td><td>Unique members ordered by a score</td><td><code>ZADD ZRANGE ZREVRANGE ZINCRBY ZRANK</code></td>
+      <td>Leaderboards, priority queues, time-ordered feeds</td></tr>
+    </tbody>
+  </table></div>
+<pre data-title="redis-cli: list, hash, set, sorted set"><code class="language-shell"># List: a queue of order ids
+127.0.0.1:6379&gt; RPUSH queue:orders 101 102 103
+(integer) 3
+127.0.0.1:6379&gt; LPOP queue:orders
+"101"
+127.0.0.1:6379&gt; LRANGE queue:orders 0 -1
+1) "102"
+2) "103"
+
+# Hash: a cart
+127.0.0.1:6379&gt; HSET cart:42 item:5 2 item:9 1
+(integer) 2
+127.0.0.1:6379&gt; HINCRBY cart:42 item:5 1
+(integer) 3
+127.0.0.1:6379&gt; HGETALL cart:42
+1) "item:5"
+2) "3"
+3) "item:9"
+4) "1"
+
+# Set: users who liked a restaurant
+127.0.0.1:6379&gt; SADD likes:restaurant:1 u1 u2 u3 u2
+(integer) 3
+127.0.0.1:6379&gt; SISMEMBER likes:restaurant:1 u2
+(integer) 1
+127.0.0.1:6379&gt; SCARD likes:restaurant:1
+(integer) 3
+
+# Sorted set: leaderboard of riders by deliveries
+127.0.0.1:6379&gt; ZADD board 120 asha 95 bilal 140 chitra
+(integer) 3
+127.0.0.1:6379&gt; ZINCRBY board 10 bilal
+"105"
+127.0.0.1:6379&gt; ZREVRANGE board 0 2 WITHSCORES
+1) "chitra"
+2) "140"
+3) "asha"
+4) "120"
+5) "bilal"
+6) "105"</code></pre>
+  <p>Also good to know: <strong>Streams</strong> (<code>XADD</code>, <code>XREAD</code>, <code>XREADGROUP</code>) are an
+  append-only log with consumer groups, a lightweight message queue. <strong>HyperLogLog</strong> (<code>PFADD</code>,
+  <code>PFCOUNT</code>) counts unique items approximately in about 12 KB however many there are.
+  <strong>Bitmaps</strong> (<code>SETBIT</code>, <code>GETBIT</code>, <code>BITCOUNT</code>) store one bit per id,
+  such as "did user N log in today".</p>
+
+  <h4>Persistence: RDB and AOF</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>RDB snapshot</th><th>AOF (append-only file)</th></tr></thead>
+    <tbody>
+      <tr><td>How</td><td>Periodic point-in-time dump of all data to a file</td><td>Logs every write command; replayed at
+      start</td></tr>
+      <tr><td>Data loss on crash</td><td>Changes since the last snapshot (minutes)</td><td>About 1 second with
+      <code>appendfsync everysec</code>; none with <code>always</code> (slower)</td></tr>
+      <tr><td>Restart speed</td><td>Fast</td><td>Slower (replays commands)</td></tr>
+      <tr><td>File size</td><td>Compact</td><td>Larger (rewritten periodically)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Use both for important data, or neither for a pure cache (a cache can always be rebuilt from the database).
+  Redis is not a replacement for your primary database for data you cannot lose.</p>
+
+  <h4>Memory limit and eviction</h4>
+  <p>Set <code>maxmemory</code> and an <code>maxmemory-policy</code> in <code>redis.conf</code> (or with
+  <code>CONFIG SET</code>). When memory is full, Redis evicts keys by the policy:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Policy</th><th>Evicts</th></tr></thead>
+    <tbody>
+      <tr><td><code>noeviction</code> (default)</td><td>Nothing; writes fail with an out-of-memory error</td></tr>
+      <tr><td><code>allkeys-lru</code></td><td>Least recently used key among all keys (a good cache default)</td></tr>
+      <tr><td><code>allkeys-lfu</code></td><td>Least frequently used among all keys</td></tr>
+      <tr><td><code>volatile-lru</code>, <code>volatile-lfu</code></td><td>Same, but only keys that have a TTL</td></tr>
+      <tr><td><code>volatile-ttl</code></td><td>Keys with the shortest time to live</td></tr>
+      <tr><td><code>allkeys-random</code>, <code>volatile-random</code></td><td>Random keys</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Use cases</h4>
+  <ul>
+    <li><strong>Cache:</strong> store query results or rendered pages with a TTL (next article).</li>
+    <li><strong>Sessions:</strong> a login session as a hash or string with a TTL, shared by all app servers.</li>
+    <li><strong>Rate limiting:</strong> <code>INCR rate:user:42:minute</code>, set <code>EXPIRE</code> 60 on first
+    use, block when the count passes the limit.</li>
+    <li><strong>Leaderboards:</strong> sorted sets give rank and top-N in logarithmic time.</li>
+    <li><strong>Queues and streams:</strong> lists or Streams for simple work queues (for serious messaging use
+    Kafka or RabbitMQ).</li>
+    <li><strong>Distributed locks:</strong> <code>SET lock:x token NX PX 30000</code> and release only if the token
+    still matches (a small Lua script). Use with caution: a lock with a timeout can expire while the holder is
+    still working, and a failover can lose the lock. Use libraries such as Redisson rather than hand-rolling, and
+    never rely on it alone for money.</li>
+  </ul>
+<pre data-title="Simple rate limiter: 5 requests per minute per user"><code class="language-shell">127.0.0.1:6379&gt; INCR rate:user:42
+(integer) 1
+127.0.0.1:6379&gt; EXPIRE rate:user:42 60 NX     # set expiry only if none yet (Redis 7+)
+(integer) 1
+# the app rejects the request when INCR returns a value greater than 5</code></pre>
+
+  <h4>From Java</h4>
+<pre data-title="Spring Data Redis (sketch)"><code class="language-java">@Service
+public class MenuCache {
+    private final StringRedisTemplate redis;
+
+    public MenuCache(StringRedisTemplate redis) { this.redis = redis; }
+
+    public void put(long restaurantId, String json) {
+        redis.opsForValue().set("menu:" + restaurantId, json, Duration.ofMinutes(5));
+    }
+    public String get(long restaurantId) {
+        return redis.opsForValue().get("menu:" + restaurantId);   // null if missing or expired
+    }
+}</code></pre>
+  <p>Setup and the <code>@Cacheable</code> abstraction are in <a href="04-spring-boot.html#m6">Spring Boot ·
+  Module 6</a>. Official docs: <a href="https://redis.io/docs/">redis.io/docs</a>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every cache key gets a TTL, and keys have a naming scheme</p>
+    <p>Use <code>type:id:field</code> style names (<code>menu:12</code>, <code>session:abc</code>) and always set an
+    expiry for cached data, so stale or forgotten keys clean themselves up.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: KEYS * in production, and unbounded keys</p>
+    <p><code>KEYS *</code> scans every key and blocks the single thread. Use <code>SCAN</code> (cursor-based,
+    incremental). Also avoid huge values and giant lists/sets (millions of members in one key): one slow
+    operation delays every client.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Setting a key again with <code>SET</code> removes its previous TTL unless you pass
+      <code>KEEPTTL</code>.</li>
+      <li>Expiry is lazy plus periodic sampling, so an expired key can occupy memory for a short time.</li>
+      <li>Redis transactions (<code>MULTI</code>/<code>EXEC</code>) run commands together without interleaving, but
+      have no rollback of commands that fail at run time. They are not SQL transactions.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Why is Redis fast?</b> In-memory data, simple data structures, mostly single-threaded execution with
+      no lock overhead, efficient protocol.</li>
+      <li><b>RDB vs AOF?</b> Snapshots (fast restart, may lose minutes) versus a write log (less loss, larger and
+      slower to replay).</li>
+      <li><b>When is Redis the wrong choice?</b> As the only copy of important data, or for complex queries and joins.</li>
+      <li><b>Which type for a leaderboard?</b> A sorted set (<code>ZADD</code>, <code>ZREVRANGE</code>).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-caching-patterns">
+  <h3>Caching patterns: cache-aside, read-through, write-through, write-behind</h3>
+  <p class="tldr">A cache keeps recent results in fast storage in front of the database; cache-aside (the app
+  checks the cache, then the database, then fills the cache) is the most common pattern, and the hard parts are
+  invalidation and stampedes.</p>
+
+  <h4>Why cache</h4>
+  <p>The database is the slow, shared, expensive part of the request path. A menu that changes once a day but is
+  read 10,000 times an hour should not hit PostgreSQL 10,000 times. A cache answers repeats from memory: faster
+  responses and less load on the database. The price is the possibility of <strong>stale</strong> data: the
+  cache and the database can disagree for a while.</p>
+
+  <h4>Cache-aside (lazy loading)</h4>
+  <p>The application owns the logic. It is the default pattern with Redis and Spring's <code>@Cacheable</code>.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant A as Application
+  participant C as Cache (Redis)
+  participant D as Database
+  A-&gt;&gt;C: GET menu:12
+  alt cache hit
+    C--&gt;&gt;A: value
+  else cache miss
+    C--&gt;&gt;A: nil
+    A-&gt;&gt;D: SELECT menu items
+    D--&gt;&gt;A: rows
+    A-&gt;&gt;C: SET menu:12 value EX 300
+  end
+</pre>
+  <figcaption>Cache-aside: the app reads the cache first and fills it on a miss</figcaption>
+  </figure>
+<pre data-title="Cache-aside in Java"><code class="language-java">public Menu getMenu(long restaurantId) {
+    String key = "menu:" + restaurantId;
+    String cached = redis.opsForValue().get(key);
+    if (cached != null) {
+        return json.fromJson(cached, Menu.class);                 // hit
+    }
+    Menu menu = menuRepository.loadMenu(restaurantId);            // miss: read the database
+    redis.opsForValue().set(key, json.toJson(menu), Duration.ofMinutes(5));
+    return menu;
+}
+
+public void updatePrice(long itemId, long restaurantId, long newPaise) {
+    menuRepository.updatePrice(itemId, newPaise);                 // write the database first
+    redis.delete("menu:" + restaurantId);                         // then invalidate the cache
+}</code></pre>
+  <p>Pros: only requested data is cached; a cache outage only slows things down. Cons: the first request after a
+  miss is slow, and there is a window where cache and database differ.</p>
+
+  <h4>Read-through</h4>
+  <p>The application talks only to the cache. On a miss, the <em>cache layer itself</em> loads the data from the
+  database and stores it. The logic moves out of your code into a cache library or provider (for example a
+  loading cache with a loader function). From the caller's view it is the same as cache-aside, with less
+  boilerplate.</p>
+
+  <h4>Write-through</h4>
+  <p>Every write goes to the cache, and the cache writes to the database synchronously before returning.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A[Application] --&gt;|1 write| C[Cache]
+  C --&gt;|2 write synchronously| D[(Database)]
+  D --&gt;|3 ack| C
+  C --&gt;|4 ack| A
+</pre>
+  <figcaption>Write-through: the cache and the database are updated together, so reads are fresh but writes are slower</figcaption>
+  </figure>
+  <p>Cache and database stay consistent and reads are always fresh. Writes are slower (two writes), and you
+  cache data that may never be read.</p>
+
+  <h4>Write-behind (write-back)</h4>
+  <p>Writes go to the cache and return immediately; the cache saves them to the database later, in batches.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A[Application] --&gt;|1 write| C[Cache]
+  C --&gt;|2 ack at once| A
+  C -.-&gt;|3 async batch| D[(Database)]
+</pre>
+  <figcaption>Write-behind: fast writes, but data is lost if the cache dies before it is flushed</figcaption>
+  </figure>
+  <p>Very fast writes and fewer database writes (good for counters like "views"), but if the cache fails before
+  flushing, data is lost. Not for payments or orders.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pattern</th><th>Read path</th><th>Write path</th><th>Risk</th></tr></thead>
+    <tbody>
+      <tr><td>Cache-aside</td><td>App checks cache, then DB</td><td>App writes DB, invalidates cache</td>
+      <td>Stale window; cold misses</td></tr>
+      <tr><td>Read-through</td><td>Cache loads from DB on a miss</td><td>Usually combined with another write pattern</td>
+      <td>Cold misses</td></tr>
+      <tr><td>Write-through</td><td>Always from cache</td><td>Cache and DB together, synchronously</td><td>Slower writes</td></tr>
+      <tr><td>Write-behind</td><td>From cache</td><td>Cache first, DB later</td><td>Data loss on cache failure</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Cache invalidation</h4>
+  <p>"There are only two hard things in computer science: cache invalidation and naming things." Your options:</p>
+  <ul>
+    <li><strong>TTL:</strong> let entries expire after N seconds. Simple; accept staleness up to N.</li>
+    <li><strong>Explicit delete on write:</strong> delete (or update) the key when the data changes, as in the
+    code above. Delete rather than update the cached value; it avoids two writers racing to set different
+    values.</li>
+    <li><strong>Versioned keys:</strong> include a version in the key (<code>menu:12:v7</code>) so old entries
+    simply stop being used.</li>
+    <li><strong>Combine TTL and delete:</strong> delete for freshness, TTL as a safety net against missed deletes.</li>
+  </ul>
+  <p>A subtle race: reader A misses and loads old data; writer updates the database and deletes the key; reader A
+  then writes the old data into the cache. A short TTL limits the damage.</p>
+
+  <h4>Cache stampede (thundering herd)</h4>
+  <p>When a popular key expires, hundreds of requests miss at once and all hit the database to rebuild it, which
+  can overload it. Defences:</p>
+  <ul>
+    <li><strong>Single-flight / lock:</strong> only the first request rebuilds; others wait briefly or serve the
+    old value.</li>
+    <li><strong>TTL jitter:</strong> add a random few seconds to TTLs so many keys do not expire together.</li>
+    <li><strong>Refresh ahead:</strong> refresh popular keys in the background before they expire.</li>
+    <li><strong>Cache negative results too</strong> (a short TTL for "not found") so missing ids don't hammer the
+    database.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the database is the source of truth; the cache must be rebuildable</p>
+    <p>You should be able to flush the entire cache and lose nothing but speed. If you cannot, the data does not
+    belong only in a cache.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: caching everything, and caching without measuring</p>
+    <p>Cache data that is read often, changes rarely and is costly to compute. Caching per-user or rapidly changing
+    data gives a low hit ratio and more staleness bugs than speed. Track the <strong>hit ratio</strong>; if it is
+    low, the cache is not helping.</p>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Most Spring Boot services use cache-aside through <code>@Cacheable</code> and <code>@CacheEvict</code> with
+    a Redis cache manager, for reference data (menus, configuration, product details), sessions and rate limits.
+    Hot paths such as login, checkout and payments stay on the database.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Explain cache-aside.</b> Check the cache; on a miss read the database and fill the cache; on a write
+      update the database and delete the key.</li>
+      <li><b>Write-through vs write-behind?</b> Synchronous write to both (consistent, slower) versus cache first and
+      database later (fast, risk of loss).</li>
+      <li><b>How do you invalidate?</b> TTL plus delete on write; versioned keys.</li>
+      <li><b>What is a cache stampede and how do you stop it?</b> Many misses at once on an expired hot key; use a
+      lock/single-flight, TTL jitter or background refresh.</li>
+    </ul>
+  </div>
+</article>

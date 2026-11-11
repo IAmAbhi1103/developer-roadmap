@@ -1,0 +1,488 @@
+<article class="topic" id="m4-event-loop">
+  <h3>The event loop: how single-threaded JavaScript does many things</h3>
+  <p class="tldr">JavaScript runs your code on one thread, one piece at a time; slow work (timers, network, clicks) is handed to the browser, and when it finishes the event loop moves its callback into a queue and runs it once the call stack is empty — microtasks (promises) always before the next macrotask (timers, events).</p>
+
+  <p>Java handles waiting with threads: one thread per request, or a thread pool. JavaScript has <strong>one main thread</strong> that runs all your code, and no <code>synchronized</code>, no race conditions between two lines of your code. Yet a page can wait for a 2-second API call and still respond to clicks. The trick is that your code never <em>waits</em>; it starts the job, gives the browser a callback, and moves on. This model is called <strong>non-blocking I/O</strong>, and it is the same idea Node.js uses on servers.</p>
+
+  <h4>The parts</h4>
+  <dl class="terms">
+    <dt>Call stack</dt>
+    <dd>The list of functions currently running, last in first out (same as the JVM stack). One function runs at a time; it must finish before the next starts.</dd>
+    <dt>Web APIs (the host)</dt>
+    <dd>Features supplied by the browser (or Node.js), not by the language: <code>setTimeout</code>, <code>fetch</code>, DOM events. They do their work outside the JavaScript thread, using the browser's own threads.</dd>
+    <dt>Task queue (macrotask queue)</dt>
+    <dd>Callbacks that are ready to run: a timer fired, a click happened, a message arrived. First in, first out.</dd>
+    <dt>Microtask queue</dt>
+    <dd>A higher-priority queue for promise callbacks (<code>.then</code>, <code>catch</code>, <code>finally</code>, code after <code>await</code>) and <code>queueMicrotask()</code>.</dd>
+    <dt>Event loop</dt>
+    <dd>The loop that watches: when the call stack is empty, run <em>all</em> microtasks, then take <em>one</em> task from the task queue, run it, and repeat. The browser may redraw the screen between tasks.</dd>
+  </dl>
+  <figure class="fig">
+<pre class="diagram">
+   Your code            Web APIs (browser)             Queues
+ ┌────────────┐       ┌───────────────────┐      ┌──────────────────────┐
+ │ Call stack │       │ setTimeout timer  │      │ Microtask queue      │
+ │            │──────▶│ fetch request     │─────▶│  promise callbacks   │
+ │  main()    │ start │ click/input events│ done │ ──────────────────── │
+ │  fn()      │       └───────────────────┘      │ Task queue           │
+ └─────▲──────┘                                  │  timer/event callbacks│
+       │                                         └──────────┬───────────┘
+       └──────── EVENT LOOP: stack empty? ◀─────────────────┘
+                 1. run all microtasks   2. run one task   3. repeat
+</pre>
+  <figcaption>The event loop feeds finished callbacks from the queues to the empty call stack</figcaption>
+  </figure>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant S as Call stack
+  participant W as Web API
+  participant Q as Task queue
+  S->>W: setTimeout(cb, 1000)
+  S->>S: run the rest of the script
+  W-->>Q: after 1000 ms, put cb in the queue
+  Q->>S: stack empty, so event loop moves cb to the stack
+  S->>S: cb runs
+</pre>
+  <figcaption>A timer callback travels through the Web API and the queue before it runs</figcaption>
+  </figure>
+
+  <h4>The ordering puzzle</h4>
+  <p>This is the most famous JavaScript interview question. Predict the output first.</p>
+  <pre data-title="order.js"><code class="language-javascript">console.log("1: script start");
+
+setTimeout(() =&gt; console.log("2: setTimeout 0"), 0);
+
+Promise.resolve()
+  .then(() =&gt; console.log("3: promise 1"))
+  .then(() =&gt; console.log("4: promise 2"));
+
+queueMicrotask(() =&gt; console.log("5: microtask"));
+
+(async () =&gt; {
+  console.log("6: async function start");
+  await null;
+  console.log("7: after await");
+})();
+
+console.log("8: script end");</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">1: script start
+6: async function start
+8: script end
+3: promise 1
+5: microtask
+7: after await
+4: promise 2
+2: setTimeout 0</code></pre>
+  <p>Step by step:</p>
+  <ol class="steps">
+    <li>The script itself is one task. Synchronous lines run first, in order: <code>1</code>, then the timer is handed to the browser, then the promise callback and the microtask are queued. The async function runs <em>synchronously until its first <code>await</code></em>, so <code>6</code> prints, and the rest of the function is queued as a microtask. Finally <code>8</code> prints.</li>
+    <li>The stack is empty. The loop now empties the <strong>microtask queue</strong>, in the order the callbacks were queued: <code>3: promise 1</code>, <code>5: microtask</code>, <code>7: after await</code>. Running "promise 1" queues "promise 2" at the end of the same queue, so it runs next (<code>4</code>) before the loop leaves the microtask phase.</li>
+    <li>Only now does the loop take the next macrotask: the timer callback, <code>2: setTimeout 0</code>.</li>
+  </ol>
+  <p>The rule to remember: <strong>synchronous code → all microtasks → next macrotask</strong>. <code>setTimeout(fn, 0)</code> does not mean "now": it means "after the current script and all promise work are done, and at least 0 ms later".</p>
+
+  <h4>Blocking the loop</h4>
+  <p>Because there is one thread, a long-running synchronous function freezes everything: no clicks, no scrolling, no timers. It also makes a timer late.</p>
+  <pre data-title="block.js"><code class="language-javascript">setTimeout(() =&gt; console.log("timer"), 100);
+
+const start = Date.now();
+while (Date.now() - start &lt; 2000) { /* busy wait for 2 seconds */ }
+console.log("loop finished");
+// Output: "loop finished" after 2 s, then "timer" — about 2 s late.
+// During those 2 seconds the page cannot be clicked.</code></pre>
+  <p>Never run heavy loops, huge <code>JSON.parse</code> calls or big sorts on the main thread of a UI. Options: split the work into chunks with <code>setTimeout</code>, move it to a <strong>Web Worker</strong> (a real second thread with its own event loop; communication only by messages), or do it on the server. In Node.js, CPU-heavy work uses worker threads or a separate service.</p>
+
+  <h4>Single thread vs Java threads</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Java (servlet / Spring MVC)</th><th>JavaScript (browser or Node.js)</th></tr></thead>
+    <tbody>
+      <tr><td>Waiting for I/O</td><td>Thread blocks until done (virtual threads make it cheap)</td><td>Never blocks; callback runs later</td></tr>
+      <tr><td>Parallel CPU work</td><td>Many threads</td><td>Web Workers / worker threads</td></tr>
+      <tr><td>Race conditions on shared data</td><td>Yes: locks, <code>synchronized</code>, atomics</td><td>Not within one thread: code runs to completion</td></tr>
+      <tr><td>Long task</td><td>Occupies one thread</td><td>Freezes the whole page or server</td></tr>
+      <tr><td>Async style</td><td><code>CompletableFuture</code>, reactive</td><td>Promises and <code>async</code>/<code>await</code> everywhere</td></tr>
+    </tbody>
+  </table></div>
+  <p>"Run to completion" means a function that has started cannot be interrupted by another of your functions. But two <em>async</em> operations can interleave at <code>await</code> points, so logical race conditions still exist: two clicks may start two requests whose responses arrive in reverse order.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: keep every task short</p>
+    <p>A task should finish in a few milliseconds. Anything that takes more than about 50 ms may be felt as a lag by the user. Start slow work with an async API and use its callback or promise.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>An endless microtask chain (a promise callback that always queues another) starves the task queue: timers and clicks never run, and the page hangs.</li>
+      <li>Timers are not exact. <code>setTimeout(fn, 100)</code> means "no earlier than 100 ms"; browsers also slow timers in background tabs and clamp nested timers to at least about 4 ms.</li>
+      <li>Node.js has its own phases and also <code>process.nextTick</code> and <code>setImmediate</code>; the microtask-before-macrotask idea is the same, but details of the order differ from the browser.</li>
+      <li><code>alert()</code>, <code>confirm()</code> and synchronous XHR block the thread. Avoid them.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>"Explain the event loop."</b> Single thread + call stack; async work goes to Web APIs; finished callbacks wait in queues; the loop runs microtasks, then one macrotask, when the stack is empty.</li>
+      <li><b>"Output of the script above?"</b> Sync logs, then promise/microtask callbacks, then the timer. Explain microtask priority.</li>
+      <li><b>"Is JavaScript multi-threaded?"</b> The language runs on one thread; the host uses threads underneath; Web Workers give extra threads.</li>
+      <li><b>"What happens if you run a 5-second loop?"</b> The page freezes, no events or timers run until it finishes.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-callbacks-promises">
+  <h3>Callbacks and promises</h3>
+  <p class="tldr">A callback is a function you hand over to be called later, which leads to nested "callback hell"; a promise is an object that stands for a future value (pending, fulfilled or rejected) and lets you chain <code>then</code>, <code>catch</code> and <code>finally</code> in a flat line, or combine many with <code>Promise.all</code>.</p>
+
+  <h4>Callbacks and callback hell</h4>
+  <p>The first way to handle async work was the <strong>callback</strong>: pass a function that runs when the job is done. The convention in Node.js was "error first": <code>callback(error, result)</code>.</p>
+  <pre data-title="callbacks.js"><code class="language-javascript">function getUser(id, callback) {
+  setTimeout(() =&gt; callback(null, { id, name: "Asha" }), 100);   // fake network
+}
+function getOrders(userId, callback) {
+  setTimeout(() =&gt; callback(null, [{ no: 1, amount: 499 }]), 100);
+}
+function getPayment(orderNo, callback) {
+  setTimeout(() =&gt; callback(null, { status: "PAID" }), 100);
+}
+
+// Each step needs the previous result, so the code drifts to the right
+getUser(7, (err, user) =&gt; {
+  if (err) return console.error(err);
+  getOrders(user.id, (err, orders) =&gt; {
+    if (err) return console.error(err);
+    getPayment(orders[0].no, (err, payment) =&gt; {
+      if (err) return console.error(err);
+      console.log(user.name, orders[0].amount, payment.status); // Asha 499 PAID
+    });
+  });
+});</code></pre>
+  <p>This staircase is called <strong>callback hell</strong> (or the pyramid of doom). Errors must be handled at every level, <code>try</code>/<code>catch</code> cannot catch an error thrown later in a callback, and the order of steps is hard to follow. Promises solve this.</p>
+
+  <h4>What is a promise?</h4>
+  <p>A <strong>promise</strong> is an object that represents the eventual result of an async operation. It is like a Java <code>CompletableFuture</code>, or a receipt for an order you placed: you do not have the food yet, but you can say what to do when it arrives. A promise is in exactly one of three states:</p>
+  <ul>
+    <li><strong>pending</strong> — the work is still running;</li>
+    <li><strong>fulfilled</strong> — it finished with a value;</li>
+    <li><strong>rejected</strong> — it failed with a reason (usually an <code>Error</code>).</li>
+  </ul>
+  <p>Fulfilled and rejected together are called <strong>settled</strong>; a settled promise never changes again. Callbacks attached with <code>then</code> always run later, as microtasks (see <a href="#m4-event-loop">the event loop</a>), even if the promise is already settled.</p>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Pending
+  Pending --> Fulfilled: resolve(value)
+  Pending --> Rejected: reject(error) or throw
+  Fulfilled --> [*]
+  Rejected --> [*]
+</pre>
+  <figcaption>A promise starts pending and settles once, to fulfilled or rejected</figcaption>
+  </figure>
+
+  <h4>Creating and using promises</h4>
+  <pre data-title="promise-basic.js"><code class="language-javascript">// Creating one: wrap callback-style code (you rarely need this; fetch already returns promises)
+function wait(ms) {
+  return new Promise((resolve) =&gt; setTimeout(resolve, ms));
+}
+function payUpi(amount) {
+  return new Promise((resolve, reject) =&gt; {
+    setTimeout(() =&gt; {
+      if (amount &gt; 1000) reject(new Error("Daily limit exceeded"));
+      else resolve({ txnId: "TX123", amount });
+    }, 100);
+  });
+}
+
+payUpi(500)
+  .then((receipt) =&gt; console.log("Paid", receipt.txnId))   // Paid TX123
+  .catch((err) =&gt; console.log("Failed:", err.message))
+  .finally(() =&gt; console.log("done, hide the spinner"));
+
+payUpi(5000)
+  .then((receipt) =&gt; console.log("Paid", receipt.txnId))
+  .catch((err) =&gt; console.log("Failed:", err.message))     // Failed: Daily limit exceeded
+  .finally(() =&gt; console.log("done, hide the spinner"));</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Runs when</th><th>Returns</th></tr></thead>
+    <tbody>
+      <tr><td><code>.then(onFulfilled, onRejected?)</code></td><td>The promise fulfils</td><td>A new promise for the callback's result</td></tr>
+      <tr><td><code>.catch(onRejected)</code></td><td>Rejected (or an earlier step threw)</td><td>A new promise (fulfilled with the handler's result)</td></tr>
+      <tr><td><code>.finally(fn)</code></td><td>Settled either way; gets no argument</td><td>A promise with the same outcome (unless <code>fn</code> throws)</td></tr>
+      <tr><td><code>Promise.resolve(x)</code> / <code>Promise.reject(e)</code></td><td>—</td><td>An already-settled promise</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Chaining: the flat version</h4>
+  <p>Every <code>then</code> returns a <em>new</em> promise. If your callback returns a plain value, the next <code>then</code> receives it. If it returns a <strong>promise</strong>, the chain waits for that promise and passes on its result. That is how the callback staircase becomes a straight line. An error thrown, or a rejected promise, skips ahead to the next <code>catch</code>.</p>
+  <pre data-title="chain.js"><code class="language-javascript">const wait = (ms, value) =&gt; new Promise(res =&gt; setTimeout(() =&gt; res(value), ms));
+
+const getUser = (id) =&gt; wait(100, { id, name: "Asha" });
+const getOrders = (userId) =&gt; wait(100, [{ no: 1, amount: 499 }]);
+const getPayment = (orderNo) =&gt; wait(100, { status: "PAID" });
+
+getUser(7)
+  .then((user) =&gt; getOrders(user.id))               // return a promise
+  .then((orders) =&gt; getPayment(orders[0].no))
+  .then((payment) =&gt; console.log(payment.status))    // PAID
+  .catch((err) =&gt; console.error("Something failed", err))   // one handler for all steps
+  .finally(() =&gt; console.log("end"));
+
+Promise.resolve(1)
+  .then((n) =&gt; n + 1)                 // returns a plain value
+  .then((n) =&gt; { throw new Error("boom " + n); })
+  .then(() =&gt; console.log("skipped"))   // skipped because of the throw
+  .catch((e) =&gt; { console.log(e.message); return "recovered"; })   // boom 2
+  .then((v) =&gt; console.log(v));        // recovered — catch returned a value, chain continues</code></pre>
+
+  <h4>Running promises together</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Function</th><th>Fulfils when</th><th>Rejects when</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>Promise.all([…])</code></td><td>All fulfil — array of results in the original order</td><td>The first one rejects (others keep running, results ignored)</td><td>Independent calls where you need all</td></tr>
+      <tr><td><code>Promise.allSettled([…])</code></td><td>All settle — array of <code>{status, value|reason}</code></td><td>Never</td><td>Partial success is fine</td></tr>
+      <tr><td><code>Promise.race([…])</code></td><td>The first to settle (win or lose)</td><td>If the first to settle rejects</td><td>Timeouts</td></tr>
+      <tr><td><code>Promise.any([…])</code></td><td>The first to fulfil</td><td>When all reject (<code>AggregateError</code>)</td><td>Fastest mirror / fallback</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="combine.js"><code class="language-javascript">const wait = (ms, v, fail) =&gt; new Promise((res, rej) =&gt;
+  setTimeout(() =&gt; (fail ? rej(new Error(v)) : res(v)), ms));
+
+// All three run at the same time: total about 300 ms, not 600
+Promise.all([wait(100, "user"), wait(300, "orders"), wait(200, "offers")])
+  .then((results) =&gt; console.log(results));          // [ 'user', 'orders', 'offers' ]
+
+Promise.allSettled([wait(100, "ok"), wait(100, "bad", true)])
+  .then((r) =&gt; console.log(r));
+// [ { status: 'fulfilled', value: 'ok' },
+//   { status: 'rejected', reason: Error: bad } ]
+
+Promise.race([wait(500, "slow API"), wait(100, "timeout!", true)])
+  .catch((e) =&gt; console.log(e.message));             // timeout!
+
+Promise.any([wait(300, "mirror A"), wait(100, "mirror B")])
+  .then((v) =&gt; console.log(v));                      // mirror B</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: return the promise inside then, and always end with a catch</p>
+    <p>If you forget to <code>return</code> the inner promise, the next step runs immediately with <code>undefined</code>. A rejection that nobody handles triggers an "unhandled rejection": the browser logs <code>Uncaught (in promise)</code> in the console, and in Node.js the process exits with an error in recent versions. End chains with <code>.catch</code>, or use <code>try</code>/<code>catch</code> with <code>await</code>.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Exceptions thrown inside <code>new Promise((resolve, reject) =&gt; …)</code> or inside <code>then</code> become rejections; but an error thrown inside a <code>setTimeout</code> callback within the executor is <em>not</em> caught (call <code>reject</code> there).</li>
+      <li><code>resolve</code> and <code>reject</code> work only once; later calls are ignored.</li>
+      <li><code>.then(a).catch(b)</code> is not <code>.then(a, b)</code>: with the second form, <code>b</code> does not see errors thrown in <code>a</code>.</li>
+      <li>A promise starts running when created, not when you call <code>then</code>. Creating the promises first and then <code>Promise.all</code> is how you get parallelism.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistake: nesting promises like callbacks</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: callback hell again</p><pre><code class="language-javascript">getUser(7).then((user) =&gt; {
+  getOrders(user.id).then((orders) =&gt; {
+    console.log(orders);
+  });
+});   // errors in the inner promise are lost</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: return and flatten</p><pre><code class="language-javascript">getUser(7)
+  .then((user) =&gt; getOrders(user.id))
+  .then((orders) =&gt; console.log(orders))
+  .catch(console.error);</code></pre></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>"What is a promise? Its states?"</b> Object for a future value: pending, fulfilled, rejected; settles once.</li>
+      <li><b>"What is callback hell and how do promises fix it?"</b> Deep nesting with scattered error handling; chaining flattens it with a single <code>catch</code>.</li>
+      <li><b>"Promise.all vs allSettled vs race vs any?"</b> Use the table above; mention fail-fast behaviour.</li>
+      <li><b>"What does <code>then</code> return?"</b> A new promise, which allows chaining.</li>
+      <li><b>"Why do promise callbacks run before setTimeout?"</b> Microtasks have priority over macrotasks.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-async-await">
+  <h3>async and await, timers and common mistakes</h3>
+  <p class="tldr">An <code>async</code> function always returns a promise, and <code>await</code> pauses it until a promise settles so asynchronous code reads like normal top-to-bottom code with <code>try</code>/<code>catch</code>; await sequentially when steps depend on each other, use <code>Promise.all</code> when they do not, and never await inside <code>forEach</code>.</p>
+
+  <p><code>async</code>/<code>await</code> (ES2017) is syntax on top of promises. It removes the <code>then</code> chains and makes asynchronous code look synchronous, much like writing blocking Java code — but only the async function pauses; the rest of the program keeps running (see <a href="#m4-event-loop">the event loop</a>).</p>
+
+  <h4>The two keywords</h4>
+  <ul>
+    <li><code>async function f() {}</code> (or <code>async () =&gt; {}</code>) — always returns a promise. A returned value becomes the fulfilled value; a thrown error becomes a rejection.</li>
+    <li><code>await promise</code> — only inside an async function (or at the top level of an ES module). It pauses the function, lets the event loop do other work, and resumes with the fulfilled value, or throws the rejection reason.</li>
+  </ul>
+  <pre data-title="async-basic.js"><code class="language-javascript">const wait = (ms, value) =&gt; new Promise(res =&gt; setTimeout(() =&gt; res(value), ms));
+const getUser = (id) =&gt; wait(100, { id, name: "Asha" });
+const getOrders = (userId) =&gt; wait(100, [{ no: 1, amount: 499 }]);
+const getPayment = (orderNo) =&gt; wait(100, { status: "PAID" });
+
+async function showOrderStatus(userId) {
+  try {
+    const user = await getUser(userId);            // pauses here, UI stays responsive
+    const orders = await getOrders(user.id);
+    const payment = await getPayment(orders[0].no);
+    console.log(user.name, orders[0].amount, payment.status);
+    return payment.status;                          // the returned promise fulfils with this
+  } catch (err) {
+    console.error("Could not load order:", err.message);
+    throw err;                                      // rethrow if the caller should know
+  } finally {
+    console.log("hide spinner");
+  }
+}
+
+showOrderStatus(7).then((s) =&gt; console.log("result:", s));
+console.log("this prints first, the function is still waiting");</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">this prints first, the function is still waiting
+Asha 499 PAID
+hide spinner
+result: PAID</code></pre>
+  <p>Compare this with the callback pyramid and the <code>then</code> chain in <a href="#m4-callbacks-promises">callbacks and promises</a>: the logic is the same, but now it is a straight line, and a single <code>try</code>/<code>catch</code>/<code>finally</code> covers every step like in Java. Note the difference: an <code>await</code> does <em>not</em> block the thread. Code after the call to <code>showOrderStatus(7)</code> ran first.</p>
+
+  <h4>Sequential vs parallel</h4>
+  <p>Each <code>await</code> waits for its promise before the next line starts. If the calls do not depend on each other, that wastes time.</p>
+  <pre data-title="parallel.js"><code class="language-javascript">async function sequential() {
+  const t = Date.now();
+  const user = await wait(300, "user");        // 300 ms
+  const offers = await wait(300, "offers");    // another 300 ms
+  console.log("sequential", Date.now() - t);   // ~600
+}
+
+async function parallel() {
+  const t = Date.now();
+  const [user, offers] = await Promise.all([wait(300, "user"), wait(300, "offers")]);
+  console.log("parallel", Date.now() - t);     // ~300
+}
+
+async function parallelManually() {
+  const userPromise = wait(300, "user");       // start both first
+  const offersPromise = wait(300, "offers");
+  const user = await userPromise;              // then wait
+  const offers = await offersPromise;
+}</code></pre>
+  <p>Rule of thumb: <strong>depends on the previous result → sequential <code>await</code>; independent → <code>Promise.all</code></strong>. A product page that loads details, reviews and recommendations should start all three at once.</p>
+
+  <h4>Looping with await</h4>
+  <pre data-title="loops.js"><code class="language-javascript">const ids = [1, 2, 3];
+const fetchOne = (id) =&gt; wait(100, `item ${id}`);
+
+// One after another: ~300 ms (use when order or rate limits matter)
+for (const id of ids) {
+  const item = await fetchOne(id);
+  console.log(item);
+}
+
+// All at once: ~100 ms
+const items = await Promise.all(ids.map(fetchOne));
+console.log(items);   // [ 'item 1', 'item 2', 'item 3' ]
+
+// WRONG: forEach ignores the promises returned by its async callback
+ids.forEach(async (id) =&gt; {
+  const item = await fetchOne(id);
+  console.log(item);
+});
+console.log("forEach finished");   // prints BEFORE any item is logged</code></pre>
+  <p><code>forEach</code>, <code>map</code> and <code>filter</code> do not wait for async callbacks. Use <code>for…of</code> with <code>await</code> to go one by one, or <code>Promise.all(array.map(async …))</code> to go in parallel.</p>
+
+  <h4>Timers: setTimeout and setInterval</h4>
+  <p>Timers are Web APIs (also in Node.js). Both return an id that you pass to the matching <code>clear…</code> function. The delay is a minimum, not a promise (see <a href="#m4-event-loop">the event loop</a>).</p>
+  <pre data-title="timers.js"><code class="language-javascript">const id = setTimeout(() =&gt; console.log("runs once after 1 s"), 1000);
+clearTimeout(id);                     // cancelled — never runs
+
+setTimeout((name) =&gt; console.log("hello", name), 500, "Asha");  // extra args are passed on
+
+let seconds = 0;
+const clock = setInterval(() =&gt; {
+  seconds++;
+  console.log("tick", seconds);
+  if (seconds === 3) clearInterval(clock);   // stop it, or it runs forever
+}, 1000);
+
+// A promise-based sleep makes async code readable
+const sleep = (ms) =&gt; new Promise((resolve) =&gt; setTimeout(resolve, ms));
+async function retry(task, times = 3) {
+  for (let i = 1; i &lt;= times; i++) {
+    try { return await task(); }
+    catch (e) { console.log(`attempt ${i} failed`); await sleep(500 * i); }
+  }
+  throw new Error("All attempts failed");
+}</code></pre>
+  <ul>
+    <li><code>setInterval</code> does not wait for the previous run to finish; a slow callback can pile up. For polling, a <code>setTimeout</code> that re-schedules itself at the end of each run is safer.</li>
+    <li>Always clear intervals when the screen closes (in React, in the <code>useEffect</code> cleanup), or they keep running and leak memory.</li>
+    <li><code>requestAnimationFrame(fn)</code> runs before the next screen repaint; use it for animations rather than a timer.</li>
+  </ul>
+
+  <h4>Common mistakes</h4>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake 1: forgetting await</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: user is a pending Promise</p><pre><code class="language-javascript">async function show() {
+  const user = getUser(7);          // no await
+  console.log(user.name);           // undefined
+  console.log(user);                // Promise { &lt;pending&gt; }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right</p><pre><code class="language-javascript">async function show() {
+  const user = await getUser(7);
+  console.log(user.name);           // "Asha"
+}</code></pre></div>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake 2: unhandled rejection, and awaiting without try/catch</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: nobody catches the failure</p><pre><code class="language-javascript">button.addEventListener("click", async () =&gt; {
+  const data = await loadData();   // may reject
+  render(data);
+});
+// Console: Uncaught (in promise) Error: ...</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: handle it where the UI can react</p><pre><code class="language-javascript">button.addEventListener("click", async () =&gt; {
+  try {
+    render(await loadData());
+  } catch (err) {
+    showError(err.message);
+  }
+});</code></pre></div>
+  </div>
+  <ul>
+    <li><strong>Mistake 3:</strong> <code>await</code> inside <code>forEach</code> (shown above).</li>
+    <li><strong>Mistake 4:</strong> awaiting in a loop when <code>Promise.all</code> would do — slow pages.</li>
+    <li><strong>Mistake 5:</strong> <code>await</code> in a non-async function: <code>SyntaxError: await is only valid in async functions and the top level bodies of modules</code>.</li>
+    <li><strong>Mistake 6:</strong> <code>return somePromise</code> inside <code>try</code> without <code>await</code>: the <code>catch</code> will not catch its rejection. Write <code>return await somePromise</code> there.</li>
+    <li><strong>Mistake 7:</strong> making the executor of <code>new Promise</code> async, or wrapping an existing promise in <code>new Promise</code> needlessly.</li>
+  </ul>
+
+  <div class="co co-note">
+    <p class="co-t">Top-level await and async in React</p>
+    <p>In an ES module (<code>type="module"</code>, Vite) you may write <code>const config = await loadConfig();</code> at the top level. In React, the function you pass to <code>useEffect</code> must not be <code>async</code>; define an async function inside and call it. You will see this in <a href="#m5">Module 5</a>.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>An async function that throws before its first <code>await</code> still returns a rejected promise; it never throws synchronously to the caller.</li>
+      <li><code>await</code> on a non-promise just wraps it: <code>await 5</code> gives 5 (after a microtask delay).</li>
+      <li>With <code>Promise.all</code>, if one promise rejects the others still run to the end, but their results are dropped. Use <code>allSettled</code> to collect everything.</li>
+      <li>You cannot cancel a promise. To stop work such as a network request, use an <code>AbortController</code> (see <a href="#m4-fetch">fetch</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>"What does an async function return?"</b> Always a promise.</li>
+      <li><b>"Does await block the thread?"</b> No; it suspends only that function and lets the event loop continue.</li>
+      <li><b>"How do you run two calls in parallel with await?"</b> Start both, then <code>await Promise.all([…])</code>.</li>
+      <li><b>"Why doesn't await work in forEach?"</b> <code>forEach</code> ignores the callback's returned promise; use <code>for…of</code> or <code>Promise.all(map)</code>.</li>
+      <li><b>"setTimeout(fn, 0) vs a promise callback?"</b> The promise runs first (microtask).</li>
+      <li><b>"setTimeout vs setInterval, and how do you stop them?"</b> Once vs repeatedly; <code>clearTimeout</code>/<code>clearInterval</code> with the returned id.</li>
+    </ul>
+  </div>
+</article>

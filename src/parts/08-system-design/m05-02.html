@@ -1,0 +1,411 @@
+<article class="topic" id="m5-api-gateway">
+  <h3>API gateway and BFF</h3>
+  <p class="tldr">An API gateway is the single front door for clients of a microservice system: it routes
+  requests and handles the cross-cutting work (authentication, rate limiting, TLS, logging, aggregation,
+  protocol translation) so each service does not repeat it; a BFF is a gateway tailored to one kind of
+  client.</p>
+
+  <h4>The problem</h4>
+  <p>With ten microservices, a mobile app would need ten addresses, ten authentication checks, and ten
+  round trips to draw one screen. Every service would also re-implement rate limits, logging and CORS. An
+  <strong>API gateway</strong> is a server that sits between clients and your services and presents one
+  uniform entry point. A gateway differs from a plain load balancer: the load balancer spreads traffic over
+  identical servers; the gateway understands your APIs and decides which <em>service</em> gets each call.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  M[Mobile app] --> G[API gateway]
+  W[Web app] --> G
+  P[Partner] --> G
+  G --> U[User service]
+  G --> O[Order service]
+  G --> C[Catalog service]
+  G -.-> A[Auth server]
+</pre>
+    <figcaption>All external traffic enters through the gateway; services stay private</figcaption>
+  </figure>
+
+  <h4>Responsibilities</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Job</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td>Routing</td><td>Maps <code>/orders/**</code> to the order service, by path, host, header or version</td></tr>
+      <tr><td>Authentication / authorisation</td><td>Validates the JWT or API key once at the edge, passes identity downstream</td></tr>
+      <tr><td>Rate limiting and quotas</td><td>Protects services and enforces plans (<a href="#m5-rate-limiting">next article</a>)</td></tr>
+      <tr><td>TLS termination</td><td>Handles certificates; internal traffic can be simpler</td></tr>
+      <tr><td>Request aggregation</td><td>One client call fans out to several services and merges the result</td></tr>
+      <tr><td>Protocol translation</td><td>Public REST/JSON to internal gRPC; WebSocket upgrades</td></tr>
+      <tr><td>Resilience</td><td>Timeouts, retries, circuit breaker, fallback responses</td></tr>
+      <tr><td>Observability</td><td>Access logs, metrics, a correlation id on every request</td></tr>
+      <tr><td>Caching, compression, CORS, request validation</td><td>Common web concerns, handled in one place</td></tr>
+    </tbody>
+  </table></div>
+  <p>Common products: Spring Cloud Gateway (a natural fit for a Java team), Kong, NGINX, Envoy-based
+  gateways, AWS API Gateway, Azure API Management. See <a href="04-spring-boot.html#m7">Spring Boot ·
+  Module 7</a> for Spring Cloud Gateway.</p>
+
+  <h4>Backend for Frontend (BFF)</h4>
+  <p>One generic gateway tends to grow a lot of client-specific code. A <strong>Backend for Frontend</strong>
+  gives each client type its own thin gateway service: a mobile BFF that returns compact payloads for slow
+  networks, a web BFF that returns what the React app needs, a partner BFF with a stable versioned API.
+  The BFF belongs to the front-end team, aggregates calls, and shapes responses, while the core services
+  stay generic. The cost is more services to run and some duplicated code.</p>
+
+  <h4>Trade-offs and failure modes</h4>
+  <ul>
+    <li><strong>Single point of failure and bottleneck:</strong> run many gateway instances behind a load
+    balancer; keep the gateway stateless and fast.</li>
+    <li><strong>Extra hop:</strong> adds a few milliseconds. Keep logic in the gateway thin.</li>
+    <li><strong>The "god gateway":</strong> if business logic creeps in, the gateway becomes a monolith that
+    every team must change. Keep it to cross-cutting work and routing.</li>
+    <li><strong>Gateway security is not enough:</strong> services should still verify identity (zero trust)
+    in case something bypasses the gateway.</li>
+  </ul>
+
+    <h4>What a request goes through</h4>
+  <p>Seeing the order of work makes the gateway concrete. A call to <code>GET /orders/42</code> from a mobile app passes through a chain of steps. Each step can reject the request early, which is why the cheap checks (TLS, rate limit, token) come before the expensive one (calling a service).</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant G as API gateway
+  participant A as Auth check
+  participant S as Order service
+  C->>G: GET /orders/42 with JWT
+  G->>G: TLS, rate limit, request id
+  G->>A: validate token
+  A-->>G: user 17, roles
+  G->>S: GET /orders/42 with X-User-Id 17
+  S-->>G: 200 JSON
+  G-->>C: 200 JSON (with CORS and cache headers)
+</pre>
+    <figcaption>The gateway authenticates once and forwards the identity; the service trusts only what the gateway adds</figcaption>
+  </figure>
+  <p>Two details matter. First, the gateway must <strong>remove</strong> any identity header sent by the client (such as <code>X-User-Id</code>) before it adds its own, or a user could pretend to be someone else. Second, it must add a <strong>correlation id</strong> (for example <code>X-Request-Id</code>) so one request can be followed through every service log.</p>
+
+  <h4>Gateway vs load balancer vs reverse proxy vs service mesh</h4>
+  <p>These four are often mixed up, and interviewers like the question. They overlap in technology (Envoy and NGINX appear in several roles) but differ in purpose.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Component</th><th>Sits</th><th>Main job</th><th>Understands your API?</th></tr></thead>
+    <tbody>
+      <tr><td><a href="#m5-load-balancers">Load balancer</a></td><td>In front of copies of one service</td><td>Spread traffic, health checks</td><td>No (L4) or a little (L7)</td></tr>
+      <tr><td>Reverse proxy</td><td>In front of servers</td><td>Forward requests, TLS, caching, compression</td><td>Only paths and headers</td></tr>
+      <tr><td>API gateway</td><td>At the edge, for external clients</td><td>Routing between services, auth, quotas, aggregation</td><td>Yes: routes, plans, API keys</td></tr>
+      <tr><td>Service mesh</td><td>Beside every service (sidecar), for internal calls</td><td>mTLS, retries, timeouts, telemetry between services</td><td>Traffic level, not business meaning</td></tr>
+    </tbody>
+  </table></div>
+  <p>A short way to remember: the gateway handles <strong>north-south</strong> traffic (clients to your system); a service mesh handles <strong>east-west</strong> traffic (service to service). Most systems use a load balancer in front of the gateway instances, a gateway at the edge, and optionally a mesh inside. See <a href="#m5-dns">DNS</a> and <a href="#m5-cdn">CDN</a> for what sits even further out.</p>
+
+  <h4>A configuration example: Spring Cloud Gateway</h4>
+  <p>For a Java team, Spring Cloud Gateway is the natural pick: it is a Spring Boot application, so routes, filters and security use the tools you already know. A route has an id, a target <code>uri</code>, <strong>predicates</strong> (when the route matches) and <strong>filters</strong> (what to change on the way). The setup, the starter and the filter catalogue are covered in <a href="04-spring-boot.html#m7">Spring Boot · Module 7</a>.</p>
+  <pre data-title="application.yml" ><code class="language-yaml">spring:
+  cloud:
+    gateway:
+      routes:
+        - id: orders
+          uri: http://order-service:8080
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - StripPrefix=1          # /api/orders/42 becomes /orders/42
+        - id: catalog
+          uri: http://catalog-service:8080
+          predicates:
+            - Path=/api/products/**
+          filters:
+            - StripPrefix=1</code></pre>
+  <div class="co co-version">
+    <p class="co-t">Property names changed in newer Spring Cloud releases</p>
+    <p>Newer Spring Cloud Gateway releases split the project into a WebFlux server and a WebMVC server, and the route properties moved under a longer prefix (for example <code>spring.cloud.gateway.server.webflux.routes</code>). The same route can also be written in Java with <code>RouteLocatorBuilder</code>. Check the reference of the version in your project before copying YAML.</p>
+  </div>
+
+  <h4>BFF in practice: one call, three services</h4>
+  <p>A mobile home screen needs the user's name, the open orders and a few recommendations. Without a BFF, the phone makes three calls over a slow network. A BFF makes the three calls on the fast data-centre network, in parallel, and returns one small JSON:</p>
+  <pre data-title="HomeBff.java"><code class="language-java">import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
+
+record Home(String userName, String openOrders, String picks) { }
+
+class HomeBff {
+    private final WebClient users;
+    private final WebClient orders;
+    private final WebClient recs;
+
+    HomeBff(WebClient users, WebClient orders, WebClient recs) {
+        this.users = users;
+        this.orders = orders;
+        this.recs = recs;
+    }
+
+    Mono&lt;Home&gt; home(String userId) {
+        Mono&lt;String&gt; u = users.get().uri("/users/{id}", userId)
+                .retrieve().bodyToMono(String.class);
+        Mono&lt;String&gt; o = orders.get().uri("/orders?user={id}&amp;status=open", userId)
+                .retrieve().bodyToMono(String.class);
+        Mono&lt;String&gt; r = recs.get().uri("/picks/{id}", userId)
+                .retrieve().bodyToMono(String.class)
+                .onErrorReturn("[]");                 // recommendations are optional
+        return Mono.zip(u, o, r, Home::new);           // three calls run in parallel
+    }
+}</code></pre>
+  <p>Note the last design choice: recommendations are optional, so if that service fails the screen still loads with an empty list. Decide for each downstream call whether it is <em>required</em> or <em>optional</em>; that is graceful degradation. (The code assumes Spring WebFlux is on the classpath.)</p>
+
+  <h4>More failure modes and how to handle them</h4>
+  <ul>
+    <li><strong>Slow service drags the gateway down:</strong> without timeouts, threads or connections pile up on the slow backend and the gateway stops answering everyone. Set a timeout per route and a limit on concurrent calls.</li>
+    <li><strong>Retry storms:</strong> if the gateway retries failed calls and every instance does the same, a struggling service receives double or triple the load. Retry only safe (idempotent) requests, a small number of times, with back-off.</li>
+    <li><strong>Circuit breaker:</strong> after repeated failures, stop calling the service for a while and return a fallback or a fast <code>503</code>.</li>
+    <li><strong>Bad config deploy:</strong> a wrong route takes the whole site down. Keep route config in version control, roll out gradually and keep the last good version.</li>
+    <li><strong>Large uploads and long connections:</strong> proxying big files or WebSockets through the gateway consumes its memory and connections. Use presigned URLs to object storage for uploads (see <a href="#m5-object-storage">Object storage</a>).</li>
+  </ul>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>One public address and one place for TLS, auth, quotas and logs.</li>
+      <li>Clients are shielded from internal service moves and splits.</li>
+      <li>Aggregation cuts mobile round trips.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>One more hop and one more component to run, scale and secure.</li>
+      <li>A shared gateway team can become a bottleneck for releases.</li>
+      <li>Risk of business logic creeping in.</li>
+    </ul></div>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Keep the gateway stateless so any instance can handle any request, and run at least two instances.</li>
+      <li>Strip client-supplied identity headers; add trusted ones after authentication.</li>
+      <li>Every route needs a timeout. No exceptions.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Version the public API in the path (<code>/v1/orders</code>) and route versions to different services if needed.</li>
+      <li>Return consistent error bodies and use <code>429</code> for rate limits and <code>503</code> for an unavailable backend.</li>
+      <li>Log request id, route, status and latency; alert on latency percentiles and 5xx rate (<a href="#m4-latency-throughput">Latency, throughput and percentiles</a>).</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to use a gateway (or a BFF)</p>
+    <ul>
+      <li>A monolith or two services: a reverse proxy and a load balancer are enough.</li>
+      <li>One client type with similar needs: a shared gateway is enough; a BFF per client is extra cost.</li>
+      <li>Service-to-service calls inside the cluster should not detour through the public gateway; use direct calls, or a mesh.</li>
+    </ul>
+  </div>
+<div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"Clients talk only to the gateway; it authenticates, rate limits and routes. Services behind it
+      stay private."</li>
+      <li>Contrast it with a load balancer in one line: the balancer spreads load over copies of one
+      service, the gateway routes between different services and applies policies.</li>
+      <li>Mention BFF when a mobile and a web client have very different needs.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: follow-ups on the gateway</p>
+    <ul>
+      <li><b>Gateway vs load balancer?</b> The balancer picks among identical servers; the gateway chooses between different services and applies API policies.</li>
+      <li><b>Gateway vs service mesh?</b> Gateway: edge, north-south. Mesh: inside, east-west.</li>
+      <li><b>Is the gateway a single point of failure?</b> Not if you run several stateless instances behind a load balancer and across zones.</li>
+      <li><b>When BFF?</b> When clients (mobile, web, partners) need different payloads and release at different speeds.</li>
+      <li><b>Where does authorisation happen?</b> Coarse checks (token valid, scope) at the gateway; fine-grained business rules in the service.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-rate-limiting">
+  <h3>Rate limiting: algorithms, Redis and responses</h3>
+  <p class="tldr">Rate limiting caps how many requests a client may make in a time window to protect the
+  system from abuse and overload; the main algorithms are token bucket, leaky bucket, fixed window, sliding
+  window log and sliding window counter, and a distributed limiter keeps its counters in Redis with atomic
+  operations.</p>
+
+  <h4>Why limit, and who to limit</h4>
+  <p>A <strong>rate limiter</strong> rejects or delays requests above an allowed rate. It protects against
+  accidental overload (a client bug in a retry loop), abuse and scraping, brute-force logins, and noisy
+  neighbours in a shared system. It also enforces paid plans (100 calls per minute on the free tier) and
+  keeps costs predictable. You choose the <strong>key</strong> to limit by: user id, API key, IP address,
+  tenant, or an endpoint (login is limited more strictly than reads).</p>
+
+  <h4>Where to rate limit</h4>
+  <ul>
+    <li><strong>CDN / edge / WAF:</strong> blocks floods early and cheaply, mostly by IP.</li>
+    <li><strong>API gateway or load balancer:</strong> the usual place; one policy for all services, before
+    expensive work happens.</li>
+    <li><strong>In the service:</strong> fine-grained limits that need business knowledge (per-tenant
+    quotas, expensive endpoints), using a library such as Bucket4j or Resilience4j.</li>
+    <li><strong>Client side:</strong> well-behaved clients also limit themselves, but never trust that.</li>
+  </ul>
+
+  <h4>The five algorithms</h4>
+  <h5>1. Token bucket</h5>
+  <p>A bucket holds up to <em>capacity</em> tokens. Tokens are added at a fixed <em>refill rate</em>. Each
+  request takes one token; with none left, the request is rejected. Because the bucket can fill while a
+  client is idle, short <strong>bursts</strong> are allowed (up to the capacity) but the long-term average
+  stays at the refill rate. Memory is tiny: two numbers per key (tokens and last refill time). This is the
+  most widely used algorithm (used by API gateways and cloud providers). A Java implementation is in
+  <a href="#m3">Module 3</a>.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  R[Refill 5 tokens per second] --> B[(Bucket capacity 10)]
+  B -->|token available| OK[Allow request]
+  B -->|bucket empty| X[Reject with 429]
+  Q[Request] --> B
+</pre>
+    <figcaption>Token bucket: tokens drip in, each request spends one</figcaption>
+  </figure>
+  <h5>2. Leaky bucket</h5>
+  <p>Requests enter a queue of fixed size (the bucket) and leave at a constant rate (the leak). If the queue
+  is full, new requests are dropped. The output is perfectly smooth, which is good when the downstream
+  system needs steady traffic (a payment partner that accepts exactly 50 per second). Cost: bursts are
+  queued and delayed rather than served at once, and old requests may wait behind new ones.</p>
+  <h5>3. Fixed window counter</h5>
+  <p>Count requests per fixed time slot (for example per minute). If the count exceeds the limit, reject until
+  the next slot. Very simple and cheap (one counter per key per window). The flaw is the
+  <strong>boundary burst</strong>: with a limit of 100 per minute, a client can send 100 at 12:00:59 and
+  another 100 at 12:01:00, so 200 requests in two seconds.</p>
+  <h5>4. Sliding window log</h5>
+  <p>Keep a timestamp of every request in the last window (a sorted set). On each request remove old
+  timestamps, count the rest, allow if under the limit. This is exact, with no boundary burst. Cost: memory
+  proportional to the limit per key (storing 10,000 timestamps for a 10,000-per-hour key), so it suits low
+  limits.</p>
+  <h5>5. Sliding window counter</h5>
+  <p>A cheap approximation of the log. Keep counters for the current and previous fixed windows, and weight
+  the previous one by how much of it still overlaps the sliding window:</p>
+  <pre data-title="Sliding window counter"><code class="language-plaintext">estimate = current_count + previous_count × (1 − elapsed_fraction_of_current_window)
+
+Limit 100 per minute. Previous minute: 80. Now 15 s into this minute: 30 so far.
+estimate = 30 + 80 × (1 − 15/60) = 30 + 60 = 90  → allow (under 100)</code></pre>
+  <p>Memory is two counters per key, and the smoothing is good enough in practice (the error is small
+  when traffic is fairly even). It is a popular balanced choice.</p>
+
+  <h4>Comparison</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Algorithm</th><th>Bursts</th><th>Accuracy</th><th>Memory per key</th><th>Weak point</th></tr></thead>
+    <tbody>
+      <tr><td>Token bucket</td><td>Allowed up to capacity</td><td>Good</td><td>2 numbers</td><td>Burst can stress downstream</td></tr>
+      <tr><td>Leaky bucket</td><td>Smoothed into a steady flow</td><td>Good</td><td>A queue</td><td>Adds delay; queue management</td></tr>
+      <tr><td>Fixed window</td><td>Double burst at boundaries</td><td>Poor</td><td>1 counter</td><td>Boundary burst</td></tr>
+      <tr><td>Sliding window log</td><td>No</td><td>Exact</td><td>One entry per request</td><td>Memory heavy</td></tr>
+      <tr><td>Sliding window counter</td><td>Smoothed</td><td>Approximate</td><td>2 counters</td><td>Assumes even traffic</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A distributed implementation with Redis</h4>
+  <p>With many gateway instances, counters cannot live in each instance's memory (a client could get N
+  times the limit). Keep them in Redis, shared by all instances. The operations must be <strong>atomic</strong>
+  or two requests can both read "99" and both be allowed.</p>
+  <h5>Fixed window with INCR and EXPIRE</h5>
+  <pre data-title="FixedWindowLimiter.java"><code class="language-java">import java.time.Duration;
+import org.springframework.data.redis.core.StringRedisTemplate;
+
+public class FixedWindowLimiter {
+    private final StringRedisTemplate redis;
+    private final int limit;
+    private final Duration window;
+
+    public FixedWindowLimiter(StringRedisTemplate redis, int limit, Duration window) {
+        this.redis = redis;
+        this.limit = limit;
+        this.window = window;
+    }
+
+    public boolean allow(String clientId) {
+        long slot = System.currentTimeMillis() / window.toMillis();
+        String key = "rl:" + clientId + ":" + slot;
+        Long count = redis.opsForValue().increment(key);   // atomic INCR
+        if (count != null &amp;&amp; count == 1) {
+            redis.expire(key, window);                     // first hit sets the TTL
+        }
+        return count != null &amp;&amp; count &lt;= limit;
+    }
+}</code></pre>
+  <p>Watch the gap between <code>INCR</code> and <code>EXPIRE</code>: if the process dies in between, the
+  key never expires. Including the window slot in the key makes stale keys harmless, and a Lua script
+  removes the gap entirely.</p>
+  <h5>Token bucket as a Lua script</h5>
+  <p>Redis runs a Lua script atomically, so read-modify-write is safe. This script keeps tokens and the last
+  refill time in a hash. (Check your Redis version's rules for using time inside scripts; passing
+  <code>now</code> from the caller is the simplest portable way, at the price of clock differences between
+  app servers.)</p>
+  <pre data-title="token_bucket.lua"><code class="language-plaintext">-- KEYS[1] = bucket key
+-- ARGV[1] = capacity, ARGV[2] = refill tokens per second, ARGV[3] = now in ms
+local data = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local tokens = tonumber(data[1])
+local ts = tonumber(data[2])
+if tokens == nil then
+  tokens = capacity
+  ts = now
+end
+tokens = math.min(capacity, tokens + (now - ts) / 1000 * rate)
+local allowed = 0
+if tokens &gt;= 1 then
+  tokens = tokens - 1
+  allowed = 1
+end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], math.ceil(capacity / rate * 1000) * 2)
+return allowed</code></pre>
+  <p>From Java, run it with Spring Data Redis's <code>DefaultRedisScript</code> and
+  <code>redis.execute(script, keys, args...)</code>. Sliding window log in Redis uses a sorted set:
+  <code>ZREMRANGEBYSCORE</code> (drop old), <code>ZCARD</code> (count), <code>ZADD</code> (record), wrapped in a
+  script or a transaction.</p>
+
+  <h4>What to return to the client</h4>
+  <pre data-title="A rejected request" class="out"><code class="language-http">HTTP/1.1 429 Too Many Requests
+Retry-After: 12
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1731312000
+Content-Type: application/json
+
+{"error":"rate_limit_exceeded","message":"Try again in 12 seconds"}</code></pre>
+  <ul>
+    <li>Use status <strong>429 Too Many Requests</strong>, not 403 or 500.</li>
+    <li><code>Retry-After</code> tells well-behaved clients how many seconds to wait.</li>
+    <li>The <code>X-RateLimit-*</code> headers (a widespread convention; an IETF draft standardises
+    similar <code>RateLimit-*</code> names) let clients slow down before they are rejected.</li>
+    <li>Clients should respond with <strong>exponential backoff with jitter</strong>.</li>
+  </ul>
+
+  <h4>Design decisions and failure modes</h4>
+  <ul>
+    <li><strong>Fail open or closed?</strong> If Redis is down, should the limiter let all traffic through
+    (risking overload) or block all (risking an outage)? Most systems fail open for ordinary APIs and fail
+    closed for security-critical ones such as login. Keep a small local fallback limiter.</li>
+    <li><strong>Race conditions:</strong> use atomic commands or Lua, never read-then-write from the app.</li>
+    <li><strong>Latency:</strong> a Redis round trip per request adds about a millisecond; limit locally in
+    batches or use sticky routing if that matters.</li>
+    <li><strong>Hot keys and sharding:</strong> one very popular client key sits on one Redis node; shard
+    keys by client id.</li>
+    <li><strong>Rule hierarchy:</strong> per-IP, per-user and global limits together; return the strictest.</li>
+    <li><strong>Distinguish rate limiting from load shedding:</strong> limits are per client; load shedding
+    drops requests when the whole system is overloaded.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistake: limiting by IP only</p>
+    <p>Many users share one IP behind a company or mobile carrier NAT, and attackers rotate IPs. Limit by
+    authenticated identity when you can, and use IP limits as a coarse outer layer.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"I use a token bucket in the gateway: it allows short bursts and enforces a steady average, and it
+      needs only two values per client in Redis."</li>
+      <li>Explain why fixed windows allow double bursts at the boundary, and how the sliding window counter
+      fixes it cheaply.</li>
+      <li>Return 429 with <code>Retry-After</code>; decide fail-open vs fail-closed out loud.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,591 @@
+<article class="topic" id="m2-layers">
+  <h3>Layers: controller, service, repository</h3>
+  <p class="tldr">A Spring Boot API is split into three layers: the controller handles HTTP, the service holds business rules and transactions, and the repository talks to the database; each layer calls only the one below it.</p>
+
+  <p>A <strong>layered architecture</strong> gives every class one reason to change. If the JSON format changes, only the controller changes. If a business rule changes (for example "an order over ₹50,000 needs approval"), only the service changes. If you switch from PostgreSQL to MongoDB, only the repository changes. It also makes testing easy: you can test the service without HTTP and the controller without a database.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  C["Client (React, mobile, curl)"] --> A["Controller: HTTP in, HTTP out"]
+  A --> S["Service: business rules, transactions"]
+  S --> R["Repository: database access"]
+  R --> D[("PostgreSQL")]
+</pre>
+  <figcaption>Calls go down; data comes back up. A layer never calls the one above it.</figcaption>
+  </figure>
+
+  <h4>What each layer does</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Layer</th><th>Annotation</th><th>Responsible for</th><th>Must not</th></tr></thead>
+    <tbody>
+      <tr><td>Controller</td><td><code>@RestController</code></td><td>Paths, binding, validation trigger, status codes, calling one service method</td><td>Contain business logic, call repositories, open transactions</td></tr>
+      <tr><td>Service</td><td><code>@Service</code></td><td>Business rules, orchestration, <code>@Transactional</code>, mapping entity ↔ DTO</td><td>Know about HTTP (<code>ResponseEntity</code>, <code>HttpServletRequest</code>, status codes)</td></tr>
+      <tr><td>Repository</td><td><code>@Repository</code> / Spring Data interface</td><td>Queries and persistence of entities</td><td>Contain business rules; return DTOs of the web layer</td></tr>
+    </tbody>
+  </table></div>
+  <p>Next to the three layers sit two kinds of classes that cross them: the <strong>entity</strong> (the database row as an object, used by service and repository) and the <strong>DTO</strong> (the shape of the JSON, used by controller and service). See <a href="#m2-dtos">DTOs</a>.</p>
+
+  <h4>What goes where: a worked example</h4>
+  <p>Requirement: "Create a product. The SKU must be unique. Price must be positive. Save it and return it."</p>
+  <ul>
+    <li><strong>Controller:</strong> receives the JSON, triggers format checks (<code>@Valid</code>: price not null, name not blank), calls <code>service.create(request)</code>, returns 201 and <code>Location</code>.</li>
+    <li><strong>Service:</strong> checks the business rule "SKU is not already used" (<code>existsBySku</code>), throws <code>DuplicateResourceException</code> if it is, builds the entity, calls <code>save</code>, maps the result to a response DTO.</li>
+    <li><strong>Repository:</strong> <code>save(entity)</code> and <code>existsBySku(sku)</code>. Nothing else.</li>
+  </ul>
+  <p>Note the split in validation: <em>format</em> rules (not blank, positive, an email shape) belong to Bean Validation at the edge; <em>business</em> rules that need data (unique SKU, enough stock, user may cancel only own order) belong to the service.</p>
+
+  <h4>Transactions live in the service</h4>
+  <p>A <strong>transaction</strong> groups several database operations into one all-or-nothing unit. One business action usually touches several repositories (reduce stock, create order, create payment record), so the <em>service method</em> is the unit of work. Put <code>@Transactional</code> there, not on controllers or repositories. Use <code>@Transactional(readOnly = true)</code> on read methods. Full details are in <a href="#m3">module 3</a>.</p>
+
+  <h4>Dependency direction and wiring</h4>
+  <pre data-title="Constructor injection through the layers"><code class="language-java">@RestController
+@RequestMapping("/api/v1/products")
+public class ProductController {
+
+    private final ProductService productService;       // depends on the service only
+
+    public ProductController(ProductService productService) {
+        this.productService = productService;
+    }
+}
+
+@Service
+public class ProductService {
+
+    private final ProductRepository productRepository; // depends on the repository only
+
+    public ProductService(ProductRepository productRepository) {
+        this.productRepository = productRepository;
+    }
+}</code></pre>
+  <p>Depending on an <em>interface</em> for the service (<code>ProductService</code> + <code>ProductServiceImpl</code>) is optional. With one implementation it adds files and no value. Introduce an interface when you truly have two implementations or need a clean seam for a test double; Mockito can mock concrete classes anyway.</p>
+
+  <h4>Package structure</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Style</th><th>Layout</th><th>Good for</th></tr></thead>
+    <tbody>
+      <tr><td>By layer</td><td><code>controller/</code>, <code>service/</code>, <code>repository/</code>, <code>dto/</code>, <code>entity/</code></td><td>Small apps, learning</td></tr>
+      <tr><td>By feature</td><td><code>product/</code> (controller, service, repository, dto…), <code>order/</code>, <code>user/</code></td><td>Growing apps; microservice splits later</td></tr>
+    </tbody>
+  </table></div>
+  <p>Package-by-feature keeps everything about one resource together, lets you make classes package-private, and is what most teams move to after the first few months. Both work; pick one and keep it.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules of the layers</p>
+    <ul>
+      <li>Controller → service → repository. Never skip a layer (a controller calling a repository), never call upwards.</li>
+      <li>No HTTP types in services: no <code>ResponseEntity</code>, <code>HttpStatus</code>, <code>HttpServletRequest</code>. A service throws domain exceptions; the web layer maps them to status codes.</li>
+      <li>No entities in controller signatures. Controllers speak DTOs.</li>
+      <li>No business logic in controllers or repositories.</li>
+      <li>Do not put <code>@Transactional</code> on a controller; do not call a <code>@Transactional</code> method from another method of the same class and expect a new transaction (self-invocation bypasses the proxy; see <a href="#m3">module 3</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: the fat controller</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: logic and database in the controller</p><pre><code class="language-java">@PostMapping
+public Product create(@RequestBody Product p) {
+    if (repo.existsBySku(p.getSku())) {
+        throw new RuntimeException("dup");
+    }
+    p.setCreatedAt(Instant.now());
+    return repo.save(p);
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: controller delegates</p><pre><code class="language-java">@PostMapping
+public ResponseEntity&lt;ProductResponse&gt; create(
+        @Valid @RequestBody CreateProductRequest r) {
+    ProductResponse created = service.create(r);
+    return ResponseEntity.created(location(created)).body(created);
+}</code></pre></div>
+    </div>
+    <p>The wrong version cannot be tested without a database, repeats its rules in every controller that needs them, and exposes the entity.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exception: simple lookups</p>
+    <p>For a trivial read-only app, a service that only forwards to the repository is "pass-through" code. Some teams still keep it so there is one place to add rules and transactions later. Pick the discipline early; moving it into a project later is harder than starting with it.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Why not call the repository from the controller?" Strong points: separation of concerns, one place for business rules and transactions, easier unit tests (mock the repository, no HTTP needed), reuse of the service from other entry points (scheduled jobs, message listeners), and the controller stays a thin translation layer between HTTP and your domain. Also name <code>@Component</code>, <code>@Service</code>, <code>@Repository</code> as stereotypes of the same idea (<a href="#m1">module 1</a>).</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-crud-example">
+  <h3>Complete CRUD example: Product API</h3>
+  <p class="tldr">One resource through every layer: entity, repository, DTO records, mapper, service, controller and exception handler, with curl requests and the JSON they return.</p>
+
+  <p>This is the pattern you will repeat for every resource in a job project. Pieces that need a later topic are marked: validation details are in <a href="#m2-validation">Bean Validation</a>, the full error handler in <a href="#m2-error-handling">error handling</a>, and JPA in <a href="#m3">module 3</a>. The example uses PostgreSQL and Spring Data JPA.</p>
+
+  <h4>Setup</h4>
+  <p>Start from Spring Initializr with: Spring Web, Spring Data JPA, Validation, PostgreSQL Driver. Package-by-feature under <code>com.example.shop.product</code>.</p>
+  <pre data-title="application.properties"><code class="language-properties">spring.datasource.url=jdbc:postgresql://localhost:5432/shop
+spring.datasource.username=shop_user
+spring.datasource.password=${DB_PASSWORD}
+# schema comes from Flyway/Liquibase or SQL scripts
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.open-in-view=false</code></pre>
+  <pre data-title="schema.sql (or a Flyway migration)"><code class="language-sql">CREATE TABLE product (
+    id          BIGSERIAL PRIMARY KEY,
+    name        VARCHAR(120)   NOT NULL,
+    sku         VARCHAR(40)    NOT NULL UNIQUE,
+    price       NUMERIC(10, 2) NOT NULL CHECK (price &gt; 0),
+    stock       INTEGER        NOT NULL DEFAULT 0,
+    created_at  TIMESTAMP WITH TIME ZONE NOT NULL
+);</code></pre>
+  <p>While learning you can use <code>spring.jpa.hibernate.ddl-auto=update</code> to let Hibernate create the table; real projects use migrations (<a href="#m3">module 3</a>).</p>
+
+  <h4>1. Entity</h4>
+  <pre data-title="Product.java"><code class="language-java">package com.example.shop.product;
+
+import jakarta.persistence.*;
+import java.math.BigDecimal;
+import java.time.Instant;
+
+@Entity
+@Table(name = "product")
+public class Product {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, length = 120)
+    private String name;
+
+    @Column(nullable = false, unique = true, length = 40)
+    private String sku;
+
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal price;
+
+    @Column(nullable = false)
+    private int stock;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    protected Product() { }                       // required by JPA
+
+    public Product(String name, String sku, BigDecimal price, int stock) {
+        this.name = name;
+        this.sku = sku;
+        this.price = price;
+        this.stock = stock;
+    }
+
+    @PrePersist
+    void onCreate() { this.createdAt = Instant.now(); }
+
+    public Long getId() { return id; }
+    public String getName() { return name; }
+    public String getSku() { return sku; }
+    public BigDecimal getPrice() { return price; }
+    public int getStock() { return stock; }
+    public Instant getCreatedAt() { return createdAt; }
+
+    public void update(String name, BigDecimal price, int stock) {
+        this.name = name;
+        this.price = price;
+        this.stock = stock;
+    }
+}</code></pre>
+
+  <h4>2. Repository</h4>
+  <pre data-title="ProductRepository.java"><code class="language-java">package com.example.shop.product;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface ProductRepository extends JpaRepository&lt;Product, Long&gt; {
+
+    boolean existsBySku(String sku);
+}</code></pre>
+  <p>Spring Data creates the implementation at startup; <code>existsBySku</code> becomes SQL from the method name.</p>
+
+  <h4>3. DTOs (records)</h4>
+  <pre data-title="ProductDtos.java (three public records, each in its own file in a real project)"><code class="language-java">public record CreateProductRequest(
+        @NotBlank @Size(max = 120) String name,
+        @NotBlank @Size(max = 40) String sku,
+        @NotNull @Positive @Digits(integer = 8, fraction = 2) BigDecimal price,
+        @PositiveOrZero int stock) {}
+
+public record UpdateProductRequest(
+        @NotBlank @Size(max = 120) String name,
+        @NotNull @Positive @Digits(integer = 8, fraction = 2) BigDecimal price,
+        @PositiveOrZero int stock) {}
+
+public record ProductResponse(
+        Long id, String name, String sku, BigDecimal price, int stock, Instant createdAt) {}</code></pre>
+  <p>The update request has no <code>sku</code>: the SKU cannot change, so the API does not accept it.</p>
+
+  <h4>4. Mapper (by hand)</h4>
+  <pre data-title="ProductMapper.java"><code class="language-java">@Component
+public class ProductMapper {
+
+    public Product toEntity(CreateProductRequest r) {
+        return new Product(r.name(), r.sku(), r.price(), r.stock());
+    }
+
+    public ProductResponse toResponse(Product p) {
+        return new ProductResponse(p.getId(), p.getName(), p.getSku(),
+                p.getPrice(), p.getStock(), p.getCreatedAt());
+    }
+}</code></pre>
+
+  <h4>5. Exceptions</h4>
+  <pre data-title="Domain exceptions"><code class="language-java">public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String resource, Object id) {
+        super(resource + " with id " + id + " not found");
+    }
+}
+
+public class DuplicateResourceException extends RuntimeException {
+    public DuplicateResourceException(String message) { super(message); }
+}</code></pre>
+
+  <h4>6. Service</h4>
+  <pre data-title="ProductService.java"><code class="language-java">@Service
+public class ProductService {
+
+    private final ProductRepository repository;
+    private final ProductMapper mapper;
+
+    public ProductService(ProductRepository repository, ProductMapper mapper) {
+        this.repository = repository;
+        this.mapper = mapper;
+    }
+
+    @Transactional(readOnly = true)
+    public List&lt;ProductResponse&gt; findAll() {
+        return repository.findAll().stream().map(mapper::toResponse).toList();
+    }
+
+    @Transactional(readOnly = true)
+    public ProductResponse findById(Long id) {
+        return mapper.toResponse(getOrThrow(id));
+    }
+
+    @Transactional
+    public ProductResponse create(CreateProductRequest request) {
+        if (repository.existsBySku(request.sku())) {
+            throw new DuplicateResourceException(
+                    "Product with SKU " + request.sku() + " already exists");
+        }
+        Product saved = repository.save(mapper.toEntity(request));
+        return mapper.toResponse(saved);
+    }
+
+    @Transactional
+    public ProductResponse update(Long id, UpdateProductRequest request) {
+        Product product = getOrThrow(id);
+        product.update(request.name(), request.price(), request.stock());
+        return mapper.toResponse(product);          // dirty checking saves it at commit
+    }
+
+    @Transactional
+    public void delete(Long id) {
+        Product product = getOrThrow(id);
+        repository.delete(product);
+    }
+
+    private Product getOrThrow(Long id) {
+        return repository.findById(id)
+                .orElseThrow(() -&gt; new ResourceNotFoundException("Product", id));
+    }
+}</code></pre>
+
+  <h4>7. Controller</h4>
+  <pre data-title="ProductController.java"><code class="language-java">@RestController
+@RequestMapping("/api/v1/products")
+public class ProductController {
+
+    private final ProductService service;
+
+    public ProductController(ProductService service) { this.service = service; }
+
+    @GetMapping
+    public List&lt;ProductResponse&gt; list() {
+        return service.findAll();
+    }
+
+    @GetMapping("/{id}")
+    public ProductResponse get(@PathVariable Long id) {
+        return service.findById(id);
+    }
+
+    @PostMapping
+    public ResponseEntity&lt;ProductResponse&gt; create(
+            @Valid @RequestBody CreateProductRequest request) {
+        ProductResponse created = service.create(request);
+        URI location = ServletUriComponentsBuilder.fromCurrentRequest()
+                .path("/{id}").buildAndExpand(created.id()).toUri();
+        return ResponseEntity.created(location).body(created);
+    }
+
+    @PutMapping("/{id}")
+    public ProductResponse update(@PathVariable Long id,
+            @Valid @RequestBody UpdateProductRequest request) {
+        return service.update(id, request);
+    }
+
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void delete(@PathVariable Long id) {
+        service.delete(id);
+    }
+}</code></pre>
+
+  <h4>8. Exception handler (minimal)</h4>
+  <pre data-title="GlobalExceptionHandler.java (the full version is in the error-handling article)"><code class="language-java">@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    ProblemDetail notFound(ResourceNotFoundException ex) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+
+    @ExceptionHandler(DuplicateResourceException.class)
+    ProblemDetail conflict(DuplicateResourceException ex) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
+    }
+}</code></pre>
+
+  <h4>Try it with curl</h4>
+  <p>Run the app (<code>./mvnw spring-boot:run</code>), then:</p>
+  <pre data-title="Create (201 + Location)"><code class="language-bash">curl -i -X POST http://localhost:8080/api/v1/products \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Wireless Mouse","sku":"MS-100","price":799.00,"stock":25}'</code></pre>
+  <pre class="out" data-title="Response"><code class="language-http">HTTP/1.1 201
+Location: http://localhost:8080/api/v1/products/1
+Content-Type: application/json
+
+{"id":1,"name":"Wireless Mouse","sku":"MS-100","price":799.00,"stock":25,
+ "createdAt":"2026-11-10T08:15:30.123456Z"}</code></pre>
+  <pre data-title="Read one and read all"><code class="language-bash">curl -s http://localhost:8080/api/v1/products/1
+curl -s http://localhost:8080/api/v1/products</code></pre>
+  <pre class="out" data-title="Response (list)"><code class="language-json">[
+  {"id":1,"name":"Wireless Mouse","sku":"MS-100","price":799.00,"stock":25,
+   "createdAt":"2026-11-10T08:15:30.123456Z"}
+]</code></pre>
+  <pre data-title="Replace (PUT)"><code class="language-bash">curl -s -X PUT http://localhost:8080/api/v1/products/1 \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Wireless Mouse Pro","price":999.00,"stock":20}'</code></pre>
+  <pre class="out" data-title="Response"><code class="language-json">{"id":1,"name":"Wireless Mouse Pro","sku":"MS-100","price":999.00,"stock":20,
+ "createdAt":"2026-11-10T08:15:30.123456Z"}</code></pre>
+  <pre data-title="Delete (204, then 404)"><code class="language-bash">curl -i -X DELETE http://localhost:8080/api/v1/products/1
+curl -i http://localhost:8080/api/v1/products/1</code></pre>
+  <pre class="out" data-title="Responses"><code class="language-http">HTTP/1.1 204
+
+HTTP/1.1 404
+Content-Type: application/problem+json
+
+{"type":"about:blank","title":"Not Found","status":404,
+ "detail":"Product with id 1 not found","instance":"/api/v1/products/1"}</code></pre>
+  <pre data-title="Business rule: duplicate SKU (409)"><code class="language-bash">curl -i -X POST http://localhost:8080/api/v1/products \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Another Mouse","sku":"MS-100","price":500,"stock":1}'</code></pre>
+  <pre class="out" data-title="Response"><code class="language-json">{"type":"about:blank","title":"Conflict","status":409,
+ "detail":"Product with SKU MS-100 already exists","instance":"/api/v1/products"}</code></pre>
+  <pre data-title="Validation failure (400) with the default Spring handling"><code class="language-bash">curl -i -X POST http://localhost:8080/api/v1/products \
+  -H "Content-Type: application/json" \
+  -d '{"name":"","sku":"X1","price":-5,"stock":0}'</code></pre>
+  <p>Without a handler for <code>MethodArgumentNotValidException</code> you only get a generic 400 body. The <a href="#m2-validation">validation</a> and <a href="#m2-error-handling">error-handling</a> articles turn it into a clean list of field errors.</p>
+
+  <h4>What to notice</h4>
+  <ul>
+    <li>The entity never leaves the service. The controller sees only records.</li>
+    <li>The service has no <code>ResponseEntity</code>; it throws domain exceptions that the advice maps to 404 and 409.</li>
+    <li><code>update</code> loads the entity and changes it inside a transaction; Hibernate's dirty checking writes the <code>UPDATE</code>. No <code>save</code> call is needed.</li>
+    <li>The check <code>existsBySku</code> is not race-proof: two concurrent requests can both pass it. The database <code>UNIQUE</code> constraint is the real guard; handle <code>DataIntegrityViolationException</code> as 409 too (see <a href="#m2-error-handling">error handling</a>).</li>
+    <li>PUT replaces the writable fields; that is why <code>UpdateProductRequest</code> requires all of them. For a partial update, use PATCH with an optional-field DTO.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases you should think about</p>
+    <ul>
+      <li>Delete of an already deleted product: this code returns 404 the second time. Some APIs return 204 again to make DELETE strictly idempotent in outcome; both are accepted, be consistent.</li>
+      <li><code>findAll()</code> on a big table is a performance bug. Real list endpoints are paged: <a href="#m2-pagination">pagination</a>.</li>
+      <li>Concurrent updates overwrite each other (lost update). Add a <code>@Version</code> field for optimistic locking (<a href="#m3">module 3</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Reviewers check this checklist on every endpoint: correct verb and status, DTO in and out, <code>@Valid</code> on bodies, no logic in the controller, transaction on the service, domain exceptions mapped centrally, a test for the happy path and for 400/404/409, and documentation in Swagger. You will use this same skeleton for the job-portal project in <a href="#m2-practice">the practice article</a>.</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-dtos">
+  <h3>DTOs and mapping (manual, MapStruct)</h3>
+  <p class="tldr">A DTO is a small class or record that defines exactly what goes into and out of your API; you map entities to DTOs in the service so internal fields and database details never leak, either by hand or with MapStruct.</p>
+
+  <p>A <strong>DTO</strong> (Data Transfer Object) carries data across a boundary. On the web edge, your API contract is the set of request and response DTOs. Your <strong>entity</strong> is a different thing: it describes a database table and may hold lazy relationships, password hashes, audit columns and internal flags. Mixing the two is the most common beginner mistake in Spring Boot APIs.</p>
+
+  <h4>Why you should never expose entities</h4>
+  <ol class="steps">
+    <li><strong>Leaking data.</strong> Return a <code>User</code> entity and the JSON includes <code>passwordHash</code>, <code>roles</code>, <code>deleted</code>, internal ids. Adding a column to the table silently adds it to the public API.</li>
+    <li><strong>Over-posting (mass assignment).</strong> If <code>@RequestBody</code> is an entity, a client can send <code>{"id": 1, "role": "ADMIN", "price": 1}</code> and set fields you never meant to expose. A request DTO has only the fields a client may set.</li>
+    <li><strong>Lazy-loading errors.</strong> A JPA relationship such as <code>order.getItems()</code> is loaded on demand. Jackson touches it after the transaction is closed and you get <code>LazyInitializationException</code>; with open-session-in-view it silently fires extra queries per row (the N+1 problem).</li>
+    <li><strong>Infinite recursion.</strong> A bidirectional relationship (<code>Order</code> ↔ <code>OrderItem</code>) makes Jackson loop until <code>StackOverflowError</code> or a "Document nesting depth" failure.</li>
+    <li><strong>Tight coupling.</strong> A database refactoring (rename a column, split a table) breaks every client. With DTOs the API stays the same and only the mapper changes.</li>
+    <li><strong>Different shapes for different needs.</strong> A list view needs three fields, a detail view fifteen, a create request needs no id and no timestamps. One entity cannot be all of these.</li>
+    <li><strong>Validation fits the request.</strong> Constraints like <code>@NotBlank</code> on a create request differ from the update request; the entity should hold database rules.</li>
+  </ol>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: entity as the API</p><pre><code class="language-java">@PostMapping
+public User register(@RequestBody User user) {   // client can set role, id, ...
+    return userRepository.save(user);            // response includes passwordHash
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: DTOs in and out</p><pre><code class="language-java">@PostMapping
+public UserResponse register(@Valid @RequestBody RegisterRequest request) {
+    return userService.register(request);        // service hashes the password
+}</code></pre></div>
+  </div>
+
+  <h4>Request DTO vs response DTO</h4>
+  <p>Use separate types for input and output and often one per operation. Java records are ideal: immutable, no boilerplate, and Jackson supports them.</p>
+  <pre data-title="User DTOs"><code class="language-java">public record RegisterRequest(
+        @NotBlank @Size(max = 80) String name,
+        @NotBlank @Email String email,
+        @NotBlank @Size(min = 8, max = 72) String password) {}
+
+public record UserResponse(Long id, String name, String email, Instant createdAt) {}
+// no password, no roles, no internal flags
+
+public record UserSummary(Long id, String name) {}   // for lists and nested use</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>DTO kind</th><th>Contains</th><th>Does not contain</th></tr></thead>
+    <tbody>
+      <tr><td>Create request</td><td>Fields the client may set</td><td>id, timestamps, computed fields</td></tr>
+      <tr><td>Update request</td><td>Changeable fields</td><td>Immutable fields (SKU, owner)</td></tr>
+      <tr><td>Patch request</td><td>Optional fields</td><td>Anything required</td></tr>
+      <tr><td>Response</td><td>What the client needs to display</td><td>Secrets, internal flags, lazy collections</td></tr>
+      <tr><td>Summary / list item</td><td>A few fields</td><td>Large nested data</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Mapping by hand</h4>
+  <p>Hand-written mapping is plain Java: no magic, easy to debug, the compiler tells you when you add a field and forget it somewhere. Keep it in a mapper class or as a static factory on the DTO.</p>
+  <pre data-title="Two common hand-written styles"><code class="language-java">// Style 1: a static factory method on the response record
+public record ProductResponse(Long id, String name, BigDecimal price) {
+    public static ProductResponse from(Product p) {
+        return new ProductResponse(p.getId(), p.getName(), p.getPrice());
+    }
+}
+List&lt;ProductResponse&gt; list = products.stream().map(ProductResponse::from).toList();
+
+// Style 2: a @Component mapper (see the CRUD article)
+@Component
+public class ProductMapper {
+    public ProductResponse toResponse(Product p) { ... }
+    public Product toEntity(CreateProductRequest r) { ... }
+}</code></pre>
+  <p>It is boring code, and that is fine for apps with up to a few dozen DTOs. When you have hundreds of mappings, a generator saves time and typos.</p>
+
+  <h4>MapStruct</h4>
+  <p><strong>MapStruct</strong> is an annotation processor: at compile time it generates a plain Java implementation of your mapper interface. There is no reflection at runtime, so it is fast, and the generated source is readable in <code>target/generated-sources</code>. If a target property has no source, the compiler warns you (set <code>unmappedTargetPolicy = ReportingPolicy.ERROR</code> to fail the build).</p>
+  <pre data-title="pom.xml (fragment)"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.mapstruct&lt;/groupId&gt;
+    &lt;artifactId&gt;mapstruct&lt;/artifactId&gt;
+    &lt;version&gt;${mapstruct.version}&lt;/version&gt;
+&lt;/dependency&gt;
+
+&lt;!-- inside maven-compiler-plugin configuration --&gt;
+&lt;annotationProcessorPaths&gt;
+    &lt;path&gt;
+        &lt;groupId&gt;org.mapstruct&lt;/groupId&gt;
+        &lt;artifactId&gt;mapstruct-processor&lt;/artifactId&gt;
+        &lt;version&gt;${mapstruct.version}&lt;/version&gt;
+    &lt;/path&gt;
+&lt;/annotationProcessorPaths&gt;</code></pre>
+  <p>Use the current stable MapStruct version from its website for <code>mapstruct.version</code>. If you also use Lombok, add Lombok and the <code>lombok-mapstruct-binding</code> artifact to the same processor-path list, with Lombok listed first, or mappers will not see Lombok-generated getters.</p>
+  <pre data-title="ProductMapper.java (MapStruct)"><code class="language-java">import org.mapstruct.*;
+
+@Mapper(componentModel = "spring")          // generated class is a Spring bean
+public interface ProductMapper {
+
+    ProductResponse toResponse(Product product);       // same names: automatic
+
+    List&lt;ProductResponse&gt; toResponses(List&lt;Product&gt; products);
+
+    @Mapping(target = "id", ignore = true)
+    @Mapping(target = "createdAt", ignore = true)
+    Product toEntity(CreateProductRequest request);
+
+    // different names and a small conversion
+    @Mapping(source = "title", target = "name")
+    @Mapping(target = "slug", expression = "java(request.title().toLowerCase())")
+    Product fromLegacy(LegacyRequest request);
+
+    // update an existing entity in place
+    @Mapping(target = "id", ignore = true)
+    @Mapping(target = "sku", ignore = true)
+    void updateEntity(UpdateProductRequest request, @MappingTarget Product product);
+}</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>MapStruct feature</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td><code>@Mapper(componentModel = "spring")</code></td><td>Generated implementation is a bean you inject</td></tr>
+      <tr><td><code>@Mapping(source, target)</code></td><td>Rename a property</td></tr>
+      <tr><td><code>@Mapping(target, ignore = true)</code></td><td>Do not fill this property</td></tr>
+      <tr><td><code>@Mapping(target, expression)</code> / <code>constant</code></td><td>Small computed values</td></tr>
+      <tr><td><code>@MappingTarget</code></td><td>Update an existing object</td></tr>
+      <tr><td><code>uses = OtherMapper.class</code></td><td>Reuse a mapper for nested types</td></tr>
+      <tr><td><code>@BeanMapping(nullValuePropertyMappingStrategy = IGNORE)</code></td><td>Skip nulls on update (simple PATCH)</td></tr>
+    </tbody>
+  </table></div>
+  <p>With a mapper bean, the service is the same as before: <code>ProductResponse r = mapper.toResponse(entity)</code>. MapStruct works with records and with classes.</p>
+
+  <h4>ModelMapper and other reflection mappers</h4>
+  <p>Libraries like <strong>ModelMapper</strong> map by guessing at runtime: <code>modelMapper.map(entity, ProductResponse.class)</code>. It saves typing but has real costs: errors show up at runtime (or silently as nulls) instead of compile time, a rename in one class quietly breaks a mapping, reflection is slower, and refactoring tools cannot follow it. Most teams, and most interviewers, prefer MapStruct or hand-written mapping.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>By hand</th><th>MapStruct</th><th>ModelMapper</th></tr></thead>
+    <tbody>
+      <tr><td>Checked at</td><td>Compile time</td><td>Compile time</td><td>Runtime</td></tr>
+      <tr><td>Speed</td><td>Fastest</td><td>Fast (plain code)</td><td>Slower (reflection)</td></tr>
+      <tr><td>Boilerplate</td><td>High</td><td>Low</td><td>Lowest</td></tr>
+      <tr><td>Debugging</td><td>Easy</td><td>Easy (generated source)</td><td>Hard</td></tr>
+      <tr><td>Recommended</td><td>Small and medium apps</td><td>Large apps</td><td>Avoid</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Nested DTOs and partial updates</h4>
+  <ul>
+    <li><strong>Nested objects:</strong> map a relationship to a small summary record, not the full entity: <code>OrderResponse(Long id, UserSummary customer, List&lt;OrderItemResponse&gt; items)</code>. Load the data you need in the service (a fetch join or an entity graph, <a href="#m3">module 3</a>) so no lazy load happens outside the transaction.</li>
+    <li><strong>Partial update (PATCH):</strong> use a request record with wrapper types, where <code>null</code> means "do not change": <code>PatchProductRequest(String name, BigDecimal price)</code>. A plain DTO cannot tell "not sent" from "sent as null". If you must support "set to null", use JSON Merge Patch or <code>JsonNullable</code>-style wrappers; for most APIs "null means unchanged" is enough.</li>
+    <li><strong>Projections:</strong> for read-heavy lists, Spring Data can return interface or record projections straight from the query, skipping the entity (<a href="#m3">module 3</a>).</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>No entity in a controller method signature, as parameter or return type, not even inside <code>List</code> or <code>ResponseEntity</code>.</li>
+      <li>Map inside the service transaction, before lazy data is out of reach.</li>
+      <li>Response DTOs never hold secrets; request DTOs never hold server-controlled fields (id, role, createdAt).</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Naming</p>
+    <p>Common names: <code>CreateProductRequest</code>, <code>UpdateProductRequest</code>, <code>ProductResponse</code>, <code>ProductSummary</code>. The suffix <code>Dto</code> alone (<code>ProductDto</code>) is also widely used, but it hides whether the type is for input or output. Nest the records inside a single <code>ProductDtos</code> class only for tiny projects.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>One <code>ProductDto</code> used for create, update and response, so the client must send an <code>id</code> and the response has null fields.</li>
+      <li>Using <code>@JsonIgnore</code> on entity fields to "hide" them. It is easy to forget and couples the database model to the API. Separate types are safer.</li>
+      <li>A mapper that calls <code>entity.getItems()</code> outside a transaction, giving <code>LazyInitializationException</code>.</li>
+      <li>Putting JPA annotations on DTOs, or validation annotations only on the entity.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Why use DTOs instead of returning entities?" Give at least four reasons: security (hide fields, stop over-posting), stability (API independent of the schema), lazy loading and recursion problems, and different shapes per use case. Then "How do you map?" Hand-written or MapStruct (compile-time, generated, fast); explain why you avoid reflection-based mappers.</p>
+  </div>
+</article>

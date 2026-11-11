@@ -1,0 +1,737 @@
+<article class="topic" id="m4-keys">
+  <h3>Keys: super, candidate, primary, alternate, unique, foreign, composite</h3>
+  <p class="tldr">A key is a column (or set of columns) that identifies rows: of all the keys that could be
+  the identifier (candidate keys), you pick one as the primary key; the rest are alternate keys, and a
+  foreign key points at another table's key.</p>
+
+  <h4>Why there are so many names</h4>
+  <p>Interviewers love this topic because the words overlap. They all answer one question: "which columns
+  identify a row?" Start from one idea: a <strong>super key</strong> is any set of columns whose values are
+  unique across the table. Everything else is a refinement of it. Take this table of employees:</p>
+<pre data-title="employees"><code class="language-sql">CREATE TABLE employees (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email         TEXT NOT NULL UNIQUE,
+    pan           CHAR(10) UNIQUE,            -- government tax id, optional
+    name          TEXT NOT NULL,
+    department_id BIGINT REFERENCES departments (id)
+);</code></pre>
+  <pre class="out" data-title="Sample rows"><code class="language-plaintext"> id |      email       |    pan     | name  | department_id
+----+------------------+------------+-------+---------------
+  1 | asha@corp.in     | ABCDE1234F | Asha  |             10
+  2 | bilal@corp.in    | PQRST5678K | Bilal |             10
+  3 | chitra@corp.in   |            | Chitra|             20</code></pre>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Key</th><th>Meaning</th><th>In <code>employees</code></th></tr></thead>
+    <tbody>
+      <tr><td><strong>Super key</strong></td><td>Any set of columns that is unique per row. It may carry
+      useless extra columns.</td><td><code>{id}</code>, <code>{id, name}</code>, <code>{email, name}</code>,
+      <code>{pan}</code> …</td></tr>
+      <tr><td><strong>Candidate key</strong></td><td>A minimal super key: remove any column and it is no
+      longer unique.</td><td><code>{id}</code>, <code>{email}</code>, <code>{pan}</code></td></tr>
+      <tr><td><strong>Primary key</strong></td><td>The one candidate key you choose as the official
+      identifier. Unique and <code>NOT NULL</code>; one per table.</td><td><code>id</code></td></tr>
+      <tr><td><strong>Alternate key</strong></td><td>A candidate key that was not chosen as the primary
+      key.</td><td><code>email</code>, <code>pan</code></td></tr>
+      <tr><td><strong>Unique key</strong></td><td>How you implement an alternate key: a <code>UNIQUE</code>
+      constraint. A table can have many; columns may allow <code>NULL</code>.</td>
+      <td><code>UNIQUE (email)</code>, <code>UNIQUE (pan)</code></td></tr>
+      <tr><td><strong>Foreign key</strong></td><td>Columns that must match a primary or unique key in another
+      (or the same) table.</td><td><code>department_id</code> → <code>departments.id</code></td></tr>
+      <tr><td><strong>Composite key</strong></td><td>A key made of two or more columns. It can be primary,
+      unique or foreign.</td><td><code>PRIMARY KEY (order_id, menu_item_id)</code> on a join table</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Super key and candidate key are theory words; you never write them in SQL. You write
+  <code>PRIMARY KEY</code>, <code>UNIQUE</code> and <code>FOREIGN KEY</code>. The theory tells you how to
+  <em>choose</em>: list every candidate key first, then pick the primary key from them.</p>
+
+  <h4>Primary key rules</h4>
+  <ul>
+    <li>It is unique and never <code>NULL</code>. The database builds a unique index for it.</li>
+    <li>A table has at most one primary key (which may be composite).</li>
+    <li>It should be stable: if a value can change (an email), every foreign key pointing at it must change
+    too. <code>ON UPDATE CASCADE</code> hides the cost but not the risk.</li>
+    <li>It should be small, because every foreign key and every index entry repeats it.</li>
+  </ul>
+
+  <h4>Unique key vs primary key</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Primary key</th><th>Unique key</th></tr></thead>
+    <tbody>
+      <tr><td>How many per table</td><td>One</td><td>Many</td></tr>
+      <tr><td><code>NULL</code> allowed</td><td>No</td><td>Yes. PostgreSQL allows many <code>NULL</code>s (each
+      is "unknown", so not equal). SQL Server allows only one.</td></tr>
+      <tr><td>Can be referenced by a foreign key</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Role</td><td>The row's identity</td><td>A business rule: "no two users share an email"</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Composite keys</h4>
+  <p>A composite key is right when no single column identifies a row but a combination does, for example
+  <code>(order_id, menu_item_id)</code> on <code>order_items</code>: one line per item per order. The column
+  order matters for the index that backs it: this key serves lookups by <code>order_id</code> alone, but not by
+  <code>menu_item_id</code> alone (see the leftmost-prefix rule in <a href="#m5-composite-indexes">Module 5</a>).
+  Composite keys get awkward when other tables must reference the row: each of them repeats every column. That
+  is a reason to prefer a single-column surrogate key for rows that other tables point at.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every table gets a primary key</p>
+    <p>A table without one allows duplicate rows that cannot be told apart, cannot be updated safely and cannot
+    be referenced by a foreign key. JPA also requires an <code>@Id</code>. If you cannot find a natural
+    identifier, add a surrogate one (next article).</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>MySQL's InnoDB stores the table <em>inside</em> the primary key index (a clustered index), so a large
+      primary key such as a random UUID makes every secondary index bigger and inserts scatter across pages.</li>
+      <li>A foreign key may point to a <code>UNIQUE</code> column, not only to a primary key, but pointing at the
+      primary key is clearer.</li>
+      <li>A composite foreign key must match the whole composite key, column for column. With
+      <code>MATCH SIMPLE</code> (the default) a row with any <code>NULL</code> in it skips the check.</li>
+      <li>A unique constraint on a nullable column does not stop duplicate "missing" values. To allow only one
+      row per non-null value, that is already what you get; to treat <code>NULL</code> as a value, use a partial
+      or expression index.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Candidate key vs primary key?</b> Candidate keys are all the minimal unique identifiers; the primary
+      key is the one you chose. The others are alternate keys, enforced with <code>UNIQUE</code>.</li>
+      <li><b>Super key vs candidate key?</b> A super key can have extra columns; a candidate key cannot lose
+      any column and stay unique.</li>
+      <li><b>Can a table have two primary keys?</b> No. It can have one composite primary key and many unique
+      keys.</li>
+      <li><b>Can a primary key be a foreign key?</b> Yes, in a shared-primary-key one-to-one, and in join tables
+      whose composite key consists of two foreign keys.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-surrogate-vs-natural">
+  <h3>Surrogate vs natural keys, and BIGINT vs UUID</h3>
+  <p class="tldr">A natural key is a real-world value (email, PAN, ISBN) used as the identifier; a surrogate key
+  is a meaningless id generated by the database, and for most application tables a surrogate
+  <code>BIGINT</code> identity primary key plus <code>UNIQUE</code> constraints on the natural keys is the
+  safest choice.</p>
+
+  <h4>The two kinds</h4>
+  <p>A <strong>natural key</strong> comes from the business: an email, a mobile number, an IFSC code, an ISBN,
+  a vehicle registration number. A <strong>surrogate key</strong> is invented by you: <code>id = 42</code> tells
+  you nothing about the row. The debate is old, but the practical answer is settled in most teams: use a
+  surrogate primary key, and still declare the natural keys <code>UNIQUE</code> so the business rule is
+  enforced.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Natural key</th><th>Surrogate key</th></tr></thead>
+    <tbody>
+      <tr><td>Meaning</td><td>Has business meaning</td><td>None; just an identity</td></tr>
+      <tr><td>Stability</td><td>Can change: people change email and mobile; "permanent" ids get
+      reissued or corrected</td><td>Never changes</td></tr>
+      <tr><td>Size</td><td>Often long text; repeated in every foreign key and index</td><td>8 bytes
+      (<code>BIGINT</code>) or 16 (UUID)</td></tr>
+      <tr><td>Privacy</td><td>Spreads personal data (an email or PAN) into every child table</td><td>Safe
+      to expose and log</td></tr>
+      <tr><td>Uniqueness guarantee</td><td>Only as good as the business rule; surprises are common</td><td>
+      Guaranteed by the generator</td></tr>
+      <tr><td>Readability</td><td>Self-explaining in joins and logs</td><td>Needs a join to know what it
+      is</td></tr>
+      <tr><td>Good fit</td><td>Tiny stable reference data: country code <code>IN</code>, currency
+      <code>INR</code></td><td>Almost every application entity</td></tr>
+    </tbody>
+  </table></div>
+  <p>The classic failure of natural keys: a company uses <code>email</code> as the primary key, then a user
+  asks to change it. Every <code>orders</code>, <code>addresses</code> and <code>payments</code> row that
+  references it must change in the same transaction, and every other system that stored the old value breaks.
+  With a surrogate key, you update one cell.</p>
+<pre data-title="Surrogate primary key, natural key still enforced"><code class="language-sql">CREATE TABLE users (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,   -- surrogate
+    email      TEXT NOT NULL,
+    mobile     TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_users_email  UNIQUE (email),                    -- natural key
+    CONSTRAINT uq_users_mobile UNIQUE (mobile)
+);</code></pre>
+  <p>Small code tables are the exception where a natural key is fine and even nicer, because the key is
+  readable and stable:</p>
+<pre data-title="Natural key on reference data"><code class="language-sql">CREATE TABLE currencies (
+    code CHAR(3) PRIMARY KEY,          -- 'INR', 'USD'
+    name TEXT NOT NULL
+);
+-- payments.currency CHAR(3) REFERENCES currencies (code)</code></pre>
+
+  <h4>Auto-generated numeric ids</h4>
+  <p>In PostgreSQL write <code>BIGINT GENERATED ALWAYS AS IDENTITY</code> (standard SQL, PostgreSQL 10+). The
+  older <code>BIGSERIAL</code> still works but is not standard. In MySQL write
+  <code>BIGINT AUTO_INCREMENT</code>. <code>GENERATED ALWAYS</code> refuses a manual value unless you say
+  <code>OVERRIDING SYSTEM VALUE</code>; <code>GENERATED BY DEFAULT</code> allows one. Use <code>BIGINT</code>,
+  not <code>INT</code>: a 32-bit integer ends at about 2.1 billion, and a busy table plus gaps from rolled-back
+  inserts can reach that sooner than you think. Changing the type on a 500-million-row table later is a long
+  migration.</p>
+  <p>Identity values have gaps. A rolled-back transaction still consumed its numbers; sequences never reuse
+  them. Never use the id as a "count of rows" or expect it to be gapless. If the business needs gapless
+  numbers (invoice numbers for GST), generate them in a controlled, separate step.</p>
+
+  <h4>BIGINT identity vs UUID</h4>
+  <p>A <strong>UUID</strong> is a 128-bit identifier shown as 36 characters, such as
+  <code>018f3c2e-7a41-7b3d-9c10-2f5d8a6b1e90</code>. It can be created anywhere, without asking the database.</p>
+  <ul>
+    <li><strong>v4</strong> is 122 random bits. Collisions are practically impossible. But values arrive in
+    random order.</li>
+    <li><strong>v7</strong> starts with a 48-bit millisecond timestamp, then random bits. Newer values sort
+    after older ones, so it keeps most of the uniqueness benefit and is friendly to indexes.</li>
+  </ul>
+<pre data-title="UUID primary keys in PostgreSQL"><code class="language-sql">-- v4: built in since PostgreSQL 13
+CREATE TABLE sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id BIGINT NOT NULL
+);
+
+-- v7: PostgreSQL 18 adds uuidv7(); on older versions generate it in the application
+-- id UUID PRIMARY KEY DEFAULT uuidv7()</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>BIGINT</code> identity</th><th>UUID v4</th><th>UUID v7</th></tr></thead>
+    <tbody>
+      <tr><td>Size</td><td>8 bytes</td><td>16 bytes</td><td>16 bytes</td></tr>
+      <tr><td>Insert pattern</td><td>Always at the end of the index</td><td>Random pages; more page
+      splits, cache misses, bigger WAL</td><td>Mostly at the end, like a counter</td></tr>
+      <tr><td>Guessable (<code>/orders/42</code>)</td><td>Yes: easy to enumerate</td><td>No</td><td>
+      Partly: the creation time is visible</td></tr>
+      <tr><td>Generated by</td><td>The database only</td><td>Anyone: app, mobile client</td><td>Anyone</td></tr>
+      <tr><td>Merging data from many systems</td><td>Ids clash</td><td>Safe</td><td>Safe</td></tr>
+      <tr><td>Readable in logs</td><td>Very</td><td>Hard</td><td>Hard</td></tr>
+    </tbody>
+  </table></div>
+  <p>A reasonable default: <code>BIGINT</code> identity for the primary key, and when you must expose an id in a
+  URL, add a separate random <code>public_id UUID UNIQUE</code> column, so the internal key stays small and
+  fast. Choose UUIDs as primary keys when ids are created outside the database (offline apps, many services,
+  data merged from several sources). Prefer v7 over v4 for a primary key. In MySQL InnoDB, a random v4 primary
+  key is the worst case, because the table itself is ordered by it.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: surrogate primary key, natural keys as UNIQUE</p>
+    <p>Name it <code>id</code>, type <code>BIGINT</code>, generated by the database. Every real-world
+    identifier (email, SKU, GSTIN) becomes a <code>UNIQUE</code> constraint with a name such as
+    <code>uq_users_email</code>. Expose a <code>public_id</code> if the id must be unguessable.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using a "stable" real-world value as the primary key</p>
+    <p>Phone numbers get recycled, emails change, PAN or Aadhaar numbers must not be copied into every table
+    (and may be restricted by law), names are not unique. If you choose a natural key, ask: can it change,
+    can it be missing or wrong at insert time, is it private, is it short?</p>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Spring Data JPA entities usually have <code>@Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    Long id</code>. If you use UUIDs, assign them in the application (or with a v7 generator) so the entity has
+    its id before it is saved; see <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Surrogate or natural key?</b> Surrogate primary key for stability and size; natural keys stay
+      <code>UNIQUE</code>. Natural keys are fine for tiny stable lookup tables.</li>
+      <li><b>Why not UUID everywhere?</b> 16 bytes in every index and foreign key, hard to read, and v4 inserts
+      fragment indexes. v7 reduces the last problem.</li>
+      <li><b>Why <code>BIGINT</code> over <code>INT</code>?</b> 2.1 billion is reachable, and gaps use up
+      numbers.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-fd-anomalies">
+  <h3>Functional dependencies and anomalies</h3>
+  <p class="tldr">A functional dependency "A → B" means that if you know A you know exactly one B; a table that
+  mixes several such facts about different things repeats data and suffers insert, update and delete
+  anomalies, which normalization removes.</p>
+
+  <h4>Functional dependencies in simple words</h4>
+  <p>Think of a <strong>functional dependency</strong> (FD) as "A decides B". Write it <code>A → B</code>. If
+  two rows have the same A, they must have the same B. Examples from a food app:</p>
+  <ul>
+    <li><code>restaurant_id → restaurant_name, city</code>: knowing the restaurant tells you its name and
+    city.</li>
+    <li><code>order_id → customer_id, order_date</code>: one order has one customer and one date.</li>
+    <li><code>(order_id, menu_item_id) → quantity</code>: the quantity needs both parts of the key.</li>
+    <li><code>menu_item_id → name</code> is true; <code>name → menu_item_id</code> is not (two restaurants can
+    both sell "Veg Biryani").</li>
+  </ul>
+  <p>FDs come from the business rules, not from the data you happen to see. A sample may look like
+  "city decides pincode" by luck. Always ask the business: "can one X ever have two Ys?" The left side of an FD
+  that decides every other column is a key. Normalization is the process of making sure every FD in a table
+  is justified by a key.</p>
+
+  <h4>Kinds of dependencies</h4>
+  <p>Four kinds of FD are worth naming, because the normal forms in
+  <a href="#m4-normalization">Normalization</a> are defined in terms of them. Take a table whose key is the
+  pair <code>(order_id, item)</code>:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Kind</th><th>Example</th><th>Meaning</th><th>Problem it causes</th></tr></thead>
+    <tbody>
+      <tr><td>Trivial</td><td><code>(order_id, item) → order_id</code></td><td>The right side is part of the
+      left side</td><td>None; always true</td></tr>
+      <tr><td>Full</td><td><code>(order_id, item) → qty</code></td><td>Needs the whole key</td><td>None;
+      this is what a good non-key column looks like</td></tr>
+      <tr><td>Partial</td><td><code>order_id → customer</code></td><td>Only part of the key decides it</td>
+      <td>Repeats on every item line; breaks 2NF</td></tr>
+      <tr><td>Transitive</td><td><code>order_id → customer → cust_city</code></td><td>A non-key column decides
+      another non-key column</td><td>Repeats the city for every order; breaks 3NF</td></tr>
+    </tbody>
+  </table></div>
+  <p>From a few FDs you can derive others with three rules called <strong>Armstrong's axioms</strong>:
+  <em>reflexivity</em> (a set determines its own subsets), <em>augmentation</em> (if A → B then A, C → B, C) and
+  <em>transitivity</em> (if A → B and B → C then A → C). Transitivity is the one that creates "hidden" chains
+  like <code>order_id → customer → cust_city</code>.</p>
+
+  <h4>Finding the key: attribute closure</h4>
+  <p>The <strong>closure</strong> of a set of columns is everything they decide, directly or through chains. A
+  set whose closure is <em>all</em> columns is a key (a minimal one is a candidate key; see
+  <a href="#m4-keys">Keys</a>). Take the FDs of the order sheet below (customer names are assumed unique to keep
+  the sketch short):</p>
+  <ul>
+    <li><code>order_id → customer, restaurant</code></li>
+    <li><code>customer → cust_city</code> and <code>restaurant → rest_city</code></li>
+    <li><code>(restaurant, item) → price</code></li>
+    <li><code>(order_id, item) → qty</code></li>
+  </ul>
+  <ol class="steps">
+    <li>Start with <code>{order_id, item}</code>.</li>
+    <li>The first FD adds <code>customer</code> and <code>restaurant</code>.</li>
+    <li>The second adds <code>cust_city</code> and <code>rest_city</code>.</li>
+    <li>Now <code>restaurant</code> and <code>item</code> are both known, so <code>price</code> joins in.</li>
+    <li>The last FD adds <code>qty</code>. All eight columns are reached: <code>(order_id, item)</code> is a
+    key.</li>
+  </ol>
+  <p>Start with <code>{order_id}</code> alone and you stop after customer, restaurant and the two cities: no
+  <code>item</code>, <code>qty</code> or <code>price</code>. So <code>order_id</code> is only <em>part</em> of
+  the key, and the columns it decides are the partial dependencies.</p>
+
+  <h4>Testing a suspected FD against data</h4>
+  <p>Data can <em>disprove</em> an FD, never prove it. To test "customer decides cust_city", look for a customer
+  that has two cities:</p>
+  <pre data-title="Counter-example search"><code class="language-sql">SELECT customer
+FROM order_sheet
+GROUP BY customer
+HAVING COUNT(DISTINCT cust_city) &gt; 1;</code></pre>
+  <p>On the sheet below the query returns no rows, so no counter-example exists yet. That is not proof; it only
+  means the data does not contradict the rule. After the half-finished update shown later it returns
+  <code>Asha</code>: the FD is now violated by the data, which is exactly an update anomaly.</p>
+
+  <h4>An unnormalized table and its anomalies</h4>
+  <p>A beginner stores everything about an order in one wide table:</p>
+  <pre class="out" data-title="order_sheet (one table for everything)"><code class="language-plaintext"> order_id | customer | cust_city | restaurant | rest_city | item         | qty | price
+----------+----------+-----------+------------+-----------+--------------+-----+------
+      101 | Asha     | Pune      | Spice Hub  | Pune      | Paneer Tikka |   2 |  220
+      101 | Asha     | Pune      | Spice Hub  | Pune      | Butter Naan  |   4 |   40
+      102 | Bilal    | Delhi     | Dosa Point | Delhi     | Masala Dosa  |   1 |  120
+      103 | Asha     | Pune      | Dosa Point | Delhi     | Masala Dosa  |   2 |  120</code></pre>
+  <p>Customer facts repeat on every line, restaurant facts repeat on every line, and the item price repeats on
+  every order. Three problems follow.</p>
+  <h5>Update anomaly</h5>
+  <p>Asha moves to Mumbai. You must change every one of her rows (101, 101, 103). Miss one and the table says
+  she lives in two cities. The same happens when Dosa Point changes its name.</p>
+<pre data-title="A partial update leaves contradictory data"><code class="language-sql">UPDATE order_sheet SET cust_city = 'Mumbai'
+WHERE order_id = 101;            -- forgot order 103!
+SELECT DISTINCT customer, cust_city FROM order_sheet WHERE customer = 'Asha';</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> customer | cust_city
+----------+-----------
+ Asha     | Mumbai
+ Asha     | Pune
+(2 rows)</code></pre>
+  <h5>Insert anomaly</h5>
+  <p>A new restaurant signs up but has no orders yet. There is no row to put it in, unless you invent a fake
+  order with <code>NULL</code> in the order columns. Facts about one thing cannot exist without facts about
+  another.</p>
+<pre data-title="No order, no row (key columns cannot be NULL)"><code class="language-sql">-- order_sheet has PRIMARY KEY (order_id, item)
+INSERT INTO order_sheet (restaurant, rest_city) VALUES ('Tandoor Town', 'Pune');
+-- ERROR:  null value in column "order_id" of relation "order_sheet" violates not-null constraint</code></pre>
+  <h5>Delete anomaly</h5>
+  <p>Asha cancels order 101 and you delete both of its rows. Spice Hub appears in no other order, so the only rows that said "Spice Hub exists in Pune and sells Paneer Tikka at 220 and Butter Naan at 40" are gone too. Deleting one order destroyed a restaurant and its menu. (Deleting order 102 would be harmless here, because Dosa Point also appears in order 103: whether you lose the fact depends on luck, which is the problem.)</p>
+<pre data-title="Deleting the order deletes the restaurant"><code class="language-sql">DELETE FROM order_sheet WHERE order_id = 101;
+SELECT * FROM order_sheet WHERE restaurant = 'Spice Hub';   -- 0 rows: Spice Hub is gone</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Anomaly</th><th>What goes wrong</th><th>Root cause</th></tr></thead>
+    <tbody>
+      <tr><td>Update</td><td>One fact stored many times; some copies change, some do not</td><td>Redundancy</td></tr>
+      <tr><td>Insert</td><td>Cannot record a fact until an unrelated fact exists</td><td>Two subjects in
+      one table</td></tr>
+      <tr><td>Delete</td><td>Removing one fact removes another</td><td>Two subjects in one table</td></tr>
+    </tbody>
+  </table></div>
+  <p>All three disappear when each table describes <em>one thing</em> and every non-key column depends on the
+  key of that thing. The next article does this step by step.</p>
+
+
+  <h4>What the fixed design looks like</h4>
+  <p>Each FD gets a home. The determinant becomes the key of a table that holds exactly what it decides:</p>
+  <pre data-title="One subject per table (PostgreSQL)"><code class="language-sql">CREATE TABLE customers   (customer_id INT PRIMARY KEY,
+                          name VARCHAR(50) NOT NULL, city VARCHAR(50) NOT NULL);
+CREATE TABLE restaurants (restaurant_id INT PRIMARY KEY,
+                          name VARCHAR(50) NOT NULL, city VARCHAR(50) NOT NULL);
+CREATE TABLE menu_items  (menu_item_id INT PRIMARY KEY,
+                          restaurant_id INT NOT NULL REFERENCES restaurants,
+                          name VARCHAR(50) NOT NULL, price NUMERIC(8,2) NOT NULL);
+CREATE TABLE orders      (order_id INT PRIMARY KEY,
+                          customer_id INT NOT NULL REFERENCES customers,
+                          restaurant_id INT NOT NULL REFERENCES restaurants);
+CREATE TABLE order_lines (order_id INT REFERENCES orders,
+                          menu_item_id INT REFERENCES menu_items,
+                          qty INT NOT NULL CHECK (qty &gt; 0),
+                          PRIMARY KEY (order_id, menu_item_id));</code></pre>
+  <p>Now each anomaly is gone:</p>
+  <pre data-title="The same three tasks, one row each"><code class="language-sql">UPDATE customers SET city = 'Mumbai' WHERE customer_id = 1;         -- Asha moves: one row
+INSERT INTO restaurants VALUES (4, 'Tandoor Town', 'Pune');          -- no order needed
+DELETE FROM orders WHERE order_id = 101;  -- (after deleting its lines) restaurant stays</code></pre>
+  <p>Fully worked, with all the steps from 1NF to 3NF, in <a href="#m4-normalization">Normalization</a> and
+  <a href="#m4-food-delivery-design">the food-delivery design</a>. A price copied into the order line at
+  purchase time (as <code>order_items.unit_price</code> in the
+  <a href="#m1-sample-schema">sample database</a>) is not a violation: it records a different fact, "the price on
+  that day", which must not change when the menu price does.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: an FD is a statement about every possible row, not only today's rows</p>
+    <p>"city decides pincode" may be true in your ten sample rows and false in real life (one city has many
+    pincodes). Decide FDs from the business rules and confirm them with the people who own the data. Use SQL
+    only to hunt for counter-examples.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using a name as the determinant</p>
+    <p>"customer decides cust_city" fails the day two customers are both called Asha. Names, emails typed by
+    hand and phone numbers are poor determinants; a surrogate id is a safe one.</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: changes every Asha</p><pre><code class="language-sql">UPDATE order_sheet SET cust_city = 'Mumbai'
+WHERE customer = 'Asha';</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: the id points to one person</p><pre><code class="language-sql">UPDATE customers SET city = 'Mumbai'
+WHERE customer_id = 1;</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases: when redundancy is acceptable</p>
+    <ul>
+      <li><strong>Read-only copies.</strong> Reporting tables and data warehouses repeat values on purpose to
+      avoid joins. There, nobody updates a single row; the table is rebuilt from the source of truth. See
+      <a href="#m4-denormalization">Denormalization</a>.</li>
+      <li><strong>Snapshots.</strong> A price or address stored on an order as it was at that moment is history,
+      not redundancy.</li>
+      <li><strong>NULL and FDs.</strong> If <code>restaurant → rest_city</code> and some restaurants have no city
+      yet, a NULL city is a "not known" value, not a second city. Keep key columns <code>NOT NULL</code> so FDs
+      stay reliable.</li>
+    </ul>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: a quick smell test</p>
+    <p>If you see the same value typed again and again down a column (a city, a product name, a category),
+    ask "which fact does this repeat, and which key decides it?" Then move it to its own table. If a column
+    needs "N/A" or <code>NULL</code> for most rows because the row is about something else, you have mixed
+    subjects.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>What is a functional dependency?</b> A → B: each value of A is linked to exactly one value of B.
+      A key is an A that decides every column.</li>
+      <li><b>Name the three anomalies with an example.</b> Update: change in many places. Insert: cannot add a
+      restaurant without an order. Delete: deleting the last order erases the restaurant.</li>
+      <li><b>Why do anomalies happen?</b> Redundancy from storing several subjects in one table.</li>
+      <li><b>Partial vs transitive dependency?</b> Partial: a non-key column depends on only part of a composite key (breaks 2NF). Transitive: a non-key column depends on another non-key column (breaks 3NF).</li>
+      <li><b>Is every FD a key?</b> No. A key is a left side whose closure is every column. <code>customer → cust_city</code> is an FD but <code>customer</code> is not a key of the order sheet.</li>
+      <li><b>How do you show an FD does not hold?</b> Find two rows with the same left side and different right sides (a <code>GROUP BY … HAVING COUNT(DISTINCT …) &gt; 1</code> query).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-normalization">
+  <h3>Normalization: 1NF, 2NF, 3NF, BCNF (and 4NF)</h3>
+  <p class="tldr">Normalization splits a table until every non-key column depends on "the key, the whole key,
+  and nothing but the key": 1NF removes repeating groups, 2NF removes partial dependencies, 3NF removes
+  transitive dependencies, and BCNF closes the last gaps.</p>
+
+  <h4>The idea</h4>
+  <p>Each normal form is a stricter test. A table in 3NF is also in 2NF and 1NF. The memory line "the key (1NF),
+  the whole key (2NF), and nothing but the key (3NF), so help me Codd" sums it up. We will use one running
+  example, the order sheet from the previous article, and fix it step by step.</p>
+
+  <h4>0NF: not even first normal form</h4>
+  <p>Here the sheet keeps all items of an order in one row and stores several phone numbers in one cell:</p>
+  <pre class="out" data-title="0NF: repeating groups and a multi-valued cell"><code class="language-plaintext"> order_id | customer | phones            | restaurant | items
+----------+----------+-------------------+------------+--------------------------------
+      101 | Asha     | 98100, 98200      | Spice Hub  | Paneer Tikka x2, Butter Naan x4
+      102 | Bilal    | 98300             | Dosa Point | Masala Dosa x1</code></pre>
+
+  <h4>1NF: atomic values, no repeating groups</h4>
+  <p><strong>Rule:</strong> every cell holds one value, there are no repeating groups or arrays of values, and
+  rows are identified by a key. Give each item its own row and keep one phone per row. The key becomes
+  <code>(order_id, item)</code>.</p>
+  <pre class="out" data-title="1NF: order_lines, key (order_id, item)"><code class="language-plaintext"> order_id | item         | qty | price | customer | cust_city | restaurant | rest_city
+----------+--------------+-----+-------+----------+-----------+------------+----------
+      101 | Paneer Tikka |   2 |   220 | Asha     | Pune      | Spice Hub  | Pune
+      101 | Butter Naan  |   4 |    40 | Asha     | Pune      | Spice Hub  | Pune
+      102 | Masala Dosa  |   1 |   120 | Bilal    | Delhi     | Dosa Point | Delhi</code></pre>
+  <p>Phones move to their own table <code>customer_phones (customer, phone)</code>. The wide table is now in
+  1NF, but still has the anomalies from before. Look at the dependencies:</p>
+  <ul>
+    <li><code>(order_id, item) → qty</code>: needs the whole key. Good.</li>
+    <li><code>order_id → customer, cust_city, restaurant, rest_city</code>: needs only <em>part</em> of the key.</li>
+    <li><code>item → price</code>: needs only the other part of the key.</li>
+  </ul>
+
+  <h4>2NF: no partial dependency on a composite key</h4>
+  <p><strong>Rule:</strong> in 1NF, and every non-key column depends on the <em>whole</em> key, not on part
+  of it. This only matters when the key is composite. Split by the part of the key that decides the column:</p>
+  <pre class="out" data-title="2NF: three tables"><code class="language-plaintext">orders(order_id PK, customer, cust_city, restaurant, rest_city)
+   101 | Asha  | Pune  | Spice Hub  | Pune
+   102 | Bilal | Delhi | Dosa Point | Delhi
+
+menu_items(item PK, price)
+   Paneer Tikka | 220
+   Butter Naan  |  40
+   Masala Dosa  | 120
+
+order_lines(order_id PK/FK, item PK/FK, qty)
+   101 | Paneer Tikka | 2
+   101 | Butter Naan  | 4
+   102 | Masala Dosa  | 1</code></pre>
+  <p>Item price is now stored once. (Later we will bring the price at order time back on purpose; see
+  <a href="#m4-denormalization">Denormalization</a>.)</p>
+  <p>One problem is left in <code>orders</code>: <code>cust_city</code> is not decided by
+  <code>order_id</code> directly, but by <code>customer</code>, who is decided by <code>order_id</code>. If
+  Asha places ten orders, her city repeats ten times.</p>
+
+  <h4>3NF: no transitive dependency</h4>
+  <p><strong>Rule:</strong> in 2NF, and no non-key column depends on another non-key column. A
+  <strong>transitive dependency</strong> is a chain <code>order_id → customer → cust_city</code>: the city
+  depends on the key only through the customer. Move each chain to its own table:</p>
+  <pre class="out" data-title="3NF"><code class="language-plaintext">customers(customer_id PK, name, city)
+restaurants(restaurant_id PK, name, city)
+menu_items(menu_item_id PK, restaurant_id FK, name, price)
+orders(order_id PK, customer_id FK, restaurant_id FK, ordered_at)
+order_lines(order_id PK/FK, menu_item_id PK/FK, qty)
+customer_phones(customer_id FK, phone, PK(customer_id, phone))</code></pre>
+  <p>Every table is about one thing. Changing Asha's city is one update, a restaurant can exist with no
+  orders, and deleting an order never deletes a customer. Most business databases stop at 3NF, and it is the
+  level interviews expect for a design question. Here it is as SQL:</p>
+<pre data-title="The 3NF schema (shortened)"><code class="language-sql">CREATE TABLE customers   (customer_id   BIGINT PRIMARY KEY, name TEXT NOT NULL, city TEXT NOT NULL);
+CREATE TABLE restaurants (restaurant_id BIGINT PRIMARY KEY, name TEXT NOT NULL, city TEXT NOT NULL);
+CREATE TABLE menu_items (
+    menu_item_id  BIGINT PRIMARY KEY,
+    restaurant_id BIGINT NOT NULL REFERENCES restaurants (restaurant_id),
+    name          TEXT NOT NULL,
+    price         NUMERIC(8,2) NOT NULL
+);
+CREATE TABLE orders (
+    order_id      BIGINT PRIMARY KEY,
+    customer_id   BIGINT NOT NULL REFERENCES customers (customer_id),
+    restaurant_id BIGINT NOT NULL REFERENCES restaurants (restaurant_id),
+    ordered_at    TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE order_lines (
+    order_id     BIGINT REFERENCES orders (order_id),
+    menu_item_id BIGINT REFERENCES menu_items (menu_item_id),
+    qty          INT NOT NULL CHECK (qty &gt; 0),
+    PRIMARY KEY (order_id, menu_item_id)
+);</code></pre>
+
+  <h4>BCNF: every determinant is a key</h4>
+  <p><strong>Boyce-Codd normal form</strong> is a slightly stricter 3NF. <strong>Rule:</strong> for every
+  functional dependency <code>X → Y</code> in the table, X must be a super key. 3NF allows one loophole: a
+  non-key column may determine part of a candidate key. BCNF closes it. The loophole appears rarely and only
+  with overlapping candidate keys. Example: riders work in zones, each dispatcher handles exactly one zone, and
+  a rider in a zone is looked after by one dispatcher.</p>
+  <pre class="out" data-title="rider_zones: 3NF but not BCNF"><code class="language-plaintext"> rider_id | zone       | dispatcher
+----------+------------+-----------
+        7 | Kothrud    | Meena
+        7 | Hinjewadi  | Sunil
+        8 | Kothrud    | Meena
+        9 | Hinjewadi  | Sunil</code></pre>
+  <p>The dependencies are <code>(rider_id, zone) → dispatcher</code> and <code>dispatcher → zone</code>.
+  The candidate keys are <code>(rider_id, zone)</code> and <code>(rider_id, dispatcher)</code>. Now
+  <code>dispatcher → zone</code> has a determinant (dispatcher) that is <em>not</em> a key, so BCNF fails,
+  although 3NF passes (zone is part of a candidate key). The symptom is redundancy: "Meena handles Kothrud"
+  is repeated, and renaming her means several updates. Decompose:</p>
+<pre data-title="BCNF decomposition"><code class="language-sql">CREATE TABLE dispatchers (
+    dispatcher TEXT PRIMARY KEY,
+    zone       TEXT NOT NULL
+);
+CREATE TABLE rider_dispatchers (
+    rider_id   BIGINT NOT NULL,
+    dispatcher TEXT   NOT NULL REFERENCES dispatchers (dispatcher),
+    PRIMARY KEY (rider_id, dispatcher)
+);</code></pre>
+  <p>The price: the original rule "a rider has one dispatcher per zone" is no longer a single constraint, so
+  you must enforce it another way (a trigger, or application logic). This is the known trade-off: BCNF can lose
+  dependency preservation, while 3NF decomposition never does. In practice, aim for BCNF and accept 3NF when
+  BCNF would make a rule hard to enforce.</p>
+
+  <h4>4NF and beyond, in one paragraph</h4>
+  <p><strong>Fourth normal form</strong> removes multi-valued dependencies. If a restaurant has several
+  cuisines and several delivery areas, and the two lists are independent, storing them in one table
+  <code>(restaurant_id, cuisine, area)</code> forces every combination: 3 cuisines and 4 areas make 12 rows,
+  and adding a cuisine means adding 4 rows. Split into <code>restaurant_cuisines</code> and
+  <code>restaurant_areas</code>, two independent many-to-many tables. 5NF handles rarer join dependencies and
+  is seldom needed. If you model each many-to-many relationship as its own join table, you get 4NF for free.</p>
+
+  <h4>Summary</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Form</th><th>Fixes</th><th>Test question</th></tr></thead>
+    <tbody>
+      <tr><td>1NF</td><td>Repeating groups, multi-valued cells</td><td>Is every cell a single value and every row
+      uniquely identified?</td></tr>
+      <tr><td>2NF</td><td>Partial dependency on part of a composite key</td><td>Does each non-key column need the
+      whole key?</td></tr>
+      <tr><td>3NF</td><td>Transitive dependency via a non-key column</td><td>Does any non-key column decide
+      another non-key column?</td></tr>
+      <tr><td>BCNF</td><td>A non-key determinant, with overlapping keys</td><td>Is every determinant a super
+      key?</td></tr>
+      <tr><td>4NF</td><td>Independent multi-valued facts in one table</td><td>Are two unrelated lists crossed
+      together?</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: normalize from the dependencies, not from guesses</p>
+    <p>List the functional dependencies first, find the keys, then check each form. A table with a
+    single-column key is automatically in 2NF (no partial dependency is possible). 3NF is the practical
+    target for transactional (OLTP) databases.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Is a <code>TEXT[]</code> or <code>JSONB</code> column a 1NF violation? Strictly, yes when you query
+      inside it as a list of facts. Use it for opaque data you only store and return, not for things you join
+      or count.</li>
+      <li>Splitting an address into street, city, pincode is "atomic enough" if you filter by city. Atomic
+      depends on how you use the value, not on the type.</li>
+      <li><code>pincode → city</code> is a real transitive dependency; many teams keep both columns on the address
+      because the data is entered together and rarely changes. That is a conscious denormalization.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: normalizing past usefulness</p>
+    <p>Splitting <code>gender</code>, <code>title</code> and <code>country</code> into lookup tables for a
+    10-row demo gives joins and no benefit. Normalize facts that change or repeat in volume (customer, product,
+    price). A <code>CHECK</code> constraint is enough for a tiny, fixed list.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Explain 1NF, 2NF, 3NF with an example.</b> Use the order sheet: items to rows (1NF), item price out
+      of the order line (2NF), customer city out of the order (3NF).</li>
+      <li><b>3NF vs BCNF?</b> BCNF needs every determinant to be a super key; 3NF lets a non-key column decide
+      part of a key. BCNF may lose a dependency.</li>
+      <li><b>Is a higher normal form always better?</b> No. It reduces anomalies but adds joins; see
+      <a href="#m4-denormalization">Denormalization</a>.</li>
+      <li><b>What is a partial dependency? A transitive dependency?</b> A column depending on part of a
+      composite key; a column depending on the key through another non-key column.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-denormalization">
+  <h3>Denormalization: when and how</h3>
+  <p class="tldr">Denormalization means deliberately storing redundant data to avoid joins or to freeze a
+  historical value; do it only for a measured need, and keep the copies consistent in a planned way.</p>
+
+  <h4>Normalize first, then break the rule on purpose</h4>
+  <p>A normalized schema is the correct starting point: it protects the data. Denormalization is a conscious
+  trade: faster or simpler reads in exchange for harder writes and a risk of inconsistency. "My join looks
+  complicated" is not a reason. A proper index and a good query fix most slow joins. Denormalize when you have
+  a measured problem or a real business rule.</p>
+
+  <h4>When it is the right thing</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Case</th><th>Example</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>History snapshot</td><td><code>order_items.unit_price</code> copied from the menu item when the
+      order is placed</td><td>This is not redundancy; it is a different fact: "the price <em>at that
+      time</em>". The menu price will change.</td></tr>
+      <tr><td>Address snapshot</td><td>Delivery address text copied onto the order</td><td>The customer may edit
+      or delete the saved address later; the order must remember where it went.</td></tr>
+      <tr><td>Derived counter</td><td><code>restaurants.rating_avg</code>, <code>rating_count</code></td>
+      <td>Computing <code>AVG</code> over millions of reviews on every page view is wasteful.</td></tr>
+      <tr><td>Read-heavy reports</td><td>A nightly <code>daily_sales</code> summary table</td><td>Dashboards
+      read pre-aggregated rows instead of scanning all orders.</td></tr>
+      <tr><td>Hot-path join</td><td>Restaurant name copied to a search index or listing table</td><td>Avoid a
+      join on the busiest page; accept a small delay in updates.</td></tr>
+    </tbody>
+  </table></div>
+<pre data-title="Snapshot columns on order_items"><code class="language-sql">CREATE TABLE order_items (
+    order_id     BIGINT NOT NULL REFERENCES orders (id) ON DELETE CASCADE,
+    menu_item_id BIGINT NOT NULL REFERENCES menu_items (id),
+    item_name    TEXT   NOT NULL,                   -- name at order time
+    unit_price_paise BIGINT NOT NULL CHECK (unit_price_paise &gt;= 0),  -- price at order time
+    quantity     INT    NOT NULL CHECK (quantity &gt; 0),
+    PRIMARY KEY (order_id, menu_item_id)
+);
+
+INSERT INTO order_items (order_id, menu_item_id, item_name, unit_price_paise, quantity)
+SELECT 101, id, name, price_paise, 2 FROM menu_items WHERE id = 5;</code></pre>
+
+  <h4>Keeping redundant data consistent</h4>
+  <p>A copy is a promise to keep two places equal. Choose one mechanism and make it the only way to write:</p>
+  <ol class="steps">
+    <li><strong>Same transaction.</strong> Update the source and the copy in one transaction in the service
+    layer. Simple, but every writer must remember.</li>
+    <li><strong>Trigger.</strong> The database updates the counter on every insert into the child table. It
+    cannot be bypassed, but it hides logic and slows writes.</li>
+    <li><strong>Materialized view.</strong> <code>CREATE MATERIALIZED VIEW daily_sales AS …</code> stores the
+    result of a query; <code>REFRESH MATERIALIZED VIEW</code> rebuilds it (on a schedule). Good for reports.</li>
+    <li><strong>Periodic job.</strong> A nightly job recomputes counters from the source of truth. It also
+    repairs any drift.</li>
+    <li><strong>Events.</strong> Publish "restaurant renamed" and let other services update their copies;
+    consistency is eventual (see <a href="#m6">Module 6</a>).</li>
+  </ol>
+<pre data-title="A counter kept in sync by the same transaction"><code class="language-sql">BEGIN;
+INSERT INTO reviews (restaurant_id, user_id, stars) VALUES (3, 1, 5);
+UPDATE restaurants
+SET rating_count = rating_count + 1,
+    rating_sum   = rating_sum + 5          -- average = rating_sum / rating_count
+WHERE id = 3;
+COMMIT;</code></pre>
+  <p>Store the sum and the count, not the average: the average cannot be updated correctly from itself, but a
+  sum and a count can.</p>
+
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Fewer joins; faster reads</li>
+      <li>Historical correctness (snapshots)</li>
+      <li>Simple queries for reports</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>Redundant storage</li>
+      <li>Every write must update the copies</li>
+      <li>Copies can drift and need repair jobs</li>
+      <li>More code to remember and test</li>
+    </ul></div>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: one source of truth for every fact</p>
+    <p>For each denormalized value, decide which column is the truth and how the copy is refreshed. Write it in
+    a comment on the column or in the team's design notes. A copy with no refresh plan is a bug waiting to
+    happen.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: denormalizing before measuring</p>
+    <p>Copying <code>customer_name</code> onto every order "to avoid a join" gives you update anomalies from
+    the previous article, on purpose. First check the plan with <code>EXPLAIN ANALYZE</code> (see
+    <a href="#m5-explain">Module 5</a>) and add an index. Only denormalize if the cost is still too high.</p>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Transactional databases (OLTP) stay close to 3NF with a few snapshots and counters. Analytics
+    databases (OLAP, data warehouses) often use wide, denormalized "star schemas" on purpose. Document stores
+    such as MongoDB embed related data by design (see <a href="#m6-mongodb">MongoDB</a>).</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>When would you denormalize?</b> Measured read-performance problems, derived counters and reports,
+      and history snapshots such as price on an order line.</li>
+      <li><b>What are the risks?</b> Inconsistent copies, slower writes, extra code.</li>
+      <li><b>Why store <code>unit_price</code> on <code>order_items</code> if it is on <code>menu_items</code>?</b>
+      Because the menu price changes and the order must keep the price actually charged.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,348 @@
+<article class="topic" id="m1-virtual-memory">
+  <h3>Virtual memory, demand paging and page faults</h3>
+  <p class="tldr">Virtual memory lets a process use more memory than RAM holds and gives each process a private address space by keeping only the pages in use in RAM and the rest on disk; a page that is touched but absent causes a page fault, which the OS handles by loading it from disk.</p>
+
+  <h4>Why virtual memory?</h4>
+  <p>Programs rarely use all their memory at once: error handlers, rarely used features and large arrays are often untouched. Loading everything wastes RAM. <strong>Virtual memory</strong> separates the logical memory that a programmer sees from the physical RAM, and it brings these benefits:</p>
+  <ul>
+    <li>A program can be <strong>larger than physical RAM</strong>.</li>
+    <li>More programs fit in RAM at once (only their active pages), so CPU utilisation and throughput rise.</li>
+    <li>Each process gets its own large, private <strong>address space</strong> (protection).</li>
+    <li>Processes can share pages (libraries, <code>fork</code> copy-on-write, <code>mmap</code> of files).</li>
+    <li>Programs start faster, because only the needed pages are loaded.</li>
+  </ul>
+  <p>It is built on paging plus a disk area. The disk area where pages are kept is called <strong>swap space</strong> (the swap partition or swap file on Linux, the page file on Windows). It is a raw area managed as large blocks, so it is faster than going through a normal file system.</p>
+
+  <h4>Demand paging</h4>
+  <p>With <strong>demand paging</strong> a page is loaded into RAM only when it is first needed (touched). With <strong>pure demand paging</strong> a process starts with no pages in memory at all and faults its way in. The page table's <strong>valid/present bit</strong> tells whether a page is in a frame (1) or not (0, either on disk or invalid altogether).</p>
+  <div class="co co-note">
+    <p class="co-t">Pager vs swapper</p>
+    <p>A swapper moves whole processes in and out. A <strong>pager</strong> moves individual pages. Demand paging uses a pager, which is why it is called "lazy swapping".</p>
+  </div>
+
+  <h4>What happens on a page fault</h4>
+  <p>A <strong>page fault</strong> is the trap raised when a process touches a page whose valid bit is 0. It is not an error by itself; it is how demand paging works.</p>
+  <figure class="fig">
+<pre class="diagram">
+ 1. CPU touches page 6 ──► MMU sees valid bit = 0 ──► TRAP to the OS
+
+    Process                    OS                              Disk
+ ┌───────────┐      2. check: is the access legal?
+ │ load M    │         no  ──► terminate (segmentation fault)
+ └─────┬─────┘         yes ──► 3. find a free frame
+       │                         (none free? choose a victim, see page replacement)
+       │               4. schedule a disk read of the page ───► read page 6
+       │                  (process goes to WAITING; CPU runs another)
+       │               5. disk interrupt: page arrives in the frame ◄──
+       │               6. update page table: frame number, valid = 1
+       │               7. put the process back in READY; later,
+       └───────────────   restart the SAME instruction ──► it now succeeds
+</pre>
+    <figcaption>Servicing a page fault: the faulting instruction is restarted</figcaption>
+  </figure>
+  <ol class="steps">
+    <li>The hardware traps to the kernel because the valid bit is 0.</li>
+    <li>The kernel checks the process's records: if the address is outside its valid memory, it is a real error and the process is killed. If the address is legal but the page is not in memory, continue.</li>
+    <li>It finds a free frame (or frees one by replacing a page).</li>
+    <li>It starts a disk read of the page into that frame; the process waits and the CPU switches to another process.</li>
+    <li>When the read completes, the kernel updates the page table (frame number, valid = 1) and the TLB.</li>
+    <li>The process becomes ready; when it runs again, the instruction that faulted is <strong>restarted</strong> from the beginning and succeeds.</li>
+  </ol>
+  <p>Types: a <strong>major</strong> fault needs a disk read (very slow); a <strong>minor</strong> fault finds the page already in RAM (for example in the page cache or shared by another process) and only needs the mapping fixed, which is much cheaper. On Linux <code>/usr/bin/time -v</code> shows both counts for a command.</p>
+
+  <h4>Performance: the cost of a fault</h4>
+  <p>Let <em>p</em> be the page-fault rate (0 means never, 1 means every access). Then:</p>
+  <p><code>EAT = (1 − p) × memory access time + p × page-fault service time</code></p>
+  <p><strong>Example.</strong> Memory access = 200 ns; servicing a fault (disk read plus overhead) = 8 ms = 8,000,000 ns; and one access in 1,000 faults (p = 0.001):</p>
+  <ul>
+    <li>EAT = 0.999 × 200 + 0.001 × 8,000,000 = 199.8 + 8,000 = <strong>8,199.8 ns</strong>, about 41 times slower than 200 ns.</li>
+    <li>For a slowdown of no more than 10% (EAT ≤ 220 ns): 200 + p × (8,000,000 − 200) ≤ 220, so p ≤ 20 / 7,999,800 ≈ 2.5 × 10<sup>-6</sup>, fewer than one fault in about 400,000 accesses.</li>
+  </ul>
+  <p>The lesson: disk is about five orders of magnitude slower than RAM, so even a tiny fault rate ruins performance. Demand paging works only because of <strong>locality of reference</strong>: programs touch the same pages again and again for a while (loops, the current stack frames), so after a burst of faults they run fine.</p>
+
+  <h4>Related features</h4>
+  <ul>
+    <li><strong>Copy-on-write:</strong> after <code>fork()</code>, parent and child share all pages marked read-only. The first write by either triggers a fault; the OS copies just that page and lets the writer continue. Fast process creation.</li>
+    <li><strong>Memory-mapped files (<code>mmap</code>):</strong> a file's content is mapped into the address space and loaded by page faults on demand. Java's <code>FileChannel.map</code> gives a <code>MappedByteBuffer</code>.</li>
+    <li><strong>Lazy allocation:</strong> memory you "allocate" (a big Java heap, <code>malloc</code>) is only given real frames when touched, which is why a JVM with <code>-Xmx8g</code> does not instantly use 8 GB of RAM.</li>
+    <li><strong>Page cache:</strong> the OS keeps recently read file data in spare RAM, so repeated reads are fast. This is why "free memory" on a Linux server looks low: most of it is useful cache that can be dropped at once.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the instruction must be restartable</p>
+    <p>A page fault can occur in the middle of an instruction. The hardware must allow it to be restarted cleanly from the start after the OS fixes the page table. This hardware requirement is what makes demand paging possible.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A page fault on an <em>illegal</em> address (null pointer, access past the end) is not served; the process gets <code>SIGSEGV</code>.</li>
+      <li>Pages of the kernel itself and pages being used for ongoing I/O are <strong>pinned</strong> (locked in RAM) and are not replaced.</li>
+      <li>Large virtual size does not mean large RAM use. Monitor the <strong>resident set size (RSS)</strong>, the part actually in RAM, not just the virtual size (VSZ).</li>
+      <li>If no free frame exists and the replaced page is <strong>dirty</strong>, the fault costs two disk operations: write the old page out, read the new page in.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "a page fault means the program crashed"</p>
+    <p>Most page faults are routine and invisible. Only a fault on an address the process has no right to use ends in a crash (segmentation fault).</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is virtual memory? What happens on a page fault?"</p>
+    <ul>
+      <li>Virtual memory: each process sees a large private address space; only the used pages are in RAM, the rest in swap/disk; made possible by paging and demand loading.</li>
+      <li>Page fault steps: trap, validity check, find a frame (replace if none), read from disk, update page table, restart the instruction.</li>
+      <li>Performance: EAT formula and why a tiny fault rate hurts; locality of reference makes it work.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-page-replacement">
+  <h3>Page replacement: FIFO, Optimal, LRU and Belady's anomaly</h3>
+  <p class="tldr">When a page fault finds no free frame, a page replacement algorithm picks a victim page to evict; FIFO evicts the oldest page, Optimal evicts the page used farthest in the future (the best possible, but impossible to build), and LRU evicts the page unused for the longest time (a good practical approximation).</p>
+
+  <h4>The problem</h4>
+  <p>Physical memory has a fixed number of frames. When all are full and a new page must come in, the OS must choose a <strong>victim</strong>. If the victim is dirty (modified), it is written to disk first. A good algorithm gives the fewest page faults for the same <strong>reference string</strong> (the sequence of page numbers the program touches). Algorithms are compared by counting faults on a reference string with a given number of frames.</p>
+  <p>All three algorithms below are run on the same string with <strong>3 frames</strong> (initially empty):</p>
+  <pre data-title="Reference string (20 references)"><code class="language-plaintext">7 0 1 2 0 3 0 4 2 3 0 3 2 1 2 0 1 7 0 1</code></pre>
+  <p>In the tables each row is a frame slot, F marks a page fault and a dot marks a hit. A page is placed in the first empty frame, or in the frame of the victim.</p>
+
+  <h4>FIFO (First-In, First-Out)</h4>
+  <p>Evict the page that has been in memory the longest. Implement with a queue. Simple, but it ignores how often or how recently a page is used, so it may evict a heavily used page just because it is old.</p>
+  <figure class="fig">
+<pre class="diagram">
+FIFO, 3 frames
+Ref    7 0 1 2 0 3 0 4 2 3 0 3 2 1 2 0 1 7 0 1
+Fr1    7 7 7 2 2 2 2 4 4 4 0 0 0 0 0 0 0 7 7 7
+Fr2    - 0 0 0 0 3 3 3 2 2 2 2 2 1 1 1 1 1 0 0
+Fr3    - - 1 1 1 1 0 0 0 3 3 3 3 3 2 2 2 2 2 1
+Fault  F F F F . F F F F F F . . F F . . F F F
+</pre>
+    <figcaption>FIFO gives 15 page faults</figcaption>
+  </figure>
+  <p>Walk through the first replacements: at reference 2 (step 4) the frames hold 7, 0, 1 and 7 is oldest, so 7 is replaced. At step 6 (page 3) the queue is 0, 1, 2, so 0 is replaced, even though page 0 was just used. At step 7 page 0 is needed again and causes another fault. Total: <strong>15 faults</strong> out of 20 references.</p>
+
+  <h4>Optimal (OPT / MIN)</h4>
+  <p>Evict the page that will <strong>not be used for the longest time in the future</strong>. It has the lowest possible fault count for any string, but the OS cannot know the future, so OPT is used only as a benchmark to measure other algorithms.</p>
+  <figure class="fig">
+<pre class="diagram">
+Optimal, 3 frames
+Ref    7 0 1 2 0 3 0 4 2 3 0 3 2 1 2 0 1 7 0 1
+Fr1    7 7 7 2 2 2 2 2 2 2 2 2 2 2 2 2 2 7 7 7
+Fr2    - 0 0 0 0 0 0 4 4 4 0 0 0 0 0 0 0 0 0 0
+Fr3    - - 1 1 1 3 3 3 3 3 3 3 3 1 1 1 1 1 1 1
+Fault  F F F F . F . F . . F . . F . . . F . .
+</pre>
+    <figcaption>Optimal gives 9 page faults</figcaption>
+  </figure>
+  <p>Example decisions: at step 4 (page 2), frames hold 7, 0, 1. Future references: 0 comes next, 1 comes at step 14, and 7 comes at step 18. So 7 is used farthest away and is evicted. At step 6 (page 3), frames 2, 0, 1; next uses are 2 at step 9, 0 at step 7, 1 at step 14; evict 1. Total <strong>9 faults</strong>. The first three (to fill the empty frames) are unavoidable for any algorithm.</p>
+
+  <h4>LRU (Least Recently Used)</h4>
+  <p>Evict the page that has not been used for the longest time <em>in the past</em>. The idea: the recent past predicts the near future (locality), so LRU is OPT looking backwards.</p>
+  <figure class="fig">
+<pre class="diagram">
+LRU, 3 frames
+Ref    7 0 1 2 0 3 0 4 2 3 0 3 2 1 2 0 1 7 0 1
+Fr1    7 7 7 2 2 2 2 4 4 4 0 0 0 1 1 1 1 1 1 1
+Fr2    - 0 0 0 0 0 0 0 0 3 3 3 3 3 3 0 0 0 0 0
+Fr3    - - 1 1 1 3 3 3 2 2 2 2 2 2 2 2 2 7 7 7
+Fault  F F F F . F . F F F F . . F . F . F . .
+</pre>
+    <figcaption>LRU gives 12 page faults</figcaption>
+  </figure>
+  <p>Example: at step 6 (page 3), the recency order (oldest first) is 1, 2, 0 because 0 was used at step 5; so LRU evicts 1, where FIFO evicted 0. At step 8 (page 4), the order is 2, 3, 0 so 2 is evicted. Total <strong>12 faults</strong>.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Algorithm</th><th>Faults (20 refs, 3 frames)</th><th>Hit rate</th></tr></thead>
+    <tbody>
+      <tr><td>FIFO</td><td>15</td><td>5 / 20 = 25%</td></tr>
+      <tr><td>LRU</td><td>12</td><td>8 / 20 = 40%</td></tr>
+      <tr><td>Optimal</td><td>9</td><td>11 / 20 = 55%</td></tr>
+    </tbody>
+  </table></div>
+  <p>The order OPT ≤ LRU ≤ FIFO is typical, though not guaranteed on every string.</p>
+
+  <h4>Implementing LRU</h4>
+  <ul>
+    <li><strong>Counter:</strong> each page-table entry stores the time of last use; evict the smallest. Needs a clock update on every access and a search on every fault.</li>
+    <li><strong>Stack (doubly linked list):</strong> on each use, move the page to the top; the bottom is the LRU page. Each update changes several pointers.</li>
+  </ul>
+  <p>Both need work on <em>every memory access</em>, so true LRU is too slow in hardware. Real systems use <strong>approximations</strong> based on the hardware <strong>reference bit</strong>:</p>
+  <ul>
+    <li><strong>Second chance (clock):</strong> pages sit in a circular list with a pointer (the clock hand). To find a victim, look at the page under the hand: if its reference bit is 1, clear it (a second chance) and move on; if 0, evict it. It degrades to FIFO if all bits are 1.</li>
+    <li><strong>Enhanced second chance:</strong> uses the pair (reference, modified) and prefers pages that are neither recently used nor dirty, since they are cheapest to evict.</li>
+    <li><strong>LFU/MFU</strong> (least or most frequently used) count uses; they are rarely used.</li>
+  </ul>
+  <p>The same idea appears in application caches. In Java, a <code>LinkedHashMap</code> in access order is a ready-made LRU cache:</p>
+  <pre data-title="LruCache.java"><code class="language-java">import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class LruCache&lt;K, V&gt; extends LinkedHashMap&lt;K, V&gt; {
+    private final int capacity;
+
+    public LruCache(int capacity) {
+        super(16, 0.75f, true);              // true = access order (LRU order)
+        this.capacity = capacity;
+    }
+
+    @Override
+    protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) {
+        return size() &gt; capacity;              // evict the least recently used
+    }
+
+    public static void main(String[] args) {
+        int[] refs = {7,0,1,2,0,3,0,4,2,3,0,3,2,1,2,0,1,7,0,1};
+        LruCache&lt;Integer, Integer&gt; frames = new LruCache&lt;&gt;(3);
+        int faults = 0;
+        for (int page : refs) {
+            if (frames.get(page) == null) {  // miss = page fault
+                faults++;
+                frames.put(page, page);
+            }
+        }
+        System.out.println("LRU page faults: " + faults);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">LRU page faults: 12</code></pre>
+  <p>This class is not thread-safe; wrap it or use a library cache (Caffeine) in real code. Redis and Caffeine caches use approximations of LRU for the same reason as the OS.</p>
+
+  <h4>Belady's anomaly</h4>
+  <p>Intuition says more frames should never mean more faults. For FIFO that is <strong>not</strong> always true. <strong>Belady's anomaly</strong> is the case where increasing the number of frames increases the number of page faults. The classic string is:</p>
+  <pre data-title="Belady's reference string"><code class="language-plaintext">1 2 3 4 1 2 5 1 2 3 4 5</code></pre>
+  <figure class="fig">
+<pre class="diagram">
+FIFO with 3 frames: 9 faults
+Ref    1 2 3 4 1 2 5 1 2 3 4 5
+Fr1    1 1 1 4 4 4 5 5 5 5 5 5
+Fr2    - 2 2 2 1 1 1 1 1 3 3 3
+Fr3    - - 3 3 3 2 2 2 2 2 4 4
+Fault  F F F F F F F . . F F .
+
+FIFO with 4 frames: 10 faults
+Ref    1 2 3 4 1 2 5 1 2 3 4 5
+Fr1    1 1 1 1 1 1 5 5 5 5 4 4
+Fr2    - 2 2 2 2 2 2 1 1 1 1 5
+Fr3    - - 3 3 3 3 3 3 2 2 2 2
+Fr4    - - - 4 4 4 4 4 4 3 3 3
+Fault  F F F F . . F F F F F F
+</pre>
+    <figcaption>FIFO: 3 frames give 9 faults, 4 frames give 10 faults (Belady's anomaly)</figcaption>
+  </figure>
+  <p>Count again: 3 frames faults at references 1, 2, 3, 4, 1, 2, 5, 3, 4 = 9; 4 frames faults at 1, 2, 3, 4, 5, 1, 2, 3, 4, 5 = 10. With four frames, the pages 1 and 2 happen to be evicted just before they are needed again. <strong>LRU and Optimal never show the anomaly</strong>: they are <em>stack algorithms</em>, meaning the set of pages in memory with <em>n</em> frames is always a subset of the set with <em>n + 1</em> frames.</p>
+
+  <h4>Global vs local replacement</h4>
+  <p><strong>Global replacement</strong> lets a process take a frame from any process; it is flexible, but a process's fault rate then depends on others. <strong>Local replacement</strong> picks the victim only from the process's own frames, giving steadier behaviour but possibly leaving free frames unused elsewhere. Frames are also divided among processes by <strong>equal allocation</strong> or <strong>proportional allocation</strong> (in proportion to process size), with a minimum per process set by the instruction set.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: count the initial faults</p>
+    <p>Filling empty frames counts as page faults (the page must be loaded). Most exam answers include them, as the 15, 9 and 12 above do. Say so explicitly if your teacher counts differently.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>If every page is referenced only once (a sequential scan), every algorithm faults on every reference and no replacement policy can help.</li>
+      <li>LRU can behave very badly on a loop slightly bigger than memory: with a cyclic string 1 2 3 4 1 2 3 4... and 3 frames, LRU faults on every single reference, because it always evicts the page needed next.</li>
+      <li>A dirty page costs more to evict than a clean one, so real systems prefer clean victims when the usage is similar.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: updating FIFO order on a hit</p>
+    <p>In FIFO a hit does not change the order; only the time of loading counts. In LRU a hit <em>does</em> move the page to "most recent". Mixing the two gives wrong tables.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Compare FIFO, LRU and Optimal; what is Belady's anomaly?"</p>
+    <ul>
+      <li>Give the rule of each; on the standard string 7,0,1,2,0,3,0,4,2,3,0,3,2,1,2,0,1,7,0,1 with 3 frames: FIFO 15, LRU 12, OPT 9.</li>
+      <li>OPT is the lower bound and unimplementable; LRU approximates it using locality; real OSes use clock/second chance.</li>
+      <li>Belady: FIFO with 1 2 3 4 1 2 5 1 2 3 4 5 gives 9 faults with 3 frames and 10 with 4. LRU/OPT are stack algorithms and are immune.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-thrashing">
+  <h3>Thrashing and the working set</h3>
+  <p class="tldr">Thrashing is when a system spends more time swapping pages than doing useful work because processes do not have enough frames for their active pages; the working-set model and page-fault-frequency control prevent it by limiting how many processes run at once.</p>
+
+  <h4>What is thrashing?</h4>
+  <p>A process is <strong>thrashing</strong> if it spends more time paging (faulting and waiting for the disk) than executing. If many processes thrash, the whole system crawls even though the disk is busy all the time.</p>
+  <p>The chain of events is a vicious circle:</p>
+  <ol class="steps">
+    <li>Too many processes are in memory, so each has too few frames to hold its active pages.</li>
+    <li>Processes fault constantly; each fault takes frames from other processes (global replacement), which then also fault.</li>
+    <li>Processes spend their time waiting for the paging disk; the ready queue empties and <strong>CPU utilisation drops</strong>.</li>
+    <li>A naive scheduler sees low CPU utilisation and <em>admits more processes</em> to raise it. That makes things worse.</li>
+  </ol>
+  <figure class="fig">
+<pre class="diagram">
+ CPU
+ utilisation
+   │            ╭────╮
+   │          ╭─╯    ╰╮
+   │        ╭─╯       ╰╮
+   │      ╭─╯           ╰╮
+   │    ╭─╯               ╰──╮
+   │  ╭─╯                     ╰────── thrashing: utilisation collapses
+   └──┴────────────────────────────────────► degree of multiprogramming
+                    (number of processes in memory)
+</pre>
+    <figcaption>Utilisation rises with more processes, then collapses once memory is over-committed</figcaption>
+  </figure>
+
+  <h4>Why it happens: locality</h4>
+  <p>Programs run in <strong>localities</strong>: at any phase a small set of pages (the current function, its data, the stack) is in use, and the program later moves on to another locality. Thrashing happens when the combined localities of all running processes do not fit into RAM. As a process moves into a new locality it faults in those pages; if there are not enough frames, it keeps throwing out pages that it needs again straight away.</p>
+
+  <h4>The working-set model</h4>
+  <p>The <strong>working set</strong> WS(t, Δ) of a process is the set of pages it referenced in its most recent Δ page references (the <em>working-set window</em>, for example Δ = 10,000). It approximates the process's current locality.</p>
+  <ul>
+    <li>Too small a Δ misses part of the locality; too large includes old, unneeded pages.</li>
+    <li>Let WSS<sub>i</sub> be the working-set size of process i. The total demand is <strong>D = ΣWSS<sub>i</sub></strong>. If D is larger than the total number of frames m, the system is over-committed and will thrash.</li>
+    <li>The OS policy: give each process at least its working set; if D &gt; m, <strong>suspend (swap out) a process</strong> and give its frames to the others; if D &lt; m, it can start another.</li>
+  </ul>
+  <p><strong>Tiny example.</strong> Δ = 6 references. A process's recent references are 3 4 3 4 5 3. Its working set is {3, 4, 5}, so WSS = 3 frames. With 20 frames in RAM and processes with working sets of 8, 7 and 9 frames (D = 24 &gt; 20), the system is over-committed: suspend one process, and the remaining two (for example 8 + 7 = 15 ≤ 20) run without thrashing.</p>
+
+  <h4>Page-fault frequency (PFF)</h4>
+  <p>A simpler control measures each process's fault rate directly. Set an <strong>upper</strong> and a <strong>lower</strong> bound:</p>
+  <ul>
+    <li>Fault rate above the upper bound → the process needs more frames: give it some, or if none are free, suspend a process.</li>
+    <li>Fault rate below the lower bound → it has too many frames: take some away.</li>
+  </ul>
+
+  <h4>Preventing and fixing thrashing</h4>
+  <ul>
+    <li>Use <strong>local replacement</strong> (or priority replacement), so one thrashing process does not steal frames from others.</li>
+    <li>Control the <strong>degree of multiprogramming</strong> with the working-set or PFF method.</li>
+    <li>Add RAM; reduce each program's memory footprint.</li>
+    <li>On a Linux server: watch the swap-in and swap-out rates (<code>vmstat 1</code>, columns <code>si</code> and <code>so</code>) and the major page faults. Constantly non-zero swapping together with high I/O wait is the sign of memory pressure. Memory-hungry services (databases, JVMs) are usually sized so they do not swap at all, and many production setups reduce swapping through the kernel's <code>vm.swappiness</code> setting or disable swap.</li>
+  </ul>
+  <pre data-title="Watching a thrashing machine"><code class="language-shell">$ vmstat 1 3
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 1  8 904320  11204   2048  40960 5120 6240  8100  9800  900 1500  3  4  2 91  0</code></pre>
+  <p>These numbers are illustrative, not a measurement: the telltale pattern is large <code>si</code>/<code>so</code> (swap traffic), many blocked processes (<code>b</code>), and a huge <code>wa</code> (CPU waiting for I/O) with almost no user work (<code>us</code>).</p>
+
+  <h4>Swap space and the OOM killer, briefly</h4>
+  <p>When both RAM and swap are exhausted, Linux cannot make progress. Its <strong>OOM (out-of-memory) killer</strong> picks a process (using a badness score that mostly reflects memory use) and kills it with <code>SIGKILL</code> to free memory. This is what you see as "Killed" in a shell or <code>OOMKilled</code> for a container. See <a href="#m1-os-backend">how this shows up in backend work</a>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: sum of working sets must fit in RAM</p>
+    <p>If D = Σ WSS &gt; available frames, performance collapses. The fix is to run fewer processes, not more.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A single process can thrash by itself if its working set alone is larger than RAM (a huge in-memory sort).</li>
+      <li>Local replacement stops thrashing from spreading, but a thrashing process still waits for the disk, which slows the others a little through disk queueing.</li>
+      <li>Thrashing is a memory problem, but the symptom (low CPU, high load average) can be mistaken for an I/O or locking problem. Check swap and page-fault counters first.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: adding more threads or processes when the CPU is idle</p>
+    <p>If the CPU is idle because everything waits on paging, adding workers makes it worse. Find out why the CPU is idle before scaling up.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is thrashing? How do you detect and prevent it?"</p>
+    <ul>
+      <li>Excessive paging so that CPU utilisation falls; cause: too many processes for the available frames.</li>
+      <li>The OS must not respond to low CPU utilisation by admitting more processes.</li>
+      <li>Prevention: working-set model (sum of working sets ≤ frames), page-fault-frequency control, local replacement, more RAM.</li>
+      <li>Detection: high swap rate, high page faults, high I/O wait with low user CPU.</li>
+    </ul>
+  </div>
+</article>

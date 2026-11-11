@@ -1,0 +1,632 @@
+<article class="topic" id="m5-stream-employee-drill">
+  <h3>Stream drill: average salary, top 3 earners, names by first letter</h3>
+  <p class="tldr">Three classic employee drills — average salary per department, top 3 earners, names grouped by first letter — solved step by step, followed by the habit that makes any stream problem easier: write the result type first.</p>
+
+  <p>These three tasks appear in interviews, in coding tests and in everyday reports. Each one uses a different tool: <code>groupingBy</code> with a downstream collector, <code>sorted</code> with <code>limit</code>, and <code>groupingBy</code> with a classifier that is not a plain getter. The data is the same list of eight employees as in the previous articles.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Name</th><th>Dept</th><th>Salary</th><th>Age</th></tr></thead>
+    <tbody>
+      <tr><td>Ravi</td><td>IT</td><td>90,000</td><td>31</td></tr>
+      <tr><td>Asha</td><td>HR</td><td>60,000</td><td>28</td></tr>
+      <tr><td>Kiran</td><td>IT</td><td>90,000</td><td>26</td></tr>
+      <tr><td>Meera</td><td>IT</td><td>120,000</td><td>35</td></tr>
+      <tr><td>John</td><td>HR</td><td>75,000</td><td>40</td></tr>
+      <tr><td>Kavya</td><td>Finance</td><td>82,000</td><td>29</td></tr>
+      <tr><td>Sanjay</td><td>Finance</td><td>95,000</td><td>45</td></tr>
+      <tr><td>Anita</td><td>IT</td><td>70,000</td><td>24</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Employee.java and the list"><code class="language-java">record Employee(String name, String dept, int salary, int age) {}
+
+List&lt;Employee&gt; emps = List.of(
+        new Employee("Ravi",   "IT",      90000, 31),
+        new Employee("Asha",   "HR",      60000, 28),
+        new Employee("Kiran",  "IT",      90000, 26),
+        new Employee("Meera",  "IT",     120000, 35),
+        new Employee("John",   "HR",      75000, 40),
+        new Employee("Kavya",  "Finance", 82000, 29),
+        new Employee("Sanjay", "Finance", 95000, 45),
+        new Employee("Anita",  "IT",      70000, 24));</code></pre>
+
+  <h4>A four-step method for any stream problem</h4>
+  <ol class="steps">
+    <li><strong>Write the result type first.</strong> "Average salary per department" is a <code>Map&lt;String, Double&gt;</code>. "Top 3 earners" is a <code>List</code>. The type tells you which terminal operation or collector you need.</li>
+    <li><strong>Find the operation that produces that type.</strong> A map from key to summary → <code>groupingBy</code> with a downstream collector. A short list in some order → <code>sorted</code>, <code>limit</code>, <code>toList</code>.</li>
+    <li><strong>Prepare the input.</strong> What must be filtered out? What value do you need from each element — the whole object or one field (<code>map</code>, <code>mapToInt</code>)?</li>
+    <li><strong>Check the edges:</strong> ties, duplicates, empty input, <code>null</code> values, and whether the result order matters.</li>
+  </ol>
+
+  <h4>Drill 1: average salary per department</h4>
+  <p>The old way needs two maps (totals and counts) and a second loop. Note the cast to <code>double</code>: without it, integer division would cut off the decimals.</p>
+  <pre data-title="Loop version"><code class="language-java">Map&lt;String, Integer&gt; totals = new TreeMap&lt;&gt;();
+Map&lt;String, Integer&gt; counts = new TreeMap&lt;&gt;();
+for (Employee e : emps) {
+    totals.merge(e.dept(), e.salary(), Integer::sum);
+    counts.merge(e.dept(), 1, Integer::sum);
+}
+Map&lt;String, Double&gt; averages = new TreeMap&lt;&gt;();
+for (String dept : totals.keySet()) {
+    averages.put(dept, (double) totals.get(dept) / counts.get(dept));
+}</code></pre>
+  <p>The stream version says what you want in one expression. The classifier <code>Employee::dept</code> makes the groups, <code>averagingInt</code> turns each group into its average, and <code>TreeMap::new</code> sorts the departments.</p>
+  <pre data-title="Stream version"><code class="language-java">Map&lt;String, Double&gt; avgByDept = emps.stream()
+        .collect(Collectors.groupingBy(Employee::dept, TreeMap::new,
+                Collectors.averagingInt(Employee::salary)));
+System.out.println(avgByDept);
+
+// Which department pays best on average?
+String best = avgByDept.entrySet().stream()
+        .max(Map.Entry.comparingByValue())
+        .map(Map.Entry::getKey)
+        .orElse("none");
+
+// Departments averaging more than 80,000
+List&lt;String&gt; rich = avgByDept.entrySet().stream()
+        .filter(e -&gt; e.getValue() &gt; 80000)
+        .map(Map.Entry::getKey)
+        .toList();
+System.out.println(best + " " + rich);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{Finance=88500.0, HR=67500.0, IT=92500.0}
+IT [Finance, IT]</code></pre>
+  <p>Check by hand: IT is (90,000 + 90,000 + 120,000 + 70,000) / 4 = 92,500; HR is (60,000 + 75,000) / 2 = 67,500; Finance is (82,000 + 95,000) / 2 = 88,500. Always do this quick check on a small list.</p>
+
+  <h4>Drill 2: top 3 earners</h4>
+  <p>Sort by salary from high to low, keep three, and show what you need. The interesting part is the tie: Ravi and Kiran both earn 90,000, and only one of them fits in third place.</p>
+  <pre data-title="Top 3 with a tie-breaker"><code class="language-java">Comparator&lt;Employee&gt; bySalaryDesc = Comparator.comparingInt(Employee::salary)
+        .reversed()
+        .thenComparing(Employee::name);       // tie-breaker: name A to Z
+
+List&lt;String&gt; top3 = emps.stream()
+        .sorted(bySalaryDesc)
+        .limit(3)
+        .map(e -&gt; e.name() + " (" + e.salary() + ")")
+        .toList();
+System.out.println(top3);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[Meera (120000), Sanjay (95000), Kiran (90000)]</code></pre>
+  <p>Without <code>.thenComparing(Employee::name)</code>, the stable sort keeps the original list order for equal salaries, so Ravi (who comes first in the list) takes third place and the answer becomes <code>[Meera, Sanjay, Ravi]</code>. Neither answer is "wrong"; the problem statement is incomplete. In an interview, say so and ask which rule to use.</p>
+  <p>Two common variations:</p>
+  <pre data-title="Variations"><code class="language-java">// a) Everyone who earns one of the top 3 salary levels (ties included)
+Set&lt;Integer&gt; topLevels = emps.stream()
+        .map(Employee::salary)
+        .distinct()
+        .sorted(Comparator.reverseOrder())
+        .limit(3)
+        .collect(Collectors.toSet());
+List&lt;String&gt; names = emps.stream()
+        .filter(e -&gt; topLevels.contains(e.salary()))
+        .sorted(bySalaryDesc)
+        .map(Employee::name)
+        .toList();
+System.out.println(names);
+
+// b) Top 2 earners in each department
+Map&lt;String, List&lt;String&gt;&gt; top2ByDept = emps.stream()
+        .collect(Collectors.groupingBy(Employee::dept, TreeMap::new,
+                Collectors.collectingAndThen(Collectors.toList(),
+                        group -&gt; group.stream()
+                                .sorted(bySalaryDesc)
+                                .limit(2)
+                                .map(Employee::name)
+                                .toList())));
+System.out.println(top2ByDept);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[Meera, Sanjay, Kiran, Ravi]
+{Finance=[Sanjay, Kavya], HR=[John, Asha], IT=[Meera, Kiran]}</code></pre>
+  <p>In variation (b) you cannot put <code>limit</code> inside <code>groupingBy</code> directly, because <code>limit</code> works on the whole stream, not per group. The trick is <code>collectingAndThen</code>: collect each group into a list, then run a small stream on that list.</p>
+
+  <h4>Drill 3: names grouped by first letter</h4>
+  <p>Here the classifier is a computed value, not a getter: the first character of the name. The downstream <code>mapping</code> keeps only the names.</p>
+  <pre data-title="Group by first letter"><code class="language-java">Map&lt;Character, List&lt;String&gt;&gt; byLetter = emps.stream()
+        .collect(Collectors.groupingBy(e -&gt; e.name().charAt(0), TreeMap::new,
+                Collectors.mapping(Employee::name, Collectors.toList())));
+System.out.println(byLetter);
+
+// Names sorted inside each group
+Map&lt;Character, Set&lt;String&gt;&gt; sorted = emps.stream()
+        .collect(Collectors.groupingBy(e -&gt; e.name().charAt(0), TreeMap::new,
+                Collectors.mapping(Employee::name,
+                        Collectors.toCollection(TreeSet::new))));
+System.out.println(sorted);
+
+// How many names per letter
+Map&lt;Character, Long&gt; perLetter = emps.stream()
+        .collect(Collectors.groupingBy(e -&gt; e.name().charAt(0), TreeMap::new,
+                Collectors.counting()));
+System.out.println(perLetter);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{A=[Asha, Anita], J=[John], K=[Kiran, Kavya], M=[Meera], R=[Ravi], S=[Sanjay]}
+{A=[Anita, Asha], J=[John], K=[Kavya, Kiran], M=[Meera], R=[Ravi], S=[Sanjay]}
+{A=2, J=1, K=2, M=1, R=1, S=1}</code></pre>
+  <p><code>charAt(0)</code> returns a <code>char</code>, which is boxed to a <code>Character</code> key. If you prefer <code>String</code> keys, use <code>e.name().substring(0, 1)</code>. For case-insensitive grouping, normalise the key: <code>Character.toUpperCase(e.name().charAt(0))</code>.</p>
+
+  <h4>Rewriting old loops as streams</h4>
+  <p>Most loops you have written fall into a few shapes. Learn the matching stream form and conversion becomes mechanical.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Loop shape</th><th>Stream form</th></tr></thead>
+    <tbody>
+      <tr><td>Loop with <code>if</code>, then <code>result.add(f(x))</code></td><td><code>filter(...).map(f).toList()</code></td></tr>
+      <tr><td><code>sum += x.value()</code></td><td><code>mapToInt(X::value).sum()</code></td></tr>
+      <tr><td>Flag set to <code>true</code>, then <code>break</code></td><td><code>anyMatch(...)</code></td></tr>
+      <tr><td>Return the first element that matches, else <code>null</code></td><td><code>filter(...).findFirst()</code> (an <code>Optional</code>)</td></tr>
+      <tr><td>Track the biggest or smallest element</td><td><code>max(Comparator...)</code> or <code>min(...)</code></td></tr>
+      <tr><td><code>map.computeIfAbsent(k, ...).add(v)</code></td><td><code>collect(groupingBy(...))</code></td></tr>
+      <tr><td><code>StringBuilder</code> with a separator</td><td><code>collect(joining(", "))</code></td></tr>
+      <tr><td><code>count++</code> inside an <code>if</code></td><td><code>filter(...).count()</code></td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Loop and stream side by side"><code class="language-java">// Loop: names of well-paid IT employees, upper case, sorted
+List&lt;String&gt; result = new ArrayList&lt;&gt;();
+for (Employee e : emps) {
+    if (e.dept().equals("IT") &amp;&amp; e.salary() &gt; 80000) {
+        result.add(e.name().toUpperCase());
+    }
+}
+Collections.sort(result);
+
+// Stream: the same, one line per step
+List&lt;String&gt; result2 = emps.stream()
+        .filter(e -&gt; e.dept().equals("IT") &amp;&amp; e.salary() &gt; 80000)
+        .map(e -&gt; e.name().toUpperCase())
+        .sorted()
+        .toList();
+System.out.println(result + " " + result2);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[KIRAN, MEERA, RAVI] [KIRAN, MEERA, RAVI]</code></pre>
+  <p>Not every loop should become a stream. A loop that needs <code>break</code> with complex conditions, changes several variables at once, throws checked exceptions or works by index is often clearer as a loop. See <a href="#m5-streams-vs-loops">Streams vs loops</a>.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases to mention in an interview</p>
+    <ul>
+      <li><strong>Ties:</strong> two people with the same salary — decide the tie-breaker and say it aloud.</li>
+      <li><strong>Empty list:</strong> <code>groupingBy</code> returns an empty map, <code>limit(3)</code> returns fewer than three, <code>max</code> returns an empty <code>Optional</code>.</li>
+      <li><strong>Null department or name:</strong> <code>groupingBy</code> throws <code>NullPointerException: element cannot be mapped to a null key</code>; <code>charAt(0)</code> on an empty name throws <code>StringIndexOutOfBoundsException</code>.</li>
+      <li><strong>Averages of <code>int</code> values:</strong> use <code>averagingInt</code> or cast one operand to <code>double</code> yourself. <code>total / count</code> with two <code>int</code> values truncates.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Find the average salary per department using streams"</p>
+    <ul>
+      <li>Say the result type: <code>Map&lt;String, Double&gt;</code>.</li>
+      <li>Write: <code>collect(groupingBy(Employee::dept, averagingInt(Employee::salary)))</code> — and mention <code>TreeMap::new</code> if sorted output is wanted.</li>
+      <li>Follow-ups they ask: highest average (stream the entry set and use <code>max</code> with <code>Map.Entry.comparingByValue()</code>), top N per group (<code>collectingAndThen</code>), the same in SQL (<code>GROUP BY dept</code> with <code>AVG(salary)</code>).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-stream-interview-recipes">
+  <h3>12 stream interview questions with solutions</h3>
+  <p class="tldr">Twelve questions that come up again and again — second highest salary, duplicates, frequency maps, sorting a map, flattening, multi-field sorting and more — each with a short, correct stream solution and the trap to avoid.</p>
+
+  <p>Use these as practice: cover the code, write your own answer, then compare. The employee list is the one from <a href="#m5-stream-employee-drill">the drill</a>. For every question, say the result type and your assumptions about ties, empty input and <code>null</code> before you write code.</p>
+
+  <h4>1. Second highest salary (and the Nth highest)</h4>
+  <pre data-title="Second highest, distinct"><code class="language-java">Optional&lt;Integer&gt; second = emps.stream()
+        .map(Employee::salary)
+        .distinct()
+        .sorted(Comparator.reverseOrder())
+        .skip(1)                          // skip(n - 1) gives the nth highest
+        .findFirst();
+System.out.println(second);
+
+int level = second.orElseThrow();
+System.out.println(emps.stream().filter(e -&gt; e.salary() == level)
+        .map(Employee::name).toList());
+
+// The trap: forgetting distinct() when the top value repeats
+List&lt;Integer&gt; pay = List.of(100, 100, 80);
+System.out.println(pay.stream().sorted(Comparator.reverseOrder())
+        .skip(1).findFirst());
+System.out.println(pay.stream().distinct().sorted(Comparator.reverseOrder())
+        .skip(1).findFirst());</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Optional[95000]
+[Sanjay]
+Optional[100]
+Optional[80]</code></pre>
+  <p>Without <code>distinct()</code>, the "second" value is the second element, which is 100 again. The result is an <code>Optional</code> because there may be fewer than two distinct salaries.</p>
+
+  <h4>2. Find the duplicates in a list</h4>
+  <pre data-title="Duplicates via a frequency map"><code class="language-java">List&lt;Integer&gt; nums = List.of(4, 2, 7, 2, 9, 4, 4, 1);
+
+Set&lt;Integer&gt; duplicates = nums.stream()
+        .collect(Collectors.groupingBy(Function.identity(), Collectors.counting()))
+        .entrySet().stream()
+        .filter(e -&gt; e.getValue() &gt; 1)
+        .map(Map.Entry::getKey)
+        .collect(Collectors.toCollection(TreeSet::new));
+System.out.println(duplicates);
+System.out.println(nums.stream().distinct().toList());   // remove duplicates, keep order</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[2, 4]
+[4, 2, 7, 9, 1]</code></pre>
+  <p>A shorter trick exists: <code>Set&lt;Integer&gt; seen = new HashSet&lt;&gt;(); nums.stream().filter(n -&gt; !seen.add(n)).collect(Collectors.toSet())</code>. It works because <code>Set.add</code> returns <code>false</code> for an element already present. But the lambda changes an outside object, which breaks the rule for stateless functions. It is acceptable on a sequential stream; never use it on a parallel one. The frequency-map version is safe everywhere.</p>
+
+  <h4>3. Frequency map: words and characters</h4>
+  <pre data-title="Word and character counts"><code class="language-java">Map&lt;String, Long&gt; wordCount = Arrays.stream("java is fun and java is fast".split(" "))
+        .collect(Collectors.groupingBy(Function.identity(), LinkedHashMap::new,
+                Collectors.counting()));
+System.out.println(wordCount);
+
+Map&lt;Character, Long&gt; letters = "banana".chars()
+        .mapToObj(c -&gt; (char) c)           // IntStream of codes -&gt; Stream&lt;Character&gt;
+        .collect(Collectors.groupingBy(Function.identity(), TreeMap::new,
+                Collectors.counting()));
+System.out.println(letters);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{java=2, is=2, fun=1, and=1, fast=1}
+{a=3, b=1, n=2}</code></pre>
+  <p><code>LinkedHashMap::new</code> keeps first-seen order, <code>TreeMap::new</code> sorts the keys. With the default <code>HashMap</code> the same word count prints in an order you cannot predict (for example <code>{fast=1, java=2, and=1, is=2, fun=1}</code>). <code>String.chars()</code> returns an <code>IntStream</code>, so cast each code to <code>char</code> before boxing.</p>
+
+  <h4>4. Sort a map by value</h4>
+  <pre data-title="Most frequent letters first"><code class="language-java">Map&lt;Character, Long&gt; freq = "mississippi".chars()
+        .mapToObj(c -&gt; (char) c)
+        .collect(Collectors.groupingBy(Function.identity(), LinkedHashMap::new,
+                Collectors.counting()));
+System.out.println(freq);
+
+Map&lt;Character, Long&gt; byCount = freq.entrySet().stream()
+        .sorted(Map.Entry.comparingByValue(Comparator.reverseOrder()))
+        .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue,
+                (a, b) -&gt; a, LinkedHashMap::new));   // LinkedHashMap keeps the order
+System.out.println(byCount);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{m=1, i=4, s=4, p=2}
+{i=4, s=4, p=2, m=1}</code></pre>
+  <p>A map has no sort operation; you sort a <em>stream of its entries</em> and collect into a map that remembers order. The collector must be a <code>LinkedHashMap</code>, or the order is lost again. The merge function <code>(a, b) -&gt; a</code> is never called here (keys are unique), but the four-argument <code>toMap</code> requires one.</p>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: Map.Entry.comparingByValue().reversed()</p>
+    <p>It fails to compile: <code>incompatible types: Comparator&lt;Entry&lt;Object,V&gt;&gt; cannot be converted to Comparator&lt;? super Entry&lt;String,Long&gt;&gt;</code>. Chaining <code>.reversed()</code> removes the target type, so the compiler cannot infer the key and value types. Pass <code>Comparator.reverseOrder()</code> as an argument, as above, or give the types explicitly: <code>Map.Entry.&lt;Character, Long&gt;comparingByValue().reversed()</code>.</p>
+  </div>
+
+  <h4>5. Flatten a list of lists</h4>
+  <pre data-title="flatMap"><code class="language-java">List&lt;List&lt;Integer&gt;&gt; nested = List.of(List.of(1, 2), List.of(3), List.of(), List.of(4, 5));
+List&lt;Integer&gt; flat = nested.stream().flatMap(List::stream).toList();
+int sum = nested.stream().flatMap(Collection::stream).mapToInt(Integer::intValue).sum();
+System.out.println(flat + " " + sum);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[1, 2, 3, 4, 5] 15</code></pre>
+
+  <h4>6. Sort by multiple fields</h4>
+  <pre data-title="Department A-Z, salary high to low, then name A-Z"><code class="language-java">emps.stream()
+        .sorted(Comparator.comparing(Employee::dept)
+                .thenComparing(Employee::salary, Comparator.reverseOrder())
+                .thenComparing(Employee::name))
+        .forEach(e -&gt; System.out.println(e.dept() + " " + e.salary() + " " + e.name()));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Finance 95000 Sanjay
+Finance 82000 Kavya
+HR 75000 John
+HR 60000 Asha
+IT 120000 Meera
+IT 90000 Kiran
+IT 90000 Ravi
+IT 70000 Anita</code></pre>
+  <p><code>thenComparing(key, Comparator.reverseOrder())</code> reverses only that key. Writing <code>.reversed()</code> at the end would reverse the whole chain, department included.</p>
+
+  <h4>7. First non-repeated character</h4>
+  <pre data-title="First character that appears once"><code class="language-java">Optional&lt;Character&gt; firstUnique = "swiss".chars()
+        .mapToObj(c -&gt; (char) c)
+        .collect(Collectors.groupingBy(Function.identity(), LinkedHashMap::new,
+                Collectors.counting()))
+        .entrySet().stream()
+        .filter(e -&gt; e.getValue() == 1)
+        .map(Map.Entry::getKey)
+        .findFirst();
+System.out.println(firstUnique);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Optional[w]</code></pre>
+  <p>The <code>LinkedHashMap</code> is what makes "first" mean first in the text. With a <code>HashMap</code> the answer would be random. For a string where every character repeats, the result is <code>Optional.empty</code>.</p>
+
+  <h4>8. Youngest employee in each department</h4>
+  <pre data-title="toMap with minBy as the merge function"><code class="language-java">Map&lt;String, Employee&gt; youngest = emps.stream()
+        .collect(Collectors.toMap(Employee::dept, Function.identity(),
+                BinaryOperator.minBy(Comparator.comparingInt(Employee::age)),
+                TreeMap::new));
+youngest.forEach((dept, e) -&gt;
+        System.out.println(dept + " -&gt; " + e.name() + " (" + e.age() + ")"));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Finance -&gt; Kavya (29)
+HR -&gt; Asha (28)
+IT -&gt; Anita (24)</code></pre>
+  <p>When two employees share a department, the merge function keeps the younger one. Replace <code>minBy</code> with <code>maxBy</code> for the oldest or the highest paid.</p>
+
+  <h4>9. Palindrome check with IntStream</h4>
+  <pre data-title="Compare the first half with the mirrored second half"><code class="language-java">static boolean isPalindrome(String s) {
+    return IntStream.range(0, s.length() / 2)
+            .allMatch(i -&gt; s.charAt(i) == s.charAt(s.length() - 1 - i));
+}
+// isPalindrome("level") -&gt; true, isPalindrome("hello") -&gt; false, isPalindrome("") -&gt; true</code></pre>
+  <p>The empty string is a palindrome because <code>allMatch</code> on an empty range is <code>true</code>. For sentences, first clean the text: <code>s.toLowerCase().replaceAll("[^a-z0-9]", "")</code>.</p>
+
+  <h4>10. Fibonacci numbers with Stream.iterate</h4>
+  <pre data-title="Keep a pair as the state"><code class="language-java">List&lt;Integer&gt; fib = Stream.iterate(new int[]{0, 1}, f -&gt; new int[]{f[1], f[0] + f[1]})
+        .limit(10)
+        .map(f -&gt; f[0])
+        .toList();
+System.out.println(fib);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[0, 1, 1, 2, 3, 5, 8, 13, 21, 34]</code></pre>
+  <p>Each element is a pair <code>[a, b]</code>; the next pair is <code>[b, a + b]</code>. Without <code>limit</code> the stream is infinite. The <code>int</code> values overflow after the 47th number; use <code>long</code> or <code>BigInteger</code> for more.</p>
+
+  <h4>11. Group anagrams</h4>
+  <pre data-title="Words with the same sorted letters share a key"><code class="language-java">List&lt;String&gt; words = List.of("listen", "silent", "enlist", "google", "gogole", "cat", "act");
+Map&lt;String, List&lt;String&gt;&gt; groups = words.stream()
+        .collect(Collectors.groupingBy(w -&gt; {
+            char[] letters = w.toCharArray();
+            Arrays.sort(letters);
+            return new String(letters);
+        }, TreeMap::new, Collectors.toList()));
+System.out.println(groups);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{act=[cat, act], eggloo=[google, gogole], eilnst=[listen, silent, enlist]}</code></pre>
+
+  <h4>12. Common elements, difference and union of two lists</h4>
+  <pre data-title="Use a Set for fast lookups"><code class="language-java">List&lt;Integer&gt; a = List.of(1, 2, 3, 4, 5);
+Set&lt;Integer&gt; b = Set.of(4, 5, 6, 7, 2);
+
+List&lt;Integer&gt; common = a.stream().filter(b::contains).toList();
+List&lt;Integer&gt; onlyInA = a.stream().filter(n -&gt; !b.contains(n)).toList();
+List&lt;Integer&gt; union = Stream.concat(a.stream(), b.stream()).distinct().sorted().toList();
+System.out.println(common + " " + onlyInA + " " + union);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[2, 4, 5] [1, 3] [1, 2, 3, 4, 5, 6, 7]</code></pre>
+  <p><code>List.contains</code> is O(n), so filtering one list against another list is O(n × m). A <code>Set</code> makes each check O(1) on average.</p>
+
+  <h4>Quick one-liners</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Task</th><th>Code</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Sum of squares of odd numbers 1 to 10</td><td><code>IntStream.rangeClosed(1, 10).filter(n -&gt; n % 2 == 1).map(n -&gt; n * n).sum()</code></td><td>165</td></tr>
+      <tr><td>Sum of the digits of 98765</td><td><code>String.valueOf(98765).chars().map(c -&gt; c - '0').sum()</code></td><td>35</td></tr>
+      <tr><td>Even and odd numbers</td><td><code>Stream.of(1, 2, 3, 4).collect(partitioningBy(n -&gt; n % 2 == 0))</code></td><td><code>{false=[1, 3], true=[2, 4]}</code></td></tr>
+      <tr><td>Longest word</td><td><code>words.stream().max(Comparator.comparingInt(String::length))</code></td><td>An <code>Optional</code> of the word</td></tr>
+      <tr><td>Group words by length</td><td><code>words.stream().collect(groupingBy(String::length))</code></td><td>Length → list of words</td></tr>
+      <tr><td>Comma-separated names</td><td><code>names.stream().collect(joining(", "))</code></td><td>One <code>String</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: how to answer a stream coding question</p>
+    <ul>
+      <li>Restate the question with the result type: "I will return a <code>Map&lt;String, Long&gt;</code>."</li>
+      <li>Ask about ties, duplicates, empty input and nulls. Mentioning them is worth as much as the code.</li>
+      <li>Build the pipeline in the order: filter → map → group, sort or reduce. Name the collector you use and why.</li>
+      <li>Give the complexity if asked: sorting is O(n log n), grouping and counting are O(n).</li>
+      <li>If the interviewer wants "without streams", show the loop. Streams are a tool, not the goal.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-streams-vs-loops">
+  <h3>Streams vs loops, side effects and primitive streams</h3>
+  <p class="tldr">Use streams to describe data transformations (filter, map, group, summarise) and plain loops for control-heavy code; keep stream lambdas free of side effects, and use primitive streams such as IntStream to avoid boxing.</p>
+
+  <p>Streams did not replace loops. They are a better fit for one family of problems: take a collection, transform it step by step, and produce a new value. Loops are a better fit for another: code with early exits, several moving variables, checked exceptions or indexes. A good developer picks by the shape of the problem, not by fashion.</p>
+
+  <h4>Streams or loops?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Streams</th><th>Loops</th></tr></thead>
+    <tbody>
+      <tr><td>Filter, map, group, summarise</td><td>Short and declarative: says <em>what</em></td><td>Longer: temporary lists and maps, you write <em>how</em></td></tr>
+      <tr><td><code>break</code>, <code>continue</code>, <code>return</code> from the middle</td><td>Only via <code>findFirst</code>, <code>anyMatch</code>, <code>limit</code>, <code>takeWhile</code></td><td>Natural</td></tr>
+      <tr><td>Several results from one pass</td><td>Awkward (<code>teeing</code>, custom collectors)</td><td>Easy: update several variables</td></tr>
+      <tr><td>Changing local variables</td><td>Not allowed (lambdas capture effectively final variables)</td><td>Natural</td></tr>
+      <tr><td>Checked exceptions</td><td>Lambdas cannot throw them: you must wrap</td><td>Natural: <code>try</code>/<code>catch</code> or <code>throws</code></td></tr>
+      <tr><td>Index access</td><td>Via <code>IntStream.range</code>; clumsy</td><td>Natural</td></tr>
+      <tr><td>Debugging</td><td>Long stack traces; breakpoints inside lambdas</td><td>Step through line by line</td></tr>
+      <tr><td>Going parallel</td><td>One method call (with caveats)</td><td>Rewrite with executors</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Debugging stream code</h4>
+  <p>A pipeline is one statement, so you cannot stop on a single step with a line breakpoint, and an exception inside a lambda produces a stack trace that is mostly <code>java.base/java.util.stream</code> frames. Three habits help. Put each operation on its own line; you can set a breakpoint on a lambda's line. Use <code>peek(x -&gt; log.debug("after filter: {}", x))</code> temporarily between steps (and remove it afterwards). In IntelliJ IDEA, the debugger's <em>Trace Current Stream Chain</em> action shows the elements after every step. If a pipeline needs this much help, extract a step into a named method and call it with a method reference.</p>
+
+  <h4>Performance: what is true and what is a myth</h4>
+  <p>For ordinary business code — a few hundred or thousand elements between database or network calls — the difference between a stream and a loop is far too small to matter; the I/O dominates. A stream does a little more work per pipeline (it creates stage objects and lambdas), and the JIT compiler removes much of it in hot code. Where it does matter is boxed numbers and very hot inner loops over primitives, where a plain loop or an <code>IntStream</code> is usually fastest. So: write the clearest version first, and measure before you change it. To measure properly use a benchmark tool such as JMH, not <code>System.currentTimeMillis()</code> around one run.</p>
+
+  <h4>Side effects: the biggest source of stream bugs</h4>
+  <p>A <strong>side effect</strong> is anything a lambda does besides computing its return value: changing an outside variable, adding to an outside list, printing, writing to a database. The Stream API expects <strong>stateless, non-interfering</strong> functions: they must not depend on or change anything that can change during the run, and they must not modify the stream's source. Breaking this works by luck on a sequential stream and fails on a parallel one.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: a counter hidden in an array</p><pre><code class="language-java">int[] counter = {0};   // trick to dodge "effectively final"
+emps.stream()
+        .filter(e -&gt; e.salary() &gt; 80000)
+        .forEach(e -&gt; counter[0]++);   // data race if parallel</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: let the stream count</p><pre><code class="language-java">long count = emps.stream()
+        .filter(e -&gt; e.salary() &gt; 80000)
+        .count();</code></pre></div>
+  </div>
+  <p>If you catch yourself using an array, an <code>AtomicInteger</code> or an outside list to get a value out of a pipeline, the pipeline is asking for a different terminal operation — <code>count</code>, <code>reduce</code>, <code>collect</code>, <code>sum</code>.</p>
+  <p>Modifying the <em>source</em> during the pipeline is worse:</p>
+  <pre data-title="Changing the list while streaming it"><code class="language-java">List&lt;Integer&gt; list = new ArrayList&lt;&gt;(List.of(1, 2, 3));
+list.stream().forEach(n -&gt; { if (n == 1) list.add(99); });</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Exception in thread "main" java.util.ConcurrentModificationException</code></pre>
+  <p>Need the position of each element? Do not keep a counter variable. Stream the indexes instead:</p>
+  <pre data-title="Numbering without a mutable counter"><code class="language-java">List&lt;String&gt; names = List.of("Ravi", "Asha");
+List&lt;String&gt; numbered = IntStream.range(0, names.size())
+        .mapToObj(i -&gt; (i + 1) + ". " + names.get(i))
+        .toList();
+System.out.println(numbered);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[1. Ravi, 2. Asha]</code></pre>
+
+  <h4>Checked exceptions inside lambdas</h4>
+  <p>The functional interfaces in <code>java.util.function</code> do not declare checked exceptions. This code does not compile: <code>paths.stream().map(p -&gt; Files.readString(p))</code> fails with <code>error: unreported exception IOException; must be caught or declared to be thrown</code>. Wrap the checked exception in an unchecked one inside a small named method:</p>
+  <pre data-title="Wrapping IOException"><code class="language-java">static String read(Path p) {
+    try {
+        return Files.readString(p);
+    } catch (IOException e) {
+        throw new UncheckedIOException(e);      // unchecked wrapper from java.io
+    }
+}
+
+List&lt;String&gt; texts = paths.stream().map(StreamExamples::read).toList();</code></pre>
+  <p>If every step can fail and you must handle each failure separately (skip the bad file, log it, continue), a plain loop with <code>try</code>/<code>catch</code> is clearer than any stream workaround.</p>
+
+  <h4>Primitive streams: avoid boxing</h4>
+  <p>A <code>Stream&lt;Integer&gt;</code> holds <code>Integer</code> <em>objects</em>. Every number is wrapped (<strong>boxed</strong>) in a heap object, and every arithmetic step unwraps and wraps again. That costs memory, garbage collection and CPU cache efficiency. <code>IntStream</code>, <code>LongStream</code> and <code>DoubleStream</code> hold plain numbers and add useful methods: <code>sum</code>, <code>average</code>, <code>max</code>, <code>summaryStatistics</code>, <code>range</code>.</p>
+  <pre data-title="Boxed vs primitive"><code class="language-java">// Boxed: every element is an Integer object
+int a = emps.stream().map(Employee::salary).reduce(0, Integer::sum);
+
+// Primitive: no boxing, and it reads better
+int b = emps.stream().mapToInt(Employee::salary).sum();
+
+// Generate numbers without a collection at all
+long c = LongStream.rangeClosed(1, 1_000_000).sum();     // 500000500000</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Direction</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>mapToInt</code>, <code>mapToLong</code>, <code>mapToDouble</code></td><td>Objects → primitives</td><td><code>mapToInt(Employee::salary)</code></td></tr>
+      <tr><td><code>boxed()</code></td><td>Primitives → wrapper objects</td><td><code>IntStream.range(0, 3).boxed()</code></td></tr>
+      <tr><td><code>mapToObj</code></td><td>Primitives → any objects</td><td><code>mapToObj(i -&gt; "Seat-" + i)</code></td></tr>
+      <tr><td><code>asLongStream()</code>, <code>asDoubleStream()</code></td><td>Widen the primitive type</td><td><code>intStream.asLongStream().sum()</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>You still need <code>Stream&lt;Integer&gt;</code> when you collect into a <code>List&lt;Integer&gt;</code> or a map — collections hold objects. Use primitive streams for the <em>calculation</em>, then box once at the end.</p>
+
+  <div class="co co-version">
+    <p class="co-t">Version note: Stream Gatherers (Java 24)</p>
+    <p>Java 24 made <strong>Stream Gatherers</strong> a standard feature. A gatherer is a custom <em>intermediate</em> operation, applied with <code>stream.gather(...)</code>. The class <code>java.util.stream.Gatherers</code> ships ready-made ones for jobs that used to need a loop, for example fixed and sliding windows:</p>
+    <pre data-title="Windows (Java 24+)"><code class="language-java">import java.util.stream.Gatherers;
+
+System.out.println(Stream.of(1, 2, 3, 4, 5).gather(Gatherers.windowFixed(2)).toList());
+System.out.println(Stream.of(1, 2, 3, 4, 5).gather(Gatherers.windowSliding(3)).toList());</code></pre>
+    <pre class="out" data-title="Output"><code class="language-plaintext">[[1, 2], [3, 4], [5]]
+[[1, 2, 3], [2, 3, 4], [3, 4, 5]]</code></pre>
+    <p>Before Java 24, <code>gather</code> was a preview API. You do not need it for everyday work; know that it exists.</p>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for stream lambdas</p>
+    <ul>
+      <li>Do not change the source collection while its stream runs.</li>
+      <li>Do not change outside variables or collections from <code>map</code>, <code>filter</code> or <code>forEach</code> to produce a result. Return values instead.</li>
+      <li>Lambdas must be safe to run in any order and on any thread if you may go parallel.</li>
+      <li>Do not share one stream between two terminal operations.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Keep lambdas short, ideally one expression. A lambda of more than three lines should become a named method used through a method reference.</li>
+      <li>Keep pipelines readable: if you need more than about six operations, split the pipeline into named steps or methods.</li>
+      <li>Do not wrap a plain loop in a stream just to look modern (<code>list.stream().forEach(...)</code> is only a worse <code>list.forEach(...)</code>).</li>
+      <li>Return a <code>List</code> or <code>Map</code> from methods; keep the stream inside the method.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a stream inside a loop makes the code O(n × m)</p>
+    <p>For every order, scanning the whole customer list with <code>customers.stream().anyMatch(...)</code> looks tidy and gets slow. Build a <code>Set</code> or <code>Map</code> of customer ids once, outside the loop, and look up in it.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Are streams faster than loops?" and "When would you not use a stream?"</p>
+    <ul>
+      <li>Not inherently. They are for readability; a plain loop on primitives is often as fast or faster, and boxed streams are slower. Measure with JMH before optimising.</li>
+      <li>Avoid streams when you need <code>break</code>/<code>continue</code> with complex logic, several mutable results, index-based work, or checked exceptions per element.</li>
+      <li>Lambdas must be stateless and non-interfering; side effects cause bugs, especially in parallel streams.</li>
+      <li>Local variables used in a lambda must be effectively final — so use <code>reduce</code>, <code>collect</code>, <code>count</code> or <code>sum</code> instead of a counter.</li>
+      <li>Primitive streams (<code>IntStream</code> and friends) avoid boxing.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-parallel-streams">
+  <h3>Parallel streams and when not to use them</h3>
+  <p class="tldr">A parallel stream splits the data and processes the chunks on several threads of the shared common ForkJoinPool; it can speed up large, CPU-heavy, stateless work, and it slows down or breaks small, blocking or stateful work.</p>
+
+  <p>Adding <code>parallelStream()</code> looks like a free speed-up: one word, and the work runs on all CPU cores. Sometimes it is. Often it is slower, and sometimes it produces wrong results. You need to know how it works to tell the cases apart.</p>
+
+  <h4>How a parallel stream works</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  S["Source: list or array"] --> SP{"Split into chunks"}
+  SP --> C1["Chunk 1 on thread A"]
+  SP --> C2["Chunk 2 on thread B"]
+  SP --> C3["Chunk 3 on thread C"]
+  C1 --> M["Combine partial results"]
+  C2 --> M
+  C3 --> M
+  M --> R["Final result"]
+</pre>
+    <figcaption>A parallel stream splits the source, processes chunks on different threads, then combines the partial results</figcaption>
+  </figure>
+  <p>You get a parallel stream with <code>collection.parallelStream()</code> or <code>stream.parallel()</code>. The source's <strong>spliterator</strong> (the splitting iterator) cuts the data into chunks, and the chunks run on the threads of <code>ForkJoinPool.commonPool()</code> — a pool shared by the whole JVM — plus the thread that called the terminal operation. The partial results are then combined by the combiner or the collector. <code>stream.isParallel()</code> tells you the mode, and <code>stream.sequential()</code> switches back. These calls affect the <em>whole</em> pipeline; the last one wins, wherever it appears in the chain.</p>
+  <p>By default the common pool has one thread fewer than the number of CPU cores, so on a 12-core machine <code>ForkJoinPool.commonPool().getParallelism()</code> is 11. The system property <code>-Djava.util.concurrent.ForkJoinPool.common.parallelism=N</code> changes it.</p>
+
+  <h4>Order is not guaranteed</h4>
+  <pre data-title="forEach vs forEachOrdered"><code class="language-java">IntStream.rangeClosed(1, 8).parallel().forEach(n -&gt; System.out.print(n + " "));
+System.out.println();
+IntStream.rangeClosed(1, 8).parallel().forEachOrdered(n -&gt; System.out.print(n + " "));
+System.out.println();</code></pre>
+  <pre class="out" data-title="One possible output: the first line differs on every run"><code class="language-plaintext">6 5 8 7 3 4 2 1
+1 2 3 4 5 6 7 8</code></pre>
+  <p>The results of <code>collect</code>, <code>toList</code> and <code>reduce</code> still respect the encounter order of an ordered source such as a list — the framework takes care of it. Only <code>forEach</code> (and <code>findAny</code>) ignore it.</p>
+
+  <h4>When a parallel stream can help</h4>
+  <ul>
+    <li><strong>Lots of data</strong> — enough that the work outweighs the cost of splitting, scheduling and combining. Hundreds of elements are almost never enough.</li>
+    <li><strong>CPU-heavy work per element</strong> — hashing, image processing, number crunching, parsing big strings. Work that waits (network, disk, database) does not benefit.</li>
+    <li><strong>A source that splits well</strong> — <code>ArrayList</code>, arrays, <code>IntStream.range</code>. A <code>HashSet</code> is acceptable.</li>
+    <li><strong>Stateless, non-interfering, associative operations</strong> — no shared variables, no ordering assumptions.</li>
+    <li><strong>Free cores</strong> — the machine is not already busy serving other requests.</li>
+  </ul>
+
+  <h4>When to stay sequential</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Situation</th><th>Why parallel hurts</th></tr></thead>
+    <tbody>
+      <tr><td>Small collections</td><td>Splitting and thread hand-off cost more than the work itself</td></tr>
+      <tr><td>Blocking I/O in the lambda (HTTP, JDBC)</td><td>Blocked threads occupy the shared common pool, so unrelated code that uses it (other parallel streams, default <code>CompletableFuture</code> tasks) is starved</td></tr>
+      <tr><td><code>LinkedList</code>, <code>Stream.iterate</code>, <code>BufferedReader.lines()</code></td><td>These split badly, so most of the work stays on one thread</td></tr>
+      <tr><td>Order-dependent operations (<code>findFirst</code>, <code>limit</code>, <code>skip</code>, <code>sorted</code> on an ordered stream)</td><td>The stream must coordinate chunks to respect the order</td></tr>
+      <tr><td>Shared mutable state in lambdas</td><td>Data races: lost updates, wrong results</td></tr>
+      <tr><td>Web request handling</td><td>Every request competes for the same common pool; one slow request affects the others</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The classic bug: collecting into a shared list</h4>
+  <pre data-title="Not thread-safe"><code class="language-java">List&lt;Integer&gt; unsafe = new ArrayList&lt;&gt;();
+IntStream.range(0, 10_000).parallel().forEach(unsafe::add);   // many threads, one ArrayList
+System.out.println(unsafe.size());</code></pre>
+  <pre class="out" data-title="Output: usually far below 10000, and different on every run"><code class="language-plaintext">3864</code></pre>
+  <p><code>ArrayList</code> is not thread-safe. Two threads write to the same slot or both grow the array, and elements are lost; on some runs you even get an <code>ArrayIndexOutOfBoundsException</code>. The fix is not a synchronized list — it is to stop sharing: let the stream build the list.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: shared mutable list</p><pre><code class="language-java">List&lt;Integer&gt; out = new ArrayList&lt;&gt;();
+list.parallelStream().forEach(out::add);</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: collect (each thread fills its own container)</p><pre><code class="language-java">List&lt;Integer&gt; out = list.parallelStream().toList();</code></pre></div>
+  </div>
+
+  <h4>reduce needs a real identity</h4>
+  <p>On a four-element list, <code>List.of(1, 2, 3, 4).parallelStream().reduce(10, Integer::sum)</code> returned <code>50</code> in a test run, not 20: each chunk started from 10. The identity of addition is 0, not 10 (see <a href="#m5-stream-terminal-ops">Terminal operations</a>).</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Lambdas in a parallel pipeline must be stateless and must not modify shared data.</li>
+      <li><code>reduce</code> functions must be associative and the identity must be a real identity; the combiner must agree with the accumulator.</li>
+      <li>Never do blocking work (HTTP, database, <code>Thread.sleep</code>) in a parallel stream. The common pool is shared by everyone.</li>
+      <li>Measure first. Parallel is an optimisation, and optimisations need evidence.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>On a machine or container with one or two CPUs, the common pool is tiny and a parallel stream gains little or nothing.</li>
+      <li><code>findAny()</code> on a parallel stream may return a different element on each run; <code>findFirst()</code> always returns the first but costs more.</li>
+      <li>For parallel grouping into maps, <code>Collectors.groupingByConcurrent</code> and <code>toConcurrentMap</code> use a concurrent map and avoid merging many partial maps.</li>
+      <li>If the lambda throws, the exception surfaces from the terminal operation, possibly wrapped or from a different thread; the stack trace is harder to read.</li>
+    </ul>
+  </div>
+
+  <div class="co co-version">
+    <p class="co-t">Version note: virtual threads do not change parallel streams</p>
+    <p>Since Java 21 you can run many blocking tasks cheaply with virtual threads (see <a href="#m6-virtual-threads">Virtual threads</a> in Module 6). Parallel streams still use the common ForkJoinPool of platform threads, so they remain a tool for CPU-bound work. For many concurrent blocking calls, use an executor, <code>CompletableFuture</code> or virtual threads instead.</p>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Spring Boot services rarely use parallel streams. Request threads are already running in parallel, and the database or remote services are the bottleneck. Parallel streams show up in batch jobs and utilities: processing a large in-memory data set, computing checksums, transforming thousands of images. Even there, many teams prefer an explicit executor so they control the number of threads.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a parallel stream? When should you avoid it?"</p>
+    <ul>
+      <li>It splits the source into chunks, processes them on threads of the common ForkJoinPool, and combines the results; create it with <code>parallelStream()</code> or <code>parallel()</code>.</li>
+      <li>It helps for large data and CPU-bound, stateless work on easily split sources.</li>
+      <li>Avoid it for small data, blocking I/O, shared mutable state, ordered operations and server request code.</li>
+      <li>Order: <code>forEach</code> loses it, <code>forEachOrdered</code> keeps it; collectors respect encounter order.</li>
+      <li>The common pool is shared JVM-wide, with roughly cores minus one threads by default.</li>
+      <li>"Is it always faster?" No — measure; splitting and merging have a cost.</li>
+    </ul>
+  </div>
+</article>

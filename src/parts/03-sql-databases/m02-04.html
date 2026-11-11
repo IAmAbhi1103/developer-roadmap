@@ -1,0 +1,484 @@
+<article class="topic" id="m2-string-functions">
+  <h3>String functions</h3>
+  <p class="tldr">SQL has a standard toolbox for text: join (<code>||</code>, <code>CONCAT</code>), measure
+  (<code>LENGTH</code>), change case, trim, cut (<code>SUBSTRING</code>, <code>LEFT</code>, <code>RIGHT</code>),
+  search (<code>POSITION</code>), replace and pad. Names differ a little between PostgreSQL and MySQL, so know
+  both.</p>
+
+  <h4>Why use them in SQL?</h4>
+  <p>Cleaning and shaping text inside the query is faster than pulling every row into Java: build a display
+  name, split an email into user and domain, mask a phone number, find the rows with a certain pattern, format an
+  invoice number with leading zeros. Remember that a function around a column in <code>WHERE</code>
+  (<code>WHERE LOWER(email) = '…'</code>) stops a normal index on that column from being used; create an
+  expression index (<code>CREATE INDEX … ON employees (LOWER(email))</code>) or store the data in the form you
+  search for.</p>
+
+  <h4>The common functions</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Task</th><th>PostgreSQL</th><th>MySQL 8</th></tr></thead>
+    <tbody>
+      <tr><td>Join text</td><td><code>a || b</code>, <code>CONCAT(a, b, …)</code>, <code>CONCAT_WS(sep, …)</code></td>
+      <td><code>CONCAT(a, b)</code>, <code>CONCAT_WS(sep, …)</code></td></tr>
+      <tr><td>Length in characters</td><td><code>LENGTH(s)</code>, <code>CHAR_LENGTH(s)</code></td>
+      <td><code>CHAR_LENGTH(s)</code> (<code>LENGTH</code> counts <em>bytes</em>)</td></tr>
+      <tr><td>Case</td><td><code>UPPER</code>, <code>LOWER</code>, <code>INITCAP</code></td><td><code>UPPER</code>, <code>LOWER</code> (no <code>INITCAP</code>)</td></tr>
+      <tr><td>Remove spaces</td><td><code>TRIM(s)</code>, <code>LTRIM</code>, <code>RTRIM</code>, <code>TRIM(BOTH 'x' FROM s)</code></td><td>same</td></tr>
+      <tr><td>Part of a string</td><td><code>SUBSTRING(s FROM 2 FOR 3)</code> or <code>SUBSTRING(s, 2, 3)</code>; <code>LEFT(s, n)</code>, <code>RIGHT(s, n)</code></td>
+      <td><code>SUBSTRING(s, 2, 3)</code> / <code>SUBSTR</code>; <code>LEFT</code>, <code>RIGHT</code></td></tr>
+      <tr><td>Find a substring</td><td><code>POSITION('@' IN s)</code>, <code>STRPOS(s, '@')</code></td><td><code>LOCATE('@', s)</code>, <code>INSTR(s, '@')</code></td></tr>
+      <tr><td>Replace</td><td><code>REPLACE(s, 'old', 'new')</code></td><td>same</td></tr>
+      <tr><td>Split on a separator</td><td><code>SPLIT_PART(s, '@', 2)</code></td><td><code>SUBSTRING_INDEX(s, '@', 1)</code> (the part before the 1st separator)</td></tr>
+      <tr><td>Pad to a width</td><td><code>LPAD(s, 5, '0')</code>, <code>RPAD</code></td><td>same</td></tr>
+      <tr><td>Repeat, reverse</td><td><code>REPEAT</code>, <code>REVERSE</code></td><td>same</td></tr>
+      <tr><td>Regex</td><td><code>s ~ 'pattern'</code>, <code>REGEXP_REPLACE</code>, <code>REGEXP_MATCH</code></td><td><code>s REGEXP 'pattern'</code>, <code>REGEXP_REPLACE</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>SQL strings are <strong>1-based</strong>: the first character is position 1, not 0 as in Java. A position
+  of 0 from <code>POSITION</code> means "not found".</p>
+
+  <h4>Examples on the sample data</h4>
+  <pre data-title="Measure, cut and split (Priya, emp_id 5)"><code class="language-sql">SELECT LENGTH(email)                      AS len,
+       UPPER(last_name)                   AS upper_last,
+       LEFT(first_name, 1) || '. ' || last_name AS short_name,
+       POSITION('@' IN email)             AS at_pos,
+       SPLIT_PART(email, '@', 1)          AS user_part,
+       SPLIT_PART(email, '@', 2)          AS domain
+FROM employees
+WHERE emp_id = 5;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> len | upper_last | short_name | at_pos |  user_part  |   domain
+-----+------------+------------+--------+-------------+-------------
+  23 | MENON      | P. Menon   |     12 | priya.menon | example.com
+(1 row)</code></pre>
+  <pre data-title="Replace, pad, trim and mask"><code class="language-sql">SELECT REPLACE(email, 'example.com', 'company.in')   AS new_email,
+       LPAD(emp_id::TEXT, 5, '0')                    AS badge_no,
+       '[' || TRIM('   hello  ') || ']'              AS trimmed,
+       SUBSTRING(email FROM 1 FOR 5)                 AS first_five
+FROM employees
+WHERE emp_id = 5;
+
+SELECT name, LEFT(phone, 2) || 'XXXXXX' || RIGHT(phone, 2) AS masked_phone
+FROM customers
+WHERE customer_id = 1;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">        new_email         | badge_no | trimmed | first_five
+--------------------------+----------+---------+------------
+ priya.menon@company.in   | 00005    | [hello] | priya
+(1 row)
+
+    name    | masked_phone
+------------+--------------
+ Aarav Shah | 98XXXXXX01
+(1 row)</code></pre>
+  <p>A frequent real task is turning "first and last name" columns into a display name. Use
+  <code>CONCAT_WS(' ', first_name, last_name)</code> when parts may be NULL: <code>||</code> returns NULL if any
+  piece is NULL, and <code>CONCAT_WS</code> skips NULL pieces.</p>
+
+  <h4>Searching text</h4>
+  <p><code>LIKE</code> and <code>ILIKE</code> (<a href="#m1-like-patterns">Module 1</a>) cover simple patterns.
+  For more, PostgreSQL has regular expressions with <code>~</code> (case-sensitive) and <code>~*</code>
+  (case-insensitive):</p>
+  <pre data-title="Regular expression match"><code class="language-sql">SELECT first_name, email
+FROM employees
+WHERE email ~ '^[a-k]'          -- starts with a letter from a to k
+ORDER BY emp_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name |           email
+------------+----------------------------
+ Ananya     | ananya.rao@example.com
+ Arjun      | arjun.reddy@example.com
+ Divya      | divya.krishnan@example.com
+ Karan      | karan.malhotra@example.com
+ Farhan     | farhan.shaikh@example.com
+ Isha       | isha.banerjee@example.com
+(6 rows)</code></pre>
+  <p>Regular expressions are powerful but cannot use a normal index. For serious text search (words, ranking, stemming)
+  PostgreSQL has full-text search (<code>to_tsvector</code>), and large systems use Elasticsearch or similar.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: NULL in, NULL out</p>
+    <p>Almost every string function returns NULL when an argument is NULL: <code>UPPER(NULL)</code>,
+    <code>NULL || 'x'</code>, <code>LENGTH(NULL)</code>. Wrap possibly-missing values in
+    <code>COALESCE(col, '')</code> or use <code>CONCAT_WS</code>.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: LENGTH in MySQL on non-English text</p>
+    <p><code>LENGTH('नमस्ते')</code> in MySQL returns the number of bytes (18 in UTF-8), not characters (6).
+    Use <code>CHAR_LENGTH</code>. PostgreSQL's <code>LENGTH</code> counts characters.</p>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: store clean, display late</p>
+    <p>Trim and lowercase data when it enters (emails), and format for display in the application or in the
+    query. Data that is stored dirty needs <code>TRIM(LOWER(…))</code> in every query, and defeats indexes.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>SUBSTRING(s FROM 0 FOR 3)</code> returns only 2 characters in PostgreSQL, since position 0 is
+      "before the string". Start at 1.</li>
+      <li><code>SPLIT_PART(s, '@', 5)</code> past the last part returns an empty string, not NULL (PostgreSQL).
+      A position of 0 raises <code>ERROR:  field position must not be zero</code>.</li>
+      <li><code>CHAR(n)</code> values are space padded, which makes length and comparison results surprising;
+      another reason to avoid <code>CHAR</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Typical: "get the domain from an email" (<code>SPLIT_PART</code> or <code>SUBSTRING</code> after
+    <code>POSITION</code>), "pad ids with zeros" (<code>LPAD</code>), "first letter capital" (<code>INITCAP</code>
+    or <code>UPPER(LEFT(…)) || LOWER(SUBSTRING(…))</code>), "count a character in a string"
+    (<code>LENGTH(s) - LENGTH(REPLACE(s, 'a', ''))</code>).</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-date-functions">
+  <h3>Date and time functions</h3>
+  <p class="tldr">Get the current time with <code>NOW()</code> and <code>CURRENT_DATE</code>, pull parts out with
+  <code>EXTRACT</code>, round down with <code>DATE_TRUNC</code>, do arithmetic with <code>INTERVAL</code>, and
+  measure gaps with <code>AGE</code> or by subtracting dates. MySQL uses <code>DATE_FORMAT</code>,
+  <code>DATEDIFF</code> and <code>DATE_ADD</code> instead.</p>
+
+  <h4>Current date and time</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>You want</th><th>PostgreSQL</th><th>MySQL 8</th></tr></thead>
+    <tbody>
+      <tr><td>Today's date</td><td><code>CURRENT_DATE</code></td><td><code>CURDATE()</code>, <code>CURRENT_DATE</code></td></tr>
+      <tr><td>Now (with zone)</td><td><code>NOW()</code>, <code>CURRENT_TIMESTAMP</code> (both <code>timestamptz</code>)</td><td><code>NOW()</code>, <code>CURRENT_TIMESTAMP</code></td></tr>
+      <tr><td>Now, no zone</td><td><code>LOCALTIMESTAMP</code></td><td>same</td></tr>
+      <tr><td>Real clock time</td><td><code>clock_timestamp()</code></td><td><code>SYSDATE()</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>In PostgreSQL, <code>NOW()</code> returns the time the <em>transaction</em> started and stays the same for
+  every statement inside it. <code>clock_timestamp()</code> returns the real, moving time. Use
+  <code>DEFAULT now()</code> for <code>created_at</code> columns.</p>
+
+  <h4>EXTRACT and DATE_TRUNC</h4>
+  <p><code>EXTRACT(field FROM value)</code> pulls out one part as a number. <code>DATE_TRUNC('unit', value)</code>
+  cuts a timestamp down to the start of the year, month, week or day, which is the key to grouping by period.
+  The examples use Priya's hire date, 2019-01-07, a Monday.</p>
+  <pre data-title="Parts of a date"><code class="language-sql">SELECT hire_date,
+       EXTRACT(YEAR  FROM hire_date)           AS yr,
+       EXTRACT(MONTH FROM hire_date)           AS mon,
+       EXTRACT(DOW   FROM hire_date)           AS dow,          -- 0 = Sunday
+       DATE_TRUNC('month', hire_date)::DATE    AS month_start,
+       TO_CHAR(hire_date, 'Dy DD Mon YYYY')    AS pretty
+FROM employees
+WHERE emp_id = 5;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> hire_date  |  yr  | mon | dow | month_start |     pretty
+------------+------+-----+-----+-------------+-----------------
+ 2019-01-07 | 2019 |   1 |   1 | 2019-01-01  | Mon 07 Jan 2019
+(1 row)</code></pre>
+  <p>Other <code>EXTRACT</code> fields: <code>DAY</code>, <code>QUARTER</code>, <code>WEEK</code>,
+  <code>DOY</code> (day of year), <code>HOUR</code>, <code>EPOCH</code> (seconds since 1970). MySQL has
+  <code>YEAR(d)</code>, <code>MONTH(d)</code>, <code>DAYOFWEEK(d)</code> (1 = Sunday) and also accepts
+  <code>EXTRACT</code>. It has no <code>DATE_TRUNC</code>; use <code>DATE_FORMAT(d, '%Y-%m-01')</code> or
+  <code>LAST_DAY()</code>.</p>
+  <p>Grouping by month is a very common report:</p>
+  <pre data-title="Orders per month"><code class="language-sql">SELECT TO_CHAR(DATE_TRUNC('month', order_date), 'YYYY-MM') AS month,
+       COUNT(*)                                             AS orders
+FROM orders
+GROUP BY DATE_TRUNC('month', order_date)
+ORDER BY DATE_TRUNC('month', order_date);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">  month  | orders
+---------+--------
+ 2026-01 |      2
+ 2026-02 |      3
+ 2026-03 |      3
+ 2026-04 |      2
+(4 rows)</code></pre>
+  <p>MySQL: <code>DATE_FORMAT(order_date, '%Y-%m')</code> in both the select list and <code>GROUP BY</code>.</p>
+
+  <h4>Date arithmetic and intervals</h4>
+  <p>An <strong>interval</strong> is a length of time (<code>INTERVAL '3 days'</code>,
+  <code>INTERVAL '1 month'</code>). The results follow clear rules:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Expression</th><th>Type of result</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>date + integer</code></td><td>date</td><td><code>DATE '2019-01-07' + 30</code> → 2019-02-06</td></tr>
+      <tr><td><code>date + interval</code></td><td>timestamp</td><td><code>DATE '2019-01-07' + INTERVAL '1 month'</code> → 2019-02-07 00:00:00</td></tr>
+      <tr><td><code>date - date</code></td><td>integer (days)</td><td><code>DATE '2026-04-10' - DATE '2019-01-07'</code> → 2650</td></tr>
+      <tr><td><code>timestamp - timestamp</code></td><td>interval</td><td><code>TIMESTAMP '2026-04-10 18:00' - TIMESTAMP '2026-04-10 09:30'</code> → 08:30:00</td></tr>
+      <tr><td><code>AGE(later, earlier)</code></td><td>interval in years, months, days</td><td>7 years 3 mons 3 days</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="How long has Priya been with us (as of 2026-04-10)?"><code class="language-sql">SELECT DATE '2026-04-10' - hire_date                AS days,
+       AGE(DATE '2026-04-10', hire_date)            AS tenure,
+       EXTRACT(YEAR FROM AGE(DATE '2026-04-10', hire_date)) AS full_years,
+       (hire_date + INTERVAL '1 year')::DATE        AS first_anniversary
+FROM employees
+WHERE emp_id = 5;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> days |         tenure          | full_years | first_anniversary
+------+-------------------------+------------+-------------------
+ 2650 | 7 years 3 mons 3 days   |          7 | 2020-01-07
+(1 row)</code></pre>
+  <p>In real queries replace the fixed date with <code>CURRENT_DATE</code>. Month arithmetic is calendar based:
+  <code>DATE '2026-01-31' + INTERVAL '1 month'</code> gives 2026-02-28 (the last valid day), not 2026-03-03.</p>
+
+  <h4>MySQL equivalents</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Task</th><th>PostgreSQL</th><th>MySQL 8</th></tr></thead>
+    <tbody>
+      <tr><td>Days between</td><td><code>d2 - d1</code></td><td><code>DATEDIFF(d2, d1)</code></td></tr>
+      <tr><td>Add time</td><td><code>d + INTERVAL '7 days'</code></td><td><code>DATE_ADD(d, INTERVAL 7 DAY)</code></td></tr>
+      <tr><td>Subtract time</td><td><code>d - INTERVAL '1 month'</code></td><td><code>DATE_SUB(d, INTERVAL 1 MONTH)</code></td></tr>
+      <tr><td>Years between</td><td><code>EXTRACT(YEAR FROM AGE(d2, d1))</code></td><td><code>TIMESTAMPDIFF(YEAR, d1, d2)</code></td></tr>
+      <tr><td>Format as text</td><td><code>TO_CHAR(d, 'DD Mon YYYY')</code></td><td><code>DATE_FORMAT(d, '%d %b %Y')</code></td></tr>
+      <tr><td>Text to date</td><td><code>TO_DATE('10-04-2026', 'DD-MM-YYYY')</code></td><td><code>STR_TO_DATE('10-04-2026', '%d-%m-%Y')</code></td></tr>
+      <tr><td>Last day of month</td><td><code>(DATE_TRUNC('month', d) + INTERVAL '1 month - 1 day')::DATE</code></td><td><code>LAST_DAY(d)</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>The format letters differ too: PostgreSQL <code>YYYY-MM-DD HH24:MI:SS</code>, MySQL
+  <code>%Y-%m-%d %H:%i:%s</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: keep dates as dates</p>
+    <p>Store dates in <code>DATE</code> or <code>TIMESTAMPTZ</code> columns, never in text. Compare dates with
+    dates, and format only at the edge, for display. Use ISO <code>'YYYY-MM-DD'</code> literals in SQL.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: DATE_TRUNC returns timestamptz, not date</p>
+    <p><code>DATE_TRUNC('month', hire_date)</code> on a <code>DATE</code> returns a timestamp with time zone, so
+    the printed value changes with the session's time zone. Cast back with <code>::DATE</code> when you want a day,
+    as in the examples above.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Invalid dates raise <code>ERROR:  date/time field value out of range: "2026-02-30"</code>.
+      A bad text input raises <code>invalid input syntax for type date</code>.</li>
+      <li>February 29: <code>+ INTERVAL '1 year'</code> from 2024-02-29 gives 2025-02-28.</li>
+      <li>"Week" numbering is a trap: <code>EXTRACT(WEEK …)</code> is the ISO week (Monday start; the first
+      days of January may belong to week 52 or 53 of the previous year).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Expect "orders per month", "employees hired in the last year", "age from date of birth", "customers who
+    joined in the last 30 days", and "find the day of week with most orders". Group with
+    <code>DATE_TRUNC</code>/<code>DATE_FORMAT</code>, filter with ranges (next article).</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-date-ranges-time-zones">
+  <h3>Filtering date ranges and time zones</h3>
+  <p class="tldr">Filter dates with a half-open range, <code>&gt;= start AND &lt; next_start</code>, never with
+  <code>BETWEEN</code> on timestamps. Store moments as <code>TIMESTAMPTZ</code>, convert to a local zone with
+  <code>AT TIME ZONE</code> only when you display or bucket by local day.</p>
+
+  <h4>The half-open range</h4>
+  <p>Hard question: "all orders in March 2026". For a <code>DATE</code> column
+  <code>BETWEEN '2026-03-01' AND '2026-03-31'</code> works. For a <code>TIMESTAMP</code> it silently loses
+  data, because the end point <code>'2026-03-31'</code> means <code>2026-03-31 00:00:00</code>:</p>
+  <pre data-title="The BETWEEN trap"><code class="language-sql">SELECT TIMESTAMP '2026-03-31 15:00:00' BETWEEN '2026-03-01' AND '2026-03-31' AS between_says,
+       TIMESTAMP '2026-03-31 15:00:00' &gt;= '2026-03-01'
+       AND TIMESTAMP '2026-03-31 15:00:00' &lt;  '2026-04-01'                  AS half_open_says;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> between_says | half_open_says
+--------------+----------------
+ f            | t
+(1 row)</code></pre>
+  <p>The <strong>half-open</strong> form includes the start and excludes the next period's start. It works for
+  dates, timestamps and any precision, and the end of one range is exactly the start of the next, so ranges
+  never overlap or leave gaps.</p>
+  <pre data-title="March 2026, rolling windows and the current month"><code class="language-sql">-- a fixed month
+SELECT order_id, order_date
+FROM orders
+WHERE order_date &gt;= DATE '2026-03-01' AND order_date &lt; DATE '2026-04-01'
+ORDER BY order_id;
+
+-- the last 30 days
+SELECT COUNT(*) FROM orders WHERE order_date &gt;= CURRENT_DATE - 30;
+
+-- the current month, whatever today is
+SELECT COUNT(*) FROM orders
+WHERE order_date &gt;= DATE_TRUNC('month', CURRENT_DATE)
+  AND order_date &lt;  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month';</code></pre>
+  <pre class="out" data-title="Output of the first query"><code class="language-plaintext"> order_id | order_date
+----------+------------
+        6 | 2026-03-08
+        7 | 2026-03-21
+        8 | 2026-03-30
+(3 rows)</code></pre>
+
+  <h4>Keep the column bare so indexes work</h4>
+  <p>A condition that wraps the column in a function cannot use a normal index on that column. The database
+  must compute the function for every row. Rewrite it as a range on the bare column:</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: function on the column (index not used)</p><pre><code class="language-sql">WHERE EXTRACT(YEAR FROM order_date) = 2026
+  AND EXTRACT(MONTH FROM order_date) = 3</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: range on the bare column</p><pre><code class="language-sql">WHERE order_date &gt;= DATE '2026-03-01'
+  AND order_date &lt;  DATE '2026-04-01'</code></pre></div>
+  </div>
+  <p>A condition written so that an index can be used is called <strong>sargable</strong> (search-argument
+  able). Same idea as <code>WHERE LOWER(email) = …</code> in the string article.</p>
+
+  <h4>Time zones</h4>
+  <p>Chapter one rule: store the instant, not the local clock. In PostgreSQL that means
+  <code>TIMESTAMPTZ</code> (<a href="#m1-date-json-id-types">data types</a>). It is saved as UTC; each session
+  shows it in its <code>TimeZone</code> setting. <code>AT TIME ZONE</code> converts between the two kinds of
+  timestamp, and its direction trips people up:</p>
+  <ul>
+    <li><code>timestamptz AT TIME ZONE 'zone'</code> returns a plain <code>timestamp</code>: the wall-clock
+    time in that zone.</li>
+    <li><code>timestamp AT TIME ZONE 'zone'</code> returns a <code>timestamptz</code>: it says "this wall-clock
+    reading was taken in that zone".</li>
+  </ul>
+  <pre data-title="Converting between UTC and India time"><code class="language-sql">SET TIME ZONE 'UTC';
+SELECT TIMESTAMPTZ '2026-04-10 09:00:00+00' AT TIME ZONE 'Asia/Kolkata' AS ist_clock,
+       TIMESTAMP   '2026-04-10 14:30:00'    AT TIME ZONE 'Asia/Kolkata' AS instant;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">      ist_clock      |        instant
+---------------------+------------------------
+ 2026-04-10 14:30:00 | 2026-04-10 09:00:00+00
+(1 row)</code></pre>
+  <p>Typical use: counting orders per <em>local</em> day. A purchase at 23:30 IST on 9 April is
+  18:00 UTC on 9 April, but 00:10 IST on 10 April is 18:40 UTC on 9 April, so grouping on the UTC date puts it
+  on the wrong day for an Indian shop. Group on the local date:</p>
+  <pre data-title="Daily buckets in IST"><code class="language-sql">SELECT (created_at AT TIME ZONE 'Asia/Kolkata')::DATE AS local_day, COUNT(*) AS orders
+FROM web_orders                        -- a hypothetical table with created_at TIMESTAMPTZ
+GROUP BY (created_at AT TIME ZONE 'Asia/Kolkata')::DATE
+ORDER BY local_day;</code></pre>
+  <p>India has no daylight saving time (always +05:30), but many countries do, and across a DST change a "day"
+  has 23 or 25 hours. Use the zone <em>name</em> (<code>'Asia/Kolkata'</code>, <code>'America/New_York'</code>),
+  not a fixed offset such as <code>'+05:30'</code>, so the database knows the rules. List names with
+  <code>SELECT name FROM pg_timezone_names</code>.</p>
+  <p><strong>MySQL:</strong> <code>TIMESTAMP</code> converts to UTC on storage according to the session
+  <code>time_zone</code> variable; <code>DATETIME</code> does not. <code>CONVERT_TZ(ts, 'UTC',
+  'Asia/Kolkata')</code> converts, but named zones work only after the time-zone tables have been loaded into
+  MySQL. A frequent production fix is running all servers, JVMs and databases in UTC.</p>
+  <p>In Java use <code>Instant</code> or <code>OffsetDateTime</code> for <code>TIMESTAMPTZ</code>, and
+  <code>LocalDate</code> for <code>DATE</code>. Never store <code>java.util.Date</code> without knowing the
+  JVM's time zone.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: ranges are closed at the start and open at the end</p>
+    <p><code>col &gt;= start AND col &lt; end_exclusive</code>. For "the whole of 30 April" the end is
+    1 May. Compute it with <code>+ INTERVAL '1 day'</code> instead of writing <code>23:59:59</code>, which loses
+    fractions of a second.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: comparing a timestamp column with a date literal</p>
+    <p><code>WHERE created_at = '2026-04-10'</code> matches only rows at exactly midnight. To match a day use
+    <code>created_at &gt;= '2026-04-10' AND created_at &lt; '2026-04-11'</code>, or
+    <code>created_at::DATE = '2026-04-10'</code> for small tables only.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A date literal compared with a <code>TIMESTAMPTZ</code> is read in the session time zone, so the same
+      query can return different rows for two sessions in different zones.</li>
+      <li><code>BETWEEN</code> with a reversed range (<code>BETWEEN 10 AND 5</code>) returns nothing; use
+      <code>BETWEEN SYMMETRIC</code> in PostgreSQL if order is unknown.</li>
+      <li>The <code>OVERLAPS</code> operator checks whether two periods overlap:
+      <code>(s1, e1) OVERLAPS (s2, e2)</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Why not BETWEEN for timestamps?" is a favourite. Give the half-open answer and add that it keeps
+    indexes usable. "How do you handle time zones?" Store UTC with <code>TIMESTAMPTZ</code>, convert at the
+    edges, run servers in UTC, use named zones.</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-casting">
+  <h3>Type casting</h3>
+  <p class="tldr">A <strong>cast</strong> converts a value from one type to another:
+  <code>CAST(x AS INTEGER)</code>, or the PostgreSQL shorthand <code>x::INTEGER</code>. Do it explicitly, and
+  expect an error when the text cannot be converted.</p>
+
+  <h4>Why you need it</h4>
+  <p>Types decide behaviour. Integer division truncates, text sorts alphabetically ('10' before '9'), dates
+  compare as dates and JDBC parameters arrive with a type. Casting is how you say what you mean: divide as
+  decimals, compare a number stored as text, turn a timestamp into a day, or build a string from an id. SQL
+  also converts some types automatically (<strong>implicit casts</strong>); the explicit form is safer.</p>
+
+  <h4>The two syntaxes</h4>
+  <pre data-title="CAST and ::"><code class="language-sql">SELECT CAST('42' AS INTEGER) + 1       AS a,    -- standard SQL, works in every database
+       '42'::INTEGER + 1               AS b,    -- PostgreSQL shorthand
+       7::NUMERIC / 2                  AS c,    -- decimal division
+       CAST(150000.60 AS INTEGER)      AS d,    -- numeric to integer rounds
+       TRUNC(150000.60)                AS e,    -- cuts off the decimals
+       '2026-04-10'::DATE + 1          AS f,
+       NOW()::DATE                     AS g,    -- timestamp to date
+       emp_id::TEXT || '-' || last_name AS h
+FROM employees WHERE emp_id = 5;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">  a | b  |          c          |   d    |   e    |     f      |     g      |    h
+----+----+---------------------+--------+--------+------------+------------+----------
+ 43 | 43 |  3.5000000000000000 | 150001 | 150000 | 2026-04-11 | 2026-04-10 | 5-Menon
+(1 row)</code></pre>
+  <p>(Column <code>g</code> shows the day you run it.) Note the rounding: casting a decimal to an integer
+  <strong>rounds</strong> in PostgreSQL (150000.60 becomes 150001), unlike Java's <code>(int)</code> cast, which
+  truncates.</p>
+
+  <h4>Common conversions</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>From → to</th><th>PostgreSQL</th><th>MySQL 8</th></tr></thead>
+    <tbody>
+      <tr><td>text → integer</td><td><code>'42'::INT</code></td><td><code>CAST('42' AS SIGNED)</code></td></tr>
+      <tr><td>text → decimal</td><td><code>'12.5'::NUMERIC(10,2)</code></td><td><code>CAST('12.5' AS DECIMAL(10,2))</code></td></tr>
+      <tr><td>number → text</td><td><code>id::TEXT</code></td><td><code>CAST(id AS CHAR)</code></td></tr>
+      <tr><td>text → date</td><td><code>'2026-04-10'::DATE</code></td><td><code>CAST('2026-04-10' AS DATE)</code></td></tr>
+      <tr><td>timestamp → date</td><td><code>ts::DATE</code></td><td><code>DATE(ts)</code></td></tr>
+      <tr><td>text → boolean</td><td><code>'true'::BOOLEAN</code> (also 't', 'yes', '1')</td><td>no real boolean; use <code>1</code>/<code>0</code></td></tr>
+      <tr><td>formatted text → number / date</td><td><code>TO_NUMBER('1,234.50', '9,999.99')</code>, <code>TO_DATE(…)</code></td><td><code>STR_TO_DATE(…)</code>, <code>REPLACE</code> then <code>CAST</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>MySQL's <code>CAST</code> accepts only a few target types: <code>SIGNED</code>, <code>UNSIGNED</code>,
+  <code>DECIMAL</code>, <code>CHAR</code>, <code>DATE</code>, <code>DATETIME</code>, <code>JSON</code> and a few
+  more (not <code>INT</code>).</p>
+
+  <h4>Errors and implicit casts</h4>
+  <pre data-title="When the value does not fit the type"><code class="language-sql">SELECT 'abc'::INTEGER;
+-- ERROR:  invalid input syntax for type integer: "abc"
+
+SELECT '2026-13-45'::DATE;
+-- ERROR:  date/time field value out of range: "2026-13-45"
+
+SELECT first_name + 1 FROM employees;
+-- ERROR:  operator does not exist: character varying + integer
+
+SELECT '10' + 5;        -- 15: a bare quoted literal is "unknown" and adopts the number type</code></pre>
+  <p>PostgreSQL is strict: a text <em>column</em> is not converted silently. <strong>MySQL is lax</strong>: it
+  converts silently, and <code>SELECT 'abc' + 5</code> returns 5 with a warning, because 'abc' becomes 0. The same
+  laxness makes <code>WHERE phone = 9876500001</code> compare numbers (and scan the whole table, ignoring the
+  index on <code>phone</code>). Be explicit.</p>
+  <p>A related pitfall is casting inside a join or <code>WHERE</code>: <code>ON o.customer_id::TEXT =
+  c.ref</code> works, but it blocks index use. Better to fix the column types.</p>
+
+  <h4>Safe conversion of dirty data</h4>
+  <p>PostgreSQL has no built-in "try cast" before version 16 (PostgreSQL 16 added <code>pg_input_is_valid</code>
+  for this check). The classic approach is a regular expression guard:</p>
+  <pre data-title="Cast only valid numbers"><code class="language-sql">SELECT CASE WHEN raw ~ '^[0-9]+$' THEN raw::INT END AS safe_value
+FROM (VALUES ('12'), ('abc'), ('7')) AS t(raw);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> safe_value
+------------
+         12
+     (null)
+          7
+(3 rows)</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: cast one side to match the other, and cast the value, not the indexed column</p>
+    <p>Write <code>WHERE phone = '9876500001'</code> (text to text) rather than casting
+    <code>phone::BIGINT</code>. Cast the literal or parameter so the indexed column stays untouched.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: integer division in percentages</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: always 0 or 1</p><pre><code class="language-sql">SELECT delivered / total * 100;      -- 5 / 10 = 0</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: cast first, or multiply first</p><pre><code class="language-sql">SELECT 100.0 * delivered / total;    -- 50.0
+SELECT delivered::NUMERIC / total * 100;</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Casting to <code>VARCHAR(5)</code> silently truncates in an explicit cast, but raises "value too long"
+      on an <code>INSERT</code>.</li>
+      <li><code>NULL</code> casts to any type and stays NULL.</li>
+      <li><code>'  42  '::INT</code> works (PostgreSQL trims spaces around numbers); <code>'4 2'::INT</code>
+      does not.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What does <code>SELECT 5/2</code> return?" (2 in PostgreSQL, 2.5000 in MySQL), "how do you get decimals?"
+    (cast one operand), "explicit vs implicit casting" and "how do you convert text to a date".</p>
+  </div>
+</article>

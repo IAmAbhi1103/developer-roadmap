@@ -1,0 +1,433 @@
+<article class="topic" id="m5-deploy-strategies">
+  <h3>Deployment strategies: recreate, rolling, blue-green, canary and rollback</h3>
+  <p class="tldr">A deployment strategy decides how the new version replaces the old one: recreate (stop, then
+  start), rolling (replace one by one), blue-green (switch between two full copies) or canary (send a small share
+  of traffic first); whatever you pick, keep the previous image tag so you can go back fast.</p>
+
+  <h4>The four strategies</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Strategy</th><th>How it works</th><th>Downtime</th><th>Extra capacity</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Recreate</strong></td><td>Stop the old version, start the new one</td><td>Yes, seconds to minutes</td><td>None</td></tr>
+      <tr><td><strong>Rolling</strong></td><td>Replace instances a few at a time; old and new run together briefly</td><td>None if done right</td><td>A little</td></tr>
+      <tr><td><strong>Blue-green</strong></td><td>Run the new version (green) beside the old (blue), test it, then switch all traffic</td><td>None</td><td>A full second copy</td></tr>
+      <tr><td><strong>Canary</strong></td><td>Send a small percentage of users to the new version, watch metrics, then increase</td><td>None</td><td>A little</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><strong>Recreate</strong> is what <code>docker compose up -d</code> does on a single server. It is simple
+    and fine for a small app where a few seconds of downtime at a quiet hour is acceptable. It is also the only
+    option when two versions cannot run at the same time (for example an incompatible schema change).</li>
+    <li><strong>Rolling</strong> is the default in Kubernetes Deployments, ECS services and Elastic Beanstalk.
+    With a load balancer in front, each instance is taken out of rotation, updated, health-checked and put back.
+    During the update both versions serve users, so they must be compatible with each other and with the
+    database.</li>
+    <li><strong>Blue-green</strong> gives instant rollback: if green misbehaves, switch the load balancer or the
+    Nginx upstream back to blue. It costs double capacity during the switch and needs care with shared
+    databases.</li>
+    <li><strong>Canary</strong> limits the damage of a bad release to a few users and gives real traffic
+    evidence. It needs a router that can split traffic and good metrics (<a href="#m6-observability">Module 6</a>).
+    A related tool is a <strong>feature flag</strong>: code ships dark and is switched on for chosen users without
+    a new deployment.</li>
+  </ul>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  U[Users] --> LB["Load balancer or Nginx"]
+  LB -->|"live"| B["Blue: version 1"]
+  LB -.->|"after the switch"| G["Green: version 2"]
+  B --- DB[("Database")]
+  G --- DB
+</pre>
+    <figcaption>Blue-green: both versions share the database; only the traffic switch moves</figcaption>
+  </figure>
+
+  <h4>Zero downtime on one server (a blue-green sketch)</h4>
+  <p>With one EC2 server you can still avoid downtime by starting the new container on a second port, checking
+  it, and switching Nginx. Assume Nginx proxies to an upstream defined in a small file:</p>
+  <pre data-title="/etc/nginx/conf.d/shop-upstream.conf"><code class="language-nginx">upstream shop_backend {
+    server 127.0.0.1:8080;      # blue is live; green would be 8081
+}</code></pre>
+  <pre data-title="Switch from blue (8080) to green (8081)"><code class="language-shell">$ docker run -d --name shop-green --env-file /opt/shop/.env \
+    -p 127.0.0.1:8081:8080 ghcr.io/asha/shop-api:sha-9b1d4e7
+$ curl -fsS http://127.0.0.1:8081/actuator/health          # wait until UP
+$ sudo sed -i 's/127.0.0.1:8080/127.0.0.1:8081/' /etc/nginx/conf.d/shop-upstream.conf
+$ sudo nginx -t &amp;&amp; sudo systemctl reload nginx          # reload does not drop connections
+$ docker stop shop-blue                                     # keep it for a while for rollback</code></pre>
+  <p>In the site config use <code>proxy_pass http://shop_backend;</code>. This is a manual teaching example; in a
+  real team a load balancer with target groups, or Kubernetes, automates the same idea.</p>
+
+  <h4>Zero-downtime basics in Spring Boot</h4>
+  <ul>
+    <li><strong>Readiness:</strong> traffic should reach an instance only after it started (health
+    checks and probes, <a href="#m6-health-checks">Module 6</a>).</li>
+    <li><strong>Graceful shutdown:</strong> when the old instance is told to stop, finish in-flight requests
+    first. Spring Boot supports this:</li>
+  </ul>
+  <pre data-title="application.properties"><code class="language-properties">server.shutdown=graceful
+spring.lifecycle.timeout-per-shutdown-phase=30s</code></pre>
+  <ul>
+    <li><strong>Connection draining:</strong> the load balancer stops sending new requests to an instance being
+    removed and lets existing ones finish (a "deregistration delay").</li>
+    <li><strong>Backward-compatible database changes</strong> (the <em>expand and contract</em> pattern): release
+    1 adds a nullable column; release 2 starts using it; a later release removes the old column. Then old and
+    new code both work against the same schema, which makes rolling updates and rollbacks safe. Renaming or
+    dropping a column in a single step breaks the version that is still running.</li>
+  </ul>
+
+  <h4>Rollback</h4>
+  <p>Rollback should be boring and fast. Rules that make it so:</p>
+  <ol class="steps">
+    <li>Tag images immutably (<code>sha-9b1d4e7</code>, <code>1.4.2</code>); never deploy
+    <code>latest</code>.</li>
+    <li>Record the previously running tag on every deployment (the runbook's <code>.previous_tag</code> file).</li>
+    <li>Keep several old images in the registry and on the server (careful with
+    <code>docker image prune -a</code>).</li>
+    <li>Make the rollback a command or a button (a script, a <code>workflow_dispatch</code> run, a platform
+    "redeploy previous").</li>
+    <li>Keep database migrations backward compatible. If a release changed data irreversibly, an image rollback
+    alone will not help; that is why the migration discipline matters.</li>
+    <li>Practise it before you need it.</li>
+  </ol>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Dropping or renaming a column in the same release that stops using it.</li>
+      <li>Calling a deployment successful because the container started, without a health check.</li>
+      <li>No graceful shutdown: users see errors for requests that were in progress.</li>
+      <li>Deploying a big release on Friday evening with no rollback plan.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Most teams use rolling updates by default, blue-green for risky releases, and canary or feature flags for
+    large user bases. A deployment typically has a health-check gate, a smoke test, and dashboards watched for
+    the first minutes after release.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Blue-green vs canary vs rolling?"</p>
+    <ul>
+      <li>Rolling: gradual replacement, cheap, mixed versions for a while. Blue-green: two full environments,
+      instant switch and rollback, double cost. Canary: small traffic slice with metrics before full rollout.</li>
+      <li>Mention database compatibility and health checks.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-prod-checklist">
+  <h3>Production deployment checklist</h3>
+  <p class="tldr">Before you call a deployment production-ready, check security, configuration, data, runtime,
+  networking, observability, release process and cost, using this list as a final pass.</p>
+
+  <h4>How to use it</h4>
+  <p>Go through the list once before the first launch and again before a major change. Every line is a small
+  failure that has hurt someone. A "no" is not always wrong; it should be a decision you can explain.</p>
+
+  <h4>Security</h4>
+  <ul>
+    <li>Root account has MFA, and no root access keys exist. Daily work uses a non-root identity.</li>
+    <li>SSH is limited to your IP (or replaced by Session Manager); password login is off; keys are not shared.</li>
+    <li>Only ports 80 and 443 are public. The app port and the database port are private.</li>
+    <li>The database is not publicly accessible. The app uses its own limited database user.</li>
+    <li>No secrets in Git, images or frontend code. The <code>.env</code> file has mode 600.</li>
+    <li>AWS access uses roles; policies name exact resources; S3 buckets block public access.</li>
+    <li>The OS gets security updates (<code>unattended-upgrades</code> or a patch routine). Images are rebuilt
+    on newer base images regularly.</li>
+    <li>Swagger UI, H2 console and sensitive Actuator endpoints are off or protected in production.</li>
+  </ul>
+
+  <h4>Configuration</h4>
+  <ul>
+    <li>All environment-specific values come from environment variables or a config service, per environment.</li>
+    <li>The production profile is active (<code>SPRING_PROFILES_ACTIVE=prod</code>); <code>ddl-auto</code> is
+    <code>validate</code> or <code>none</code>; migrations run through Flyway or Liquibase.</li>
+    <li>CORS allows exactly the real frontend origins, not <code>*</code> with credentials.</li>
+    <li>Time zone, character set and locale are set on purpose (store timestamps in UTC).</li>
+  </ul>
+
+  <h4>Data</h4>
+  <ul>
+    <li>Automated backups are on, and you have <em>tested a restore</em>.</li>
+    <li>The database has enough connections for the pool sizes times the number of instances.</li>
+    <li>Uploaded files live in S3 or a durable volume, not in the container's temporary disk.</li>
+  </ul>
+
+  <h4>Runtime</h4>
+  <ul>
+    <li>Memory is sized: <code>MaxRAMPercentage</code> is set, container limits match, and swap exists on tiny
+    machines.</li>
+    <li>Restart policy is set; the app and Docker start on boot; you tested a reboot.</li>
+    <li>Graceful shutdown is on. Health endpoints (liveness and readiness) exist.</li>
+    <li>Logs go to stdout, are rotated (<code>max-size</code>, <code>max-file</code>), and the disk cannot fill
+    silently.</li>
+  </ul>
+
+  <h4>Networking and domain</h4>
+  <ul>
+    <li>DNS records are correct; HTTPS works; HTTP redirects to HTTPS; the certificate renewal was tested with
+    <code>certbot renew --dry-run</code>.</li>
+    <li>Nginx forwards the right headers; upload size and timeouts match your needs.</li>
+    <li>The Elastic IP is attached (the address survives restarts).</li>
+  </ul>
+
+  <h4>Observability</h4>
+  <ul>
+    <li>An external uptime monitor checks the public health URL and alerts you by email, Slack or Telegram.</li>
+    <li>You can read logs quickly; important errors are noticed without a user complaint.</li>
+    <li>Basic metrics (CPU, memory, disk, request errors, latency) are visible
+    (<a href="#m6">Module 6</a>).</li>
+  </ul>
+
+  <h4>Release process</h4>
+  <ul>
+    <li>CI runs tests on every pull request; deployment comes only from the main branch after tests pass.</li>
+    <li>Images carry immutable tags. The previous tag is known and rollback is rehearsed.</li>
+    <li>A smoke test runs after each deployment.</li>
+    <li>The runbook (how to deploy, roll back, and who to call) is written down and stored in the repository.</li>
+  </ul>
+
+  <h4>Cost</h4>
+  <ul>
+    <li>A budget alert exists and goes to an email you read.</li>
+    <li>You know what each resource costs per month (from the current pricing pages), and unused resources are
+    deleted: stopped servers with disks, old snapshots, unattached Elastic IPs, forgotten databases.</li>
+  </ul>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: keep the checklist in the repository</p>
+    <p>Put a <code>DEPLOYMENT.md</code> file next to the code with the checklist and the runbook commands.
+    Reviewers can then check it, and a new team member can deploy on day one.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What do you check before releasing to production?"</p>
+    <ul>
+      <li>Tests and migrations are green and backward compatible; config and secrets are correct for the
+      environment; health checks and monitoring are in place; there is a rollback plan; the deployment is
+      done at a quiet time with a smoke test afterwards.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m5-interview">
+  <h3>Interview questions — Cloud and deployment</h3>
+
+  <details class="qa">
+    <summary>What are IaaS, PaaS and SaaS? Give one example of each.</summary>
+    <div class="qa-a">
+      <p>IaaS rents virtual infrastructure (servers, disks, networks): you manage the OS and everything above it;
+      example EC2. PaaS rents a platform to run your code: you manage the app and its settings; examples Render,
+      Railway, Elastic Beanstalk. SaaS is finished software you just use: Gmail, Jira, Slack. The further toward
+      SaaS, the less you manage and the less you can change.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the shared-responsibility model?</summary>
+    <div class="qa-a">
+      <p>The provider secures the cloud itself (buildings, hardware, virtualisation). You secure what you put in
+      it: data, accounts and permissions, network rules, and, on EC2, the OS and application. The split changes
+      with the service: for RDS, AWS patches the engine; for EC2, you patch the OS. Typical customer errors are
+      public buckets, open security groups and leaked keys.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between a region and an availability zone? How do you get high availability?</summary>
+    <div class="qa-a">
+      <p>A region is a geographic area (Mumbai, <code>ap-south-1</code>); an availability zone is an isolated
+      group of data centres inside it. Spread instances over at least two AZs behind a load balancer and enable
+      Multi-AZ on the database, so a failure of one zone does not stop the app. Regions are independent, so
+      cross-region designs cost more and are used only when needed.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What do you do first in a new AWS account?</summary>
+    <div class="qa-a">
+      <p>Enable MFA on the root user and stop using it, create an IAM Identity Center or IAM user (with MFA) for
+      daily work, grant least privilege, avoid access keys, set a budget with email alerts, and enable
+      CloudTrail. Check the current free-tier terms instead of assuming. These steps prevent the most common
+      incidents: leaked keys and surprise bills.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Name common surprise costs on AWS and how to avoid them.</summary>
+    <div class="qa-a">
+      <p>Instances left running, EBS volumes and snapshots that remain after termination, Elastic IPs and public
+      IPv4 addresses, NAT gateways, load balancers, data transfer, and RDS instances left on. Avoid them with
+      budgets and alerts, tags, a cleanup routine after labs, a weekly look at the bill by service and region,
+      and infrastructure as code so <code>terraform destroy</code> removes everything.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between stopping and terminating an EC2 instance?</summary>
+    <div class="qa-a">
+      <p>Stopping shuts the instance down but keeps it and its EBS volumes; you stop paying for compute but still
+      pay for storage, and the automatic public IP changes on the next start. Terminating deletes the instance
+      and, by default, its root volume; it cannot be undone. Data on instance-store disks is lost on stop.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you let only your application reach the RDS database?</summary>
+    <div class="qa-a">
+      <p>Create the database with Public access off, in the same VPC as the app. In its security group add an
+      inbound rule for port 5432 whose source is the application's security group, not an IP range. Then only
+      instances in that group can connect. Use a dedicated database user and pass the credentials through
+      environment variables or a secrets service.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>RDS Multi-AZ vs read replica?</summary>
+    <div class="qa-a">
+      <p>Multi-AZ keeps a synchronous standby in another AZ for automatic failover; it is for availability and
+      you cannot read from the standby. A read replica is an asynchronously updated copy with its own endpoint
+      that serves read queries to scale reads; it can lag behind. They solve different problems and can be used
+      together.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does an app on EC2 call S3 without storing access keys?</summary>
+    <div class="qa-a">
+      <p>Create an IAM role with a least-privilege policy and attach it to the instance (through an instance
+      profile). The AWS SDK's default credentials chain gets temporary, automatically rotated credentials from
+      the instance metadata service. Nothing is written to disk or Git. Inside Docker you may need the metadata
+      hop limit set to 2.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a presigned URL and why use it?</summary>
+    <div class="qa-a">
+      <p>It is an S3 URL signed with your server's credentials that allows one operation (GET or PUT) on one
+      object until it expires. The browser uploads or downloads directly to and from a private bucket, so large
+      files do not pass through your server, and you do not expose credentials or make the bucket public. Keep the
+      expiry short and generate the object key on the server.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Walk me through putting a Spring Boot app on a fresh EC2 server with HTTPS.</summary>
+    <div class="qa-a">
+      <p>Launch Ubuntu with a security group (SSH from my IP, 80 and 443 open), attach an Elastic IP, SSH in,
+      install Docker, log in to the registry and pull the tagged image, run it with Compose using an env file and
+      a port bound to <code>127.0.0.1:8080</code>, install Nginx as a reverse proxy, create a DNS A record to the
+      Elastic IP, run <code>certbot --nginx -d api.example.com</code>, verify renewal with a dry run, and enable
+      restart policies. Finish with logs, a health check, and a deploy and rollback script.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why put Nginx in front of Spring Boot?</summary>
+    <div class="qa-a">
+      <p>It terminates TLS, serves on ports 80/443 without running Java as a privileged user, redirects HTTP to
+      HTTPS, can add compression, request size limits, caching and rate limiting, and hides the app port. It also
+      lets you switch between app versions without changing the public address. The app then trusts the
+      <code>X-Forwarded-*</code> headers (<code>server.forward-headers-strategy</code>).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why does a React app on Vercel or Netlify return 404 on refresh, and how do you fix it?</summary>
+    <div class="qa-a">
+      <p>Client-side routes such as <code>/orders/42</code> do not exist as files; the server finds nothing and
+      returns 404. Add a rewrite sending all unknown paths to <code>index.html</code> (<code>vercel.json</code>
+      rewrites, or a Netlify redirect with status 200), and React Router renders the right page. Also remember
+      that <code>VITE_</code> variables are fixed at build time.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Compare recreate, rolling, blue-green and canary deployments. How do you roll back?</summary>
+    <div class="qa-a">
+      <p>Recreate: stop old, start new, with downtime. Rolling: replace instances gradually behind a load
+      balancer. Blue-green: run a full new copy and switch traffic, with instant rollback and double capacity.
+      Canary: send a small share of traffic to the new version first. Rollback is easy when images have immutable
+      tags, the previous tag is known, the switch is scripted, and database changes are backward compatible.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Your site works on its Elastic IP but not on the domain. What do you check?</summary>
+    <div class="qa-a">
+      <p>Run <code>dig +short name</code> to see what DNS returns. Check the record type and host field (only
+      <code>api</code>, not the full name), that it points to the Elastic IP, the TTL and cached answers, and that
+      Nginx has a matching <code>server_name</code>. For HTTPS, check certbot succeeded, port 443 is open, and
+      the certificate covers that name. If the domain is proxied by Cloudflare, check the SSL mode.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m5-cheatsheet">
+  <h3>Cheat sheet — Cloud and deployment</h3>
+  <ul class="cheat">
+    <li><b>IaaS / PaaS / SaaS</b> servers (EC2) / platform for code (Render) / finished software (Gmail)</li>
+    <li><b>Region vs AZ</b> geographic area (<code>ap-south-1</code> Mumbai, <code>ap-south-2</code> Hyderabad) / isolated data centres inside it</li>
+    <li><b>Shared responsibility</b> provider secures the cloud; you secure what you put in it</li>
+    <li><b>Day one</b> root MFA, no root keys, non-root user, budget alert, read the current free-tier terms</li>
+    <li><b>Surprise costs</b> running EC2, orphan EBS, Elastic IPs, NAT gateway, load balancer, RDS, data transfer</li>
+    <li><b>Instance name</b> <code>t3.micro</code> = family, generation, size; <code>g</code> = Graviton (ARM)</li>
+    <li><b>Security group</b> stateful firewall; SSH from my IP only; open 80 and 443; never 8080 or 5432</li>
+    <li><b>Key pair</b> <code>chmod 400 key.pem</code>; <code>ssh -i key.pem ubuntu@IP</code> (Amazon Linux: <code>ec2-user</code>)</li>
+    <li><b>Stop vs terminate</b> stop keeps disks and bills storage; terminate deletes the instance</li>
+    <li><b>Elastic IP</b> static public IPv4; attach it before DNS; release when unused</li>
+    <li><b>Docker on Ubuntu</b> install, <code>usermod -aG docker $USER</code>, re-login, <code>docker compose up -d</code></li>
+    <li><b>Compose port</b> <code>"127.0.0.1:8080:8080"</code> and <code>restart: unless-stopped</code></li>
+    <li><b>Nginx</b> <code>proxy_pass http://127.0.0.1:8080</code> plus X-Forwarded headers; <code>nginx -t</code> then reload</li>
+    <li><b>HTTPS</b> <code>certbot --nginx -d api.example.com</code>; test <code>certbot renew --dry-run</code></li>
+    <li><b>Update</b> change the image tag, <code>compose pull api &amp;&amp; compose up -d api</code>, health check, roll back on failure</li>
+    <li><b>RDS</b> managed Postgres; public access off; port 5432 only from the app's security group</li>
+    <li><b>Spring datasource env vars</b> <code>SPRING_DATASOURCE_URL</code>, <code>_USERNAME</code>, <code>_PASSWORD</code></li>
+    <li><b>S3</b> private bucket, Block Public Access on, keys generated by the server</li>
+    <li><b>Presigned URL</b> short-lived signed link for one GET or PUT; needs bucket CORS for browsers</li>
+    <li><b>IAM</b> user / group / role / policy; default deny; least privilege; role for EC2 instead of keys</li>
+    <li><b>Policy ARNs</b> object actions on <code>bucket/*</code>; <code>s3:ListBucket</code> on <code>bucket</code></li>
+    <li><b>Vercel / Netlify</b> build <code>npm run build</code>, output <code>dist</code>, SPA rewrite, <code>VITE_</code> vars at build time</li>
+    <li><b>Render / Railway</b> <code>server.port=${PORT:8080}</code>, JDBC URL not <code>postgres://</code>, free plans may sleep</li>
+    <li><b>DNS</b> A = name to IP; CNAME = name to name (not at the apex); check with <code>dig +short</code></li>
+    <li><b>Strategies</b> recreate, rolling, blue-green, canary; immutable tags make rollback easy</li>
+    <li><b>Zero downtime</b> readiness checks, graceful shutdown, backward-compatible migrations</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m5-practice">
+  <h3>Practice — Cloud and deployment</h3>
+  <ol class="steps">
+    <li><strong>Secure the account (easy).</strong> Turn on MFA for root, create a daily-use user or Identity
+    Center user with MFA, and create a monthly budget with email alerts. Done when: you can sign in as the new
+    user, <code>aws sts get-caller-identity</code> shows it, and a test alert email arrives.</li>
+    <li><strong>Read the bill (easy).</strong> Open Bills and Cost Explorer; list the services and regions you
+    used this week. Done when: you can say what each line is and what you will delete.</li>
+    <li><strong>First server (easy).</strong> Launch an Ubuntu EC2 instance with a security group that allows SSH
+    only from your IP, SSH in, install Nginx, and open the default page in a browser. Done when: you can explain
+    each security group rule, and you then terminate the instance and check it is gone in all regions.</li>
+    <li><strong>Run your container (medium).</strong> On a new instance, install Docker, pull your Spring Boot
+    image from GHCR, and run it with Compose on <code>127.0.0.1:8080</code>. Done when:
+    <code>curl localhost:8080/actuator/health</code> on the server returns UP, and port 8080 is unreachable from
+    your laptop.</li>
+    <li><strong>Proxy, DNS and HTTPS (medium).</strong> Attach an Elastic IP, configure Nginx, create an A record
+    for <code>api.yourdomain</code>, and run certbot. Done when: the browser shows a valid padlock and
+    <code>certbot renew --dry-run</code> passes.</li>
+    <li><strong>Managed database (medium).</strong> Create an RDS PostgreSQL instance that is not public, allow
+    5432 only from the EC2 security group, create a <code>shop_app</code> user, and connect the app through
+    environment variables. Done when: the app starts, Flyway runs, and a connection attempt from your laptop times
+    out.</li>
+    <li><strong>S3 uploads (medium).</strong> Create a private bucket, an IAM policy limited to it, and an
+    instance role. Add presigned PUT and GET endpoints to Spring Boot and a small React upload form with the
+    bucket CORS rules. Done when: you upload from the browser and view the file through a presigned link, and the
+    object URL without a signature returns AccessDenied.</li>
+    <li><strong>Update and roll back (medium to hard).</strong> Write the <code>deploy.sh</code> from the runbook,
+    deploy a new tag, then deploy a deliberately broken one (for example a missing environment variable). Done
+    when: the script detects the unhealthy app and returns to the previous tag by itself.</li>
+    <li><strong>Deploy Project 3 (hard).</strong> Deploy the React frontend on Vercel or Netlify and Spring Boot
+    with PostgreSQL on EC2 (or Render), under your own domain with HTTPS, with CI/CD from
+    <a href="#m4">Module 4</a>. Done when: Project 3 is live on a public HTTPS address, and you can explain
+    everything that happens between <code>git push</code> and the new version going live (CI, tests, image build,
+    registry, deploy, health check, DNS and TLS in the request path, and how to roll back).</li>
+  </ol>
+</article>

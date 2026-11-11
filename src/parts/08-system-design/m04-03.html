@@ -1,0 +1,297 @@
+<article class="topic" id="m4-availability">
+  <h3>Availability, reliability and what "99.9% uptime" means</h3>
+  <p class="tldr">Availability is the fraction of time a system works; each extra "nine" cuts the allowed
+  downtime ten times, components in series multiply their availabilities (worse), components in parallel
+  multiply their failure chances (better), and you reach high availability by removing single points of
+  failure with redundancy and failover.</p>
+
+  <h4>Availability as a percentage</h4>
+  <p><strong>Availability</strong> = uptime ÷ (uptime + downtime), usually written as a percentage and
+  described by its "nines". "Three nines" means 99.9%. The allowed downtime shrinks very fast:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Availability</th><th>Nines</th><th>Downtime per year</th><th>Per month (30 days)</th></tr></thead>
+    <tbody>
+      <tr><td>99%</td><td>two</td><td>about 3.65 days</td><td>about 7.2 hours</td></tr>
+      <tr><td>99.9%</td><td>three</td><td>about 8.77 hours</td><td>about 43 minutes</td></tr>
+      <tr><td>99.99%</td><td>four</td><td>about 52.6 minutes</td><td>about 4.3 minutes</td></tr>
+      <tr><td>99.999%</td><td>five</td><td>about 5.26 minutes</td><td>about 26 seconds</td></tr>
+    </tbody>
+  </table></div>
+  <p>The formula is downtime = (1 − availability) × period. For 99.9% over a year:
+  0.001 × 365 days × 24 h = 8.76 hours. The jump from 99.9% to 99.99% looks small but means going from
+  "a bad afternoon per year" to "less than an hour per year", which usually needs automatic failover,
+  because no human can react in minutes. Each nine costs much more than the last, so choose the number
+  from the business need. A college timetable app does not need five nines; a payments switch does.</p>
+
+  <h4>SLI, SLO and SLA</h4>
+  <dl class="terms">
+    <dt>SLI (Service Level Indicator)</dt><dd>A measured number: "the fraction of requests that returned
+    non-5xx", "the share of requests under 300 ms".</dd>
+    <dt>SLO (Service Level Objective)</dt><dd>The internal target for an SLI: "99.9% of requests succeed
+    over 30 days". Teams use it to decide when to stop shipping features and fix reliability.</dd>
+    <dt>SLA (Service Level Agreement)</dt><dd>A contract with customers, often with refunds or credits when
+    broken: "99.95% monthly uptime or you get a credit". The SLA is looser than the SLO so the team has a
+    safety margin.</dd>
+  </dl>
+  <p>The gap between 100% and your SLO is the <strong>error budget</strong>. With a 99.9% SLO you may fail
+  0.1% of requests; if the budget is spent, you pause risky releases. This turns "be reliable" into a number
+  that engineers and product managers can argue about calmly.</p>
+
+  <h4>Availability in series and in parallel</h4>
+  <p>A request usually passes through many components. How they are connected decides the total.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  subgraph Series
+    direction LR
+    A[LB 99.9%] --> B[App 99.9%] --> C[DB 99.9%]
+  end
+  subgraph Parallel
+    direction LR
+    L[Router] --> P1[Server 99.9%]
+    L --> P2[Server 99.9%]
+  end
+</pre>
+    <figcaption>Series: all must work. Parallel: at least one must work</figcaption>
+  </figure>
+  <h5>In series (every part is required)</h5>
+  <p>Multiply the availabilities. The chain is weaker than its weakest link:</p>
+  <pre data-title="Series"><code class="language-plaintext">Total = A1 × A2 × A3
+Load balancer 99.9% × app 99.9% × database 99.9%
+  = 0.999 × 0.999 × 0.999 ≈ 0.997  →  99.7%
+Downtime ≈ 0.003 × 8,760 h ≈ 26 hours per year (not 8.77 hours!)</code></pre>
+  <p>Ten dependencies at 99.9% each give about 99%. This is why a microservice call chain of ten
+  services is dangerous: the more hard dependencies a request needs, the lower the total availability.</p>
+  <h5>In parallel (any one part is enough)</h5>
+  <p>Multiply the <em>failure</em> chances. The system is down only if all copies are down:</p>
+  <pre data-title="Parallel"><code class="language-plaintext">Total = 1 − (1 − A1) × (1 − A2)
+Two servers at 99.9% each
+  = 1 − (0.001 × 0.001) = 1 − 0.000001 = 0.999999  →  99.9999%
+Three servers: 1 − 0.001^3 = 99.9999999%</code></pre>
+  <p>These are theoretical best cases. They assume failures are <strong>independent</strong>. If both
+  servers share one power supply, one rack, one bug or one bad deploy, they fail together and the
+  calculation is wrong. This is why real redundancy spreads copies over racks, availability zones and
+  regions, and why code bugs (identical on every copy) are not fixed by adding replicas.</p>
+  <h5>Combining both</h5>
+  <p>Compute parallel groups first, then multiply the groups in series. Example: load balancer (99.99%) →
+  two app servers (99.9% each, parallel) → one database (99.9%): app group = 99.9999%, total =
+  0.9999 × 0.999999 × 0.999 ≈ 99.89%. The single database is now the weak point. You improve the
+  system by making that part redundant, not by buying more app servers.</p>
+
+  <h4>Single points of failure and redundancy</h4>
+  <p>A <strong>single point of failure (SPOF)</strong> is any component whose failure takes the whole
+  system down. Walk the request path and ask of every box: "if this dies, what happens?" Typical SPOFs: one
+  load balancer, one database primary, one DNS provider, one availability zone, one shared config
+  service, one person who knows the password. The cure is <strong>redundancy</strong>: run more than one
+  copy and make the switch between them automatic.</p>
+
+  <h4>Failover: active-passive vs active-active</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Active-passive (standby)</th><th>Active-active</th></tr></thead>
+    <tbody>
+      <tr><td>How</td><td>One node serves; a standby waits and takes over on failure</td><td>All nodes serve traffic at once</td></tr>
+      <tr><td>Failover time</td><td>Seconds to minutes (detect, promote, redirect)</td><td>Near zero; others already serving</td></tr>
+      <tr><td>Capacity use</td><td>Standby idle: wasted money</td><td>All capacity used</td></tr>
+      <tr><td>Complexity</td><td>Simpler; one writer</td><td>Higher: shared state, conflicts, split-brain risk</td></tr>
+      <tr><td>Example</td><td>Database primary with a hot standby</td><td>Stateless app servers behind a load balancer</td></tr>
+    </tbody>
+  </table></div>
+  <p>Failover steps in a typical active-passive pair: a health check or heartbeat detects the primary is
+  down, a coordinator promotes the standby, traffic is redirected (virtual IP, DNS or the load
+  balancer), and the old primary is fenced off so it cannot keep accepting writes.
+  <strong>Split-brain</strong> is the danger case: both nodes believe they are primary and accept
+  different writes. Quorum-based election (an odd number of voters, majority wins) and fencing prevent it.
+  Also note that async replication may lose the last few writes at failover (<a href="#m5-replication">Replication</a>).</p>
+  <p>Redundancy can go beyond servers: multiple availability zones (separate buildings in a city) survive
+  a data centre fire; multiple regions survive a regional outage and also reduce latency, at the cost of
+  complexity and money.</p>
+
+  <h4>Reliability, availability, durability, fault tolerance</h4>
+  <p>These four words are often mixed up.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Term</th><th>Meaning</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Reliability</td><td>The system does the <em>correct</em> thing, consistently, over time</td><td>A transfer debits and credits the right amounts</td></tr>
+      <tr><td>Availability</td><td>The system is <em>up</em> and answers when asked</td><td>The app responds 99.95% of the time</td></tr>
+      <tr><td>Durability</td><td>Saved data is not lost</td><td>S3 advertises extremely high durability (eleven nines); a single disk has far less</td></tr>
+      <tr><td>Fault tolerance</td><td>The system keeps working while parts fail</td><td>One of three replicas dies, users notice nothing</td></tr>
+    </tbody>
+  </table></div>
+  <p>They are different: a system can be available but unreliable (it answers quickly with wrong data),
+  or durable but unavailable (data is safe, but the site is down for an hour). A fault is a
+  component misbehaving; a failure is when users see the effect. Fault tolerance means faults do not
+  become failures.</p>
+
+  <h4>Techniques to raise availability</h4>
+  <ul>
+    <li><strong>Redundancy</strong> at every layer, spread across zones.</li>
+    <li><strong>Health checks and automatic failover</strong>, so recovery is in seconds.</li>
+    <li><strong>Timeouts, retries with backoff and jitter, and circuit breakers</strong> so one slow
+    dependency does not drag down the caller (<a href="#m6">Module 6</a>).</li>
+    <li><strong>Graceful degradation</strong>: when recommendations are down, show the page without
+    them rather than an error.</li>
+    <li><strong>Safe deployments</strong>: rolling, blue-green or canary releases and quick rollback; many
+    outages come from changes, not hardware.</li>
+    <li><strong>Backups and tested restore</strong>; <strong>monitoring and alerts</strong> on the SLIs.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Exception: "available" does not mean "correct"</p>
+    <p>A server that is up but answers with stale or wrong data counts as available in the simple formula.
+    That is why SLIs should measure <em>successful</em> responses (right status, within the latency target),
+    not just whether the process is alive.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Adding a second app server but keeping one database and calling it highly available.</li>
+      <li>Ignoring that serial dependencies multiply: five hard dependencies at 99.9% is about 99.5%.</li>
+      <li>Promising 99.999% in an SLA without automatic failover or an on-call process.</li>
+      <li>Counting planned maintenance as "not downtime" without telling users.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"99.9% is about 8.8 hours of downtime per year, 43 minutes per month. Four nines is about
+      52 minutes per year, which needs automatic failover."</li>
+      <li>Show the arithmetic: serial 0.999 × 0.999 ≈ 99.8%; parallel 1 − 0.001<sup>2</sup> = 99.9999%.</li>
+      <li>Say "no single point of failure" and then name each layer's redundancy: multi-AZ load balancer,
+      N app instances, database with a standby, replicated cache.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-cap">
+  <h3>CAP theorem and PACELC</h3>
+  <p class="tldr">CAP says that when a network partition happens, a distributed data system must choose
+  between consistency (reject or delay requests) and availability (answer, maybe with stale data); since
+  partitions cannot be avoided, the real choice is CP or AP, and PACELC adds that even without a
+  partition you trade latency for consistency.</p>
+
+  <h4>The three letters</h4>
+  <ul>
+    <li><strong>Consistency (C):</strong> every read sees the most recent write, as if there were one copy
+    of the data. (This is the "linearizable" meaning, not the same as the "C" in ACID.)</li>
+    <li><strong>Availability (A):</strong> every request to a working node gets a non-error answer,
+    without a guarantee it is the latest data.</li>
+    <li><strong>Partition tolerance (P):</strong> the system keeps operating even when the network drops
+    or delays messages between nodes, so the cluster splits into groups that cannot talk.</li>
+  </ul>
+
+  <h4>The partition scenario</h4>
+  <p>Two data centres, Mumbai and Chennai, each hold a copy of a user's balance: ₹1,000. The link between
+  them breaks. Both sides are still running and still receiving requests. A user in Mumbai withdraws
+  ₹800. Mumbai cannot tell Chennai. Now a request for the balance arrives in Chennai. What should
+  Chennai do?</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant M as Mumbai node
+  participant C as Chennai node
+  participant U as User
+  Note over M,C: Network partition: link is down
+  U->>M: withdraw 800
+  M-->>U: ok, balance now 200
+  M--xC: replicate (lost)
+  U->>C: read balance
+  alt CP choice
+    C-->>U: error or wait (cannot confirm latest)
+  else AP choice
+    C-->>U: 1000 (stale, but answers)
+  end
+</pre>
+    <figcaption>During a partition Chennai must pick: stay correct and refuse, or answer with possibly stale data</figcaption>
+  </figure>
+  <ul>
+    <li><strong>CP (consistency over availability):</strong> Chennai refuses to answer (returns an error or
+    waits) because it cannot be sure it has the latest value. The data stays correct; some users see
+    errors until the partition heals.</li>
+    <li><strong>AP (availability over consistency):</strong> Chennai answers ₹1,000 from its own copy.
+    Everyone gets an answer, but it is stale, and if both sides accept writes the copies <em>diverge</em>
+    and must be merged later.</li>
+  </ul>
+  <p>When the partition heals, an AP system has to <strong>reconcile</strong> conflicting writes
+  (last-write-wins by timestamp, version vectors, application-level merge, CRDTs); a CP system simply
+  resumes.</p>
+
+  <h4>Why "CA" is not a real choice</h4>
+  <p>The folk version says "pick any two of three". That is misleading. In a distributed system over a
+  network, partitions <em>will</em> happen (cables, switches, GC pauses, misconfigured firewalls look like
+  partitions). You cannot choose to not have them. So P is not optional, and the real choice, during a
+  partition, is between C and A. A "CA" system only exists on a single node (or one that is never
+  partitioned), which is not distributed in the interesting sense. When nothing is partitioned, a system
+  can offer both C and A; CAP only forces the trade-off during the partition.</p>
+
+  <h4>CP and AP examples</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Leans</th><th>Examples (typical behaviour)</th><th>When you want it</th></tr></thead>
+    <tbody>
+      <tr><td>CP</td><td>ZooKeeper, etcd, Consul (consensus-based); HBase; MongoDB with majority write and read concerns; single-primary relational databases</td><td>Money, inventory counts, leader election, locks, configuration</td></tr>
+      <tr><td>AP</td><td>Cassandra and DynamoDB (by default, tunable); Riak; DNS; CouchDB</td><td>Shopping carts, likes, feeds, sessions, telemetry</td></tr>
+    </tbody>
+  </table></div>
+  <div class="co co-note">
+    <p class="co-t">Many systems are tunable</p>
+    <p>Cassandra and DynamoDB let each request choose how many replicas must agree (see
+    <a href="#m4-consistency-models">quorums</a>), so the same database can behave CP-like for one query and
+    AP-like for another. Treat the labels as tendencies, not permanent tags. Behaviour also depends on
+    configuration, so say "by default" or "when configured with…" in interviews.</p>
+  </div>
+
+  <h4>PACELC: the full picture</h4>
+  <p>CAP only talks about the rare partition. <strong>PACELC</strong> (Daniel Abadi) says: if there is a
+  <strong>P</strong>artition, choose <strong>A</strong>vailability or <strong>C</strong>onsistency;
+  <strong>E</strong>lse (normal operation), choose <strong>L</strong>atency or <strong>C</strong>onsistency.
+  The second half matters every day: to keep replicas consistent, a write must wait for acknowledgements
+  from other nodes (more latency); to be fast, it returns early and lets replicas catch up (weaker
+  consistency).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>System type</th><th>If partition</th><th>Else</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>PA / EL</td><td>Availability</td><td>Latency</td><td>Cassandra and DynamoDB at default settings</td></tr>
+      <tr><td>PC / EC</td><td>Consistency</td><td>Consistency</td><td>Traditional single-primary RDBMS with sync replication, Google Spanner-style systems</td></tr>
+      <tr><td>PC / EL</td><td>Consistency</td><td>Latency</td><td>Some designs that are strict only when partitioned</td></tr>
+    </tbody>
+  </table></div>
+  <p>Cross-region replication shows the ELC trade-off clearly: a synchronous write to Singapore from
+  Mumbai pays about 60 ms or more per write; asynchronous replication is fast but a regional failure can
+  lose the last writes.</p>
+
+  <h4>Choosing per feature, not per system</h4>
+  <p>One product has different needs in different places. A strong design says so:</p>
+  <ul>
+    <li><strong>Payments, wallet balance, seat booking, inventory at checkout:</strong> choose consistency.
+    An error is better than selling the same seat twice or losing money.</li>
+    <li><strong>Likes, view counts, follower counts, feed ordering:</strong> choose availability and
+    latency. Showing 1,203 instead of 1,205 hurts nobody.</li>
+    <li><strong>Shopping cart:</strong> classic AP (Amazon's Dynamo paper): never refuse an "add to cart";
+    merge carts later.</li>
+    <li><strong>User profile read right after update:</strong> needs at least read-your-writes, even in an
+    otherwise eventual system.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Saying "we pick CA". Distributed systems cannot opt out of partitions.</li>
+      <li>Treating CAP's "consistency" as ACID's "consistency". They are different ideas.</li>
+      <li>Calling a whole database "CP" or "AP" forever, instead of saying it depends on configuration.</li>
+      <li>Forgetting that partial failures (slow nodes, packet loss) behave like partitions.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Start from the partition: "When the network splits, I must either reject some requests (CP) or
+      serve possibly stale data (AP)."</li>
+      <li>Add PACELC: "Even without a partition, stronger consistency costs latency."</li>
+      <li>Give a feature-level answer: "Payments are CP; the like counter is AP."</li>
+      <li>Link to <a href="03-sql-databases.html#m6">SQL · Module 6</a> for CAP basics, then go beyond them
+      with the partition story and tunable consistency.</li>
+    </ul>
+  </div>
+</article>

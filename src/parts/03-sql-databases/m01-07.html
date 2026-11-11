@@ -1,0 +1,222 @@
+<article class="topic recap" id="m1-interview">
+  <h3>Interview questions — SQL basics</h3>
+
+  <details class="qa">
+    <summary>What is the difference between DELETE, TRUNCATE and DROP?</summary>
+    <div class="qa-a">
+      <p><code>DELETE</code> removes rows one by one, accepts a <code>WHERE</code>, fires row triggers and can
+      be rolled back. <code>TRUNCATE</code> empties the whole table quickly, has no <code>WHERE</code>, resets
+      identity counters if you ask (<code>RESTART IDENTITY</code>) and is transactional in PostgreSQL but commits
+      implicitly in MySQL. <code>DROP TABLE</code> removes the table itself: structure, data, indexes and
+      constraints. <code>DELETE</code> and <code>TRUNCATE</code> keep the table definition; <code>DROP</code>
+      does not.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why does WHERE salary = NULL return no rows, and what is the fix?</summary>
+    <div class="qa-a">
+      <p>SQL uses three-valued logic: true, false and unknown. Any comparison with NULL, including
+      <code>NULL = NULL</code>, gives unknown, and <code>WHERE</code> keeps only rows that are true. Use
+      <code>IS NULL</code> / <code>IS NOT NULL</code>, or <code>IS DISTINCT FROM</code> when you want a
+      NULL-safe comparison. <code>COALESCE(x, 0)</code> replaces NULL with a default.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does NOT IN return if the list contains a NULL?</summary>
+    <div class="qa-a">
+      <p>Nothing. <code>x NOT IN (1, 2, NULL)</code> means <code>x &lt;&gt; 1 AND x &lt;&gt; 2 AND x &lt;&gt;
+      NULL</code>; the last part is unknown, so the whole expression is never true. A subquery that returns one
+      NULL empties the result. Use <code>NOT EXISTS</code>, or filter the NULLs out of the subquery
+      (<a href="#m1-null-logic">NULL and three-valued logic</a>).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Primary key vs unique key: what is the difference?</summary>
+    <div class="qa-a">
+      <p>A table has at most one primary key; it is unique and cannot be NULL, and it identifies the row (JPA's
+      <code>@Id</code> maps to it). A table may have many unique constraints; their columns may contain NULL, and
+      several NULLs are allowed because NULL is never equal to NULL. Both create a unique index.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Which data type do you use for money, and why not FLOAT?</summary>
+    <div class="qa-a">
+      <p><code>NUMERIC(p, s)</code> / <code>DECIMAL</code>, mapped to <code>BigDecimal</code> in Java. Floats are
+      binary approximations: <code>0.1 + 0.2</code> is not exactly <code>0.3</code> in a
+      <code>DOUBLE PRECISION</code>, and errors add up across many rows. Some systems store whole paise in a
+      <code>BIGINT</code> instead.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>VARCHAR vs TEXT vs CHAR?</summary>
+    <div class="qa-a">
+      <p><code>CHAR(n)</code> is fixed length and space padded; avoid it except for fixed codes.
+      <code>VARCHAR(n)</code> holds up to <code>n</code> characters and rejects more, a good way to express a
+      business limit. <code>TEXT</code> has no limit. In PostgreSQL all three perform the same, so the length is
+      only a rule; in MySQL <code>TEXT</code> is a separate family with index restrictions.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between TIMESTAMP and TIMESTAMPTZ?</summary>
+    <div class="qa-a">
+      <p><code>TIMESTAMP</code> stores the date and time you typed, with no zone. <code>TIMESTAMPTZ</code>
+      converts input to UTC, stores that, and shows it in the session time zone, so it always means one exact
+      instant. Use it for event times (<code>created_at</code>). MySQL's equivalents are <code>DATETIME</code>
+      (no conversion) and <code>TIMESTAMP</code> (UTC, limited to the year 2038).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the order of rows without ORDER BY, and why does paging need it?</summary>
+    <div class="qa-a">
+      <p>It is unspecified. The database returns rows in whatever order is cheapest, which can change after an
+      update, a vacuum or a different plan. With <code>LIMIT 10 OFFSET 20</code> and no <code>ORDER BY</code>, a
+      row can appear on two pages or none. Order by a unique column (add the id as a tie-breaker) for stable
+      pages.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Does BETWEEN include its end points? Any trap with dates?</summary>
+    <div class="qa-a">
+      <p>Yes, both ends are included. For a <code>TIMESTAMP</code> column,
+      <code>BETWEEN '2026-04-01' AND '2026-04-30'</code> stops at midnight on the 30th and misses the rest of
+      that day. Use a half-open range instead: <code>&gt;= '2026-04-01' AND &lt; '2026-05-01'</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What happens if you run UPDATE or DELETE without WHERE? How do you work safely?</summary>
+    <div class="qa-a">
+      <p>Every row is changed or removed. Safe workflow: write the <code>SELECT</code> with the same
+      <code>WHERE</code> first and check the rows, run the change inside <code>BEGIN</code>, look at the row
+      count and a verification query, then <code>COMMIT</code> or <code>ROLLBACK</code>. Add <code>RETURNING
+      *</code> in PostgreSQL to see what changed, and take a backup before big changes. MySQL's
+      <code>--safe-updates</code> mode refuses statements without a key in <code>WHERE</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What error do you get when a constraint is violated? Name the four main ones.</summary>
+    <div class="qa-a">
+      <ul>
+        <li><b>NOT NULL</b>: <code>null value in column "x" violates not-null constraint</code> (SQLState 23502)</li>
+        <li><b>UNIQUE / PRIMARY KEY</b>: <code>duplicate key value violates unique constraint "..."</code> (23505)</li>
+        <li><b>CHECK</b>: <code>new row for relation "t" violates check constraint "..."</code> (23514)</li>
+        <li><b>FOREIGN KEY</b>: <code>violates foreign key constraint "..."</code> (23503)</li>
+      </ul>
+      <p>In Spring these arrive as <code>DataIntegrityViolationException</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain ON DELETE CASCADE, SET NULL and RESTRICT with an example.</summary>
+    <div class="qa-a">
+      <p>They tell the database what to do with child rows when the parent is deleted.
+      <code>CASCADE</code>: deleting an order deletes its <code>order_items</code>. <code>SET NULL</code>:
+      deleting a department sets <code>employees.dept_id</code> to NULL (the column must be nullable).
+      <code>RESTRICT</code> (and the default <code>NO ACTION</code>): deleting a product that was sold fails.
+      Choose cascade only when the child is part of the parent.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you insert a row if it does not exist, otherwise update it?</summary>
+    <div class="qa-a">
+      <p>An upsert. PostgreSQL: <code>INSERT ... ON CONFLICT (email) DO UPDATE SET ...</code> (or <code>DO
+      NOTHING</code>). MySQL: <code>INSERT ... ON DUPLICATE KEY UPDATE ...</code>. It relies on a unique
+      constraint and is atomic, unlike "select then insert", which breaks when two requests race.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why avoid SELECT * in application code?</summary>
+    <div class="qa-a">
+      <p>It sends columns you do not use, breaks position-based readers when the table changes, blocks
+      index-only scans, and returns duplicate column names in joins. List the columns you need. It is fine for
+      <code>COUNT(*)</code>, <code>EXISTS</code> and exploring in a terminal.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you add a NOT NULL column to a large live table?</summary>
+    <div class="qa-a">
+      <p>Adding it as <code>NOT NULL</code> with no default fails if the table has rows. Safe path: add the
+      column nullable (or with a constant default, which is instant in PostgreSQL 11+), backfill existing rows in
+      batches, then <code>ALTER COLUMN ... SET NOT NULL</code>. Do it as a Flyway or Liquibase migration, and be
+      aware of table locks.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m1-cheatsheet">
+  <h3>Cheat sheet — SQL basics</h3>
+  <ul class="cheat">
+    <li><b>Query order written</b> <code>SELECT … FROM … WHERE … ORDER BY … LIMIT</code>; keywords uppercase, names snake_case.</li>
+    <li><b>NULL</b> never equals anything; use <code>IS NULL</code>, <code>COALESCE(x, d)</code>, <code>NULLIF(a, b)</code>, <code>IS DISTINCT FROM</code>.</li>
+    <li><b>NOT IN + NULL</b> returns no rows; use <code>NOT EXISTS</code>.</li>
+    <li><b>AND before OR</b>; put parentheses around every <code>OR</code> group.</li>
+    <li><b>BETWEEN</b> is inclusive on both ends; use <code>&gt;= … AND &lt; …</code> for timestamps.</li>
+    <li><b>LIKE</b> <code>%</code> any text, <code>_</code> one character; <code>ILIKE</code> is case-insensitive (PostgreSQL only).</li>
+    <li><b>Paging</b> <code>ORDER BY id LIMIT n OFFSET m</code> or <code>OFFSET m ROWS FETCH FIRST n ROWS ONLY</code>; always order.</li>
+    <li><b>DISTINCT</b> removes duplicate rows; <code>DISTINCT ON (col)</code> keeps the first row per group (PostgreSQL).</li>
+    <li><b>INSERT</b> <code>INSERT INTO t (a, b) VALUES (1, 2), (3, 4) RETURNING id;</code></li>
+    <li><b>Upsert</b> <code>ON CONFLICT (key) DO UPDATE SET c = EXCLUDED.c</code> / MySQL <code>ON DUPLICATE KEY UPDATE</code>.</li>
+    <li><b>UPDATE / DELETE</b> always with <code>WHERE</code>; test with <code>SELECT</code> first, inside <code>BEGIN … ROLLBACK</code>.</li>
+    <li><b>DELETE vs TRUNCATE vs DROP</b> rows with filter, all rows fast, whole table.</li>
+    <li><b>Whole numbers</b> <code>SMALLINT</code> 2 bytes, <code>INT</code> 4, <code>BIGINT</code> 8.</li>
+    <li><b>Money</b> <code>NUMERIC(12,2)</code> → Java <code>BigDecimal</code>; never <code>REAL</code> / <code>DOUBLE</code>.</li>
+    <li><b>Text</b> <code>VARCHAR(n)</code> for limits, <code>TEXT</code> for free text; ids like phone are text.</li>
+    <li><b>Time</b> <code>TIMESTAMPTZ</code> for moments, <code>DATE</code> for days; store UTC.</li>
+    <li><b>Ids</b> <code>INT GENERATED ALWAYS AS IDENTITY</code> (MySQL <code>AUTO_INCREMENT</code>); gaps are normal.</li>
+    <li><b>DDL</b> <code>CREATE TABLE IF NOT EXISTS</code>, <code>ALTER TABLE … ADD/DROP/RENAME COLUMN</code>, <code>DROP TABLE IF EXISTS … CASCADE</code>.</li>
+    <li><b>Constraints</b> PRIMARY KEY (unique, not null), UNIQUE (NULLs ok), NOT NULL, CHECK (NULL passes), DEFAULT (only when column omitted), FOREIGN KEY.</li>
+    <li><b>Error codes</b> 23502 not null, 23505 unique, 23503 foreign key, 23514 check.</li>
+    <li><b>FK actions</b> <code>NO ACTION</code> (default), <code>RESTRICT</code>, <code>CASCADE</code>, <code>SET NULL</code>, <code>SET DEFAULT</code>.</li>
+    <li><b>psql</b> <code>\l</code> databases, <code>\c db</code> connect, <code>\dt</code> tables, <code>\d table</code> columns, <code>\q</code> quit.</li>
+    <li><b>MySQL differences</b> backticks, <code>||</code> is OR, <code>7/2 = 3.5</code>, no <code>RETURNING</code>, case-insensitive text, DDL auto-commits.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m1-practice">
+  <h3>Practice — SQL basics</h3>
+  <p>Run <code>sample_schema.sql</code> first, so you start from known data. Write every query yourself, then
+  compare with the results in the earlier articles.</p>
+  <ol class="steps">
+    <li><strong>Warm-up reads.</strong> List the first and last name of employees in Engineering (dept 1),
+    highest salary first. Then list products costing between 100 and 1,000, sorted by price. Done when the first
+    query returns five rows, Vikram (220000) first and Divya (90000) last.</li>
+    <li><strong>NULL hunting.</strong> Find employees with no department; find customers with no phone number;
+    list customers with the phone shown as <code>'unknown'</code> when missing (<code>COALESCE</code>). Done when
+    you get 1 employee (Meera) and 3 customers (Diya, Rohan, Tanvi).</li>
+    <li><strong>Filters and patterns.</strong> Employees hired in 2023 or later whose last name starts with
+    <code>S</code> or <code>G</code>, using parentheses correctly; customers whose email contains
+    <code>"an"</code> (use <code>ILIKE</code>). Explain why the parentheses matter.</li>
+    <li><strong>Paging.</strong> Show employees ordered by salary descending, page size 4: write page 1, 2 and 3.
+    Make the order stable with <code>emp_id</code> as a tie-breaker. Done when no employee appears twice.</li>
+    <li><strong>Safe change.</strong> In a transaction, give everyone in Sales a 10 percent raise. Check with
+    <code>SELECT</code> first, use <code>RETURNING</code>, then <code>ROLLBACK</code>. Then do a failing one:
+    set a salary to -1 and read the exact error and constraint name.</li>
+    <li><strong>Upsert.</strong> Write an upsert into <code>departments</code> keyed on <code>name</code> that
+    updates the location when the name exists (Sales moves to Chennai) and inserts a new row otherwise (Legal in
+    Chennai). Run it twice; the second run must not fail.</li>
+    <li><strong>Design a table.</strong> Create <code>leave_requests</code> as in the notes, then add a column
+    <code>approved_by</code> with a foreign key to <code>employees</code>. Insert one valid row and one row for
+    each constraint violation (bad employee, end before start, unknown status). Record the error text and
+    SQLState of each. Done when you can predict each message before running it.</li>
+    <li><strong>Foreign key actions.</strong> Create <code>reviews (review_id, product_id, customer_id,
+    rating)</code> with <code>rating</code> from 1 to 5, a unique pair <code>(product_id, customer_id)</code>,
+    <code>product_id</code> with <code>ON DELETE CASCADE</code> and <code>customer_id</code> with <code>ON DELETE
+    SET NULL</code>. Insert three reviews, delete a product and a customer inside a transaction, and show what
+    remains before rolling back.</li>
+    <li><strong>Type review.</strong> Take a column list from an app you know (user: id, name, phone, balance,
+    created time, is_verified, preferences) and pick a PostgreSQL type, NOT NULL decision and default for each.
+    Justify the money and time columns in one line each.</li>
+  </ol>
+</article>

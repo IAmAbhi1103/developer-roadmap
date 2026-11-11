@@ -1,0 +1,437 @@
+<article class="topic" id="m7-news-feed">
+  <h3>Design a news feed (like Instagram)</h3>
+  <p class="tldr">A news feed shows each user the recent posts of the people they follow; the core decision is
+  fan-out on write (push each new post into followers' precomputed feeds, fast reads) versus fan-out on read
+  (assemble the feed at request time), and real systems use a hybrid so celebrity accounts do not cause millions
+  of writes.</p>
+
+  <h4>1. Requirements</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>Users create posts (text, photos, videos).</li>
+    <li>Users follow and unfollow other users.</li>
+    <li>A user opens the app and sees a feed of recent posts from the accounts they follow, newest or best first,
+    loaded page by page (infinite scroll).</li>
+    <li>Likes and comments exist, but the design focus is the feed itself.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> feed load in under about 300 ms (reads must be fast), high availability, a
+  new post appears in followers' feeds within a few seconds (eventual consistency is fine; a delay of seconds is
+  not noticed), scalability to hundreds of millions of users, and tolerance for accounts with tens of millions of
+  followers. Strong consistency is <em>not</em> required: seeing a post a little late is acceptable.
+  <strong>Out of scope:</strong> the ranking model itself (mention the inputs), ads, stories.</p>
+
+  <h4>2. Capacity estimates (assumptions)</h4>
+  <ul>
+    <li>100 million daily active users; each opens the feed 10 times a day → 1 billion feed reads per day →
+    1,000,000,000 ÷ 86,400 ≈ <strong>11,600 per second</strong>; peak 3× ≈ 35,000 per second.</li>
+    <li>10 million new posts per day → 10,000,000 ÷ 86,400 ≈ <strong>116 posts per second</strong>.</li>
+    <li>Reads outnumber writes: 11,600 ÷ 116 = 100:1. This strongly favours doing work at write time.</li>
+    <li>Average user follows 200 accounts. Fan-out on write: 10M posts × 200 followers = <strong>2 billion
+    feed insertions per day</strong> ≈ 23,000 per second. That is a lot but each is a tiny write
+    (an id into a list), and it runs asynchronously.</li>
+    <li>A celebrity with 50 million followers: one post would need 50,000,000 insertions. At 23,000 per second of
+    system capacity that single post would take about 36 minutes of the total fan-out budget. This is why a
+    pure push model fails for celebrities.</li>
+    <li>Feed cache: keep the latest 500 post ids per active user. Each id 8 bytes → 500 × 8 = 4 KB per user →
+    100,000,000 × 4 KB = <strong>400 GB</strong> (before Redis overhead, which might double it). A sharded Redis
+    cluster of a few nodes with 128 GB each can hold it.</li>
+    <li>Post storage: 10M posts × ~1 KB metadata = 10 GB per day (3.65 TB per year). Media: if 30% of posts carry
+    a 500 KB photo → 3M × 500 KB = 1.5 TB per day in object storage behind a CDN.</li>
+  </ul>
+
+  <h4>3. API design</h4>
+  <pre data-title="API" class="out"><code class="language-http">POST /api/v1/posts
+{"text": "Diwali lights", "mediaIds": ["med_88"]}
+201 Created   {"postId": "p_91823412", "createdAt": "2026-11-11T09:30:00Z"}
+
+GET /api/v1/feed?limit=20&amp;cursor=p_91823377
+200 OK
+{"items": [{"postId": "p_91823412", "author": {"id": 7, "name": "Asha"},
+            "text": "Diwali lights", "media": ["https://cdn.../med_88.jpg"],
+            "likes": 12}, ...],
+ "nextCursor": "p_91823101"}
+
+POST   /api/v1/users/7/follow
+DELETE /api/v1/users/7/follow</code></pre>
+  <p><strong>Pagination:</strong> use a <strong>cursor</strong> (the id or time of the last item seen), not
+  <code>page=5</code> or <code>OFFSET</code>. With offset, new posts push items down and the user sees duplicates
+  or skips; deep offsets are also slow (<a href="03-sql-databases.html#m5">SQL · Module 5</a> explains why).
+  Cursor pagination asks for "20 items older than this id", which is stable and uses an index.</p>
+
+  <h4>4. Data model</h4>
+  <pre data-title="schema (conceptual)" class="out"><code class="language-plaintext">users        user_id, name, follower_count, is_celebrity
+follows      (follower_id, followee_id)   index both ways
+posts        post_id (Snowflake, time-sortable), author_id, text, media_ids, created_at
+feed:{user}  Redis sorted set: member = post_id, score = post_id or time
+             (latest ~500 entries)
+likes        (post_id, user_id) + counter cache
+media        media_id -> object-storage path</code></pre>
+  <ul>
+    <li><strong>Posts</strong> are written once and read by id, plus "latest posts of author X": a wide-column
+    store or sharded SQL keyed by <code>author_id</code> works, with time-sortable post ids
+    (<a href="#m6-unique-ids">Unique IDs</a>) so newest-first ordering needs no extra column.</li>
+    <li><strong>Follows</strong> is a graph edge list; it needs both "who does X follow" and "who follows X". Store
+    two tables or two indexes. Shard by user id.</li>
+    <li>The <strong>precomputed feed</strong> is a Redis sorted set per user holding only <em>post ids</em>, not
+    full posts (small, and edits or deletes affect one copy). Hydrate ids into full posts by fetching from a post
+    cache.</li>
+    <li>Counters (likes) are updated asynchronously and cached; approximate counts are acceptable.</li>
+  </ul>
+
+  <h4>5. High-level architecture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  U[Client] --> GW[API gateway]
+  GW --> PS[Post service]
+  GW --> FS[Feed service]
+  PS --> PDB[(Post store)]
+  PS --> MQ[[Fan-out queue]]
+  MQ --> FW[Fan-out workers]
+  FW --> GS[Graph service for followers]
+  FW --> FC[(Feed cache in Redis)]
+  FS --> FC
+  FS --> PC[(Post cache)]
+  PC -.->|miss| PDB
+  U -->|images and video| CDN[CDN]
+</pre>
+    <figcaption>Posting triggers asynchronous fan-out into feed caches; reading is mostly a cache lookup plus hydration</figcaption>
+  </figure>
+  <p><strong>Write path:</strong> the post service stores the post, then publishes a "post created" event (via an
+  outbox, <a href="#m6-outbox-cdc">Outbox</a>). Fan-out workers read the author's follower list in pages and add
+  the post id to each follower's feed sorted set, trimming to 500. <strong>Read path:</strong> the feed service
+  reads the top 20 ids after the cursor from the user's sorted set, fetches post bodies from the post cache
+  (batch get), fetches author data, and returns the page; images load from the CDN.</p>
+
+  <h4>6. Deep dive A: fan-out on write vs on read vs hybrid</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Fan-out on write (push)</th><th>Fan-out on read (pull)</th></tr></thead>
+    <tbody>
+      <tr><td>When feed is built</td><td>When the post is created</td><td>When the user opens the app</td></tr>
+      <tr><td>Read cost</td><td>Very low: read one list</td><td>High: read posts of ~200 followees, merge, sort</td></tr>
+      <tr><td>Write cost</td><td>High: one insert per follower</td><td>Low: store the post once</td></tr>
+      <tr><td>Celebrity problem</td><td>50M inserts per post</td><td>None for writes</td></tr>
+      <tr><td>Inactive followers</td><td>Wasted work filling feeds nobody opens</td><td>No waste</td></tr>
+      <tr><td>Freshness</td><td>Seconds of delay</td><td>Always current</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Hybrid (the usual answer).</strong> Use push for normal users and pull for celebrities:</p>
+  <ul>
+    <li>If the author has fewer than a threshold of followers (say 100,000, tuned from data), fan out on write.</li>
+    <li>If the author is above the threshold, <em>do not</em> fan out. Store the post only.</li>
+    <li>At read time, the feed service takes the user's precomputed feed (normal accounts) and merges in recent
+    posts from the few celebrities the user follows, fetched from a per-celebrity "recent posts" cache. A user
+    follows few celebrities, so this extra read is small and the celebrity's list is shared by all their
+    followers, so it caches very well.</li>
+    <li>Skip fan-out for inactive users (not opened the app in 30 days). Rebuild their feed on return with the
+    pull method.</li>
+  </ul>
+  <pre data-title="FeedService.java"><code class="language-java">public List&lt;PostView&gt; getFeed(long userId, String cursor, int limit) {
+    List&lt;Long&gt; ids = new ArrayList&lt;&gt;(feedCache.range(userId, cursor, limit));  // pushed posts
+
+    for (long celeb : graph.celebritiesFollowedBy(userId)) {                  // few of them
+        ids.addAll(celebRecent.range(celeb, cursor, limit));                  // pulled posts
+    }
+    ids.sort(Comparator.reverseOrder());          // newest first (time-sortable ids)
+    List&lt;Long&gt; page = ids.stream().distinct().limit(limit).toList();
+    return postHydrator.load(page);                // batch get from post cache
+}</code></pre>
+
+  <h4>7. Deep dive B: ranking, caching and consistency</h4>
+  <ul>
+    <li><strong>Chronological vs ranked.</strong> A chronological feed is the sorted set as it is. A ranked feed
+    takes candidate posts (say 500 ids), scores each with features (author affinity, recency, past engagement,
+    post type), and returns the top ones. Scoring is a separate service; keep the interface simple: ids in, ordered
+    ids out. In the interview, mention it and keep the focus on retrieval.</li>
+    <li><strong>Hot posts and cache.</strong> A viral post is read by millions, so cache the post object with a
+    short TTL, and use a local cache for the hottest ids to avoid a hot key on one Redis shard
+    (<a href="#m5">Module 5</a>). Media is served from the CDN with long cache lifetimes.</li>
+    <li><strong>Deletes and edits.</strong> Because feeds hold ids only, a deleted post disappears when hydration
+    returns "not found" or "deleted"; the feed service filters those out. No need to remove it from 200 feeds
+    immediately.</li>
+    <li><strong>Unfollow and block.</strong> Filter at read time by the current follow set (cheap), and lazily clean
+    the stored feed.</li>
+    <li><strong>New follow.</strong> Backfill: add the followee's last few posts into the follower's feed.</li>
+    <li><strong>Consistency.</strong> The feed is eventually consistent: after posting, the author should see their
+    own post immediately (read-your-writes), so the client inserts it locally or the feed service merges the
+    author's own latest posts. Followers see it within seconds.</li>
+  </ul>
+
+  <h4>8. Deep dive C: the fan-out pipeline at scale</h4>
+  <ul>
+    <li>Fan-out is a queue-driven job. Split one author's follower list into pages of, say, 1,000 followers; each
+    page is a separate task so many workers share one big fan-out and a failed page can be retried alone.</li>
+    <li>Writes to Redis are idempotent (<code>ZADD</code> of the same member is harmless), so at-least-once
+    processing is fine (<a href="#m6-delivery-semantics">Delivery semantics</a>).</li>
+    <li>Use priority: a post by a user with 100 followers should not wait behind a 5-million follower fan-out.
+    Separate queues by author size.</li>
+    <li>Fan-out lag is the key metric: time from post creation to last insertion. Alert when it exceeds a few
+    seconds for normal accounts.</li>
+    <li>Redis memory is the cost driver: trimming to 500 entries and limiting to active users keeps it bounded.
+    If the cache is lost, rebuild feeds lazily by pull.</li>
+  </ul>
+
+  <h4>9. Bottlenecks and scaling</h4>
+  <ul>
+    <li><strong>Feed cache shards</strong> by user id; add nodes with consistent hashing
+    (<a href="#m5">Module 5</a>).</li>
+    <li><strong>Graph service</strong> reads of follower lists are heavy: cache them and page them.</li>
+    <li><strong>Post store</strong> shards by author or post id; read replicas for hydration misses.</li>
+    <li><strong>Media</strong> is offloaded to object storage and CDN; image resizing happens asynchronously at
+    upload, producing several sizes.</li>
+    <li><strong>Monitoring:</strong> feed p99 latency, cache hit ratio for feeds and posts, fan-out lag, queue
+    depth, empty-feed rate (a sign of cache loss).</li>
+  </ul>
+
+  <h4>Follow-up questions</h4>
+  <ul>
+    <li>Where exactly is the threshold between push and pull, and how do you pick it? (Measure follower
+    distribution and fan-out cost; start near 10<sup>5</sup> and tune.)</li>
+    <li>How do you show "new posts available" without reloading? (Poll a lightweight count endpoint or use a
+    WebSocket event.)</li>
+    <li>How would you add comments and like counts without hot-row contention? (Sharded counters, async
+    aggregation.)</li>
+    <li>How do you avoid showing the same post twice across pages? (Stable cursor by post id, dedupe in the
+    merge.)</li>
+    <li>How do you handle a user following 5,000 accounts? (Cap, or lean on pull with caching.)</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Lead with the read:write ratio (100:1) to justify precomputing feeds.</li>
+      <li>Explain the celebrity problem with a number (50 million inserts per post), then the hybrid fix.</li>
+      <li>Store ids, not posts, in the feed; use cursor pagination.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m7-food-delivery">
+  <h3>Design a food delivery app (like Swiggy)</h3>
+  <p class="tldr">A food delivery platform connects customers, restaurants and delivery partners; the design is a
+  restaurant discovery and menu service, an order service driven by a state machine and payment saga, a
+  location service tracking partners, and a matching service that assigns the best nearby partner with a
+  timeout and fallback.</p>
+
+  <h4>1. Requirements</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li><strong>Customer:</strong> search and browse restaurants near me, view menus, add to cart, pay, place an
+    order, track it live, rate it.</li>
+    <li><strong>Restaurant:</strong> receive orders, accept or reject, update menu and availability, mark order
+    ready.</li>
+    <li><strong>Delivery partner:</strong> go online/offline, receive an assignment, accept or reject, pick up,
+    deliver, share live location.</li>
+    <li><strong>Platform:</strong> estimate delivery time, handle cancellations, refunds and payouts.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> an order must never be lost or charged twice (consistency for orders and
+  payments); browsing can be eventually consistent and must be fast; high availability, especially at lunch and
+  dinner peaks; location updates in near real time; assignment decisions within a few seconds. <strong>Out of
+  scope:</strong> routing algorithm internals, pricing and surge models, ads.</p>
+
+  <h4>2. Capacity estimates (assumptions)</h4>
+  <ul>
+    <li>5 million orders per day nationwide. Average: 5,000,000 ÷ 86,400 ≈ 58 per second. Orders cluster in lunch
+    and dinner: assume 60% of orders fall in 4 hours (14,400 seconds) → 3,000,000 ÷ 14,400 ≈
+    <strong>210 orders per second</strong> at peak. Use 250 with headroom.</li>
+    <li>Browsing: each order comes from about 20 sessions that search and browse, with several requests each →
+    peak read traffic on the order of 20 × 210 = 4,200 sessions/s, say <strong>20,000 read requests per
+    second</strong>. Heavily cached.</li>
+    <li>Delivery partners: 100,000 online at peak. Location update every 5 seconds → 100,000 ÷ 5 =
+    <strong>20,000 location writes per second</strong>. Each update ~50 bytes (partner id, lat, lng, time) →
+    1 MB/s. Only the <em>latest</em> position matters for matching, so this is an overwrite workload, not an
+    append workload.</li>
+    <li>Order storage: 5M orders/day × 2 KB (order, items, history) = 10 GB per day → 3.65 TB per year.
+    Manageable in sharded SQL.</li>
+    <li>Menu catalogue: 300,000 restaurants × 100 items × 1 KB = 30 GB. It fits in memory caches easily.</li>
+  </ul>
+
+  <h4>3. API design</h4>
+  <pre data-title="API" class="out"><code class="language-http">GET  /api/v1/restaurants?lat=12.9716&amp;lng=77.5946&amp;cuisine=south&amp;cursor=...
+GET  /api/v1/restaurants/812/menu
+
+POST /api/v1/orders
+Idempotency-Key: 1f6c...
+{"restaurantId": 812, "items": [{"itemId": 55, "qty": 2}],
+ "addressId": 301, "paymentMethodId": "pm_9"}
+201 Created
+{"orderId": "o_7731", "status": "PLACED", "total": 41800, "currency": "INR"}
+
+GET  /api/v1/orders/o_7731                 (status, partner, ETA)
+POST /api/v1/orders/o_7731/cancel
+POST /api/v1/restaurant/orders/o_7731/accept
+POST /api/v1/partners/me/location          {"lat": 12.97, "lng": 77.59}
+POST /api/v1/partners/me/assignments/a_1/accept</code></pre>
+  <p>Amounts are in paise (integers), never floating point. Order creation takes an idempotency key
+  (<a href="#m6-idempotency">Idempotency</a>) so a double tap on the pay button creates one order.</p>
+
+  <h4>4. Data model</h4>
+  <ul>
+    <li><strong>Orders, payments, users, partners:</strong> relational (PostgreSQL / MySQL) because an order
+    involves several related rows and needs transactions and constraints. Shard by city or by customer id when
+    needed.</li>
+    <li><strong>Restaurants and menus:</strong> read-heavy, rarely changed, read as a document. Store in the
+    database, index into a <strong>search engine</strong> (Elasticsearch/OpenSearch) for text and filter queries
+    (cuisine, rating, veg only), with a <strong>geo filter</strong> for distance.</li>
+    <li><strong>Live partner locations:</strong> an in-memory geo store (Redis GEO or a geohash/H3 grid), with the
+    latest location only. History can be sampled into a log store for analytics and disputes.</li>
+  </ul>
+  <pre data-title="schema.sql"><code class="language-sql">CREATE TABLE orders (
+    order_id      VARCHAR(20) PRIMARY KEY,
+    customer_id   BIGINT       NOT NULL,
+    restaurant_id BIGINT       NOT NULL,
+    partner_id    BIGINT,
+    status        VARCHAR(24)  NOT NULL,
+    total_paise   BIGINT       NOT NULL,
+    created_at    TIMESTAMP    NOT NULL,
+    updated_at    TIMESTAMP    NOT NULL
+);
+CREATE TABLE order_item (
+    order_id VARCHAR(20), item_id BIGINT, qty INT, price_paise BIGINT,
+    PRIMARY KEY (order_id, item_id)
+);
+CREATE TABLE order_status_history (
+    order_id VARCHAR(20), status VARCHAR(24), at TIMESTAMP, actor VARCHAR(20)
+);</code></pre>
+  <p>Price is copied into <code>order_item</code> at order time, so later menu price changes do not alter past
+  orders (the deliberate duplication from
+  <a href="#m6-monolith-microservices">Monolith vs microservices</a>).</p>
+
+  <h4>5. High-level architecture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  C[Customer app] --> GW[API gateway]
+  GW --> DS[Discovery and search]
+  GW --> OS[Order service]
+  GW --> TS[Tracking service]
+  DS --> ES[(Search index)]
+  OS --> ODB[(Order database)]
+  OS --> PAY[Payment service]
+  OS --> K[[Events]]
+  K --> RS[Restaurant service]
+  K --> MS[Matching service]
+  MS --> LS[(Location store, geo index)]
+  P[Partner app] -->|location every 5s| LOC[Location service]
+  LOC --> LS
+  TS --> LS
+  K --> NS[Notification service]
+</pre>
+    <figcaption>Order service drives the workflow through events; matching reads live locations from a geo index</figcaption>
+  </figure>
+
+  <h4>6. Deep dive A: the order lifecycle as a state machine</h4>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> PLACED
+  PLACED --> PAID: payment captured
+  PLACED --> CANCELLED: payment failed
+  PAID --> ACCEPTED: restaurant accepts
+  PAID --> CANCELLED: restaurant rejects or times out
+  ACCEPTED --> PREPARING
+  PREPARING --> READY
+  READY --> PICKED_UP: partner collects
+  PICKED_UP --> DELIVERED
+  ACCEPTED --> CANCELLED: customer cancels early
+  DELIVERED --> [*]
+  CANCELLED --> [*]
+</pre>
+    <figcaption>Order states and the events that move between them</figcaption>
+  </figure>
+  <ul>
+    <li><strong>One service owns the state</strong> (order service). Others send events; the order service
+    validates that a transition is legal (for example, you cannot go from DELIVERED to PREPARING) with an
+    optimistic-lock update: <code>UPDATE orders SET status = 'ACCEPTED' WHERE order_id = ? AND status =
+    'PAID'</code>. Zero rows updated means a stale or duplicate event; ignore it.</li>
+    <li><strong>The flow is a saga</strong> (<a href="#m6-saga">Saga</a>): reserve/authorise payment → ask the
+    restaurant to accept → find a partner. Compensation: if the restaurant rejects or does not respond within,
+    say, 3 minutes (a timer in a scheduler or a delayed message), refund and cancel. If no partner can be found,
+    retry matching with a wider radius, then cancel and refund.</li>
+    <li><strong>Reliable events</strong> via the outbox pattern (<a href="#m6-outbox-cdc">Outbox</a>); every
+    consumer is idempotent.</li>
+    <li>Keep the status history table for support and for showing the customer a timeline.</li>
+  </ul>
+
+  <h4>7. Deep dive B: location tracking and nearby search</h4>
+  <ul>
+    <li><strong>Ingestion.</strong> 20,000 updates per second go to a location service that overwrites each
+    partner's latest position in an in-memory geo store. Use a lightweight protocol (HTTP/2 or MQTT; a WebSocket
+    works too). Batch and reduce the rate when the partner is idle or stationary. Update the geo index only
+    when the cell changes or every N seconds.</li>
+    <li><strong>Nearby query.</strong> Redis GEO stores points in a sorted set using a geohash score and supports
+    a radius query around a point (<code>GEOSEARCH</code> in current Redis versions). Alternative: bucket space
+    into geohash or H3 cells and keep a set of partners per cell; to find partners within 3 km, query the cell and
+    its neighbours. The deep treatment of geohash and quadtrees is in
+    <a href="#m7-ride-sharing">Ride sharing</a>.</li>
+    <li><strong>Live tracking for the customer.</strong> While the order is PICKED_UP, the customer app polls
+    <code>GET /orders/{id}</code> every few seconds or holds a Server-Sent Events / WebSocket stream. The tracking
+    service reads the partner's latest location and an ETA. Polling every 5 seconds from 500,000 simultaneous
+    deliveries is 100,000 requests per second, so a push channel and a small cache are cheaper.</li>
+    <li><strong>ETA</strong> = restaurant preparation time + partner travel time to restaurant + travel time to
+    the customer. Use a maps/routing service with live traffic; add a learned correction from past orders.
+    State this as an estimate with error bars.</li>
+  </ul>
+
+  <h4>8. Deep dive C: partner matching</h4>
+  <p>When an order becomes ACCEPTED, start matching so that a partner arrives as food becomes ready (not too
+  early; waiting partners waste capacity).</p>
+  <ol class="steps">
+    <li><strong>Candidates:</strong> query the geo index for available partners within a radius of the
+    restaurant (start with 2–3 km).</li>
+    <li><strong>Filter:</strong> online, not already carrying too many orders, right vehicle type, not recently
+    rejected this order.</li>
+    <li><strong>Score:</strong> distance or ETA to the restaurant, current load, rating, acceptance rate, and
+    whether the delivery direction fits an order they already carry (batching).</li>
+    <li><strong>Offer:</strong> send the best candidate an assignment with a timeout (10–15 seconds). Create the
+    assignment in the database with state OFFERED. If accepted, atomically update
+    <code>partner_id</code> where it is still null (a conditional update prevents two partners getting one
+    order). If rejected or timed out, offer to the next candidate.</li>
+    <li><strong>Fallback:</strong> if nobody accepts after K attempts, widen the radius, add an incentive, or
+    alert operations.</li>
+  </ol>
+  <p>Avoid assigning the same partner to two orders at once by marking the partner as <em>reserved</em> during an
+  offer; use a short lease with a TTL, not a lock that can get stuck (<a href="#m6-coordination">Coordination</a>).
+  Global optimisation (batching many orders and many partners and solving an assignment problem every few
+  seconds) beats greedy one-by-one matching but is more complex; mention it as an improvement.</p>
+
+  <h4>9. Bottlenecks, scaling and failure</h4>
+  <ul>
+    <li><strong>Peaks:</strong> lunch and dinner. Pre-scale before the peak, cache restaurant lists per area,
+    and shed non-essential features (recommendations) first
+    (<a href="#m6-resilience">Resilience</a>).</li>
+    <li><strong>Sharding:</strong> by city for orders, restaurants and partners; each city is nearly independent,
+    which also limits the blast radius of a failure.</li>
+    <li><strong>Search:</strong> read replicas of the search index; update it asynchronously when menus change.</li>
+    <li><strong>Payments:</strong> use the idempotent flow in <a href="#m7-payments">Payments</a>; never store
+    card data yourself.</li>
+    <li><strong>Failure cases:</strong> restaurant tablet offline (fallback: call, auto-cancel after timeout);
+    partner phone loses network (last known position, reassign after a timeout); duplicate events (idempotent
+    handlers).</li>
+    <li><strong>Monitoring:</strong> order success rate, time to restaurant accept, time to assign a partner,
+    delivery time vs ETA, location staleness, cancellation reasons.</li>
+  </ul>
+
+  <h4>Follow-up questions</h4>
+  <ul>
+    <li>How do you handle a restaurant going out of stock after an order? (Item-level substitution/refund flow;
+    short menu cache TTL; push availability changes.)</li>
+    <li>How do you show "restaurants open now within 5 km, sorted by rating"? (Search index with geo-distance
+    filter and sort, ranked results, cached per area.)</li>
+    <li>How do you prevent a partner's duplicate location updates from corrupting state? (Last-write-wins by
+    timestamp; discard older updates.)</li>
+    <li>What happens if the order service restarts mid-saga? (State is in the database; resume from the last
+    persisted status; timers are persisted.)</li>
+    <li>How would you support batching two orders for one partner? (Matching scores route overlap and time
+    windows.)</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Draw the order state machine; interviewers like it because it exposes failure paths.</li>
+      <li>Separate consistency needs: orders and payments strong, browsing and tracking eventual.</li>
+      <li>Explain matching as candidates → filter → score → offer with timeout → fallback.</li>
+    </ul>
+  </div>
+</article>

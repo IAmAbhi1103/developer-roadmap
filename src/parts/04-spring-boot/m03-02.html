@@ -1,0 +1,766 @@
+<article class="topic" id="m3-repositories">
+  <h3>Spring Data repositories and derived queries</h3>
+  <p class="tldr">You declare an interface that extends <code>JpaRepository</code>; Spring Data creates the implementation, gives you CRUD and paging for free, and turns method names such as <code>findByEmail</code> into queries.</p>
+
+  <h4>The repository hierarchy</h4>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  Repository &lt;|-- CrudRepository
+  CrudRepository &lt;|-- ListCrudRepository
+  Repository &lt;|-- PagingAndSortingRepository
+  ListCrudRepository &lt;|-- JpaRepository
+  PagingAndSortingRepository &lt;|-- JpaRepository
+  class Repository {
+    marker interface
+  }
+  class JpaRepository {
+    flush()
+    saveAndFlush()
+    deleteAllInBatch()
+    getReferenceById()
+  }
+</pre>
+  <figcaption>Each level adds methods; JpaRepository is the one you normally extend</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Interface</th><th>Adds</th></tr></thead>
+    <tbody>
+      <tr><td><code>Repository&lt;T, ID&gt;</code></td><td>Nothing: a marker. Extend it to expose only the methods you choose.</td></tr>
+      <tr><td><code>CrudRepository</code></td><td><code>save</code>, <code>saveAll</code>, <code>findById</code>, <code>existsById</code>, <code>findAll</code>, <code>count</code>, <code>deleteById</code>, <code>delete</code>, <code>deleteAll</code></td></tr>
+      <tr><td><code>ListCrudRepository</code></td><td>Same as above but returns <code>List</code> instead of <code>Iterable</code></td></tr>
+      <tr><td><code>PagingAndSortingRepository</code></td><td><code>findAll(Sort)</code>, <code>findAll(Pageable)</code></td></tr>
+      <tr><td><code>JpaRepository</code></td><td>JPA extras: <code>flush</code>, <code>saveAndFlush</code>, <code>deleteInBatch</code>-style methods, <code>getReferenceById</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>In Spring Data 3.x, <code>PagingAndSortingRepository</code> no longer extends <code>CrudRepository</code>, which is why <code>ListCrudRepository</code> and <code>ListPagingAndSortingRepository</code> exist; <code>JpaRepository</code> combines them so you get everything.</p>
+
+  <h4>Using it</h4>
+  <pre data-title="UserRepository.java"><code class="language-java">public interface UserRepository extends JpaRepository&lt;User, Long&gt; {
+
+    Optional&lt;User&gt; findByEmail(String email);
+
+    boolean existsByEmail(String email);
+}</code></pre>
+  <p>No <code>@Repository</code> annotation is needed; Boot's auto-configuration scans for interfaces that extend a Spring Data repository (starting at the package of your <code>@SpringBootApplication</code> class). At startup Spring creates a proxy that implements the interface, backed by <code>SimpleJpaRepository</code>. Exceptions are translated into Spring's <code>DataAccessException</code> hierarchy.</p>
+  <pre data-title="What you get for free"><code class="language-java">User saved = repo.save(user);                 // insert or update
+Optional&lt;User&gt; one = repo.findById(5L);        // SELECT ... where id=?
+List&lt;User&gt; all = repo.findAll();              // SELECT all (careful on big tables)
+Page&lt;User&gt; page = repo.findAll(PageRequest.of(0, 20, Sort.by("name")));
+long n = repo.count();
+boolean has = repo.existsById(5L);
+repo.deleteById(5L);                          // loads the entity, then DELETE
+repo.saveAll(users);                          // one persist/merge per element</code></pre>
+  <p><code>deleteById</code> loads the entity first (so cascades and lifecycle callbacks work). <code>deleteAllInBatch()</code> and <code>deleteAllByIdInBatch(ids)</code> issue a single bulk <code>DELETE</code> and skip callbacks and cascades. Paging was introduced in <a href="#m2">module 2</a>; the same <code>Pageable</code> works on every repository method below.</p>
+
+  <h4>Derived queries: the method name is the query</h4>
+  <p>Spring Data parses the method name. The prefix says what to do (<code>find…By</code>, <code>read…By</code>, <code>get…By</code>, <code>query…By</code>, <code>count…By</code>, <code>exists…By</code>, <code>delete…By</code>), and the part after <code>By</code> is a list of conditions on entity properties, joined by <code>And</code> / <code>Or</code>. A wrong property name fails at <strong>startup</strong>, not at runtime, which is a big advantage.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Keyword</th><th>Example</th><th>JPQL / SQL idea</th></tr></thead>
+    <tbody>
+      <tr><td><code>And</code>, <code>Or</code></td><td><code>findByCityAndStatus(c, s)</code></td><td><code>where city=?1 and status=?2</code></td></tr>
+      <tr><td><code>Is</code>, <code>Equals</code></td><td><code>findByEmail(e)</code></td><td><code>where email=?1</code></td></tr>
+      <tr><td><code>Between</code></td><td><code>findBySalaryMaxBetween(a, b)</code></td><td><code>between ?1 and ?2</code></td></tr>
+      <tr><td><code>LessThan</code>, <code>LessThanEqual</code></td><td><code>findByExperienceLessThan(3)</code></td><td><code>&lt; ?1</code></td></tr>
+      <tr><td><code>GreaterThan</code>, <code>GreaterThanEqual</code></td><td><code>findByCreatedAtGreaterThanEqual(t)</code></td><td><code>&gt;= ?1</code></td></tr>
+      <tr><td><code>After</code>, <code>Before</code></td><td><code>findByPostedAtAfter(t)</code></td><td><code>&gt; ?1</code> / <code>&lt; ?1</code></td></tr>
+      <tr><td><code>IsNull</code>, <code>IsNotNull</code></td><td><code>findByClosedAtIsNull()</code></td><td><code>is null</code></td></tr>
+      <tr><td><code>Like</code>, <code>NotLike</code></td><td><code>findByTitleLike("%dev%")</code></td><td><code>like ?1</code> (you add the <code>%</code>)</td></tr>
+      <tr><td><code>Containing</code></td><td><code>findByTitleContaining("dev")</code></td><td><code>like %?1%</code> (adds <code>%</code>)</td></tr>
+      <tr><td><code>StartingWith</code>, <code>EndingWith</code></td><td><code>findByNameStartingWith("A")</code></td><td><code>like ?1%</code> / <code>like %?1</code></td></tr>
+      <tr><td><code>IgnoreCase</code></td><td><code>findByEmailIgnoreCase(e)</code></td><td><code>upper(email)=upper(?1)</code></td></tr>
+      <tr><td><code>In</code>, <code>NotIn</code></td><td><code>findByStatusIn(List.of(...))</code></td><td><code>in (?1)</code></td></tr>
+      <tr><td><code>True</code>, <code>False</code></td><td><code>findByActiveTrue()</code></td><td><code>active = true</code></td></tr>
+      <tr><td><code>OrderBy…Asc/Desc</code></td><td><code>findByCityOrderByCreatedAtDesc(c)</code></td><td><code>order by created_at desc</code></td></tr>
+      <tr><td><code>Top</code>, <code>First</code></td><td><code>findTop5ByOrderBySalaryMaxDesc()</code></td><td><code>limit 5</code></td></tr>
+      <tr><td><code>Distinct</code></td><td><code>findDistinctByCity()</code></td><td><code>select distinct</code></td></tr>
+      <tr><td><code>existsBy</code></td><td><code>existsByEmail(e)</code></td><td>returns <code>boolean</code></td></tr>
+      <tr><td><code>countBy</code></td><td><code>countByStatus(s)</code></td><td>returns <code>long</code></td></tr>
+      <tr><td><code>deleteBy</code>, <code>removeBy</code></td><td><code>deleteByStatus(s)</code></td><td>loads then deletes each (needs a transaction)</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="JobRepository.java (derived queries)"><code class="language-java">public interface JobRepository extends JpaRepository&lt;Job, Long&gt; {
+
+    List&lt;Job&gt; findByStatusOrderByPostedAtDesc(JobStatus status);
+
+    List&lt;Job&gt; findByCityIgnoreCaseAndStatus(String city, JobStatus status);
+
+    List&lt;Job&gt; findTop5ByStatusOrderByPostedAtDesc(JobStatus status);
+
+    long countByCompanyId(Long companyId);          // traverses job.company.id
+
+    boolean existsByCompanyIdAndTitle(Long companyId, String title);
+
+    Page&lt;Job&gt; findByTitleContainingIgnoreCase(String text, Pageable pageable);
+}</code></pre>
+  <p>Property traversal: <code>findByCompanyName(n)</code> joins to <code>company</code>. If a name is ambiguous, separate with an underscore: <code>findByCompany_Name(n)</code>. <code>findByCompanyId</code> uses the foreign key without a join.</p>
+  <pre class="out" data-title="SQL for findByCityIgnoreCaseAndStatus (PostgreSQL, simplified)"><code class="language-sql">select j.* from job j
+where upper(j.city) = upper(?) and j.status = ?</code></pre>
+
+  <h4>Return types</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Return type</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>T</code></td><td>One result or <code>null</code>; throws <code>IncorrectResultSizeDataAccessException</code> if more than one</td></tr>
+      <tr><td><code>Optional&lt;T&gt;</code></td><td>Zero or one. Use for "find one" methods</td></tr>
+      <tr><td><code>List&lt;T&gt;</code>, <code>Set&lt;T&gt;</code></td><td>All results, loaded in memory</td></tr>
+      <tr><td><code>Page&lt;T&gt;</code></td><td>One page + total count (an extra <code>count</code> query)</td></tr>
+      <tr><td><code>Slice&lt;T&gt;</code></td><td>One page + "has next?" only (fetches size+1 rows, no count query)</td></tr>
+      <tr><td><code>Stream&lt;T&gt;</code></td><td>Lazy stream; must run in a transaction and be closed (<code>try-with-resources</code>)</td></tr>
+      <tr><td><code>long</code>, <code>boolean</code></td><td>For <code>countBy</code> / <code>existsBy</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Use <code>Slice</code> for "load more" or infinite scroll when the total count is not shown; the count query on a big table can be slower than the page itself.</p>
+
+  <h4>Limits of derived queries</h4>
+  <p>Names are checked at startup and are great for one to three conditions. After that they become unreadable: <code>findByStatusAndCityAndExperienceLessThanEqualAndSalaryMaxGreaterThanEqualOrderByPostedAtDesc</code>. Switch to <code>@Query</code> (<a href="#m3-query-projections">next article</a>) for long or join-heavy queries, and to Specifications for optional filters. Derived queries also cannot do joins with conditions on collections, aggregations, or <code>group by</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Property names in the method must match entity <em>field</em> names (<code>postedAt</code>, not <code>posted_at</code>).</li>
+      <li>Parameters are bound by position, in the order of the conditions in the name.</li>
+      <li><code>deleteBy…</code> and modifying queries need a transaction; put <code>@Transactional</code> on the service method.</li>
+      <li>A repository for an aggregate root only. Do not create one repository per table (e.g. no <code>ApplicationItemRepository</code> if items are only reached through their parent).</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Using <code>List&lt;T&gt; findAll()</code> on a table with millions of rows. Always page.</li>
+      <li>Returning <code>T</code> (not <code>Optional</code>) for a "find one" and then getting <code>null</code> or an exception when it is missing.</li>
+      <li>Using <code>deleteByStatus</code> for a mass delete: it loads every entity and deletes row by row (N+1 deletes). Use a <code>@Modifying @Query</code> instead.</li>
+      <li>Expecting <code>Like</code> to add wildcards. <code>Like</code> uses your string as is; <code>Containing</code> adds them.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions</p>
+    <ul>
+      <li><code>PropertyReferenceException: No property 'x' found for type 'Job'</code> — typo in a derived method; the app fails to start.</li>
+      <li><code>IncorrectResultSizeDataAccessException</code> — a single-result method found two rows.</li>
+      <li><code>InvalidDataAccessApiUsageException: no transaction</code> — <code>deleteBy…</code> or a modifying query outside a transaction (<code>TransactionRequiredException</code> inside).</li>
+      <li><code>DataIntegrityViolationException</code> — unique or foreign-key violation on save; map it to HTTP 409 (<a href="#m2">module 2</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How does Spring Data create a repository with no implementation?" At startup it builds a JDK proxy for the interface, backed by <code>SimpleJpaRepository</code>; method names are parsed into queries (<code>PartTree</code>) and validated against the entity. "Page vs Slice?" Page runs an extra count query; Slice does not. "findAll vs findAll(Pageable)?" Memory and speed on large tables.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-query-projections">
+  <h3>@Query, projections, Specifications and Query by Example</h3>
+  <p class="tldr">When a method name is too long, write the query with <code>@Query</code> (JPQL or native SQL); return small DTO projections for reads; use Specifications to build dynamic filters from optional parameters.</p>
+
+  <h4>JPQL with @Query</h4>
+  <p><strong>JPQL</strong> (Jakarta Persistence Query Language) looks like SQL but works on <em>entities and fields</em>, not tables and columns. You write <code>from Job j where j.city = :city</code>, and Hibernate translates it into SQL for your database. That is why JPQL is portable.</p>
+  <pre data-title="JobRepository.java"><code class="language-java">public interface JobRepository extends JpaRepository&lt;Job, Long&gt; {
+
+    @Query("""
+           select j from Job j
+           where j.status = :status
+             and (:city is null or lower(j.city) = lower(:city))
+             and j.salary.max &gt;= :minSalary
+           order by j.postedAt desc
+           """)
+    List&lt;Job&gt; search(@Param("status") JobStatus status,
+                     @Param("city") String city,
+                     @Param("minSalary") BigDecimal minSalary);
+
+    @Query("select j from Job j join j.company c where c.name = :company")
+    List&lt;Job&gt; findByCompanyName(@Param("company") String company);
+}</code></pre>
+  <ul>
+    <li>Use the <strong>entity name</strong> (<code>Job</code>) and <strong>field names</strong> (<code>j.postedAt</code>), not <code>job</code> and <code>posted_at</code>.</li>
+    <li>Use <strong>named parameters</strong> <code>:status</code> with <code>@Param("status")</code>. Positional <code>?1</code> works but breaks silently when you reorder arguments. (With <code>-parameters</code> compiler flag, which Boot's Maven/Gradle plugins enable, <code>@Param</code> is optional; keeping it is safer.)</li>
+    <li>JPQL is validated at startup, so a typo fails fast.</li>
+    <li>The <code>(:city is null or ...)</code> trick works for a few optional filters; it can hurt index use. For many filters use Specifications.</li>
+  </ul>
+
+  <h4>Native SQL</h4>
+  <pre data-title="Native query"><code class="language-java">@Query(value = """
+        select * from job
+        where to_tsvector('english', title || ' ' || description)
+              @@ plainto_tsquery('english', :text)
+        """, nativeQuery = true)
+List&lt;Job&gt; fullTextSearch(@Param("text") String text);
+
+@Query(value = "select * from job where status = :s",
+       countQuery = "select count(*) from job where status = :s",
+       nativeQuery = true)
+Page&lt;Job&gt; findPageNative(@Param("s") String status, Pageable pageable);</code></pre>
+  <p>Native queries use table and column names and database-specific features, and are <strong>not</strong> checked at startup. They do not apply <code>Sort</code> from a <code>Pageable</code> reliably; give a <code>countQuery</code> and write the <code>order by</code> yourself. Use them for window functions, full-text search, <code>jsonb</code> and tuned reports.</p>
+
+  <h4>Sorting and paging with @Query</h4>
+  <pre data-title="Pageable works with JPQL"><code class="language-java">@Query("select j from Job j where j.company.id = :companyId")
+Page&lt;Job&gt; findByCompany(@Param("companyId") Long companyId, Pageable pageable);
+
+// call:
+jobRepository.findByCompany(7L,
+        PageRequest.of(0, 10, Sort.by(Sort.Direction.DESC, "postedAt")));</code></pre>
+  <p>Spring Data appends <code>order by</code> from the <code>Sort</code> and builds the count query from your query. If the query is complex (joins, <code>distinct</code>, group by), pass your own <code>countQuery</code>. Sort property names are entity fields in JPQL. Never concatenate user input into the query string; sort fields from the client must be checked against an allow-list.</p>
+
+  <h4>@Modifying: UPDATE and DELETE queries</h4>
+  <pre data-title="Bulk update"><code class="language-java">@Modifying(clearAutomatically = true, flushAutomatically = true)
+@Query("update Job j set j.status = 'CLOSED' where j.closingDate &lt; :today")
+int closeExpired(@Param("today") LocalDate today);     // returns rows changed</code></pre>
+  <p>Call it from a <code>@Transactional</code> service method. A bulk statement runs directly in the database and <strong>bypasses the persistence context</strong>: entities already loaded in memory still show the old values. <code>clearAutomatically = true</code> clears the context after the update so the next read hits the database; <code>flushAutomatically = true</code> flushes pending changes first. Bulk statements also skip <code>@Version</code>, lifecycle callbacks and auditing, unless you handle them yourself. One <code>UPDATE</code> for 100,000 rows beats loading and changing 100,000 entities.</p>
+
+  <h4>Projections: read only what you need</h4>
+  <p>Loading an entire <code>Job</code> (with description text and relationships) to show a list of titles wastes memory and time. A <strong>projection</strong> returns only chosen fields.</p>
+  <pre data-title="Interface projection and record (DTO) projection"><code class="language-java">// 1. Interface-based (closed projection): getters named like entity fields
+public interface JobSummary {
+    Long getId();
+    String getTitle();
+    String getCity();
+}
+List&lt;JobSummary&gt; findByStatus(JobStatus status);   // derived query, selects 3 columns
+
+// 2. Record / DTO-based
+public record JobCard(Long id, String title, String companyName) {}
+
+List&lt;JobCard&gt; findCardsByStatus(JobStatus status);   // derived queries can return DTOs too
+
+@Query("""
+       select new com.example.jobs.job.JobCard(j.id, j.title, c.name)
+       from Job j join j.company c
+       where j.status = :status
+       """)
+List&lt;JobCard&gt; cards(@Param("status") JobStatus status);   // constructor expression</code></pre>
+  <pre class="out" data-title="SQL: only three columns are selected"><code class="language-sql">select j.id, j.title, c.name
+from job j join company c on c.id = j.company_id
+where j.status = ?</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Kind</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody>
+      <tr><td>Interface (closed)</td><td>Little code; Spring selects only the declared fields</td><td>Proxy-based; native queries need aliases matching the getters</td></tr>
+      <tr><td>Interface (open, with <code>@Value("#{...}")</code>)</td><td>Computed values</td><td>Loads the whole entity; loses the benefit</td></tr>
+      <tr><td>Record / class DTO</td><td>Plain, immutable, easy to test</td><td>Needs a matching constructor; full class name in a JPQL constructor expression</td></tr>
+      <tr><td>Dynamic: <code>findBy(..., Class&lt;T&gt;)</code></td><td>Same method, many projection types</td><td>Generic parameter at the end of the method</td></tr>
+    </tbody>
+  </table></div>
+  <p>Projections are also a way to dodge the N+1 problem (<a href="#m3-n-plus-one">next module topics</a>): a DTO query with an explicit <code>join</code> reads exactly what the response needs in one SQL statement.</p>
+
+  <h4>Specifications: dynamic filters</h4>
+  <p>The "search jobs" screen has optional filters: city, minimum salary, keyword, status. Writing one method per combination is impossible. A <strong>Specification</strong> is a small reusable predicate; you combine the ones you need. Make the repository also extend <code>JpaSpecificationExecutor&lt;Job&gt;</code>.</p>
+  <pre data-title="JobSpecs.java and use"><code class="language-java">public interface JobRepository
+        extends JpaRepository&lt;Job, Long&gt;, JpaSpecificationExecutor&lt;Job&gt; { }
+
+public final class JobSpecs {
+    private JobSpecs() { }
+
+    public static Specification&lt;Job&gt; hasStatus(JobStatus status) {
+        return (root, query, cb) -&gt; cb.equal(root.get("status"), status);
+    }
+    public static Specification&lt;Job&gt; inCity(String city) {
+        return (root, query, cb) -&gt;
+                cb.equal(cb.lower(root.get("city")), city.toLowerCase());
+    }
+    public static Specification&lt;Job&gt; titleContains(String text) {
+        return (root, query, cb) -&gt;
+                cb.like(cb.lower(root.get("title")), "%" + text.toLowerCase() + "%");
+    }
+    public static Specification&lt;Job&gt; minSalary(BigDecimal min) {
+        return (root, query, cb) -&gt;
+                cb.greaterThanOrEqualTo(root.get("salary").get("max"), min);
+    }
+}
+
+// in the service
+Specification&lt;Job&gt; spec = Specification.where(JobSpecs.hasStatus(JobStatus.OPEN));
+if (city != null &amp;&amp; !city.isBlank()) spec = spec.and(JobSpecs.inCity(city));
+if (text != null &amp;&amp; !text.isBlank()) spec = spec.and(JobSpecs.titleContains(text));
+if (min != null) spec = spec.and(JobSpecs.minSalary(min));
+
+Pageable pageable = PageRequest.of(0, 20, Sort.by("postedAt").descending());
+Page&lt;Job&gt; page = jobRepository.findAll(spec, pageable);</code></pre>
+  <p>Each lambda gets <code>root</code> (the entity, like <code>from Job j</code>), <code>query</code> and the <code>CriteriaBuilder cb</code>. The builder produces a type-aware, injection-safe query: user text goes in as a bound parameter. The attribute names are strings, so a typo fails at runtime; the JPA static metamodel (<code>Job_.status</code>) gives compile-time safety if you generate it. Combining with <code>and</code>/<code>or</code>/<code>not</code> reads well.</p>
+
+  <h4>Query by Example (QBE), briefly</h4>
+  <pre data-title="Query by Example"><code class="language-java">Job probe = new Job();
+probe.setCity("Pune");
+ExampleMatcher matcher = ExampleMatcher.matching()
+        .withIgnoreCase()
+        .withStringMatcher(ExampleMatcher.StringMatcher.CONTAINING);
+List&lt;Job&gt; jobs = jobRepository.findAll(Example.of(probe, matcher));   // needs QueryByExampleExecutor</code></pre>
+  <p>QBE builds a query from a filled-in "probe" object. It is quick for simple equality and string matching on non-null fields, but it cannot express ranges, <code>or</code> or nested collections. Most real projects choose Specifications (or QueryDSL / jOOQ for heavy reporting).</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Need</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td>One or two simple conditions</td><td>Derived query</td></tr>
+      <tr><td>Fixed, joined, or aggregated query</td><td><code>@Query</code> JPQL</td></tr>
+      <tr><td>Database-specific feature</td><td><code>@Query(nativeQuery = true)</code></td></tr>
+      <tr><td>List screen with few columns</td><td>Projection (interface or record)</td></tr>
+      <tr><td>Optional filters from a search form</td><td>Specifications</td></tr>
+      <tr><td>Prototype with equality filters</td><td>Query by Example</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Table names in JPQL: <code>from job</code> works only if it happens to match the entity name. Think entities.</li>
+      <li>Forgetting <code>@Modifying</code> on an update query: an <code>InvalidDataAccessApiUsageException</code> at runtime (the query is run as a SELECT and the DML is rejected).</li>
+      <li>Concatenating user input into a JPQL or native string: SQL/JPQL injection. Always bind parameters.</li>
+      <li>Reading entities after a bulk update without <code>clearAutomatically</code>: you see stale values.</li>
+      <li>Projection getter names that do not match fields: <code>null</code> values, or startup errors for constructor expressions with the wrong signature.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"JPQL vs native?" JPQL is portable and entity-based, validated at startup; native is raw SQL, not portable, for special features. "Why use projections?" Fewer columns, less memory, no lazy loading, avoids N+1. "How do you build a search with optional filters?" Specifications (or Criteria API) combined with <code>and</code>, with paging. "After a bulk update, why are my entities stale?" The persistence context was bypassed; clear it.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-relationships">
+  <h3>Relationships: owning side, mappedBy, cascade and orphanRemoval</h3>
+  <p class="tldr">A relationship is stored as a foreign key; the entity whose table holds that column is the owning side, <code>mappedBy</code> marks the inverse side, and cascade and <code>orphanRemoval</code> decide what happens to children when the parent changes.</p>
+
+  <h4>The four relationship types</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation</th><th>Meaning</th><th>Database shape</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>@ManyToOne</code></td><td>Many rows point to one</td><td>FK column on the "many" table</td><td>Job → Company</td></tr>
+      <tr><td><code>@OneToMany</code></td><td>One row has many children</td><td>FK on the child table (mirror of ManyToOne)</td><td>Company → Jobs</td></tr>
+      <tr><td><code>@ManyToMany</code></td><td>Many to many</td><td>A join table with two FKs</td><td>Job ↔ Tag</td></tr>
+      <tr><td><code>@OneToOne</code></td><td>One to one</td><td>FK (unique) on one side, or shared primary key</td><td>User → Profile</td></tr>
+    </tbody>
+  </table></div>
+  <p>Every relationship can be <strong>unidirectional</strong> (only one entity has a field) or <strong>bidirectional</strong> (both have one). The database has just one foreign key either way. In bidirectional relations, two Java fields describe one FK, so JPA needs to know which field is "the real one".</p>
+
+  <h4>The owning side and mappedBy</h4>
+  <p>The <strong>owning side</strong> is the one that controls the foreign key column: when you change it, Hibernate writes the FK. It is always the side whose <strong>table contains the foreign key</strong>: the <code>@ManyToOne</code> side. The other side is the <strong>inverse side</strong>, marked with <code>mappedBy = "fieldNameOnTheOwner"</code>; changes made only on the inverse side are ignored when saving.</p>
+  <figure class="fig">
+<pre class="mermaid">
+erDiagram
+  COMPANY ||--o{ JOB : posts
+  COMPANY {
+    bigint id PK
+    varchar name
+  }
+  JOB {
+    bigint id PK
+    bigint company_id FK
+    varchar title
+  }
+</pre>
+  <figcaption>The FK company_id lives in job, so Job.company is the owning side</figcaption>
+  </figure>
+  <pre data-title="Bidirectional Company 1 - n Job"><code class="language-java">@Entity
+public class Company {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String name;
+
+    @OneToMany(mappedBy = "company", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List&lt;Job&gt; jobs = new ArrayList&lt;&gt;();    // inverse side
+
+    public void addJob(Job job) {                       // keep both sides in sync
+        jobs.add(job);
+        job.setCompany(this);
+    }
+    public void removeJob(Job job) {
+        jobs.remove(job);
+        job.setCompany(null);
+    }
+}
+
+@Entity
+public class Job {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String title;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "company_id", nullable = false)  // owning side: the FK
+    private Company company;
+}</code></pre>
+  <p><code>@JoinColumn</code> names the FK column (the default would be <code>company_id</code> anyway). Without <code>mappedBy</code>, a <code>@OneToMany</code> becomes <em>its own</em> owning side and Hibernate creates a hidden <strong>join table</strong> (<code>company_jobs</code>) or, with <code>@JoinColumn</code> on the many side, extra UPDATE statements. Both are usually unwanted.</p>
+
+  <h4>Helper methods keep both sides in sync</h4>
+  <p>In memory, Java does not update the other side for you. If you only call <code>company.getJobs().add(job)</code>, <code>job.getCompany()</code> stays <code>null</code>, and since <code>Job</code> is the owner, the FK is saved as <code>NULL</code> (or the insert fails). Always change both sides in one place, with <code>addJob</code>/<code>removeJob</code> methods, and avoid exposing the raw list for modification (return <code>Collections.unmodifiableList(jobs)</code>).</p>
+
+  <h4>Unidirectional vs bidirectional</h4>
+  <ul>
+    <li>Prefer <strong>unidirectional @ManyToOne</strong> only: <code>Job.company</code> exists, <code>Company.jobs</code> does not. You can still ask <code>jobRepository.findByCompanyId(id)</code> with paging. It is simpler, avoids sync bugs and JSON loops, and avoids loading big collections.</li>
+    <li>Add the <code>@OneToMany</code> side only when the parent really owns a <em>small</em> child list and cascading is useful (an <code>Order</code> with its <code>OrderItem</code>s). A company with 50,000 jobs should never be loaded through <code>company.getJobs()</code>.</li>
+    <li>Avoid a unidirectional <code>@OneToMany</code> without <code>mappedBy</code>: it generates inefficient SQL.</li>
+  </ul>
+
+  <h4>Cascade types</h4>
+  <p><strong>Cascade</strong> says "when I do this to the parent, do it to the children too".</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>CascadeType</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>PERSIST</code></td><td>Saving the parent (persist) saves new children</td></tr>
+      <tr><td><code>MERGE</code></td><td>Merging the parent merges the children</td></tr>
+      <tr><td><code>REMOVE</code></td><td>Deleting the parent deletes the children</td></tr>
+      <tr><td><code>REFRESH</code>, <code>DETACH</code></td><td>Passed to children on refresh / detach</td></tr>
+      <tr><td><code>ALL</code></td><td>All of the above</td></tr>
+    </tbody>
+  </table></div>
+  <p>Cascade is for <strong>composition</strong>: children that cannot exist without the parent and are not shared (an order and its items; a job and its screening questions). Do <em>not</em> cascade across independent aggregates: deleting a <code>Company</code> must not silently delete <code>User</code>s, and an <code>Application</code> must not cascade <code>REMOVE</code> to its <code>Job</code>.</p>
+  <p><strong><code>orphanRemoval = true</code></strong> deletes a child when it is removed from the parent's collection (<code>company.getJobs().remove(job)</code> → <code>DELETE</code>), even if the parent itself stays. Use it only for true compositions. Do not replace the collection object (<code>setJobs(newList)</code>) on an orphanRemoval collection: Hibernate throws <code>HibernateException: A collection with cascade="all-delete-orphan" was no longer referenced</code>. Clear and addAll instead.</p>
+  <div class="co co-mistake">
+    <p class="co-t">Never CascadeType.REMOVE (or ALL) on @ManyToMany</p>
+    <p>Deleting one <code>Job</code> would delete every <code>Tag</code> it links to, although other jobs use those tags. The same for <code>REMOVE</code> on a <code>@ManyToOne</code>: deleting a job would delete its company. Rule: cascade flows from parent to <em>owned</em> children only.</p>
+  </div>
+
+  <h4>@ManyToMany and the join table</h4>
+  <pre data-title="Job ↔ Tag (Job owns the join table)"><code class="language-java">@Entity
+public class Job {
+    // ...
+    @ManyToMany
+    @JoinTable(name = "job_tag",
+            joinColumns = @JoinColumn(name = "job_id"),
+            inverseJoinColumns = @JoinColumn(name = "tag_id"))
+    private Set&lt;Tag&gt; tags = new HashSet&lt;&gt;();
+
+    public void addTag(Tag tag)    { tags.add(tag);    tag.getJobs().add(this); }
+    public void removeTag(Tag tag) { tags.remove(tag); tag.getJobs().remove(this); }
+}
+
+@Entity
+public class Tag {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String name;
+
+    @ManyToMany(mappedBy = "tags")          // inverse side
+    private Set&lt;Job&gt; jobs = new HashSet&lt;&gt;();
+}</code></pre>
+  <pre class="out" data-title="Tables created"><code class="language-sql">create table job_tag (
+    job_id bigint not null references job(id),
+    tag_id bigint not null references tag(id),
+    primary key (job_id, tag_id)
+);</code></pre>
+  <p>Use <strong><code>Set</code></strong> for <code>@ManyToMany</code>: removing from a <code>List</code> makes Hibernate delete <em>all</em> join rows of that owner and re-insert the remaining ones; a <code>Set</code> deletes just one row. For <code>@OneToMany</code> a <code>List</code> without <code>@OrderColumn</code> is a "bag" (unordered, duplicates allowed); a <code>Set</code> avoids the <code>MultipleBagFetchException</code> trap (see <a href="#m3-n-plus-one">fetching pitfalls</a>), but then <code>equals</code>/<code>hashCode</code> must be correct (<a href="#m3-entities">entities</a>).</p>
+
+  <h4>Many-to-many with extra columns: an explicit join entity</h4>
+  <p>The moment the link needs data of its own (when did the user apply, with which status, which cover letter), the join table has columns beyond the two FKs. <code>@ManyToMany</code> cannot hold them. Model the link as an entity with two <code>@ManyToOne</code>s. In the job portal, <code>Application</code> is exactly this: <code>User</code> ↔ <code>Job</code> many-to-many, made explicit (see the <a href="#m3-relationships-example">full example</a>).</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: no place for status</p><pre><code class="language-java">@ManyToMany
+@JoinTable(name = "application", ...)
+private Set&lt;Job&gt; appliedJobs;       // where do appliedAt and status go?</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: explicit entity</p><pre><code class="language-java">@Entity
+class Application {
+    @ManyToOne(fetch = LAZY) private User applicant;
+    @ManyToOne(fetch = LAZY) private Job job;
+    private Instant appliedAt;
+    @Enumerated(EnumType.STRING) private ApplicationStatus status;
+}</code></pre></div>
+  </div>
+
+  <h4>@OneToOne and @MapsId</h4>
+  <p>A one-to-one is a foreign key with a unique constraint. The owning side holds the FK (<code>@JoinColumn</code>); the other uses <code>mappedBy</code>. Because Hibernate cannot make the inverse side lazy without extra work (it must query to know whether the row exists), the inverse side of a bidirectional <code>@OneToOne</code> is often loaded eagerly anyway. Prefer unidirectional from the side with the FK.</p>
+  <p><code>@MapsId</code> shares the primary key: the child's id <em>is</em> the parent's id, so no separate FK or index is needed.</p>
+  <pre data-title="UserProfile shares the primary key of User"><code class="language-java">@Entity
+public class UserProfile {
+    @Id
+    private Long id;                         // same value as user.id
+
+    @OneToOne(fetch = FetchType.LAZY, optional = false)
+    @MapsId                                  // copies user's id into this id
+    @JoinColumn(name = "id")
+    private User user;
+
+    private String headline;
+    private String resumeUrl;
+}</code></pre>
+
+  <h4>@JoinColumn and defaults</h4>
+  <ul>
+    <li><code>@JoinColumn(name = "company_id", nullable = false)</code> sets the FK column name and NOT NULL.</li>
+    <li><code>foreignKey = @ForeignKey(name = "fk_job_company")</code> names the constraint (useful if Hibernate generates the DDL).</li>
+    <li><code>optional = false</code> on <code>@ManyToOne</code> tells Hibernate the FK is never null, so it can use inner joins.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>The side with the foreign key (<code>@ManyToOne</code>) is the owner; <code>mappedBy</code> goes on the other side and names the owner's <em>field</em>.</li>
+      <li>Only the owning side writes the FK. Update both sides in memory with helper methods.</li>
+      <li>Cascade and <code>orphanRemoval</code> only for owned children (composition).</li>
+      <li>Use <code>Set</code> for <code>@ManyToMany</code>; use an explicit entity when the link has its own data.</li>
+      <li>Do not use entities with bidirectional links in JSON responses; use DTOs (<a href="#m2">module 2</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>TransientPropertyValueException: object references an unsaved transient instance</code> — you linked to an entity that was never persisted and has no cascade.</li>
+      <li><code>DataIntegrityViolationException</code> (<code>null value in column "company_id"</code>) — set only the inverse side.</li>
+      <li><code>ConstraintViolationException</code> on delete — a child row still references the parent; delete children first or cascade.</li>
+      <li><code>StackOverflowError</code> in <code>toString</code>/<code>hashCode</code>/Jackson — bidirectional loop (<a href="#m3-entities">entities</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is the owning side?" The side with the foreign key; the other has <code>mappedBy</code>. "What does <code>mappedBy</code> do?" Tells JPA this side only mirrors a mapping defined on the other entity, so no extra table or column. "Cascade vs orphanRemoval?" Cascade propagates operations; orphanRemoval deletes children that leave the collection. "How to model many-to-many with extra columns?" A join entity with two ManyToOne. "Why Set for ManyToMany?" Efficient removal and no duplicates.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-relationships-example">
+  <h3>Project 2 model: User, Company, Job, Application</h3>
+  <p class="tldr">A full set of entities for the job portal: Company 1-n Job, User 1-n Application n-1 Job, with lazy ManyToOne everywhere, a Set-based tag link, the matching Flyway SQL, and the repository methods that read it.</p>
+
+  <p>The job portal has recruiters who post jobs for a company, and candidates who apply. The relationships are:</p>
+  <figure class="fig">
+<pre class="mermaid">
+erDiagram
+  USER ||--o{ APPLICATION : submits
+  JOB ||--o{ APPLICATION : receives
+  COMPANY ||--o{ JOB : posts
+  COMPANY ||--o{ USER : employs
+  USER {
+    bigint id PK
+    varchar email
+    varchar role
+    bigint company_id FK
+  }
+  COMPANY {
+    bigint id PK
+    varchar name
+  }
+  JOB {
+    bigint id PK
+    bigint company_id FK
+    varchar title
+    varchar status
+  }
+  APPLICATION {
+    bigint id PK
+    bigint job_id FK
+    bigint user_id FK
+    varchar status
+    timestamptz applied_at
+  }
+</pre>
+  <figcaption>ER diagram of Project 2. USER to JOB is many-to-many through APPLICATION</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Company → Job:</strong> one-to-many; <code>Job.company</code> is the owner.</li>
+    <li><strong>Company → User:</strong> a recruiter works for one company (<code>User.company</code>, nullable for candidates).</li>
+    <li><strong>User ↔ Job through Application:</strong> an explicit join entity with status and date. A candidate may apply to a job only once: a unique constraint on <code>(job_id, user_id)</code>.</li>
+  </ul>
+
+  <h4>Base class with the shared id</h4>
+  <pre data-title="BaseEntity.java"><code class="language-java">@MappedSuperclass
+public abstract class BaseEntity {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    public Long getId() { return id; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || Hibernate.getClass(this) != Hibernate.getClass(o)) return false;
+        BaseEntity other = (BaseEntity) o;
+        return id != null &amp;&amp; id.equals(other.getId());
+    }
+
+    @Override
+    public int hashCode() { return Hibernate.getClass(this).hashCode(); }
+}</code></pre>
+  <p>A <code>@MappedSuperclass</code> is not an entity itself; its fields become columns in each subclass's table. Audit fields are added to it in the <a href="#m3-auditing">auditing article</a>.</p>
+
+  <h4>The entities</h4>
+  <pre data-title="Company.java"><code class="language-java">@Entity
+@Table(name = "company")
+public class Company extends BaseEntity {
+
+    @Column(nullable = false, length = 120)
+    private String name;
+
+    @Column(length = 200)
+    private String website;
+
+    protected Company() { }
+    public Company(String name, String website) { this.name = name; this.website = website; }
+    // getters
+    // No Set&lt;Job&gt; jobs on purpose: a company can have thousands of jobs.
+}</code></pre>
+  <pre data-title="User.java (relationship part)"><code class="language-java">@Entity
+@Table(name = "app_user")
+public class User extends BaseEntity {
+
+    @Column(nullable = false, length = 80)  private String name;
+    @Column(nullable = false, length = 150) private String email;
+    @Column(name = "password_hash", nullable = false, length = 100)
+    private String passwordHash;
+
+    @Enumerated(EnumType.STRING) @Column(nullable = false, length = 20)
+    private Role role;
+
+    @ManyToOne(fetch = FetchType.LAZY)           // null for candidates
+    @JoinColumn(name = "company_id")
+    private Company company;
+
+    protected User() { }
+    // constructor, getters
+}</code></pre>
+  <pre data-title="Job.java"><code class="language-java">@Entity
+@Table(name = "job")
+public class Job extends BaseEntity {
+
+    @Column(nullable = false, length = 150) private String title;
+    @Column(nullable = false, columnDefinition = "text") private String description;
+    @Column(length = 80) private String city;
+
+    @Embedded private SalaryRange salary;
+
+    @Enumerated(EnumType.STRING) @Column(nullable = false, length = 20)
+    private JobStatus status = JobStatus.OPEN;
+
+    @Column(name = "posted_at", nullable = false)
+    private Instant postedAt = Instant.now();
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "company_id", nullable = false)
+    private Company company;
+
+    @ManyToMany
+    @JoinTable(name = "job_tag",
+            joinColumns = @JoinColumn(name = "job_id"),
+            inverseJoinColumns = @JoinColumn(name = "tag_id"))
+    private Set&lt;Tag&gt; tags = new HashSet&lt;&gt;();
+
+    protected Job() { }
+    public Job(Company company, String title, String description) {
+        this.company = company; this.title = title; this.description = description;
+    }
+    public void close() { this.status = JobStatus.CLOSED; }
+}</code></pre>
+  <pre data-title="Application.java (the join entity)"><code class="language-java">@Entity
+@Table(name = "application",
+       uniqueConstraints = @UniqueConstraint(
+               name = "uk_application_job_user", columnNames = {"job_id", "user_id"}))
+public class Application extends BaseEntity {
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "job_id", nullable = false)
+    private Job job;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "user_id", nullable = false)
+    private User applicant;
+
+    @Enumerated(EnumType.STRING) @Column(nullable = false, length = 20)
+    private ApplicationStatus status = ApplicationStatus.SUBMITTED;
+
+    @Column(name = "cover_letter", columnDefinition = "text")
+    private String coverLetter;
+
+    @Column(name = "applied_at", nullable = false, updatable = false)
+    private Instant appliedAt = Instant.now();
+
+    protected Application() { }
+    public Application(Job job, User applicant, String coverLetter) {
+        this.job = job; this.applicant = applicant; this.coverLetter = coverLetter;
+    }
+    public void shortlist() { this.status = ApplicationStatus.SHORTLISTED; }
+}</code></pre>
+  <p>Notice the decisions: every <code>@ManyToOne</code> is <code>LAZY</code>; nobody has a <code>List</code> that could grow without limit; the one collection (<code>tags</code>) is a <code>Set</code> and small; <code>Application</code> has behaviour (<code>shortlist()</code>) instead of a public setter.</p>
+
+  <h4>The matching Flyway migration</h4>
+  <pre data-title="V1__init.sql (PostgreSQL)"><code class="language-sql">CREATE TABLE company (
+    id      BIGSERIAL PRIMARY KEY,
+    name    VARCHAR(120) NOT NULL,
+    website VARCHAR(200)
+);
+
+CREATE TABLE app_user (
+    id            BIGSERIAL PRIMARY KEY,
+    name          VARCHAR(80)  NOT NULL,
+    email         VARCHAR(150) NOT NULL,
+    password_hash VARCHAR(100) NOT NULL,
+    role          VARCHAR(20)  NOT NULL,
+    company_id    BIGINT REFERENCES company (id),
+    CONSTRAINT uk_user_email UNIQUE (email)
+);
+
+CREATE TABLE job (
+    id          BIGSERIAL PRIMARY KEY,
+    company_id  BIGINT       NOT NULL REFERENCES company (id),
+    title       VARCHAR(150) NOT NULL,
+    description TEXT         NOT NULL,
+    city        VARCHAR(80),
+    salary_min  NUMERIC(12, 2),
+    salary_max  NUMERIC(12, 2),
+    status      VARCHAR(20)  NOT NULL,
+    posted_at   TIMESTAMPTZ  NOT NULL
+);
+CREATE INDEX idx_job_company ON job (company_id);
+CREATE INDEX idx_job_status_posted ON job (status, posted_at DESC);
+
+CREATE TABLE application (
+    id           BIGSERIAL PRIMARY KEY,
+    job_id       BIGINT      NOT NULL REFERENCES job (id),
+    user_id      BIGINT      NOT NULL REFERENCES app_user (id),
+    status       VARCHAR(20) NOT NULL,
+    cover_letter TEXT,
+    applied_at   TIMESTAMPTZ NOT NULL,
+    CONSTRAINT uk_application_job_user UNIQUE (job_id, user_id)
+);
+CREATE INDEX idx_application_user ON application (user_id);</code></pre>
+  <p>PostgreSQL does not index foreign key columns automatically, so add indexes on <code>job.company_id</code> and <code>application.user_id</code> yourself (the unique index on <code>(job_id, user_id)</code> already covers lookups by <code>job_id</code>). See <a href="03-sql-databases.html#m5">SQL · Module 5</a> on indexes.</p>
+
+  <h4>Repositories and a service</h4>
+  <pre data-title="ApplicationRepository.java and ApplicationService.java"><code class="language-java">public interface ApplicationRepository extends JpaRepository&lt;Application, Long&gt; {
+
+    boolean existsByJobIdAndApplicantId(Long jobId, Long userId);
+
+    Page&lt;Application&gt; findByApplicantId(Long userId, Pageable pageable);
+
+    @Query("select a from Application a join fetch a.applicant where a.job.id = :jobId")
+    List&lt;Application&gt; findForJob(@Param("jobId") Long jobId);
+}
+
+@Service
+public class ApplicationService {
+    // constructor injection of repositories omitted
+
+    @Transactional
+    public Long apply(Long jobId, Long userId, String coverLetter) {
+        if (applicationRepository.existsByJobIdAndApplicantId(jobId, userId)) {
+            throw new DuplicateResourceException("Already applied");
+        }
+        Job job = jobRepository.findById(jobId)
+                .orElseThrow(() -&gt; new ResourceNotFoundException("Job", jobId));
+        if (job.getStatus() != JobStatus.OPEN) {
+            throw new IllegalStateException("Job is closed");
+        }
+        User applicant = userRepository.getReferenceById(userId);   // no SELECT
+        return applicationRepository.save(
+                new Application(job, applicant, coverLetter)).getId();
+    }
+}</code></pre>
+  <pre class="out" data-title="SQL log for one apply() call"><code class="language-sql">select count(*) &gt; 0 from application where job_id=? and user_id=?
+select ... from job where id=?
+insert into application (applied_at, cover_letter, job_id, status, user_id)
+    values (?, ?, ?, ?, ?)</code></pre>
+
+  <div class="co co-conv">
+    <p class="co-t">Design notes</p>
+    <ul>
+      <li>The database <code>UNIQUE (job_id, user_id)</code> is the real guarantee; the <code>existsBy</code> check only gives a friendly message. Catch <code>DataIntegrityViolationException</code> for the race.</li>
+      <li>Give constraints and indexes explicit names. They appear in error messages and make migrations easier to read.</li>
+      <li>Aggregate boundaries: <code>Application</code> has its own repository because it is queried by user and by job, not only through a parent.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Teams often skip bidirectional collections entirely and read children through repositories with paging, which avoids both huge collections and the N+1 traps discussed next. Cascading is used rarely: for an <code>Order</code> with its <code>OrderItem</code>s, yes; for anything shared between aggregates, no.</p>
+  </div>
+</article>

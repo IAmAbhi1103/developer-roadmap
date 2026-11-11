@@ -1,0 +1,378 @@
+<div class="mintro">
+  <p>A high-level design (HLD) interview gives you one vague sentence, such as "Design a URL shortener",
+  and 45 minutes. Nobody expects a perfect answer. They want to see how you think: do you ask questions, do
+  the arithmetic, pick sensible components, explain trade-offs and notice what can fail? This module gives you
+  a repeatable method and ten fully worked problems, so that you have both the process and the building
+  blocks ready.</p>
+  <p>Every problem uses tools from earlier modules. Estimation and trade-offs come from
+  <a href="#m4">Module 4</a>, the components (cache, queue, sharding, CDN, object storage) from
+  <a href="#m5">Module 5</a>, and idempotency, sagas, outbox and IDs from <a href="#m6">Module 6</a>. Where a
+  problem needs a pattern, it links back instead of re-explaining. The low-level class-design cousins of
+  some of these problems are in <a href="#m3">Module 3</a>.</p>
+  <p>All numbers in the capacity estimates are <strong>assumptions made for practice</strong>. They are
+  round and approximate on purpose; in an interview you state your assumptions aloud and the interviewer
+  adjusts them. They are not statistics about any real company.</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>Run a 45-minute HLD interview with a clear time plan and know how you will be scored.</li>
+    <li>Turn a vague prompt into requirements, estimates, APIs, a data model and a diagram.</li>
+    <li>Design the ten classic systems: URL shortener, Pastebin, rate limiter, notification system, chat,
+    news feed, food delivery, ride sharing, video streaming and payments.</li>
+    <li>Discuss two to four deep dives per problem with options and trade-offs.</li>
+    <li>Answer "what if traffic grows 10 times?" and other follow-ups calmly.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m7-hld-method">
+  <h3>The HLD interview method: a script, a checklist and a rubric</h3>
+  <p class="tldr">Spend 45 minutes in six phases (requirements, estimates, high-level design, data model,
+  deep dive, trade-offs), say your reasoning out loud, drive the conversation yourself, and always cover
+  numbers, bottlenecks and failure.</p>
+
+  <h4>What an HLD interview tests</h4>
+  <p>There is no single right answer. The interviewer checks whether you can: handle ambiguity by asking
+  questions, size a system with simple arithmetic, assemble known building blocks into a coherent whole,
+  justify choices by trade-offs, go deep on one or two hard parts, and communicate clearly. Seniority shows in
+  depth and judgement, not in the number of boxes on the board.</p>
+
+  <h4>The six phases and the clock</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Phase</th><th>Minutes</th><th>Output on the board</th></tr></thead>
+    <tbody>
+      <tr><td>1. Requirements and scope</td><td>5</td><td>Functional list, non-functional list, out-of-scope list</td></tr>
+      <tr><td>2. Capacity estimates</td><td>5</td><td>QPS, storage, bandwidth, read/write ratio</td></tr>
+      <tr><td>3. High-level design</td><td>10–15</td><td>API list and a box-and-arrow diagram</td></tr>
+      <tr><td>4. Data model</td><td>5</td><td>Tables or collections, keys, SQL vs NoSQL choice</td></tr>
+      <tr><td>5. Deep dive</td><td>10–15</td><td>One or two hard components, in detail with options</td></tr>
+      <tr><td>6. Trade-offs, bottlenecks, wrap-up</td><td>5</td><td>Failures, scaling, monitoring, what you would do next</td></tr>
+    </tbody>
+  </table></div>
+  <p>Total: 40–50 minutes. For a 60-minute slot, give the deep dive more time. Wear a watch; the most common
+  time mistake is spending 20 minutes on requirements and drawing, then rushing the part that scores most.</p>
+
+  <h4>The script: what to say in each phase</h4>
+  <h5>Phase 1: requirements (5 min)</h5>
+  <p>Say: "Before I design anything, I want to clarify scope. I will ask a few questions, then write down
+  what is in and out." Then ask from this checklist, choosing the questions that matter:</p>
+  <ul>
+    <li><strong>Users and use cases:</strong> who uses it, and what are the two or three core actions?</li>
+    <li><strong>Scale:</strong> how many users or requests per day? Read-heavy or write-heavy?</li>
+    <li><strong>Features:</strong> what is in scope for 45 minutes, and what is a later extension?</li>
+    <li><strong>Consistency and freshness:</strong> must users always see the latest data, or is a few seconds
+    of delay fine?</li>
+    <li><strong>Availability and latency:</strong> any target, such as 99.9% uptime or under 200 ms?</li>
+    <li><strong>Durability:</strong> can we ever lose data? (A chat message: no. A view counter: maybe.)</li>
+    <li><strong>Geography:</strong> one region or global? Mobile, web, or both?</li>
+    <li><strong>Constraints:</strong> abuse and security, privacy, compliance, retention time.</li>
+  </ul>
+  <p>Write two lists: <strong>functional</strong> (what the system does) and <strong>non-functional</strong>
+  (how well: scale, latency, availability, consistency, durability). End with "Out of scope: ...". Confirm:
+  "Does this match what you have in mind?"</p>
+  <h5>Phase 2: estimates (5 min)</h5>
+  <p>Say: "I will do rough numbers to see which parts are hard. All approximate." Convert users to requests
+  per second: <strong>daily requests ÷ 86,400 ≈ per second</strong>, and round 86,400 to about 100,000 when
+  you are in a hurry. Peak is typically 2–3 times the average. Then storage (items × size × retention) and
+  bandwidth (QPS × size). Use powers of ten and write the units. See
+  <a href="#m4">Module 4</a> for the cheat numbers. State what the numbers imply: "4,000 reads per second is
+  easy for one cache node, so the real problem is storage over 5 years" is the kind of conclusion that earns
+  credit.</p>
+  <h5>Phase 3: high-level design (10–15 min)</h5>
+  <p>Say: "First the API, then a simple end-to-end design, then I will improve it." Define the 3–5 endpoints
+  with request and response shapes. Draw the minimum working path: client → load balancer → app servers →
+  database. Walk one write and one read through it. Then add components only when a requirement or number
+  demands them: cache for read-heavy load, queue for slow or bursty work, CDN for static content, search
+  index for text search. Name each addition and why.</p>
+  <h5>Phase 4: data model (5 min)</h5>
+  <p>List the main entities, their key fields, primary keys and the main access patterns ("lookup by short
+  code", "latest posts of user X"). Choose SQL or NoSQL <em>based on those patterns, scale and consistency
+  needs</em>, and say why. Mention indexes and the shard key if you will shard.</p>
+  <h5>Phase 5: deep dive (10–15 min)</h5>
+  <p>Say: "The hardest part here is X. Let me go deeper." Often the interviewer picks. Present options, compare
+  them in a table or sentences, choose one, and state the cost of the choice. Two good deep dives beat five
+  shallow ones.</p>
+  <h5>Phase 6: trade-offs and wrap-up (5 min)</h5>
+  <p>Cover: single points of failure and what happens when each box dies; bottlenecks; how it scales 10×;
+  data loss and duplicates; monitoring and alerting; security and abuse; cost. Finish with a 20-second
+  summary of the design and what you would build next.</p>
+
+  <h4>How to drive the conversation</h4>
+  <ul>
+    <li>Narrate: "I am choosing X over Y because...". Silence worries interviewers.</li>
+    <li>Propose a plan at the start ("I will cover requirements, numbers, design, data, then a deep dive") and
+    tick it off.</li>
+    <li>Check in at phase ends: "Shall I go deeper here, or move on?" Follow the interviewer's hints; a
+    question usually points at what they want to see.</li>
+    <li>When you do not know, reason aloud from principles. Do not bluff about product internals.</li>
+    <li>Use the board: one diagram, labelled arrows, numbers beside components.</li>
+    <li>Say the trade-off every time you pick: "Fan-out on write makes reads fast but writes expensive."</li>
+  </ul>
+
+  <h4>How you are evaluated: a rubric</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Area</th><th>Weak</th><th>Strong</th></tr></thead>
+    <tbody>
+      <tr><td>Requirements</td><td>Jumps straight to boxes</td><td>Clarifies scope, writes functional and non-functional lists</td></tr>
+      <tr><td>Estimation</td><td>No numbers, or wild numbers</td><td>Clear assumptions, correct arithmetic, draws conclusions</td></tr>
+      <tr><td>Design</td><td>Buzzword list of technologies</td><td>Works end to end; every component has a reason</td></tr>
+      <tr><td>Data</td><td>"Use MongoDB" with no reason</td><td>Entities, keys and access patterns drive the choice</td></tr>
+      <tr><td>Depth</td><td>Stays at the surface</td><td>Goes deep on the hard part with options and trade-offs</td></tr>
+      <tr><td>Failure thinking</td><td>Assumes everything works</td><td>Handles crashes, duplicates, hot spots, overload</td></tr>
+      <tr><td>Communication</td><td>Silent or rambling</td><td>Structured, checks in, takes hints</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Common mistakes</h4>
+  <div class="co co-mistake">
+    <p class="co-t">What loses points</p>
+    <ul>
+      <li><strong>No requirements:</strong> designing the wrong system.</li>
+      <li><strong>No numbers:</strong> you cannot justify sharding or caching without them.</li>
+      <li><strong>Over-engineering:</strong> Kafka, Kubernetes, microservices and a service mesh for 40
+      requests per second. Start simple, scale when numbers demand it.</li>
+      <li><strong>Name-dropping:</strong> saying "Cassandra" without saying why.</li>
+      <li><strong>Ignoring failure:</strong> never saying what happens when a node, a network link or a
+      dependency fails.</li>
+      <li><strong>Single point of failure</strong> left on the diagram.</li>
+      <li><strong>Not listening:</strong> ignoring a hint to move to the part the interviewer cares about.</li>
+      <li><strong>Defensive tone:</strong> treat challenges as new requirements, not attacks.</li>
+    </ul>
+  </div>
+
+  <h4>"What if traffic grows 10×?"</h4>
+  <p>Answer with a method, not panic. First <strong>re-do the numbers</strong>: which resource hits its limit
+  first? Then walk the path from the user inwards:</p>
+  <ol class="steps">
+    <li><strong>Edge:</strong> CDN and caching for anything static or cacheable.</li>
+    <li><strong>App tier:</strong> stateless servers behind a load balancer scale horizontally; add instances
+    and autoscaling.</li>
+    <li><strong>Cache:</strong> raise the hit ratio, add nodes, protect against hot keys.</li>
+    <li><strong>Database reads:</strong> add read replicas; accept replication lag where allowed.</li>
+    <li><strong>Database writes and storage:</strong> shard by a good key, or move the hot table to a store
+    built for writes.</li>
+    <li><strong>Async the slow stuff:</strong> move non-urgent work to queues; add back-pressure.</li>
+    <li><strong>Protect the system:</strong> rate limits, load shedding, graceful degradation.</li>
+  </ol>
+  <p>Then say what would break <em>next</em> at 100×. That shows you know scaling is a sequence of
+  bottlenecks.</p>
+
+  <h4>A skeleton to memorise</h4>
+  <pre data-title="whiteboard.txt"><code class="language-plaintext">1. Requirements  functional | non-functional | out of scope
+2. Numbers       QPS (avg, peak) | storage/year | bandwidth | R:W ratio
+3. API           3-5 endpoints, request and response
+4. Design        client - LB - app - cache - DB (+ queue, CDN, search)
+5. Data          entities, keys, SQL or NoSQL and why, shard key
+6. Deep dive     hardest part: options, choice, cost
+7. Wrap-up       failures, scaling 10x, monitoring, security</code></pre>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Open with the plan and the clarifying questions. That alone separates you from most candidates.</li>
+      <li>Always give at least one number, one trade-off and one failure scenario per component you add.</li>
+      <li>Practise out loud with a timer. Saying it is a different skill from knowing it.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m7-url-shortener">
+  <h3>Design a URL shortener (like bit.ly)</h3>
+  <p class="tldr">A URL shortener maps a short code to a long URL; it is read-heavy, so the design is a key-value
+  lookup with a cache in front, a collision-free way to create 7-character codes (counter plus base62, hash,
+  or pre-generated keys), and a choice between 301 and 302 redirects that trades speed for analytics.</p>
+
+  <h4>1. Requirements</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>Given a long URL, create a short URL (for example <code>https://sho.rt/aZ3k9Q1</code>).</li>
+    <li>Opening the short URL redirects to the original URL.</li>
+    <li>Optional: custom alias, expiry time, click analytics, user accounts.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> very low redirect latency (under about 50 ms server time), high
+  availability (a dead short link breaks every page it was posted on), short codes that are hard to guess
+  or enumerate, durable links (never lose a mapping), and eventual consistency is fine for analytics but
+  not for the mapping itself. <strong>Out of scope:</strong> link-preview pages, malware scanning (mention
+  it).</p>
+
+  <h4>2. Capacity estimates (assumptions)</h4>
+  <ul>
+    <li>New URLs: 100 million per month. A month is about 30 × 86,400 = 2,592,000 seconds. Writes ≈
+    100,000,000 ÷ 2,592,000 ≈ <strong>39 per second</strong>, call it 40. Peak at 3× ≈ 120 per second.</li>
+    <li>Read:write ratio 100:1. Reads ≈ 40 × 100 = <strong>4,000 per second</strong> on average, about
+    12,000 per second at peak.</li>
+    <li>Retention 5 years: 100M × 12 × 5 = <strong>6 billion</strong> URLs.</li>
+    <li>Row size: code 7 B + long URL ~200 B + timestamps and user ~50 B, say <strong>500 B</strong> with
+    index overhead. Storage = 6 × 10<sup>9</sup> × 500 B = 3 × 10<sup>12</sup> B = <strong>3 TB</strong>.
+    One modern database cluster handles that; sharding is for write throughput and availability more than
+    raw size.</li>
+    <li>Code length: base62 has 62 characters (a–z, A–Z, 0–9). 62<sup>6</sup> ≈ 56.8 billion and
+    62<sup>7</sup> ≈ 3.52 trillion. For 6 billion URLs, 6 characters would fit, but 7 gives about 590 times
+    headroom. Use <strong>7</strong>.</li>
+    <li>Cache: 4,000 reads/s × 86,400 ≈ 345 million reads/day. If the hottest 20% of URLs get most traffic,
+    caching 20% of one day's distinct URLs ≈ 0.2 × 345M × 500 B ≈ 35 GB. That fits a small Redis cluster.</li>
+    <li>Bandwidth: 4,000 × 500 B = 2 MB/s of response data. Tiny.</li>
+  </ul>
+  <p>Conclusion: this is not a big-data problem. The interesting parts are generating unique codes, caching,
+  and keeping redirects fast and available.</p>
+
+  <h4>3. API design</h4>
+  <pre data-title="API" class="out"><code class="language-http">POST /api/v1/urls
+Authorization: Bearer ...
+{"longUrl": "https://example.com/very/long/path?x=1",
+ "customAlias": "diwali-sale",     // optional
+ "expiresAt": "2027-01-01T00:00:00Z"}   // optional
+
+201 Created
+{"shortCode": "aZ3k9Q1", "shortUrl": "https://sho.rt/aZ3k9Q1",
+ "expiresAt": "2027-01-01T00:00:00Z"}
+
+GET /aZ3k9Q1
+302 Found
+Location: https://example.com/very/long/path?x=1
+
+GET /api/v1/urls/aZ3k9Q1/stats   -> {"clicks": 1532, "byDay": [...]}
+DELETE /api/v1/urls/aZ3k9Q1      -> 204 No Content</code></pre>
+  <p>Creation should accept an <code>Idempotency-Key</code> header so a retry does not create two codes
+  (<a href="#m6-idempotency">Idempotency</a>). Unknown or expired codes return 404 (or 410 Gone for expired).</p>
+
+  <h4>4. Data model</h4>
+  <pre data-title="schema.sql"><code class="language-sql">CREATE TABLE url_mapping (
+    short_code  VARCHAR(10)   PRIMARY KEY,
+    long_url    VARCHAR(2048) NOT NULL,
+    user_id     BIGINT,
+    created_at  TIMESTAMP     NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMP
+);
+CREATE INDEX idx_mapping_user ON url_mapping (user_id);</code></pre>
+  <p>The main access pattern is a single-key lookup by <code>short_code</code>, with no joins and no
+  transactions across rows. That fits a <strong>key-value or wide-column store</strong> (DynamoDB,
+  Cassandra) very well, and also a sharded SQL database. PostgreSQL or MySQL is fine up to this scale with
+  replicas; choose NoSQL if you expect much higher write rates or want built-in horizontal scaling. The
+  shard key is <code>short_code</code> (even spread because codes are random-looking). Analytics are stored
+  separately (see below).</p>
+
+  <h4>5. High-level architecture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  U[Client] --> LB[Load balancer]
+  LB --> W[Write service]
+  LB --> R[Redirect service]
+  W --> ID[ID generator]
+  W --> DB[(Mapping database)]
+  R --> C[(Redis cache)]
+  C -.->|miss| DB
+  R --> Q[[Click events queue]]
+  Q --> A[(Analytics store)]
+</pre>
+    <figcaption>Writes create codes and store them; reads go cache first; clicks are logged asynchronously</figcaption>
+  </figure>
+  <p>The read path (99% of traffic) and the write path have very different load, so deploy them as separate
+  services or at least separate scaling groups. Redirect servers are stateless; any instance can serve any
+  code.</p>
+
+  <h4>6. Deep dive A: generating the short code</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Option</th><th>How it works</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody>
+      <tr><td>Counter + base62</td><td>Get next unique number, encode in base62</td><td>No collisions, shortest codes</td><td>Counter is a dependency; codes are guessable and sequential</td></tr>
+      <tr><td>Hash of the URL</td><td>MD5 or SHA-256, take first 7 base62 characters</td><td>No coordination; same URL gives same code</td><td>Collisions to handle; two users cannot have separate codes for one URL</td></tr>
+      <tr><td>Pre-generated keys (KGS)</td><td>A key service creates random unused codes in advance; app takes one</td><td>Fast, no collision check at request time, unguessable</td><td>One more service; must avoid giving a key twice</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Counter + base62.</strong> Take a number such as 125 and convert it to base 62: repeatedly divide
+  by 62 and map remainders to characters. A 64-bit counter from a ticket server with ranges or a Snowflake
+  generator (<a href="#m6-unique-ids">Unique IDs</a>) removes the single-database bottleneck: each app
+  server leases a range of, say, 1,000 numbers and encodes them locally. To stop people enumerating links
+  (<code>aZ3k9Q1</code>, <code>aZ3k9Q2</code>), apply a reversible shuffle to the number first, or use a
+  random permutation.</p>
+  <pre data-title="Base62.java"><code class="language-java">public final class Base62 {
+    private static final String ALPHABET =
+        "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    public static String encode(long n) {
+        if (n == 0) return "0";
+        StringBuilder sb = new StringBuilder();
+        while (n &gt; 0) {
+            sb.append(ALPHABET.charAt((int) (n % 62)));
+            n /= 62;
+        }
+        return sb.reverse().toString();
+    }
+
+    public static void main(String[] args) {
+        System.out.println(encode(125));            // 125 = 2*62 + 1
+        System.out.println(encode(3_521_614_606_207L)); // 62^7 - 1, the largest 7-char value
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">21
+ZZZZZZZ</code></pre>
+  <p><strong>Hash + collision handling.</strong> Compute <code>base62(md5(longUrl))</code> and keep 7
+  characters. Seven characters is about 42 bits of the hash, so with billions of URLs collisions do happen
+  (birthday effect). On insert, if the code exists with a <em>different</em> long URL, append a counter or
+  salt to the input and hash again. This makes the write path a read-then-write loop; rely on the primary key
+  constraint to catch the race between two writers.</p>
+  <p><strong>Pre-generated keys.</strong> A separate key generation service fills a table of unused 7-char
+  random codes. App servers take a batch of keys (for example 1,000) and mark them used atomically. Keys given
+  to a server that crashes are simply lost, which is fine with 3.5 trillion possible codes. Pick this when
+  unguessability matters.</p>
+
+  <h4>7. Deep dive B: redirects, 301 vs 302 and analytics</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Status</th><th>Meaning</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>301 Moved Permanently</code></td><td>Cache this redirect</td><td>Browsers and proxies remember it; later clicks may never reach you, so no analytics and the link cannot be changed</td></tr>
+      <tr><td><code>302 Found</code> (or <code>307</code>)</td><td>Temporary redirect</td><td>Every click hits your server: you can count it, change the target or expire the link; slightly more load</td></tr>
+    </tbody>
+  </table></div>
+  <p>If you need analytics, expiry or editing, use <strong>302</strong> and accept the extra load (the
+  numbers above are small). If you only want minimal cost and fixed links, 301. The click must not slow the
+  redirect: the redirect service sends the user to the target first and writes a small event (code, time,
+  country, user agent) to a queue; consumers aggregate into an analytics store (ClickHouse or similar, or
+  counters in a time-series table). Losing a few click events is acceptable (at-most-once is fine, see
+  <a href="#m6-delivery-semantics">Delivery semantics</a>).</p>
+
+  <h4>8. Deep dive C: caching hot links</h4>
+  <p>Link popularity is highly skewed: a few viral links get most clicks. Use <strong>cache-aside</strong> in
+  Redis: look up <code>code</code>; on a miss read the database and store with a TTL of hours; an LRU or
+  LFU policy handles memory (<a href="#m5">Module 5</a>). With a 90%+ hit ratio the database sees under 400
+  reads per second at the 4,000/s average. Add a tiny in-process cache for the top few thousand codes to
+  protect Redis from <strong>hot keys</strong>. Cache "not found" for a short time so scanners guessing
+  random codes do not reach the database (penetration), and a Bloom filter of all existing codes can reject
+  most guesses outright. Expired links: store <code>expires_at</code> in the cache value and check it on
+  every read; the database cleans up with a background job.</p>
+
+  <h4>9. Bottlenecks and scaling</h4>
+  <ul>
+    <li><strong>Database:</strong> add read replicas first; shard by <code>short_code</code> when storage or
+    writes outgrow one cluster. Use consistent hashing so adding shards moves little data.</li>
+    <li><strong>Availability:</strong> multiple app instances across zones; Redis with replicas; database with
+    replicas and automatic failover. Serve cached redirects even if the database is briefly down.</li>
+    <li><strong>Multi-region:</strong> replicate the mapping to each region and route users to the nearest
+    one with DNS (<a href="#m5">Module 5</a>). Writes can go to a home region.</li>
+    <li><strong>Abuse:</strong> rate limit creation per user and IP; scan target URLs for malware and
+    phishing; block known bad domains.</li>
+    <li><strong>Monitoring:</strong> redirect p99 latency, cache hit ratio, error rate, counter or key pool
+    remaining, queue lag.</li>
+  </ul>
+
+  <h4>Follow-up questions</h4>
+  <ul>
+    <li>Same long URL submitted twice: return the same code or a new one? (Per-user dedupe by hashing
+    <code>userId + url</code>.)</li>
+    <li>How do you delete expired links at scale? (TTL in a key-value store, or a nightly batch by partition.)</li>
+    <li>How do you stop one user's custom alias clashing with generated codes? (Reserve a different
+    namespace or length.)</li>
+    <li>What if the counter service dies? (Servers hold leased ranges; run two counter nodes with odd and even
+    steps.)</li>
+    <li>How would you count unique visitors? (Approximate with HyperLogLog.)</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Do the 62<sup>7</sup> arithmetic out loud; it shows you size the code length from the numbers.</li>
+      <li>Compare the three code-generation options in a sentence each and pick one with a reason.</li>
+      <li>Know 301 vs 302 and its analytics consequence.</li>
+    </ul>
+  </div>
+</article>

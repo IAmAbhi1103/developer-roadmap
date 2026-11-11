@@ -1,0 +1,851 @@
+<div class="mintro">
+  <p>Real programs meet problems all the time: a file is missing, a user types "abc" where a number
+  belongs, a payment gateway times out, or a bug passes <code>null</code> where an object was expected.
+  Java reports these problems with <strong>exceptions</strong> — objects that describe what went wrong
+  and where. Good exception handling is the difference between an app that shows a clear error and
+  keeps serving users, and one that dies with a 300-line stack trace in production.</p>
+  <p>The second half of the module is about <strong>files</strong>: reading and writing text, CSV files
+  and huge logs with <code>java.nio.file.Files</code>, plus the classic <code>java.io</code> streams,
+  Java serialization and <code>.properties</code> files. Files and exceptions belong together, because
+  almost every file operation can fail with an <code>IOException</code>.</p>
+  <p>This module builds on inheritance from <a href="#m2">Module 2</a> — exception types form a class
+  hierarchy. <a href="#m4">Module 4</a> explains <code>ConcurrentModificationException</code>,
+  <a href="#m5">Module 5</a> covers <code>Optional</code> and streams, and the Spring Boot page shows how
+  exceptions become HTTP error responses (<a href="04-spring-boot.html#m2">Spring Boot · Module 2</a>).
+  After this module you will be able to:</p>
+  <ul>
+    <li>Read a stack trace and find the real cause of a failure in seconds.</li>
+    <li>Explain the exception hierarchy and checked vs unchecked exceptions in an interview.</li>
+    <li>Write correct try / catch / finally and try-with-resources code, and predict the output of
+    tricky <code>finally</code> puzzles.</li>
+    <li>Design clean custom exceptions such as <code>InsufficientBalanceException</code>.</li>
+    <li>Read and write text files, CSV files and multi-gigabyte logs with <code>java.nio.file</code>.</li>
+    <li>Know where <code>java.io</code> streams, Java serialization and <code>Properties</code> still
+    fit in modern code.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m3-what-is-exception">
+  <h3>What an exception is: throwing and stack unwinding</h3>
+  <p class="tldr">An exception is an object that describes an abnormal event. When it is thrown, Java
+  stops the normal flow and unwinds the call stack, method by method, until a matching catch block
+  handles it — if nothing does, the thread dies and prints a stack trace.</p>
+
+  <p>Before exceptions, languages like C reported errors with special return values: <code>-1</code>,
+  <code>null</code> or an error code. That design has two big problems. First, callers forget to check
+  the return value, and the program continues with garbage data. Second, the error checks mix with the
+  business logic, so every line of real work is followed by three lines of "did that fail?".</p>
+
+  <p>Java's answer is the <strong>exception</strong>: an object of a class that extends
+  <code>Throwable</code>. It carries four things:</p>
+  <ul>
+    <li>its <strong>type</strong> — the class name already says a lot
+    (<code>FileNotFoundException</code>, <code>NumberFormatException</code>);</li>
+    <li>a <strong>message</strong> — a human-readable detail such as
+    <code>"Insufficient wallet balance"</code>;</li>
+    <li>a <strong>stack trace</strong> — the chain of method calls that were active when the exception
+    object was created;</li>
+    <li>an optional <strong>cause</strong> — another exception that led to this one.</li>
+  </ul>
+  <p>To <strong>throw</strong> an exception means to hand this object to the JVM and say "I cannot
+  continue normally". To <strong>catch</strong> it means to say "I know how to deal with this kind of
+  problem". The code that throws and the code that catches can be many method calls apart — that is
+  the whole point.</p>
+
+  <h4>The call stack</h4>
+  <p>Every time a method is called, the JVM pushes a <strong>stack frame</strong> onto the current
+  thread's <strong>call stack</strong>. The frame holds the method's parameters, its local variables
+  and the place to return to. When the method returns, its frame is popped. So at any moment the stack
+  is a record of "who called whom", with the running method on top.</p>
+
+  <figure class="fig">
+<pre class="diagram">
+          Call stack of thread "main"
+         ┌──────────────────────────────┐
+  top →  │ chargeWallet(amount = 250)   │  ← exception thrown here
+         ├──────────────────────────────┤
+         │ placeOrder(amount = 250)     │  ← called chargeWallet
+         ├──────────────────────────────┤
+         │ main(args)                   │  ← called placeOrder
+         └──────────────────────────────┘
+</pre>
+    <figcaption>Each method call adds a frame; the running method is on top</figcaption>
+  </figure>
+
+  <h4>What happens when an exception is thrown</h4>
+  <ol class="steps">
+    <li>Code creates an exception object, for example
+    <code>new IllegalStateException("Insufficient wallet balance")</code>. The stack trace is
+    recorded at this moment, inside the <code>Throwable</code> constructor — not at the
+    <code>throw</code> statement.</li>
+    <li>The <code>throw</code> statement hands the object to the JVM. The current block stops
+    immediately; the next line does not run.</li>
+    <li>The JVM looks for an enclosing <code>try</code> block in the current method that has a
+    <code>catch</code> clause whose type matches. "Matches" means the exception is an instance of the
+    catch type — the same class or a subclass.</li>
+    <li>If there is no match, the method ends abruptly. Its <code>finally</code> blocks run, its frame
+    is popped, and the exception reappears in the caller, at the line that made the call. This is
+    <strong>stack unwinding</strong>.</li>
+    <li>Steps 3 and 4 repeat frame by frame. The first matching <code>catch</code> handles the
+    exception, and execution continues after that whole try statement.</li>
+    <li>If the exception unwinds past the bottom frame (<code>main</code> for the main thread), it is
+    <strong>uncaught</strong>. The thread's uncaught-exception handler runs — by default it prints
+    <code>Exception in thread "main"</code> plus the stack trace to <code>System.err</code> — and the
+    thread terminates.</li>
+  </ol>
+
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A[Exception thrown] --> B{"Matching catch in this method?"}
+  B -->|Yes| C[Run the catch block]
+  C --> D[Continue after the try statement]
+  B -->|No| E["Run finally blocks, pop the frame"]
+  E --> F{"Any caller frame left?"}
+  F -->|Yes| G[Exception reappears in the caller]
+  G --> B
+  F -->|No| H["Thread dies, stack trace printed"]
+</pre>
+    <figcaption>How the JVM searches for a handler while it unwinds the stack</figcaption>
+  </figure>
+
+  <h4>Example: an uncaught exception</h4>
+  <p>A small food-ordering flow: <code>main</code> calls <code>placeOrder</code>, which calls
+  <code>chargeWallet</code>. The wallet has ₹100 and the order costs ₹250.</p>
+<pre data-title="OrderFlow.java"><code class="language-java">public class OrderFlow {
+    public static void main(String[] args) {
+        System.out.println("main: start");
+        placeOrder(250);
+        System.out.println("main: end");                 // never printed
+    }
+
+    static void placeOrder(int amount) {
+        System.out.println("placeOrder: start");
+        chargeWallet(amount);
+        System.out.println("placeOrder: confirmed");     // never printed
+    }
+
+    static void chargeWallet(int amount) {
+        int balance = 100;
+        System.out.println("chargeWallet: balance " + balance + ", amount " + amount);
+        if (amount &gt; balance) {
+            throw new IllegalStateException("Insufficient wallet balance");
+        }
+        System.out.println("chargeWallet: charged");     // never printed
+    }
+}</code></pre>
+<pre class="out" data-title="Output (exit code 1)"><code class="language-plaintext">main: start
+placeOrder: start
+chargeWallet: balance 100, amount 250
+Exception in thread "main" java.lang.IllegalStateException: Insufficient wallet balance
+    at OrderFlow.chargeWallet(OrderFlow.java:18)
+    at OrderFlow.placeOrder(OrderFlow.java:10)
+    at OrderFlow.main(OrderFlow.java:4)</code></pre>
+  <p>The three "never printed" lines did not run. As soon as <code>throw</code> executed,
+  <code>chargeWallet</code> stopped. Then <code>placeOrder</code> stopped at line 10, the line that
+  called it. Then <code>main</code> stopped at line 4. Nobody caught the exception, so the main thread
+  died, the JVM printed the stack trace, and the process ended with exit code 1 instead of 0. A
+  deployment script or CI job sees that non-zero code as a failure.</p>
+
+  <h4>Example: the same exception, caught</h4>
+<pre data-title="OrderFlowCaught.java"><code class="language-java">public class OrderFlowCaught {
+    public static void main(String[] args) {
+        System.out.println("main: start");
+        try {
+            placeOrder(250);
+        } catch (IllegalStateException e) {
+            System.out.println("main: order failed -&gt; " + e.getMessage());
+        }
+        System.out.println("main: end");
+    }
+
+    static void placeOrder(int amount) {
+        System.out.println("placeOrder: start");
+        chargeWallet(amount);
+        System.out.println("placeOrder: confirmed");
+    }
+
+    static void chargeWallet(int amount) {
+        int balance = 100;
+        if (amount &gt; balance) {
+            throw new IllegalStateException("Insufficient wallet balance");
+        }
+        System.out.println("chargeWallet: charged");
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">main: start
+placeOrder: start
+main: order failed -&gt; Insufficient wallet balance
+main: end</code></pre>
+  <p>Now <code>main</code> catches the exception, prints a friendly message and carries on. Notice that
+  <code>placeOrder: confirmed</code> is still not printed. Catching an exception does not resume the
+  code after the throw point; execution continues after the try statement that caught it.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: control never returns to the throw point</p>
+    <p>Java has no "resume". Once an exception is thrown, every statement between the
+    <code>throw</code> and the matching <code>catch</code> is skipped (except <code>finally</code>
+    blocks). If <code>placeOrder</code> had already reserved stock before calling
+    <code>chargeWallet</code>, that reservation is not undone automatically — you must design for it
+    (a <code>finally</code> block, a database transaction, or a compensating action).</p>
+  </div>
+
+  <div class="co co-note">
+    <p class="co-t">Note: uncaught exceptions in other threads</p>
+    <p>Each thread has its own call stack, so an uncaught exception kills only the thread where it
+    happened. The JVM keeps running while any non-daemon thread is alive. In a web server, the
+    framework catches exceptions from your controllers, so one bad request does not stop the server.
+    With an <code>ExecutorService</code>, an exception from a task started with <code>submit()</code>
+    is stored inside the returned <code>Future</code> and appears only when you call
+    <code>get()</code>, wrapped in an <code>ExecutionException</code> — a classic "silent failure"
+    (see <a href="#m6">Module 6</a>).</p>
+  </div>
+
+  <h4>Exceptions vs error codes</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Return codes (C style)</th><th>Exceptions (Java)</th></tr></thead>
+    <tbody>
+      <tr><td>Can be ignored by accident</td><td>Yes, very easily</td><td>No — an uncaught exception
+      stops the thread</td></tr>
+      <tr><td>Mixed into business logic</td><td>Yes, a check after every call</td><td>No — handling
+      lives in catch blocks</td></tr>
+      <tr><td>Details carried</td><td>A number or <code>null</code></td><td>Type, message, stack trace
+      and cause</td></tr>
+      <tr><td>Passing through layers</td><td>Every layer must pass it up by hand</td><td>Propagates
+      automatically until caught</td></tr>
+      <tr><td>Cost</td><td>Very cheap</td><td>Creating one is relatively expensive because it captures
+      the stack — use it for exceptional cases, not normal flow</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What happens when an exception is thrown and nobody catches it?"</p>
+    <ul>
+      <li>The JVM searches the current method for a matching catch; if there is none, it runs the
+      method's finally blocks, pops the frame and repeats the search in the caller — this is stack
+      unwinding.</li>
+      <li>If no frame catches it, the thread's uncaught-exception handler prints the stack trace and
+      the thread terminates.</li>
+      <li>For the main thread, when no other non-daemon thread is running, the JVM exits; the
+      <code>java</code> launcher returns exit code 1.</li>
+      <li>Bonus point: the stack trace is captured when the exception object is created, not when it
+      is thrown.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-stack-trace">
+  <h3>Reading a stack trace</h3>
+  <p class="tldr">Read a stack trace from the top: the first line gives the exception type and message,
+  the first "at" line shows where it was thrown, the first frame from your own package shows where your
+  code was involved, and the last "Caused by" section usually holds the root cause.</p>
+
+  <p>A <strong>stack trace</strong> is the printed form of an exception: its type, its message and the
+  list of stack frames that were active when it was created. It looks scary because it is long, but it
+  has a fixed structure. Once you know the structure, most bugs take minutes instead of hours to
+  find. Reading stack traces quickly is one of the most valuable debugging skills on a real job.</p>
+
+  <h4>A chained example</h4>
+  <p>The method below parses a price. Someone typed the letter <code>O</code> instead of the digit
+  zero. The parsing error is caught and wrapped in a new exception that adds context — the original
+  exception becomes the <strong>cause</strong>.</p>
+<pre data-title="StackTraceDemo.java"><code class="language-java">public class StackTraceDemo {
+    public static void main(String[] args) {
+        new StackTraceDemo().loadPrice("12O");   // letter O, not zero
+    }
+
+    void loadPrice(String raw) {
+        try {
+            int price = parsePrice(raw);
+            System.out.println("Price: " + price);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Bad price in catalog: " + raw, e);
+        }
+    }
+
+    int parsePrice(String raw) {
+        return Integer.parseInt(raw);
+    }
+}</code></pre>
+<pre class="out" data-title="Output (javac + java, JDK 25)"><code class="language-plaintext">Exception in thread "main" java.lang.IllegalArgumentException: Bad price in catalog: 12O
+    at StackTraceDemo.loadPrice(StackTraceDemo.java:11)
+    at StackTraceDemo.main(StackTraceDemo.java:3)
+Caused by: java.lang.NumberFormatException: For input string: "12O"
+    at java.base/java.lang.NumberFormatException.forInputString(NumberFormatException.java:67)
+    at java.base/java.lang.Integer.parseInt(Integer.java:565)
+    at java.base/java.lang.Integer.parseInt(Integer.java:662)
+    at StackTraceDemo.parsePrice(StackTraceDemo.java:16)
+    at StackTraceDemo.loadPrice(StackTraceDemo.java:8)
+    ... 1 more</code></pre>
+
+  <h4>The parts of a stack trace</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Part</th><th>Example</th><th>What it tells you</th></tr></thead>
+    <tbody>
+      <tr><td>Thread header</td><td><code>Exception in thread "main"</code></td><td>The exception
+      was not caught and killed this thread</td></tr>
+      <tr><td>Type and message</td><td><code>java.lang.IllegalArgumentException: Bad price in
+      catalog: 12O</code></td><td>The fully qualified class name, then <code>getMessage()</code></td></tr>
+      <tr><td>Frame</td><td><code>at StackTraceDemo.loadPrice(StackTraceDemo.java:11)</code></td>
+      <td>class.method(file:line). The first frame is where the exception object was created</td></tr>
+      <tr><td>Module prefix</td><td><code>java.base/java.lang.Integer.parseInt</code></td><td>The
+      class lives in a JDK module (Java 9+). These are JDK frames, not your code</td></tr>
+      <tr><td>Caused by</td><td><code>Caused by: java.lang.NumberFormatException</code></td><td>The
+      wrapped cause, with its own frames. There can be several levels</td></tr>
+      <tr><td>... n more</td><td><code>... 1 more</code></td><td>The last n frames are the same as
+      the bottom frames of the trace above, so they are not repeated</td></tr>
+      <tr><td>Suppressed</td><td><code>Suppressed: java.io.IOException: close failed</code></td>
+      <td>An extra exception attached with <code>addSuppressed()</code>, usually by
+      try-with-resources (see <a href="#m3-try-with-resources">try-with-resources</a>)</td></tr>
+    </tbody>
+  </table></div>
+  <p>In the example, <code>... 1 more</code> stands for the frame <code>main(StackTraceDemo.java:3)</code>,
+  which is the bottom frame of both traces. The frame <code>loadPrice</code> appears in both traces but
+  with different line numbers (11 in the outer trace, where the new exception was created, and 8 in
+  the cause, where <code>parsePrice</code> was called), so it is printed twice.</p>
+
+  <h4>How to read one: four steps</h4>
+  <ol class="steps">
+    <li><strong>Read the first line.</strong> Type plus message is often enough:
+    <code>NumberFormatException: For input string: "12O"</code> already tells you the input was
+    bad.</li>
+    <li><strong>Jump to the last "Caused by".</strong> Outer exceptions are usually wrappers that
+    add context; the deepest cause is the <strong>root cause</strong> — the thing that really
+    failed.</li>
+    <li><strong>Find the first frame from your own code</strong> in that section. Skip JDK frames
+    (<code>java.</code>, <code>jdk.</code>, <code>sun.</code>), framework frames
+    (<code>org.springframework.</code>, <code>org.hibernate.</code>) and generated proxy frames (names
+    containing <code>$$</code> or <code>jdk.proxy</code>). Here it is
+    <code>StackTraceDemo.parsePrice(StackTraceDemo.java:16)</code>.</li>
+    <li><strong>Open that line and ask two questions:</strong> which value was wrong, and where did
+    that value come from? Then walk down the frames (towards the callers) to trace the value back to
+    its source.</li>
+  </ol>
+
+  <div class="co co-real">
+    <p class="co-t">Real project: in Spring Boot the useful part is at the bottom</p>
+    <p>A database error in a Spring Boot app can produce a 150-line trace. The top says something
+    general; the real reason sits in the last "Caused by". An abridged example:</p>
+<pre><code class="language-plaintext">org.springframework.dao.DataIntegrityViolationException: could not execute statement [...]
+    at org.springframework.orm.jpa.vendor.HibernateJpaDialect.convertHibernateAccessException(...)
+    ... many framework frames ...
+Caused by: org.hibernate.exception.ConstraintViolationException: could not execute statement [...]
+    ...
+Caused by: org.postgresql.util.PSQLException: ERROR: duplicate key value violates unique
+constraint "users_email_key"
+    ...</code></pre>
+    <p>Reading only the first line ("could not execute statement") tells you little. The last cause
+    says exactly what happened: a user with this email already exists.</p>
+  </div>
+
+  <h4>Working with exceptions in code</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method (on <code>Throwable</code>)</th><th>Returns / does</th></tr></thead>
+    <tbody>
+      <tr><td><code>getMessage()</code></td><td>The detail message, or <code>null</code> if none was
+      given</td></tr>
+      <tr><td><code>toString()</code></td><td>Class name + <code>": "</code> + message (just the class
+      name when the message is <code>null</code>)</td></tr>
+      <tr><td><code>getCause()</code></td><td>The wrapped cause, or <code>null</code></td></tr>
+      <tr><td><code>getStackTrace()</code></td><td>The frames as a <code>StackTraceElement[]</code>
+      (class, method, file, line)</td></tr>
+      <tr><td><code>printStackTrace()</code></td><td>Prints the full trace to
+      <code>System.err</code></td></tr>
+      <tr><td><code>getSuppressed()</code></td><td>Exceptions attached with
+      <code>addSuppressed()</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: logs only the message — type, trace and cause are lost</p><pre><code class="language-java">try {
+    paymentClient.charge(order);
+} catch (PaymentException e) {
+    log.error("Payment failed: " + e.getMessage());
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: pass the exception as the last argument</p><pre><code class="language-java">try {
+    paymentClient.charge(order);
+} catch (PaymentException e) {
+    // SLF4J prints the full stack trace, including every "Caused by"
+    log.error("Payment failed for order {}", order.id(), e);
+}</code></pre></div>
+  </div>
+  <p>With SLF4J (the logging API Spring Boot uses), a <code>Throwable</code> passed as the last
+  argument, with no <code>{}</code> placeholder left for it, is printed as a full stack trace. Avoid
+  <code>e.printStackTrace()</code> in real applications: it writes to <code>System.err</code>, which
+  bypasses your log format, log levels and log files.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: wrapping an exception without its cause</p>
+    <p><code>throw new IllegalStateException("Could not load config");</code> inside a catch block
+    throws away the original exception — the stack trace will no longer show why loading failed.
+    Always pass the caught exception as the cause:
+    <code>throw new IllegalStateException("Could not load config", e);</code>.</p>
+  </div>
+
+  <div class="co co-note">
+    <p class="co-t">Note: an exception with no stack trace in production logs</p>
+    <p>Sometimes a production log shows <code>java.lang.NullPointerException</code> with no frames at
+    all. The HotSpot JIT compiler can replace some built-in exceptions that are thrown very often from
+    the same hot code (such as <code>NullPointerException</code> and <code>ArithmeticException</code>)
+    with a preallocated exception that has no stack trace, to save time. The first occurrences in the
+    log still have full traces, so search earlier lines — or start the JVM with
+    <code>-XX:-OmitStackTraceInFastThrow</code> to switch the optimization off.</p>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: let the IDE do the clicking</p>
+    <p>In IntelliJ IDEA, a stack trace printed in the Run window is already clickable. For a trace
+    copied from a log file or a ticket, use the IDE's "Analyze Stack Trace" action: paste the text and
+    every frame becomes a link to the source line.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "A production API returns 500. How do you find the cause?"</p>
+    <ul>
+      <li>Find the error in the logs (by time, request id or trace id) and read the full stack
+      trace, not just the first line.</li>
+      <li>Go to the deepest "Caused by" — the root cause — and the first frame from your own
+      package.</li>
+      <li>Explain the pieces: frames are listed most recent first, <code>... n more</code> means shared
+      frames were omitted, <code>Suppressed:</code> comes from try-with-resources.</li>
+      <li>Reproduce with the same input in a test, fix, and add the test so it cannot come back.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-exception-hierarchy">
+  <h3>The exception hierarchy: Throwable, Error and Exception</h3>
+  <p class="tldr">Everything you can throw extends Throwable. Error means the JVM or the environment is
+  in serious trouble (don't catch it), Exception means a condition your program can respond to, and
+  RuntimeException marks the unchecked exceptions that usually signal bugs or bad input.</p>
+
+  <p>Exceptions are ordinary classes, so they form an inheritance tree. The tree matters for two
+  reasons. First, a <code>catch (IOException e)</code> block also catches every subclass of
+  <code>IOException</code>, such as <code>FileNotFoundException</code>. Second, the position of a class
+  in the tree decides whether it is <strong>checked</strong> (the compiler forces you to handle it) or
+  <strong>unchecked</strong> (it does not) — see <a href="#m3-checked-unchecked">the next
+  article</a>.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  Throwable &lt;|-- Error
+  Throwable &lt;|-- Exception
+  Error &lt;|-- VirtualMachineError
+  VirtualMachineError &lt;|-- OutOfMemoryError
+  VirtualMachineError &lt;|-- StackOverflowError
+  Exception &lt;|-- IOException
+  Exception &lt;|-- SQLException
+  Exception &lt;|-- InterruptedException
+  Exception &lt;|-- RuntimeException
+  IOException &lt;|-- FileNotFoundException
+  RuntimeException &lt;|-- NullPointerException
+  RuntimeException &lt;|-- IllegalArgumentException
+  RuntimeException &lt;|-- IllegalStateException
+  IllegalArgumentException &lt;|-- NumberFormatException
+</pre>
+    <figcaption>The core of the hierarchy (simplified). RuntimeException, Error and their subclasses
+    are unchecked; everything else is checked.</figcaption>
+  </figure>
+
+  <h4>The four classes at the top</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Class</th><th>Meaning</th><th>Checked?</th><th>Should you catch it?</th></tr></thead>
+    <tbody>
+      <tr><td><code>Throwable</code></td><td>Root of everything that can be thrown or caught. Holds
+      the message, cause, stack trace and suppressed exceptions</td><td>Yes (itself)</td><td>Only in
+      rare top-level code that must log everything</td></tr>
+      <tr><td><code>Error</code></td><td>A serious problem in the JVM or environment: out of memory,
+      stack overflow, a missing class</td><td>No</td><td>No — let it crash, then fix the root
+      cause</td></tr>
+      <tr><td><code>Exception</code></td><td>A condition a reasonable program may want to handle:
+      I/O failure, database error, interruption</td><td>Yes</td><td>Yes, where you can actually do
+      something</td></tr>
+      <tr><td><code>RuntimeException</code></td><td>Usually a programming bug (null, bad index, bad
+      cast) or an invalid argument or state</td><td>No</td><td>Usually fix the bug instead; catch at
+      boundaries</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Why you should not catch Errors</h4>
+  <p>An <code>Error</code> says the environment is broken, not your business logic. When the heap is
+  full (<code>OutOfMemoryError</code>), even the code inside your catch block may fail to allocate
+  memory. When the stack overflows, the JVM's state is fine but your algorithm is wrong (usually a
+  recursion without a base case). When a class is missing at runtime, the deployment is broken. None
+  of these can be fixed by the method that happens to be running. The right reaction is to let the
+  thread or the process fail, alert someone, and fix the root cause: a memory leak, a too-small
+  <code>-Xmx</code>, infinite recursion, or a missing JAR.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Error</th><th>When it happens</th></tr></thead>
+    <tbody>
+      <tr><td><code>OutOfMemoryError</code></td><td>The heap is full and garbage collection cannot
+      free enough space ("Java heap space"), or another memory area such as Metaspace runs out. Causes:
+      a memory leak, loading a huge file into memory, a heap size that is too small</td></tr>
+      <tr><td><code>StackOverflowError</code></td><td>The call stack is too deep — almost always
+      infinite recursion. A real-world classic: two JPA entities whose <code>toString()</code> (or
+      generated JSON) call each other through a bidirectional relationship</td></tr>
+      <tr><td><code>NoClassDefFoundError</code></td><td>A class that existed at compile time cannot be
+      loaded at runtime — a JAR is missing from the runtime classpath, or the class's static
+      initialization failed earlier ("Could not initialize class …")</td></tr>
+      <tr><td><code>ExceptionInInitializerError</code></td><td>A static initializer or a static field
+      initializer threw an exception while the class was being initialized</td></tr>
+      <tr><td><code>AssertionError</code></td><td>An <code>assert</code> statement failed (assertions
+      must be enabled with <code>-ea</code>). Test frameworks also throw subclasses of it when an
+      assertion fails</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exception to the rule: top-level code may catch Throwable</p>
+    <p>Framework and infrastructure code at the very top of a thread — a web server's request loop, a
+    scheduler running jobs, a message consumer — often catches <code>Throwable</code> to log the
+    failure and keep the process alive for the next request. Test frameworks catch
+    <code>AssertionError</code> to report failed tests. Business code should never do this.</p>
+  </div>
+
+  <h4>The common exceptions and when each happens</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Exception</th><th>Kind</th><th>When it happens</th><th>Typical trigger</th></tr></thead>
+    <tbody>
+      <tr><td><code>NullPointerException</code></td><td>Unchecked</td><td>Using a <code>null</code>
+      reference as if it were an object: calling a method, reading a field, unboxing a null
+      <code>Integer</code></td><td><code>customer.getName()</code> when <code>customer</code> is
+      <code>null</code></td></tr>
+      <tr><td><code>ArrayIndexOutOfBoundsException</code></td><td>Unchecked</td><td>Array index below 0
+      or ≥ length</td><td><code>seats[seats.length]</code></td></tr>
+      <tr><td><code>IndexOutOfBoundsException</code></td><td>Unchecked</td><td>Bad index on a
+      <code>List</code> (and the parent of the array and string versions)</td><td><code>list.get(5)</code>
+      on a list of size 3</td></tr>
+      <tr><td><code>ClassCastException</code></td><td>Unchecked</td><td>Casting an object to a type it
+      is not an instance of</td><td><code>(Integer) obj</code> when <code>obj</code> holds a
+      <code>String</code></td></tr>
+      <tr><td><code>NumberFormatException</code></td><td>Unchecked (a subclass of
+      <code>IllegalArgumentException</code>)</td><td>Parsing text that is not a valid number —
+      including <code>""</code>, <code>" 42"</code> with a space, and <code>null</code></td>
+      <td><code>Integer.parseInt("12a")</code></td></tr>
+      <tr><td><code>IllegalArgumentException</code></td><td>Unchecked</td><td>A method received an
+      argument value it does not accept</td><td><code>Thread.sleep(-1)</code>, or your own
+      validation</td></tr>
+      <tr><td><code>IllegalStateException</code></td><td>Unchecked</td><td>A method was called at the
+      wrong time — the object is not in the right state</td><td><code>iterator.remove()</code> before
+      <code>next()</code>; using a closed <code>Scanner</code></td></tr>
+      <tr><td><code>ArithmeticException</code></td><td>Unchecked</td><td>Integer division by zero,
+      <code>Math.addExact</code> overflow, a non-terminating <code>BigDecimal</code> division</td>
+      <td><code>total / count</code> with <code>count == 0</code></td></tr>
+      <tr><td><code>ConcurrentModificationException</code></td><td>Unchecked</td><td>A collection was
+      structurally changed while being iterated (see <a href="#m4">Module 4</a>)</td><td>Calling
+      <code>list.remove(x)</code> inside a for-each over <code>list</code></td></tr>
+      <tr><td><code>UnsupportedOperationException</code></td><td>Unchecked</td><td>The object does not
+      support this operation</td><td><code>List.of(1, 2).add(3)</code></td></tr>
+      <tr><td><code>NoSuchElementException</code></td><td>Unchecked</td><td>Asking for an element that
+      does not exist</td><td><code>iterator.next()</code> at the end; <code>Optional.empty().get()</code></td></tr>
+      <tr><td><code>IOException</code></td><td>Checked</td><td>An input/output operation failed: file
+      unreadable, disk full, network connection broken</td><td><code>Files.readString(path)</code></td></tr>
+      <tr><td><code>FileNotFoundException</code></td><td>Checked (a subclass of
+      <code>IOException</code>)</td><td>Classic <code>java.io</code> could not open a file: missing, a
+      directory, or no permission</td><td><code>new FileInputStream("missing.txt")</code></td></tr>
+      <tr><td><code>SQLException</code></td><td>Checked</td><td>A JDBC database operation failed: bad
+      SQL, lost connection, constraint violation. Has <code>getSQLState()</code> and
+      <code>getErrorCode()</code></td><td><code>statement.executeQuery(sql)</code></td></tr>
+      <tr><td><code>InterruptedException</code></td><td>Checked</td><td>A thread waiting in
+      <code>sleep</code>, <code>wait</code> or <code>join</code> was interrupted by another thread
+      (see <a href="#m6">Module 6</a>)</td><td><code>Thread.sleep(1000)</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The program below triggers several of these and prints each exception with
+  <code>toString()</code>, so you can see the real messages the JDK produces.</p>
+<pre data-title="CommonExceptions.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class CommonExceptions {
+    static String city;            // a field that is still null
+
+    public static void main(String[] args) {
+        List&lt;Runnable&gt; cases = List.of(
+            () -&gt; city.length(),
+            () -&gt; { int[] seats = new int[3]; seats[3] = 1; },
+            () -&gt; new ArrayList&lt;String&gt;().get(0),
+            () -&gt; { Object o = "hi"; Integer i = (Integer) o; },
+            () -&gt; Integer.parseInt("12a"),
+            () -&gt; { int a = 10, b = 0; System.out.println(a / b); },
+            () -&gt; List.of(1, 2).add(3),
+            () -&gt; new ArrayList&lt;String&gt;().iterator().next()
+        );
+        for (Runnable r : cases) {
+            try {
+                r.run();
+            } catch (RuntimeException e) {
+                System.out.println(e);       // toString(): class name + message
+            }
+        }
+    }
+}</code></pre>
+<pre class="out" data-title="Output (JDK 25)"><code class="language-plaintext">java.lang.NullPointerException: Cannot invoke "String.length()" because "CommonExceptions.city" is null
+java.lang.ArrayIndexOutOfBoundsException: Index 3 out of bounds for length 3
+java.lang.IndexOutOfBoundsException: Index 0 out of bounds for length 0
+java.lang.ClassCastException: class java.lang.String cannot be cast to class java.lang.Integer (...)
+java.lang.NumberFormatException: For input string: "12a"
+java.lang.ArithmeticException: / by zero
+java.lang.UnsupportedOperationException
+java.util.NoSuchElementException</code></pre>
+  <p>The detailed <code>NullPointerException</code> message ("because … is null") comes from the
+  <em>helpful NullPointerException</em> feature of Java 14+ (see
+  <a href="#m3-null-handling">NullPointerException</a>). Also notice that floating-point division by
+  zero does <em>not</em> throw: <code>10.0 / 0</code> is <code>Infinity</code> and
+  <code>0.0 / 0</code> is <code>NaN</code>. Only integer division throws
+  <code>ArithmeticException</code>.</p>
+
+  <h4>ClassNotFoundException vs NoClassDefFoundError</h4>
+  <p>This pair is a favourite interview question because the names look alike but they sit on
+  different branches of the tree.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th><code>ClassNotFoundException</code></th><th><code>NoClassDefFoundError</code></th></tr></thead>
+    <tbody>
+      <tr><td>Type</td><td>Checked exception</td><td>Error (a <code>LinkageError</code>)</td></tr>
+      <tr><td>When</td><td>You load a class by name at runtime and it is not found</td><td>A class
+      that was present at compile time cannot be found or initialized at runtime</td></tr>
+      <tr><td>Thrown by</td><td><code>Class.forName("…")</code>,
+      <code>ClassLoader.loadClass("…")</code></td><td>The JVM, when your code first uses the
+      class</td></tr>
+      <tr><td>Typical cause</td><td>A JDBC driver or plugin JAR missing from the classpath</td><td>A
+      dependency JAR missing at runtime only, or an earlier failure in the class's static
+      initializer</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: only Throwable objects can be thrown</p>
+    <p><code>throw "error";</code> does not compile: <em>incompatible types: String cannot be converted
+    to Throwable</em>. The same applies to <code>catch</code> — the parameter type must be
+    <code>Throwable</code> or a subclass.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: catch (Throwable t) around business logic</p>
+    <p>It also catches <code>OutOfMemoryError</code> and <code>StackOverflowError</code>, so a dying
+    JVM keeps limping along and nobody notices. Catch the specific exceptions you can handle; let
+    errors reach the top-level handler.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain the exception hierarchy" / "Error vs Exception"</p>
+    <ul>
+      <li><code>Throwable</code> is the root; it has two direct subclasses, <code>Error</code> and
+      <code>Exception</code>.</li>
+      <li><code>Error</code> = problems a program should not try to handle (OOM, stack overflow,
+      linkage errors). <code>Exception</code> = conditions a program can handle.</li>
+      <li><code>RuntimeException</code> (under <code>Exception</code>) and <code>Error</code> are
+      unchecked; everything else, including <code>Throwable</code> itself, is checked.</li>
+      <li>Give two or three examples on each branch and say when they happen.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-checked-unchecked">
+  <h3>Checked vs unchecked exceptions</h3>
+  <p class="tldr">The compiler forces you to catch or declare checked exceptions (Exception and its
+  subclasses outside RuntimeException); unchecked exceptions (RuntimeException, Error and their
+  subclasses) can be thrown anywhere without any declaration.</p>
+
+  <p>Java is almost alone among popular languages in having <strong>checked exceptions</strong>. A
+  checked exception is part of a method's contract: <code>Files.readString(Path)</code> declares
+  <code>throws IOException</code>, which says "reading can fail, and you must decide what to do about
+  it". An <strong>unchecked exception</strong> is not part of the contract the compiler checks: any
+  method may throw a <code>NullPointerException</code> without saying so.</p>
+
+  <h4>Which is which</h4>
+  <ul>
+    <li><strong>Unchecked</strong> = <code>RuntimeException</code> and its subclasses, plus
+    <code>Error</code> and its subclasses.</li>
+    <li><strong>Checked</strong> = every other <code>Throwable</code>: <code>Exception</code> itself,
+    <code>IOException</code>, <code>SQLException</code>, <code>InterruptedException</code>,
+    <code>ClassNotFoundException</code>, your own classes that extend <code>Exception</code>, and even
+    <code>Throwable</code> itself.</li>
+  </ul>
+
+  <h4>The compiler rule: catch or declare</h4>
+  <p>If code inside a method can throw a checked exception, the method must either
+  <strong>catch</strong> it or <strong>declare</strong> it in its <code>throws</code> clause. This is
+  called the <strong>catch-or-declare rule</strong> (also "handle or declare").</p>
+<pre data-title="Unreported.java"><code class="language-java">import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Unreported {
+    static String readConfig() {
+        return Files.readString(Path.of("app.conf"));   // throws IOException
+    }
+}</code></pre>
+<pre class="out" data-title="javac output"><code class="language-plaintext">Unreported.java:6: error: unreported exception IOException; must be caught or declared to be thrown
+        return Files.readString(Path.of("app.conf"));
+                               ^
+1 error</code></pre>
+  <p>Two ways to fix it — catch it where you can handle it, or declare it and let the caller
+  decide:</p>
+<pre data-title="Two valid fixes"><code class="language-java">// Fix 1: handle it here (for example, fall back to a default)
+static String readConfigOrDefault() {
+    try {
+        return Files.readString(Path.of("app.conf"));
+    } catch (IOException e) {
+        return "mode=default";
+    }
+}
+
+// Fix 2: declare it; now every caller must catch or declare it in turn
+static String readConfig() throws IOException {
+    return Files.readString(Path.of("app.conf"));
+}</code></pre>
+
+  <h4>The second compiler rule: no catching what cannot be thrown</h4>
+  <p>The compiler also rejects a catch block for a checked exception that the try block can never
+  throw — it would be dead code.</p>
+<pre data-title="NeverThrown.java"><code class="language-java">static int parse(String s) {
+    try {
+        return Integer.parseInt(s);       // throws only unchecked exceptions
+    } catch (IOException e) {             // compile error
+        return -1;
+    }
+}</code></pre>
+<pre class="out" data-title="javac output"><code class="language-plaintext">NeverThrown.java:7: error: exception IOException is never thrown in body of corresponding try statement</code></pre>
+
+  <div class="co co-exc">
+    <p class="co-t">Exception: catch (Exception e) and catch (Throwable t) are always allowed</p>
+    <p>Even when the try block throws no checked exception, catching <code>Exception</code> or
+    <code>Throwable</code> compiles, because those types also cover unchecked exceptions that any
+    code can throw. Unchecked types like <code>NumberFormatException</code> can always be caught
+    too.</p>
+  </div>
+
+  <h4>Unchecked exceptions: no rule at all</h4>
+  <p>You may throw <code>IllegalArgumentException</code> from any method without a
+  <code>throws</code> clause, and callers need not catch it. You <em>may</em> list unchecked
+  exceptions in <code>throws</code>, but it changes nothing for the compiler. The professional way to
+  document them is the Javadoc <code>@throws</code> tag:</p>
+<pre data-title="Documenting unchecked exceptions"><code class="language-java">/**
+ * Withdraws money from this account.
+ *
+ * @throws IllegalArgumentException if amount is zero or negative
+ * @throws InsufficientBalanceException if the balance is lower than amount
+ */
+public void withdraw(BigDecimal amount) { ... }</code></pre>
+
+  <h4>Side by side</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Checked</th><th>Unchecked</th></tr></thead>
+    <tbody>
+      <tr><td>Classes</td><td><code>Exception</code> and subclasses, except the
+      <code>RuntimeException</code> branch</td><td><code>RuntimeException</code>, <code>Error</code>
+      and their subclasses</td></tr>
+      <tr><td>Compiler</td><td>Must be caught or declared</td><td>No requirement</td></tr>
+      <tr><td>Typical meaning</td><td>A failure outside your control that a caller can react to (file,
+      network, database, interruption)</td><td>A programming error or invalid input/state</td></tr>
+      <tr><td>Examples</td><td><code>IOException</code>, <code>SQLException</code>,
+      <code>InterruptedException</code></td><td><code>NullPointerException</code>,
+      <code>IllegalArgumentException</code>, <code>ArithmeticException</code></td></tr>
+      <tr><td>Usual handling</td><td>Recover, retry, or translate to a higher-level exception</td>
+      <td>Fix the bug; validate input; handle once at a boundary (e.g., an API error handler)</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-note">
+    <p class="co-t">Note: checked exceptions exist only in the compiler</p>
+    <p>The JVM does not know about checked exceptions. Bytecode may throw any <code>Throwable</code>
+    from anywhere; the catch-or-declare rule is enforced by <code>javac</code> alone. That is why other
+    JVM languages such as Kotlin and Scala have no checked exceptions, and why Lombok's
+    <code>@SneakyThrows</code> can throw a checked exception without declaring it.</p>
+  </div>
+
+  <h4>The design debate</h4>
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">For checked exceptions</p><ul>
+      <li>The method signature tells you what can go wrong.</li>
+      <li>The compiler stops you from forgetting a failure that really happens in production (a file
+      that is missing, a network that drops).</li>
+      <li>Good for recoverable situations the caller is expected to handle.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Against checked exceptions</p><ul>
+      <li>Boilerplate: catch blocks that do nothing useful, or <code>throws</code> clauses copied up
+      through every layer.</li>
+      <li>They tempt people into swallowing exceptions just to make the code compile.</li>
+      <li>They leak implementation details: a service method should not declare
+      <code>SQLException</code> just because its repository uses JDBC.</li>
+      <li>They do not work with lambdas and streams — <code>Function.apply</code> declares no checked
+      exceptions.</li>
+      <li>Adding a checked exception to a public method breaks every caller.</li>
+    </ul></div>
+  </div>
+  <p>The modern Java ecosystem leans towards unchecked exceptions. Spring translates JDBC's checked
+  <code>SQLException</code> into its unchecked <code>DataAccessException</code> family, JPA's
+  <code>PersistenceException</code> is unchecked, and most libraries written in the last decade throw
+  unchecked exceptions. Checked exceptions are still the right tool in some places, and the JDK itself
+  uses them heavily for I/O.</p>
+
+  <h4>Checked exceptions and lambdas</h4>
+  <p>A stream pipeline takes functional interfaces like <code>Function</code>, whose method
+  declares no checked exceptions. So a lambda that calls <code>Files.readString</code> does not
+  compile:</p>
+<pre data-title="Does not compile"><code class="language-java">List&lt;String&gt; contents = files.stream()
+        .map(p -&gt; Files.readString(p))     // unreported exception IOException
+        .toList();
+
+List&lt;String&gt; contents2 = files.stream()
+        .map(Files::readString)            // incompatible thrown types IOException
+        .toList();</code></pre>
+  <p>The standard fix is to catch inside the lambda and wrap the checked exception in an unchecked
+  one. The JDK has a ready-made wrapper for I/O, <code>java.io.UncheckedIOException</code>:</p>
+<pre data-title="Wrapping inside the lambda"><code class="language-java">List&lt;String&gt; contents = files.stream()
+        .map(p -&gt; {
+            try {
+                return Files.readString(p);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);   // keeps the IOException as the cause
+            }
+        })
+        .toList();</code></pre>
+  <p>If you need this in many places, move the try/catch into a small helper method such as
+  <code>readOrThrow(Path)</code> and use <code>map(Util::readOrThrow)</code>.</p>
+
+  <h4>When to use which</h4>
+  <ul>
+    <li><strong>Unchecked</strong> when the problem is a bug in the caller (null argument, invalid
+    value, wrong order of calls), or when the caller cannot reasonably recover. This is the default in
+    most modern application code, including Spring Boot services.</li>
+    <li><strong>Checked</strong> when the failure is expected in normal operation, the caller can
+    really do something about it (retry, choose another file, ask the user), and you want the
+    compiler to make sure they think about it.</li>
+    <li>When in doubt in a Spring Boot app, make business exceptions unchecked and handle them in one
+    central place that maps them to HTTP responses (see <a href="#m3-best-practices">best
+    practices</a>).</li>
+  </ul>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: throws Exception is for demos only</p>
+    <p><code>public static void main(String[] args) throws Exception</code> is legal and handy in
+    quick experiments. In real code, declaring <code>throws Exception</code> hides which failures can
+    actually happen and forces every caller to catch the broadest type. Declare the specific checked
+    types, or wrap them.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: an empty catch block just to satisfy the compiler</p>
+    <p><code>catch (IOException e) { }</code> makes the error disappear — the program continues as if
+    the file had been read. If you cannot handle a checked exception, declare it or wrap it in an
+    unchecked exception with the original as the cause.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Checked vs unchecked — and which do you prefer?"</p>
+    <ul>
+      <li>Define both by the hierarchy and state the catch-or-declare rule; mention it is a
+      compile-time rule only.</li>
+      <li>Give examples: <code>IOException</code>, <code>SQLException</code> vs
+      <code>NullPointerException</code>, <code>IllegalArgumentException</code>.</li>
+      <li>Guideline: checked for recoverable conditions the caller must handle, unchecked for
+      programming errors.</li>
+      <li>Mention the trade-offs (lambdas, boilerplate, leaking details) and that Spring prefers
+      unchecked exceptions, translating <code>SQLException</code> into
+      <code>DataAccessException</code>.</li>
+    </ul>
+  </div>
+</article>

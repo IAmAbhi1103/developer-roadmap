@@ -1,0 +1,549 @@
+<div class="mintro">
+  <p>Almost every Java application you will build keeps its data in a relational database: users, orders,
+  payments, bookings. Spring Boot, JPA and Hibernate sit on top of it, but underneath they all send
+  <strong>SQL</strong> to the database. If you understand SQL well, you can write correct queries, debug slow
+  or wrong results, read what Hibernate generates and answer the SQL round that almost every Java interview
+  has.</p>
+  <p>This module covers the core: how relational databases organise data, how to install PostgreSQL (or
+  MySQL) and a client tool, how to read data with <code>SELECT</code>, filters, sorting and paging, how to
+  change data with <code>INSERT</code>, <code>UPDATE</code> and <code>DELETE</code>, and how to define tables
+  with the right data types and constraints. Every example runs on one sample database (a small company plus
+  a small online shop) that you create in <a href="#m1-sample-schema">The sample database</a>; Modules 2 and 3
+  use the same tables. PostgreSQL syntax is the default and MySQL differences are noted where they matter.
+  Database design is in <a href="#m4">Module 4</a>, and indexes and transactions inside the engine are in
+  <a href="#m5">Module 5</a>. The same tables are used from Java in
+  <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>.</p>
+  <ul>
+    <li>Explain tables, rows, columns, primary keys and foreign keys, and what a DBMS does for you.</li>
+    <li>Install PostgreSQL or MySQL, connect with <code>psql</code> / <code>mysql</code> and a GUI client, and
+    create a database and a user.</li>
+    <li>Write <code>SELECT</code> queries with <code>WHERE</code>, <code>ORDER BY</code>, <code>LIMIT</code> and
+    <code>DISTINCT</code>, and handle <code>NULL</code> correctly.</li>
+    <li>Insert, update, delete and upsert rows safely, without destroying data by accident.</li>
+    <li>Create and change tables with suitable data types and constraints, and recognise the error each
+    constraint raises.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m1-relational-databases">
+  <h3>Relational databases: tables, rows, columns and keys</h3>
+  <p class="tldr">A relational database stores data in tables. Each row is one record, each column is one
+  attribute with a fixed data type, and a primary key gives every row a unique identity that other tables
+  can point to with foreign keys.</p>
+
+  <h4>Database, DBMS and RDBMS</h4>
+  <p>A <strong>database</strong> is an organised collection of data that programs can store and find again
+  later. A <strong>DBMS</strong> (database management system) is the software that manages it. It writes the
+  data to disk, answers queries, lets hundreds of users work at the same time, and keeps the data safe when
+  the machine crashes. An <strong>RDBMS</strong> (relational DBMS) is a DBMS that organises data as tables and
+  is queried with SQL. PostgreSQL, MySQL, MariaDB, Oracle Database, Microsoft SQL Server and SQLite are all
+  RDBMSs. Databases that do not use tables (MongoDB, Redis, Cassandra) are called NoSQL databases; they are
+  covered in <a href="#m6">Module 6</a>.</p>
+  <p>Why not just write the data to files from your Java code? Because the DBMS solves problems you would
+  otherwise have to solve yourself, badly:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Need</th><th>Plain files (CSV, JSON)</th><th>RDBMS</th></tr></thead>
+    <tbody>
+      <tr><td>Find one record among millions</td><td>Read and parse the whole file</td><td>Index lookup in
+      milliseconds</td></tr>
+      <tr><td>Two users write at the same time</td><td>Lost updates or a corrupted file</td><td>Transactions
+      and locks</td></tr>
+      <tr><td>Power cut in the middle of a write</td><td>Half-written file</td><td>Atomic commit and crash
+      recovery</td></tr>
+      <tr><td>Keep the data valid</td><td>Your code must check everything, everywhere</td><td>Constraints
+      enforced by the engine for every client</td></tr>
+      <tr><td>Answer a new question</td><td>Write new parsing code</td><td>Write a new query</td></tr>
+      <tr><td>Control who can see what</td><td>Operating-system file permissions</td><td>Users, roles and
+      <code>GRANT</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Tables, rows and columns</h4>
+  <p>A <strong>table</strong> holds data about one kind of thing: departments, employees, orders. A
+  <strong>column</strong> is one attribute of that thing (name, location) and has a fixed
+  <strong>data type</strong>, so every value in the column is of that type. A <strong>row</strong> is one
+  record: one department, one employee. The set of columns and their types is the table's
+  <strong>schema</strong> (its structure); the rows are its data.</p>
+  <figure class="fig">
+<pre class="diagram">
+                      table: departments
+              ┌─────────┬─────────────┬───────────┐
+   columns →  │ dept_id │ name        │ location  │
+              ├─────────┼─────────────┼───────────┤
+   row 1   →  │ 1       │ Engineering │ Bengaluru │
+   row 2   →  │ 2       │ Sales       │ Mumbai    │
+   row 3   →  │ 3       │ HR          │ Pune      │
+              └─────────┴─────────────┴───────────┘
+                 ↑ primary key: unique, never NULL
+</pre>
+  <figcaption>A table is a set of rows; every row has the same columns</figcaption>
+  </figure>
+  <p>The theory behind this comes from Edgar F. Codd's <strong>relational model</strong> (1970). In that
+  theory a table is called a <strong>relation</strong>, which is why these are "relational" databases. You will
+  meet the formal words in interviews and in DBMS courses:</p>
+  <dl class="terms">
+    <dt>Relation</dt><dd>A table.</dd>
+    <dt>Tuple</dt><dd>A row.</dd>
+    <dt>Attribute</dt><dd>A column.</dd>
+    <dt>Domain</dt><dd>The set of values a column may hold (its data type plus its constraints).</dd>
+    <dt>Degree</dt><dd>The number of columns in a table.</dd>
+    <dt>Cardinality</dt><dd>The number of rows in a table. (The same word also describes relationships:
+    one-to-many, many-to-many.)</dd>
+  </dl>
+  <p>A relation has a few properties that matter every day:</p>
+  <ul>
+    <li><strong>Every row has the same columns.</strong> You cannot add a column to just one row.</li>
+    <li><strong>Each cell holds one value</strong> (atomic). A list such as <code>'java,sql,react'</code> in one
+    column breaks this rule and makes queries painful (see first normal form in <a href="#m4">Module 4</a>).</li>
+    <li><strong>Rows have no order.</strong> A table is a set, not a list. When you query without
+    <code>ORDER BY</code>, the database may return rows in any order, and the order can change after an update
+    or a new index.</li>
+    <li><strong>Rows should be distinguishable.</strong> That is the job of the primary key.</li>
+  </ul>
+
+  <h4>Primary keys</h4>
+  <p>A <strong>primary key</strong> (PK) is a column, or a set of columns, whose value uniquely identifies
+  one row. The database enforces two things for it: the value must be <strong>unique</strong> and it must be
+  <strong>NOT NULL</strong>. A table has at most one primary key, and the database builds an index on it
+  automatically, so looking up a row by its key is fast.</p>
+  <ul>
+    <li>A <strong>natural key</strong> is a real-world value that is already unique: an email address, a PAN
+    number, an ISBN.</li>
+    <li>A <strong>surrogate key</strong> is a value the database generates only to identify the row: an
+    auto-incrementing number or a UUID. It has no business meaning, so it never needs to change.</li>
+    <li>A <strong>composite key</strong> uses two or more columns together. In the sample database,
+    <code>employee_projects</code> uses <code>(emp_id, project_id)</code>: one employee can be on many projects
+    and one project has many employees, but the same pair appears only once.</li>
+  </ul>
+  <p>Any column set that could serve as the primary key is a <strong>candidate key</strong>; the one you
+  choose is the primary key and the others usually get a <code>UNIQUE</code> constraint.</p>
+
+  <h4>Foreign keys and relationships</h4>
+  <p>A <strong>foreign key</strong> (FK) is a column whose value must match a key value in another table (or
+  in the same table). <code>employees.dept_id</code> points to <code>departments.dept_id</code>: the database
+  refuses an employee row with <code>dept_id = 99</code> if department 99 does not exist. This guarantee is
+  called <strong>referential integrity</strong>. Foreign keys create the relationships between tables:</p>
+  <ul>
+    <li><strong>One-to-many</strong>: one department has many employees. The FK lives on the "many" side
+    (<code>employees.dept_id</code>).</li>
+    <li><strong>Many-to-many</strong>: employees and projects. You need a third table (a
+    <strong>junction table</strong>, here <code>employee_projects</code>) with an FK to each side.</li>
+    <li><strong>One-to-one</strong>: an FK that is also unique, for example a <code>user_profiles</code> row per
+    user.</li>
+  </ul>
+  <figure class="fig">
+<pre class="mermaid">
+erDiagram
+  departments ||--o{ employees : "has"
+  departments {
+    int dept_id PK
+    varchar name
+    varchar location
+  }
+  employees {
+    int emp_id PK
+    varchar first_name
+    int dept_id FK
+  }
+</pre>
+  <figcaption>One department has zero or more employees; each employee row points to one department</figcaption>
+  </figure>
+
+  <h4>Where tables live: server, database, schema</h4>
+  <p>In PostgreSQL one server (called a <strong>cluster</strong>) holds many databases. Each database holds
+  one or more <strong>schemas</strong>, which are namespaces for tables; the default schema is
+  <code>public</code>, so the full name of a table is <code>public.employees</code>. A connection always
+  belongs to one database, and a query cannot simply join tables from two databases. In MySQL the words
+  database and schema mean the same thing, and one query can read <code>shop.orders</code> and
+  <code>hr.employees</code> together.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every table gets a primary key</p>
+    <p>Without one, duplicate rows can appear, you cannot reliably update or delete one specific row, and
+    tools depend on it: JPA entities need an <code>@Id</code>, and replication and many admin tools expect a
+    key.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: surrogate primary key plus unique natural key</p>
+    <p>Most Java projects use a generated <code>BIGINT</code> or <code>UUID</code> as the primary key and add a
+    <code>UNIQUE</code> constraint on natural identifiers such as email. Emails and phone numbers change;
+    a surrogate key never has to.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>SQL itself allows a table without a primary key. The table then behaves like a bag of rows and
+      can hold exact duplicates. MySQL's InnoDB engine quietly uses the first <code>UNIQUE NOT NULL</code>
+      index as the clustered key, or creates a hidden row id if there is none.</li>
+      <li>A foreign key column may be <code>NULL</code> unless you declare it <code>NOT NULL</code>. A NULL FK
+      means "no related row", for example an employee not yet assigned to a department.</li>
+      <li>A foreign key may point to the same table: <code>employees.manager_id</code> refers to
+      <code>employees.emp_id</code>. This is a <strong>self-reference</strong>.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: trusting the order of rows</p>
+    <p>"It always comes back sorted by id" is luck, not a guarantee. After updates, deletes, a new index or a
+    parallel plan, the order changes. If the order matters, write <code>ORDER BY</code>.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Primary key vs unique key:</b> both reject duplicates; a primary key also rejects NULL and there
+      is only one per table, while a table can have many unique keys and a unique column can usually hold
+      NULLs.</li>
+      <li><b>Can a table have two primary keys?</b> No. It can have one primary key made of two columns (a
+      composite key).</li>
+      <li><b>Can a foreign key be NULL?</b> Yes, unless the column is <code>NOT NULL</code>.</li>
+      <li><b>Candidate key vs primary key vs super key:</b> a super key is any column set that is unique; a
+      candidate key is a minimal super key; the primary key is the candidate key you pick.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-sql-language">
+  <h3>SQL: a declarative language and its sublanguages</h3>
+  <p class="tldr">In SQL you describe the result you want, not the steps to get it; the database's planner
+  chooses how. SQL statements fall into five groups: DDL, DML, DQL, DCL and TCL.</p>
+
+  <h4>What "declarative" means</h4>
+  <p><strong>SQL</strong> (Structured Query Language, said "ess-queue-ell" or "sequel") is the standard
+  language for relational databases. It is <strong>declarative</strong>: you state <em>what</em> you want,
+  and the database decides <em>how</em> to get it. Java is <strong>imperative</strong>: you write every step.
+  Compare finding Sales employees who earn more than ₹1,00,000, highest paid first:</p>
+  <pre data-title="Imperative Java (fragment)"><code class="language-java">// You decide HOW: loop, test, collect, sort
+List&lt;Employee&gt; result = new ArrayList&lt;&gt;();
+for (Employee e : allEmployees) {
+    if (e.getDeptId() == 2 &amp;&amp; e.getSalary().compareTo(new BigDecimal("100000")) &gt; 0) {
+        result.add(e);
+    }
+}
+result.sort(Comparator.comparing(Employee::getSalary).reversed());</code></pre>
+  <pre data-title="Declarative SQL"><code class="language-sql">-- You say WHAT you want; the database picks the method
+SELECT first_name, salary
+FROM employees
+WHERE dept_id = 2
+  AND salary &gt; 100000
+ORDER BY salary DESC;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name |  salary
+------------+-----------
+ Karan      | 160000.00
+ Ananya     | 150000.00
+(2 rows)</code></pre>
+  <p>The SQL version does not say whether to scan the whole table or use an index, or which sort algorithm
+  to use. The database's <strong>query planner</strong> (also called the optimizer) looks at table sizes,
+  indexes and statistics and picks the cheapest plan. The same query can run differently on a table of 10 rows
+  and a table of 10 crore rows, and you do not change a word. This is also why you can ask the database to
+  explain its plan with <code>EXPLAIN</code> (covered in <a href="#m5">Module 5</a>).</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A["SQL text"] --> B[Parser]
+  B --> C["Rewriter (views)"]
+  C --> D["Planner / optimizer"]
+  D --> E[Executor]
+  E --> F["Result rows"]
+</pre>
+  <figcaption>How PostgreSQL runs a query: check the syntax, expand views, choose a plan, execute it</figcaption>
+  </figure>
+
+  <h4>Standard SQL and dialects</h4>
+  <p>SQL is an ISO/ANSI standard (first published in 1986; the current edition is SQL:2023). Every database
+  implements most of the core and adds its own extensions, so each has a <strong>dialect</strong>. The basics
+  (<code>SELECT</code>, <code>WHERE</code>, <code>JOIN</code>, <code>GROUP BY</code>, <code>INSERT</code>)
+  are the same everywhere. Differences show up in details: paging (<code>LIMIT</code> vs
+  <code>FETCH FIRST</code> vs SQL Server's <code>TOP</code>), auto-generated ids, string functions, date
+  functions and upserts. PostgreSQL follows the standard closely; MySQL is more lenient and has more
+  non-standard behaviour. Learn one dialect well and the others take days, not months.</p>
+
+  <h4>The five sublanguages</h4>
+  <p>SQL statements are grouped by what they do. Interviewers like this classification.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Group</th><th>Full name</th><th>Purpose</th><th>Statements</th></tr></thead>
+    <tbody>
+      <tr><td><b>DDL</b></td><td>Data Definition Language</td><td>Define and change structure</td>
+      <td><code>CREATE</code>, <code>ALTER</code>, <code>DROP</code>, <code>TRUNCATE</code>, <code>COMMENT</code></td></tr>
+      <tr><td><b>DML</b></td><td>Data Manipulation Language</td><td>Change the rows</td>
+      <td><code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, <code>MERGE</code></td></tr>
+      <tr><td><b>DQL</b></td><td>Data Query Language</td><td>Read rows</td><td><code>SELECT</code></td></tr>
+      <tr><td><b>DCL</b></td><td>Data Control Language</td><td>Permissions</td>
+      <td><code>GRANT</code>, <code>REVOKE</code></td></tr>
+      <tr><td><b>TCL</b></td><td>Transaction Control Language</td><td>Group changes into transactions</td>
+      <td><code>BEGIN</code> / <code>START TRANSACTION</code>, <code>COMMIT</code>, <code>ROLLBACK</code>,
+      <code>SAVEPOINT</code></td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="One statement from each group"><code class="language-sql">CREATE TABLE skills (skill_id INT PRIMARY KEY, name VARCHAR(50));   -- DDL
+INSERT INTO skills (skill_id, name) VALUES (1, 'Java');             -- DML
+SELECT skill_id, name FROM skills;                                  -- DQL
+GRANT SELECT ON skills TO report_user;                              -- DCL
+BEGIN;                                                              -- TCL
+UPDATE skills SET name = 'Java 21' WHERE skill_id = 1;              -- DML
+COMMIT;                                                             -- TCL</code></pre>
+  <div class="co co-note">
+    <p class="co-t">Note: textbooks disagree on the boxes</p>
+    <p>Many books put <code>SELECT</code> inside DML and have only four groups. <code>TRUNCATE</code> removes
+    rows but is classed as DDL, because it works on the whole table rather than row by row. If an
+    interviewer uses four groups, follow their lead and mention that some sources split out DQL.</p>
+  </div>
+
+  <h4>Basic syntax rules</h4>
+  <ul>
+    <li>A statement ends with a semicolon <code>;</code>. Tools such as psql wait for it before running
+    anything.</li>
+    <li>Keywords are case-insensitive: <code>select</code>, <code>SELECT</code> and <code>Select</code> are
+    the same. Convention is uppercase (see <a href="#m1-sql-style">SQL style</a>).</li>
+    <li>String and date literals use <strong>single quotes</strong>: <code>'Mumbai'</code>,
+    <code>'2026-04-05'</code>. To put a quote inside a string, double it: <code>'D''Souza'</code>.</li>
+    <li>Double quotes are for identifiers in PostgreSQL (<code>"Order"</code>), not for strings.</li>
+    <li>Whitespace and line breaks do not matter, so format for readability.</li>
+  </ul>
+
+  <h4>PostgreSQL vs MySQL at a glance</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Topic</th><th>PostgreSQL</th><th>MySQL (InnoDB)</th></tr></thead>
+    <tbody>
+      <tr><td>Owner and licence</td><td>Community project, permissive PostgreSQL Licence</td><td>Oracle;
+      Community Edition under GPL, plus commercial editions</td></tr>
+      <tr><td>Default port</td><td>5432</td><td>3306</td></tr>
+      <tr><td>Standards</td><td>Strict and close to the SQL standard</td><td>More lenient; behaviour depends
+      on <code>sql_mode</code></td></tr>
+      <tr><td>String comparison</td><td>Case-sensitive by default</td><td>Case-insensitive with the default
+      collation <code>utf8mb4_0900_ai_ci</code></td></tr>
+      <tr><td>Auto ids</td><td><code>GENERATED … AS IDENTITY</code> (or <code>SERIAL</code>)</td>
+      <td><code>AUTO_INCREMENT</code></td></tr>
+      <tr><td>Return changed rows</td><td><code>RETURNING</code></td><td>Not available; use
+      <code>LAST_INSERT_ID()</code></td></tr>
+      <tr><td>DDL inside a transaction</td><td>Yes: <code>CREATE</code>/<code>ALTER</code> can be rolled
+      back</td><td>No: DDL commits implicitly</td></tr>
+      <tr><td>Full outer join</td><td>Yes</td><td>No (emulate with <code>UNION</code>)</td></tr>
+      <tr><td>JSON</td><td><code>JSON</code> and indexed binary <code>JSONB</code></td><td><code>JSON</code>
+      (binary format)</td></tr>
+      <tr><td>Extras</td><td>Materialized views, arrays, rich types, extensions (PostGIS, pgvector)</td>
+      <td>Simple to run; very common in PHP and older Java stacks</td></tr>
+    </tbody>
+  </table></div>
+  <p>Both are excellent, free and fully supported by Spring Boot. Learn PostgreSQL as your default (it is
+  the more common choice for new Java projects and its strictness teaches good habits) and learn the MySQL
+  differences noted throughout these notes, because many service-company projects run MySQL.</p>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: think in sets, not loops</p>
+    <p>SQL works on whole sets of rows at once. If you catch yourself fetching rows into Java just to filter,
+    count or join them in a loop, the database can almost always do it faster in one query, close to the
+    data.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: double quotes around strings</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: PostgreSQL reads "Mumbai" as a column name</p><pre><code class="language-sql">SELECT name FROM departments WHERE location = "Mumbai";
+-- ERROR:  column "Mumbai" does not exist</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: single quotes for values</p><pre><code class="language-sql">SELECT name FROM departments WHERE location = 'Mumbai';</code></pre></div>
+    </div>
+    <p>MySQL accepts double-quoted strings by default (unless the <code>ANSI_QUOTES</code> mode is on), which
+    hides this bug until you move to PostgreSQL.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Why is SQL declarative?</b> You describe the result; the optimizer chooses the access paths, join
+      order and algorithms.</li>
+      <li><b>DDL vs DML:</b> DDL changes structure (tables, columns), DML changes rows. In MySQL DDL commits
+      the current transaction automatically; in PostgreSQL most DDL can be rolled back.</li>
+      <li><b>Is TRUNCATE DDL or DML?</b> DDL. It removes all rows without scanning them one by one.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-install-setup">
+  <h3>Install PostgreSQL or MySQL and a client tool</h3>
+  <p class="tldr">Install a database server (natively or in Docker), connect with the command-line client
+  (<code>psql</code> or <code>mysql</code>) and a GUI such as pgAdmin, DBeaver or MySQL Workbench, then create
+  a database and a non-superuser account for your work.</p>
+
+  <h4>The pieces</h4>
+  <p>A database has two parts. The <strong>server</strong> is a background process that owns the data files
+  and listens on a network port (5432 for PostgreSQL, 3306 for MySQL). A <strong>client</strong> connects to
+  that port, sends SQL and shows the results. Your Spring Boot application is just another client, using a
+  JDBC driver. You can install the server directly on Windows or run it in Docker; either is fine for
+  learning.</p>
+
+  <h4>PostgreSQL on Windows</h4>
+  <ol class="steps">
+    <li>Open <a href="https://www.postgresql.org/download/windows/">postgresql.org/download/windows</a> and
+    download the installer (packaged by EDB). Pick the newest version offered.</li>
+    <li>Run it and keep the default components: <b>PostgreSQL Server</b>, <b>pgAdmin 4</b> (GUI) and
+    <b>Command Line Tools</b> (<code>psql</code>, <code>pg_dump</code>). Stack Builder is optional.</li>
+    <li>Set a password for the <code>postgres</code> superuser and write it down. Keep port
+    <code>5432</code>.</li>
+    <li>Finish. The server is installed as a Windows service and starts with Windows.</li>
+    <li>Open a new terminal and run <code>psql --version</code>. If it is not found, add
+    <code>C:\Program Files\PostgreSQL\&lt;version&gt;\bin</code> to your <code>PATH</code>, or use the
+    <b>SQL Shell (psql)</b> shortcut from the Start menu.</li>
+  </ol>
+
+  <h4>PostgreSQL in Docker</h4>
+  <p>If Docker Desktop is installed (see <a href="07-devops.html#m3">DevOps · Module 3</a>), one command gives
+  you a server, and deleting the container leaves your machine clean:</p>
+  <pre data-title="Terminal"><code class="language-bash"># Start PostgreSQL 18 in the background, data kept in a named volume
+docker run --name pg-learn \
+  -e POSTGRES_PASSWORD=change_me \
+  -p 5432:5432 \
+  -v pgdata:/var/lib/postgresql \
+  -d postgres:18
+
+# Open psql inside the container as the postgres superuser
+docker exec -it pg-learn psql -U postgres</code></pre>
+  <div class="co co-version">
+    <p class="co-t">Version note: Docker volume path</p>
+    <p>The official image changed its data directory layout in version 18, so mount the volume at
+    <code>/var/lib/postgresql</code>. For images up to 17 the usual mount point is
+    <code>/var/lib/postgresql/data</code>. Check the image's page on Docker Hub when you change versions.</p>
+  </div>
+
+  <h4>MySQL on Windows or in Docker</h4>
+  <p>From <a href="https://dev.mysql.com/downloads/">dev.mysql.com/downloads</a>, install <b>MySQL Community
+  Server</b> (the 8.4 LTS release is the safe choice) with its MSI installer, and <b>MySQL Workbench</b> as
+  the GUI. The installer asks for a <code>root</code> password and offers to run MySQL as a Windows service on
+  port 3306. With Docker:</p>
+  <pre data-title="Terminal"><code class="language-bash">docker run --name mysql-learn \
+  -e MYSQL_ROOT_PASSWORD=change_me \
+  -p 3306:3306 \
+  -v mysqldata:/var/lib/mysql \
+  -d mysql:8.4
+
+docker exec -it mysql-learn mysql -u root -p</code></pre>
+
+  <h4>GUI clients</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Tool</th><th>Works with</th><th>Good for</th></tr></thead>
+    <tbody>
+      <tr><td><b>pgAdmin 4</b></td><td>PostgreSQL</td><td>Comes with the Windows installer; query tool, table
+      browser, server admin</td></tr>
+      <tr><td><b>DBeaver Community</b></td><td>PostgreSQL, MySQL, Oracle, SQL Server and many more</td>
+      <td>Free; one tool for every database you meet at work; ER diagrams; data export</td></tr>
+      <tr><td><b>MySQL Workbench</b></td><td>MySQL</td><td>Official MySQL GUI; visual modelling</td></tr>
+      <tr><td><b>IntelliJ IDEA Ultimate / DataGrip</b></td><td>Most databases</td><td>SQL inside your IDE with
+      completion that knows your schema (paid)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Learn the command-line client too. On servers, in Docker containers and in CI there is no GUI, and
+  interviewers sometimes ask you to work in a terminal.</p>
+
+  <h4>psql basics</h4>
+  <pre data-title="Connect with psql"><code class="language-bash"># host, port, user and database are explicit; psql asks for the password
+psql -h localhost -p 5432 -U postgres -d postgres
+
+# the same as a connection URI
+psql postgresql://postgres@localhost:5432/postgres</code></pre>
+  <p>Inside psql, lines that start with a backslash are <strong>meta-commands</strong>: psql handles them
+  itself and they need no semicolon. Everything else is SQL and runs only when you type <code>;</code>.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>\l</code></td><td>List databases</td></tr>
+      <tr><td><code>\c learn_sql</code></td><td>Connect to another database</td></tr>
+      <tr><td><code>\dt</code></td><td>List tables in the current schema (<code>\dt+</code> adds sizes)</td></tr>
+      <tr><td><code>\d employees</code></td><td>Describe a table: columns, types, defaults, indexes,
+      constraints</td></tr>
+      <tr><td><code>\dn</code>, <code>\du</code>, <code>\dv</code>, <code>\di</code>, <code>\df</code></td>
+      <td>List schemas, roles (users), views, indexes, functions</td></tr>
+      <tr><td><code>\x auto</code></td><td>Show wide rows vertically when they do not fit</td></tr>
+      <tr><td><code>\pset null '(null)'</code></td><td>Print NULL visibly instead of an empty cell</td></tr>
+      <tr><td><code>\timing</code></td><td>Toggle showing how long each statement takes</td></tr>
+      <tr><td><code>\i file.sql</code></td><td>Run the SQL in a file</td></tr>
+      <tr><td><code>\conninfo</code></td><td>Show which database, user, host and port you are on</td></tr>
+      <tr><td><code>\?</code> and <code>\h SELECT</code></td><td>Help on meta-commands; syntax help for a SQL
+      statement</td></tr>
+      <tr><td><code>\q</code></td><td>Quit</td></tr>
+    </tbody>
+  </table></div>
+  <p>The prompt tells you where you are: <code>learn_sql=#</code> means you are a superuser,
+  <code>learn_sql=&gt;</code> a normal user, and <code>learn_sql-#</code> means psql is still waiting for the
+  rest of a statement (usually a missing semicolon).</p>
+
+  <h4>mysql client basics</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Task</th><th>mysql client</th><th>psql equivalent</th></tr></thead>
+    <tbody>
+      <tr><td>Connect</td><td><code>mysql -h localhost -P 3306 -u root -p</code></td><td><code>psql -h localhost -p 5432 -U postgres</code></td></tr>
+      <tr><td>List databases</td><td><code>SHOW DATABASES;</code></td><td><code>\l</code></td></tr>
+      <tr><td>Switch database</td><td><code>USE learn_sql;</code></td><td><code>\c learn_sql</code></td></tr>
+      <tr><td>List tables</td><td><code>SHOW TABLES;</code></td><td><code>\dt</code></td></tr>
+      <tr><td>Describe a table</td><td><code>DESCRIBE employees;</code> or <code>SHOW CREATE TABLE employees\G</code></td><td><code>\d employees</code></td></tr>
+      <tr><td>Run a file</td><td><code>SOURCE file.sql;</code></td><td><code>\i file.sql</code></td></tr>
+      <tr><td>Quit</td><td><code>exit</code></td><td><code>\q</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Note the capital <code>-P</code> for the port in <code>mysql</code>; lowercase <code>-p</code> means
+  "ask for the password". Ending a statement with <code>\G</code> instead of <code>;</code> prints each row
+  vertically, like psql's <code>\x</code>.</p>
+
+  <h4>Create a database and a user</h4>
+  <p>Do not run your work, or your application, as the superuser. A superuser can drop every database by
+  mistake. Create a normal user that owns one database:</p>
+  <pre data-title="PostgreSQL (run in psql as postgres)"><code class="language-sql">CREATE USER app_user WITH PASSWORD 'change_me';
+CREATE DATABASE learn_sql OWNER app_user;
+
+-- Show timestamps in Indian time for every new session on this database
+ALTER DATABASE learn_sql SET timezone TO 'Asia/Kolkata';</code></pre>
+  <pre data-title="Reconnect as the new user"><code class="language-bash">psql -h localhost -U app_user -d learn_sql</code></pre>
+  <pre data-title="MySQL (run in mysql as root)"><code class="language-sql">CREATE DATABASE learn_sql;
+CREATE USER 'app_user'@'localhost' IDENTIFIED BY 'change_me';
+GRANT ALL PRIVILEGES ON learn_sql.* TO 'app_user'@'localhost';</code></pre>
+  <p>In PostgreSQL, <code>CREATE USER</code> is the same as <code>CREATE ROLE … LOGIN</code>: users and
+  groups are both <strong>roles</strong>. The <code>timezone</code> setting only changes how timestamps are
+  <em>displayed</em> in each session; you will see why that matters in
+  <a href="#m1-date-json-id-types">Dates, times, UUID and JSON types</a>. In MySQL a user is the pair of a
+  name and a host: <code>'app_user'@'localhost'</code> can connect only from the same machine, while
+  <code>'app_user'@'%'</code> can connect from anywhere (needed when MySQL runs in Docker and you connect from
+  the host).</p>
+  <div class="co co-version">
+    <p class="co-t">Version note: PostgreSQL 15 changed the public schema</p>
+    <p>Before PostgreSQL 15, every user could create tables in the <code>public</code> schema of any database
+    they could connect to. From 15 on, only the database owner (and roles it grants) can. That is why the
+    example makes <code>app_user</code> the <code>OWNER</code> of <code>learn_sql</code>. If you see
+    <code>ERROR:  permission denied for schema public</code>, either make the user the owner or run
+    <code>GRANT CREATE ON SCHEMA public TO app_user;</code> as the owner.</p>
+  </div>
+
+  <h4>Connecting from Spring Boot</h4>
+  <p>Your application connects with the same details, written as a JDBC URL:</p>
+  <pre data-title="application.properties"><code class="language-properties"># PostgreSQL (driver dependency: org.postgresql:postgresql)
+spring.datasource.url=jdbc:postgresql://localhost:5432/learn_sql
+spring.datasource.username=app_user
+spring.datasource.password=${DB_PASSWORD}
+
+# MySQL (driver dependency: com.mysql:mysql-connector-j)
+# spring.datasource.url=jdbc:mysql://localhost:3306/learn_sql</code></pre>
+  <p>Keep the password out of the file and read it from an environment variable, as shown. Connection pools,
+  JPA and migrations are in <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common setup problems</p>
+    <ul>
+      <li><b>Nothing happens after Enter in psql:</b> you forgot the <code>;</code>. The prompt shows
+      <code>-#</code>. Type <code>;</code> and press Enter.</li>
+      <li><b>Tables "disappear":</b> you are connected to the default <code>postgres</code> database, not
+      <code>learn_sql</code>. Check with <code>\conninfo</code>.</li>
+      <li><b><code>password authentication failed for user</code>:</b> wrong password, or wrong user name
+      (on Windows, psql defaults to your Windows user name if you leave out <code>-U</code>).</li>
+      <li><b>Port already in use:</b> another PostgreSQL (a second install or a Docker container) holds 5432.
+      Stop one, or map Docker to another port: <code>-p 5433:5432</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Teams usually run the database for local development in Docker (often through a
+    <code>docker-compose.yml</code> or Testcontainers in tests), so everyone uses the same version as
+    production. The application connects with a limited user, and only administrators hold the superuser
+    password.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Setup questions are rare, but you may be asked: the default ports (5432 and 3306), how to describe a
+    table from the command line (<code>\d</code> or <code>DESCRIBE</code>), why an application should not use
+    the superuser (least privilege: a bug or SQL injection then cannot drop the whole database), and what a
+    JDBC URL looks like.</p>
+  </div>
+</article>

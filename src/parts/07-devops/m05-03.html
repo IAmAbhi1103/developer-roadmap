@@ -1,0 +1,537 @@
+<article class="topic" id="m5-rds">
+  <h3>RDS: managed PostgreSQL, private access and the cheap Docker alternative</h3>
+  <p class="tldr">RDS runs PostgreSQL for you (installation, patching, backups, failover); you keep it private
+  by allowing port 5432 only from your EC2 security group, pass the endpoint to Spring Boot through environment
+  variables, and delete it when a lab ends.</p>
+
+  <h4>Why a managed database</h4>
+  <p>Running PostgreSQL yourself means installing it, tuning it, patching it, taking backups, testing restores
+  and planning for a failed disk. <strong>Amazon RDS</strong> (Relational Database Service) does the heavy parts:</p>
+  <ul>
+    <li><strong>Backups:</strong> automatic daily backups plus transaction logs, so you can restore to a point
+    in time within the retention period you set.</li>
+    <li><strong>Patching:</strong> minor engine updates and OS patches in a maintenance window you choose.</li>
+    <li><strong>Multi-AZ:</strong> a standby copy in another availability zone with automatic failover.</li>
+    <li><strong>Monitoring and storage growth:</strong> metrics in CloudWatch and storage that can scale.</li>
+  </ul>
+  <p>You still own the schema, the users, the queries, the indexes and the network rules. RDS is the right
+  default for a real application; the cost is higher than running the database yourself, and the exact price
+  changes, so check the current RDS pricing page and any free-tier offer before you create one.</p>
+
+  <h4>Create an instance (console steps)</h4>
+  <ol class="steps">
+    <li>RDS → Create database → <strong>Standard create</strong> → engine <strong>PostgreSQL</strong>.</li>
+    <li>Pick a template for your purpose (the console offers dev/test or free-tier style templates; read the
+    current descriptions) and a small instance class. Use the same region as your EC2 instance.</li>
+    <li>DB instance identifier <code>shop-db</code>; master username and a long random password (or let RDS keep
+    the password in Secrets Manager).</li>
+    <li>Storage: small is enough; understand whether storage autoscaling is on.</li>
+    <li>Connectivity: the same VPC as your EC2 instance; <strong>Public access: No</strong>; create a new
+    security group <code>shop-db-sg</code>.</li>
+    <li>Additional configuration: initial database name <code>shop</code>; backup retention; Multi-AZ only if
+    you need it (it roughly doubles the cost).</li>
+    <li>Create. After a few minutes, copy the <strong>endpoint</strong>, a DNS name such as
+    <code>shop-db.abc123.ap-south-1.rds.amazonaws.com</code>.</li>
+  </ol>
+
+  <h4>Let only your server in</h4>
+  <p>A security group rule can name another security group as its source. Edit <code>shop-db-sg</code> and add
+  an inbound rule: type PostgreSQL, port 5432, source = the security group of your EC2 instance (for example
+  <code>shop-ec2-sg</code>). Now any instance in that group can connect, whatever its IP, and nobody else can,
+  including you from your laptop.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  I[Internet] -->|"80, 443"| E["EC2 (shop-ec2-sg)"]
+  E -->|"5432 allowed from shop-ec2-sg"| D[("RDS (shop-db-sg)")]
+  I -.->|"blocked"| D
+</pre>
+    <figcaption>The database accepts connections only from the application's security group</figcaption>
+  </figure>
+
+  <h4>Connect and create an application user</h4>
+  <pre data-title="On the EC2 server"><code class="language-shell">$ sudo apt install -y postgresql-client
+$ psql -h shop-db.abc123.ap-south-1.rds.amazonaws.com -U postgres -d shop
+Password for user postgres:
+shop=&gt;</code></pre>
+  <pre data-title="psql"><code class="language-sql">CREATE USER shop_app WITH PASSWORD 'change-me-long-random';
+ALTER DATABASE shop OWNER TO shop_app;   -- simple for a small app; Flyway needs DDL rights</code></pre>
+  <p>Do not run the application as the master user. A dedicated user limits the damage of a bug or a leaked
+  password. If you need to reach the database from your laptop (for a one-time import), use an SSH tunnel
+  through the EC2 server instead of opening 5432 to the world:</p>
+  <pre data-title="Your laptop"><code class="language-shell">$ ssh -i shop-key.pem -N -L 5433:shop-db.abc123.ap-south-1.rds.amazonaws.com:5432 ubuntu@203.0.113.25
+# in another terminal:
+$ psql -h localhost -p 5433 -U shop_app -d shop</code></pre>
+
+  <h4>Connect from Spring Boot</h4>
+  <p>Spring Boot reads the standard properties, and any property can be set by an environment variable (dots
+  become underscores, uppercase). Put the values in the server's <code>.env</code> file:</p>
+  <pre data-title=".env on the server"><code class="language-properties">SPRING_DATASOURCE_URL=jdbc:postgresql://shop-db.abc123.ap-south-1.rds.amazonaws.com:5432/shop?sslmode=require
+SPRING_DATASOURCE_USERNAME=shop_app
+SPRING_DATASOURCE_PASSWORD=change-me-long-random
+SPRING_JPA_HIBERNATE_DDL_AUTO=validate
+SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE=10</code></pre>
+  <p><code>sslmode=require</code> asks the PostgreSQL JDBC driver to encrypt the connection (it does not verify
+  the server certificate; stricter modes need the RDS CA bundle). <code>ddl-auto=validate</code> means Hibernate
+  only checks the schema; create tables with Flyway or Liquibase migrations, never with <code>update</code> in
+  production (see <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>). Limit the Hikari pool: a small
+  RDS instance allows only a limited number of connections, and several app instances each hold a pool.</p>
+
+  <h4>Backups, snapshots and restore</h4>
+  <ul>
+    <li><strong>Automated backups</strong> are on by default with a retention period you set; they enable
+    point-in-time restore.</li>
+    <li><strong>Manual snapshots</strong> are kept until you delete them. Take one before a risky migration.
+    Snapshots use (billed) storage.</li>
+    <li><strong>A restore creates a new instance</strong> with a new endpoint; it does not rewind the old one.
+    You then update <code>SPRING_DATASOURCE_URL</code>. Practise a restore once while nothing depends on it; a
+    backup you have never restored is only a hope.</li>
+    <li>When you delete an instance, the console offers a final snapshot. Automated backups are removed with the
+    instance unless you choose otherwise.</li>
+  </ul>
+
+  <h4>Multi-AZ and read replicas</h4>
+  <p><strong>Multi-AZ</strong> keeps a synchronous standby in another AZ. If the primary fails, RDS flips the
+  endpoint's DNS to the standby, usually within a minute or two. It improves availability, not read speed.
+  A <strong>read replica</strong> is a separate copy used to spread read queries and has its own endpoint; it is
+  for scaling, not failover. Do not confuse the two (a common interview question).</p>
+
+  <h4>The cheap option: PostgreSQL in Docker on the same EC2</h4>
+  <p>For a learning project you can run PostgreSQL as another Compose service and skip the RDS cost:</p>
+  <pre data-title="compose.yaml (add next to api)"><code class="language-yaml">  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: shop
+      POSTGRES_USER: shop_app
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    # no 'ports:' section: only the api container can reach it
+
+volumes:
+  pgdata:</code></pre>
+  <p>The app then uses <code>jdbc:postgresql://postgres:5432/shop</code> (the service name, see
+  <a href="#m3-networks">Docker networks</a>). The risks are real:</p>
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>No extra service cost; simple to start.</li>
+      <li>Fast: same machine, no network hop.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>One disk and one machine: if the instance dies, the data may die with it.</li>
+      <li>No automatic backups, failover or patching; you must do them.</li>
+      <li>The database and the app fight over a small amount of RAM.</li>
+      <li><code>docker compose down -v</code> deletes the data volume.</li>
+    </ul></div>
+  </div>
+  <pre data-title="A minimum backup: nightly pg_dump (run from cron), copied off the server"><code class="language-shell">$ docker compose exec -T postgres pg_dump -U shop_app shop | gzip &gt; /opt/backups/shop-$(date +%F).sql.gz
+$ aws s3 cp /opt/backups/shop-$(date +%F).sql.gz s3://shop-backups-asha/</code></pre>
+  <p>Also take regular EBS snapshots. For anything with real users, use RDS.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Turning on "Public access" and opening 5432 to <code>0.0.0.0/0</code> to "make it work". Bots find it in
+      minutes.</li>
+      <li>Leaving a test RDS instance running for weeks.</li>
+      <li>Using the master user and <code>ddl-auto=create</code> in production.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Errors and what they mean</p>
+    <ul>
+      <li><em>Connection timed out</em> or <code>PSQLException: The connection attempt failed</code> — security
+      group rule missing or wrong source, wrong endpoint, or EC2 in a different VPC.</li>
+      <li><em>password authentication failed for user</em> — wrong password or user; special characters in a
+      password inside a URL need escaping (put credentials in separate variables as above).</li>
+      <li><em>too many connections</em> — pool sizes times app instances exceed the database limit.</li>
+      <li>After the instance was stopped: RDS can be stopped for a limited time and then restarts by itself, so a
+      "stopped" database may begin billing again.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Why use RDS instead of installing PostgreSQL on EC2?"</p>
+    <ul>
+      <li>Managed backups with point-in-time restore, patching, Multi-AZ failover, monitoring; less operational
+      risk. Cost: higher price and less OS-level control.</li>
+      <li>Security: private subnet or no public access, access only from the app's security group.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-s3">
+  <h3>S3: buckets, objects, safe access and presigned URLs</h3>
+  <p class="tldr">S3 stores files as objects in buckets; keep buckets private with Block Public Access, let your
+  app reach them through an IAM role, and let browsers upload or download directly using short-lived presigned
+  URLs.</p>
+
+  <h4>Buckets and objects</h4>
+  <p><strong>S3</strong> (Simple Storage Service) is object storage: you put whole files in and get whole files
+  out over HTTP. A <strong>bucket</strong> is a top-level container, and its name is unique across all AWS
+  accounts (lowercase letters, digits, hyphens). An <strong>object</strong> is a file plus metadata, found by its
+  <strong>key</strong>, for example <code>products/42/photo.jpg</code>. S3 has no real folders; the slashes are
+  just part of the key, and the console shows them as folders using the prefix. S3 is very durable and scales
+  without limit, but it is not a file system: you cannot append to an object or edit part of it, only replace
+  it. Typical uses: user uploads, invoices and PDFs, images, backups, static websites and build artefacts.</p>
+
+  <h4>Storage classes (brief)</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Class</th><th>Meant for</th></tr></thead>
+    <tbody>
+      <tr><td>Standard</td><td>Frequently accessed data (the default)</td></tr>
+      <tr><td>Intelligent-Tiering</td><td>Unknown or changing access patterns; S3 moves objects automatically</td></tr>
+      <tr><td>Standard-IA / One Zone-IA</td><td>Rarely accessed but needs quick access; cheaper storage, retrieval fee</td></tr>
+      <tr><td>Glacier classes</td><td>Archives and compliance data; retrieval takes minutes to hours</td></tr>
+    </tbody>
+  </table></div>
+  <p>A <strong>lifecycle rule</strong> moves or deletes objects automatically, for example "delete temp uploads
+  after 7 days" or "move logs to an archive class after 30 days". Costs depend on class, requests and data
+  transfer; check current pricing.</p>
+
+  <h4>Keep it private</h4>
+  <ul>
+    <li><strong>Block Public Access</strong> is on by default for new buckets. Leave it on. Public buckets are
+    behind many data leaks.</li>
+    <li>Access is decided by IAM policies (what a user or role may do) and optionally a bucket policy. Your app
+    gets access through an <a href="#m5-iam">instance role</a>, not through keys in the code.</li>
+    <li>Enable default encryption (new buckets already encrypt objects at rest) and consider versioning to
+    recover from accidental overwrites.</li>
+  </ul>
+
+  <h4>Uploading from Spring Boot (AWS SDK for Java v2)</h4>
+  <p>Add the SDK's BOM (bill of materials, which keeps module versions aligned) and the <code>s3</code> module.
+  Use the latest 2.x version shown on the SDK's documentation page for the property below.</p>
+  <pre data-title="pom.xml (fragment)"><code class="language-xml">&lt;dependencyManagement&gt;
+  &lt;dependencies&gt;
+    &lt;dependency&gt;
+      &lt;groupId&gt;software.amazon.awssdk&lt;/groupId&gt;
+      &lt;artifactId&gt;bom&lt;/artifactId&gt;
+      &lt;version&gt;${aws.sdk.version}&lt;/version&gt;
+      &lt;type&gt;pom&lt;/type&gt;
+      &lt;scope&gt;import&lt;/scope&gt;
+    &lt;/dependency&gt;
+  &lt;/dependencies&gt;
+&lt;/dependencyManagement&gt;
+
+&lt;dependencies&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;software.amazon.awssdk&lt;/groupId&gt;
+    &lt;artifactId&gt;s3&lt;/artifactId&gt;
+  &lt;/dependency&gt;
+&lt;/dependencies&gt;</code></pre>
+  <pre data-title="AwsConfig.java"><code class="language-java">@Configuration
+public class AwsConfig {
+
+    @Bean
+    S3Client s3Client(@Value("${app.aws.region}") String region) {
+        // No keys here: the SDK finds credentials by itself (env, profile, or the EC2 role)
+        return S3Client.builder().region(Region.of(region)).build();
+    }
+
+    @Bean
+    S3Presigner s3Presigner(@Value("${app.aws.region}") String region) {
+        return S3Presigner.builder().region(Region.of(region)).build();
+    }
+}</code></pre>
+  <pre data-title="FileStorageService.java"><code class="language-java">@Service
+public class FileStorageService {
+
+    public record UploadTicket(String key, String url) { }
+
+    private final S3Client s3;
+    private final S3Presigner presigner;
+    private final String bucket;
+
+    public FileStorageService(S3Client s3, S3Presigner presigner,
+                              @Value("${app.aws.bucket}") String bucket) {
+        this.s3 = s3;
+        this.presigner = presigner;
+        this.bucket = bucket;
+    }
+
+    /** Server-side upload: the file passes through your app. Fine for small files. */
+    public String upload(MultipartFile file) throws IOException {
+        String key = "uploads/" + UUID.randomUUID();      // never trust the user's file name
+        PutObjectRequest request = PutObjectRequest.builder()
+                .bucket(bucket).key(key).contentType(file.getContentType()).build();
+        s3.putObject(request, RequestBody.fromInputStream(file.getInputStream(), file.getSize()));
+        return key;
+    }
+
+    /** A link the browser can use to download one private object for 10 minutes. */
+    public String downloadUrl(String key) {
+        GetObjectRequest get = GetObjectRequest.builder().bucket(bucket).key(key).build();
+        GetObjectPresignRequest presign = GetObjectPresignRequest.builder()
+                .signatureDuration(Duration.ofMinutes(10)).getObjectRequest(get).build();
+        return presigner.presignGetObject(presign).url().toString();
+    }
+
+    /** A link the browser can use to upload one object directly to S3. */
+    public UploadTicket uploadTicket(String contentType) {
+        String key = "uploads/" + UUID.randomUUID();
+        PutObjectRequest put = PutObjectRequest.builder()
+                .bucket(bucket).key(key).contentType(contentType).build();
+        PutObjectPresignRequest presign = PutObjectPresignRequest.builder()
+                .signatureDuration(Duration.ofMinutes(10)).putObjectRequest(put).build();
+        return new UploadTicket(key, presigner.presignPutObject(presign).url().toString());
+    }
+}</code></pre>
+
+  <h4>Presigned URLs</h4>
+  <p>A <strong>presigned URL</strong> is a normal S3 URL with a signature in its query string, created by your
+  server using its credentials. Whoever holds the URL can perform <em>that one operation on that one object</em>
+  until it expires, with no AWS account. This lets the browser talk to S3 directly, so a 200 MB video does not
+  pass through your Spring Boot server.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant B as Browser (React)
+  participant API as Spring Boot
+  participant S as S3
+  B->>API: POST /files/upload-url (contentType)
+  API->>API: check login, build key, presign PUT
+  API-->>B: key + presigned URL
+  B->>S: PUT file to the URL
+  S-->>B: 200 OK
+  B->>API: POST /files (key) - save the key in the database
+</pre>
+    <figcaption>Direct browser upload with a presigned PUT URL</figcaption>
+  </figure>
+  <pre data-title="React: upload to the presigned URL"><code class="language-javascript">async function uploadFile(file) {
+  const res = await fetch("/api/files/upload-url", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contentType: file.type }),
+  });
+  const { key, url } = await res.json();
+
+  // The Content-Type here must match the one that was signed
+  const put = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": file.type },
+    body: file,
+  });
+  if (!put.ok) throw new Error("Upload failed: " + put.status);
+  return key;
+}</code></pre>
+  <p>The browser calls S3 from your site's origin, so the bucket needs a <strong>CORS</strong> configuration
+  (Bucket → Permissions → Cross-origin resource sharing). Restrict it to your real origins:</p>
+  <pre data-title="Bucket CORS configuration (JSON)"><code class="language-json">[
+  {
+    "AllowedOrigins": ["https://shop.example.com", "http://localhost:5173"],
+    "AllowedMethods": ["GET", "PUT"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3000
+  }
+]</code></pre>
+
+  <h4>Serving a React build from S3 and CloudFront (brief)</h4>
+  <p>S3 can hold the static files of a React app, and <strong>CloudFront</strong> (AWS's CDN) serves them over
+  HTTPS from locations near the user. Keep the bucket private and give CloudFront access with an
+  <strong>Origin Access Control</strong>.</p>
+  <ol class="steps">
+    <li>Build: <code>npm run build</code> creates <code>dist/</code>.</li>
+    <li>Upload: <code>aws s3 sync dist/ s3://shop-web-asha --delete</code>.</li>
+    <li>Create a CloudFront distribution with the bucket as origin, default root object
+    <code>index.html</code>.</li>
+    <li>For client-side routing, add custom error responses that return <code>/index.html</code> with status 200
+    for 403 and 404.</li>
+    <li>For a custom domain, request a certificate in AWS Certificate Manager (CloudFront needs it in
+    <code>us-east-1</code>) and add the domain to the distribution.</li>
+    <li>After each deploy: <code>aws cloudfront create-invalidation --distribution-id EXXXX --paths "/*"</code>
+    so users do not see old files.</li>
+  </ol>
+  <p>This is fine, but Vercel or Netlify do the same with far less setup (see
+  <a href="#m5-paas-frontend">Vercel and Netlify</a>).</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Making the bucket public so "the images load". Use presigned GET URLs, or CloudFront.</li>
+      <li>Putting AWS keys in the React code to upload directly. Everything in the browser is public; use a
+      presigned URL.</li>
+      <li>Using the original file name as the key (path tricks, clashes, personal data). Generate the key.</li>
+      <li>Very long expiry times on presigned URLs. Use minutes.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and errors</p>
+    <ul>
+      <li>A presigned URL made with temporary role credentials stops working when those credentials expire,
+      even if you asked for a longer time.</li>
+      <li><em>SignatureDoesNotMatch</em> on a PUT — the browser sent a different Content-Type (or signed
+      header) than the one signed.</li>
+      <li><code>S3Exception</code> with status 403 <em>AccessDenied</em> — the role lacks the permission, or
+      the bucket policy denies it; 404 <code>NoSuchKeyException</code> — wrong key; <code>NoSuchBucket</code> —
+      wrong name or region.</li>
+      <li><code>SdkClientException: Unable to load credentials</code> — no role, profile or environment
+      credentials on this machine.</li>
+      <li>CORS errors appear in the browser console, not in your Java logs.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How would you let users upload a large file securely?"</p>
+    <ul>
+      <li>The API authenticates the user and returns a short-lived presigned PUT URL for a generated key; the
+      browser uploads directly to a private bucket (with CORS); the API then stores the key in the database.
+      Limit type and size, and scan if needed.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-iam">
+  <h3>IAM: users, roles, policies, least privilege and instance roles</h3>
+  <p class="tldr">IAM decides who may do what in AWS: policies (JSON documents) grant actions on resources to
+  users, groups or roles; give every person and application the minimum, and give EC2 a role so no access keys
+  are stored on the server.</p>
+
+  <h4>The building blocks</h4>
+  <dl class="terms">
+    <dt>User</dt><dd>An identity for one person or program, with a password and/or access keys. Long-lived
+    credentials, so use them sparingly.</dd>
+    <dt>Group</dt><dd>A set of users that share permissions ("developers"). Permissions attach to the group, not
+    to each user.</dd>
+    <dt>Role</dt><dd>An identity with <em>no permanent password or key</em> that a trusted entity can
+    <strong>assume</strong> to receive temporary credentials: an EC2 instance, a Lambda function, another AWS
+    account, or a person signing in through Identity Center.</dd>
+    <dt>Policy</dt><dd>A JSON document listing allowed or denied actions on resources. Attached to users, groups
+    and roles (identity policies), or to a resource such as a bucket (resource policy).</dd>
+  </dl>
+  <p>IAM is global, not tied to a region. By default everything is <strong>denied</strong>. A request succeeds
+  only when some policy allows it and no policy explicitly denies it (an explicit <code>Deny</code> always
+  wins).</p>
+
+  <h4>Anatomy of a policy</h4>
+  <pre data-title="shop-s3-access.json: the app may use one bucket and nothing else"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadWriteObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::shop-uploads-asha/*"
+    },
+    {
+      "Sid": "ListTheBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::shop-uploads-asha"
+    }
+  ]
+}</code></pre>
+  <dl class="terms">
+    <dt>Version</dt><dd>The policy language version. Always <code>2012-10-17</code>.</dd>
+    <dt>Statement</dt><dd>One or more rules.</dd>
+    <dt>Effect</dt><dd><code>Allow</code> or <code>Deny</code>.</dd>
+    <dt>Action</dt><dd>The API operation, written <code>service:Operation</code>. Wildcards such as
+    <code>s3:*</code> are allowed but broad.</dd>
+    <dt>Resource</dt><dd>What the action applies to, as an <strong>ARN</strong> (Amazon Resource Name), in the
+    form <code>arn:aws:service:region:account-id:resource</code>. S3 ARNs have no region or account.</dd>
+    <dt>Condition</dt><dd>Optional extra checks, for example the region or source IP.</dd>
+  </dl>
+  <p>Notice the two ARNs. Object actions apply to <code>bucket/*</code> (the objects), while
+  <code>s3:ListBucket</code> applies to the bucket itself, without <code>/*</code>. Mixing them up is the most
+  common S3 policy bug. A condition example, which allows an action only in the Mumbai region:</p>
+  <pre data-title="A Condition block"><code class="language-json">{
+  "Effect": "Allow",
+  "Action": "ec2:*",
+  "Resource": "*",
+  "Condition": {
+    "StringEquals": { "aws:RequestedRegion": "ap-south-1" }
+  }
+}</code></pre>
+  <p>Policies are either <strong>AWS managed</strong> (ready-made, for example
+  <code>AmazonS3ReadOnlyAccess</code>, easy but often broader than needed) or <strong>customer managed</strong>
+  (yours, like the one above), plus <strong>inline</strong> policies embedded in one identity. Prefer customer
+  managed policies for anything real.</p>
+
+  <h4>Least privilege in practice</h4>
+  <ol class="steps">
+    <li>Start with no permissions. Add what the task needs.</li>
+    <li>Name exact resources (one bucket) instead of <code>"Resource": "*"</code>.</li>
+    <li>Name exact actions instead of <code>"Action": "*"</code>.</li>
+    <li>When a call fails with <em>AccessDenied</em>, read the message. It names the action and resource, such as
+    "not authorized to perform: s3:PutObject on resource: arn:aws:s3:::shop-uploads-asha/uploads/x", and tells
+    you exactly what to add.</li>
+    <li>Later, use IAM's "last accessed" information and Access Analyzer to remove unused permissions.</li>
+  </ol>
+
+  <h4>Instance roles: no keys on the server</h4>
+  <p>Your Spring Boot app on EC2 needs to reach S3. The wrong way is to create an access key and paste it into
+  <code>.env</code>. The right way is an <strong>IAM role for EC2</strong>. AWS gives the instance temporary
+  credentials that rotate automatically, and the SDK finds them by itself through the instance metadata service.</p>
+  <ol class="steps">
+    <li>IAM → Roles → Create role → trusted entity: AWS service → EC2.</li>
+    <li>Attach your customer-managed policy (the JSON above). Name the role <code>shop-api-role</code>.</li>
+    <li>EC2 → select the instance → Actions → Security → <strong>Modify IAM role</strong> → choose
+    <code>shop-api-role</code>. (Behind the scenes the role sits in an "instance profile".)</li>
+    <li>Run the app with no <code>AWS_ACCESS_KEY_ID</code> variables. The SDK's default credentials provider
+    chain tries environment variables, then profile files, and finally the instance role.</li>
+  </ol>
+  <p>The role also has a <strong>trust policy</strong>, saying who may assume it. The console writes it for you
+  when you pick EC2:</p>
+  <pre data-title="Trust policy of the role"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "ec2.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}</code></pre>
+  <p>Two policies, two questions: the <em>trust policy</em> answers "who can become this role?" and the
+  <em>permissions policy</em> answers "what can the role do?".</p>
+  <div class="co co-exc">
+    <p class="co-t">Edge case: the role does not work inside a Docker container</p>
+    <p>Recent instances require IMDSv2 with a hop limit of 1, and a request from a container on the default
+    bridge network takes one more hop, so the SDK inside the container may fail with "Unable to load
+    credentials". Raise the hop limit to 2 for the instance:</p>
+    <pre data-title="Your laptop (with permission to modify instances)"><code class="language-shell">$ aws ec2 modify-instance-metadata-options \
+    --instance-id i-0abc123def456789 \
+    --http-tokens required \
+    --http-put-response-hop-limit 2</code></pre>
+  </div>
+  <p>Check which identity the server uses (install the AWS CLI first, or read the app's startup log):</p>
+  <pre class="out" data-title="aws sts get-caller-identity on the EC2 instance"><code class="language-json">{
+    "UserId": "AROAEXAMPLEROLEID:i-0abc123def456789",
+    "Account": "123456789012",
+    "Arn": "arn:aws:sts::123456789012:assumed-role/shop-api-role/i-0abc123def456789"
+}</code></pre>
+
+  <h4>Other tools worth knowing</h4>
+  <ul>
+    <li><strong>MFA</strong> for every human user. <strong>Password policy</strong> for IAM users.</li>
+    <li><strong>Permission boundaries</strong> and <strong>Service Control Policies</strong> (organisation-wide
+    limits) set the maximum permissions; companies with many accounts use them.</li>
+    <li><strong>IAM Identity Center</strong> for staff sign-in with temporary credentials.</li>
+    <li><strong>CloudTrail</strong> records who called which API, which is essential for audits and for
+    investigating incidents.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Attaching <code>AdministratorAccess</code> to the application, "just to make it work".</li>
+      <li>Keys in <code>.env</code> on the server, in the image, or in Git, when a role would do.</li>
+      <li>Sharing one IAM user among several people.</li>
+      <li>Writing <code>s3:ListBucket</code> on <code>bucket/*</code>; it needs the bucket ARN.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Each service has its own role with a small policy; developers sign in through SSO with roles that expire;
+    production access is limited and audited; policies are written as Terraform
+    (<a href="#m6-terraform">Module 6</a>) and reviewed like code.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How does an application on EC2 access S3 securely?"</p>
+    <ul>
+      <li>An IAM role with a least-privilege policy, attached to the instance (instance profile); the SDK uses
+      temporary credentials from the metadata service; nothing is stored on disk.</li>
+      <li>Explain user vs role, trust policy vs permissions policy, default deny and explicit deny.</li>
+    </ul>
+  </div>
+</article>

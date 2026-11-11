@@ -1,0 +1,584 @@
+<article class="topic" id="m6-executors">
+  <h3>Executors and thread pools</h3>
+  <p class="tldr">A thread pool keeps a fixed set of reusable worker threads that take tasks from a queue, so you submit tasks instead of creating threads; ThreadPoolExecutor is the engine behind every factory method in Executors.</p>
+
+  <h4>Why thread pools</h4>
+  <p>Creating a platform thread is expensive (stack memory, operating-system work), and an unlimited number of threads can crash the JVM. A <strong>thread pool</strong> starts a limited number of <strong>worker threads</strong> once and reuses them. You submit <strong>tasks</strong> (<code>Runnable</code> or <code>Callable</code>) and the pool decides which worker runs each. Benefits: lower creation cost, a hard limit on resource use, a queue to absorb bursts, and one place to shut everything down. The <code>Executor</code> interface (one method, <code>execute(Runnable)</code>) separates <em>what</em> to run from <em>how</em> to run it; <code>ExecutorService</code> adds lifecycle and result handling.</p>
+
+  <h4>Factory methods in Executors</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Factory</th><th>Behaviour</th><th>Watch out</th></tr></thead>
+    <tbody>
+      <tr><td><code>newFixedThreadPool(n)</code></td><td>Exactly <code>n</code> workers; extra tasks wait in an unbounded queue</td><td>Queue can grow without limit and exhaust memory</td></tr>
+      <tr><td><code>newCachedThreadPool()</code></td><td>Creates workers as needed, reuses idle ones, removes ones idle for 60 seconds</td><td>Maximum size is effectively unlimited; a burst can create thousands of threads</td></tr>
+      <tr><td><code>newSingleThreadExecutor()</code></td><td>One worker; tasks run one after another in submission order</td><td>Unbounded queue too</td></tr>
+      <tr><td><code>newScheduledThreadPool(n)</code></td><td>Run a task after a delay or repeatedly</td><td>A task that throws stops its own repetition</td></tr>
+      <tr><td><code>newVirtualThreadPerTaskExecutor()</code></td><td>A new <a href="#m6-virtual-threads">virtual thread</a> for every task (Java 21)</td><td>Not a pool; do not limit work by pool size, use a semaphore</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="PoolBasics.java"><code class="language-java">import java.util.concurrent.*;
+
+public class PoolBasics {
+    public static void main(String[] args) {
+        // Java 19+: ExecutorService is AutoCloseable; close() waits for tasks to finish
+        try (ExecutorService pool = Executors.newFixedThreadPool(3)) {
+            for (int i = 1; i &lt;= 5; i++) {
+                int orderId = i;
+                pool.execute(() -&gt; System.out.println(
+                        "Order " + orderId + " on " + Thread.currentThread().getName()));
+            }
+        }   // close(): stops accepting new tasks, waits for the running ones
+        System.out.println("All orders done");
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (one possible run)"><code class="language-plaintext">Order 1 on pool-1-thread-1
+Order 2 on pool-1-thread-2
+Order 3 on pool-1-thread-3
+Order 4 on pool-1-thread-1
+Order 5 on pool-1-thread-2
+All orders done</code></pre>
+  <p>Five tasks, three threads: threads are reused. Before Java 19 you wrote <code>pool.shutdown()</code> plus <code>awaitTermination</code> yourself (see below).</p>
+
+  <h4>ThreadPoolExecutor: the real parameters</h4>
+  <p>Every factory above builds a <code>ThreadPoolExecutor</code>. In production code you often create it directly to control all the knobs:</p>
+  <pre data-title="PoolConfig.java"><code class="language-java">import java.util.concurrent.*;
+
+ThreadPoolExecutor pool = new ThreadPoolExecutor(
+        4,                                   // corePoolSize: threads kept alive
+        8,                                   // maximumPoolSize: upper limit
+        60, TimeUnit.SECONDS,                // keepAliveTime for threads above core
+        new ArrayBlockingQueue&lt;&gt;(100),       // bounded work queue
+        Thread.ofPlatform().name("invoice-", 1).factory(),   // names: invoice-1, ...
+        new ThreadPoolExecutor.CallerRunsPolicy());          // rejection policy</code></pre>
+  <p>Order of events when you submit a task:</p>
+  <ol class="steps">
+    <li>If fewer than <code>corePoolSize</code> workers are running, start a new worker for this task (even if others are idle).</li>
+    <li>Otherwise try to put the task in the work queue.</li>
+    <li>If the queue is full and fewer than <code>maximumPoolSize</code> workers exist, start an extra worker.</li>
+    <li>If the queue is full and the pool is at maximum, the task is <strong>rejected</strong>: the <strong>rejection policy</strong> decides what happens.</li>
+  </ol>
+  <p>Note the surprise: extra threads above the core size are created only when the <em>queue is full</em>. With an unbounded queue (the default for fixed and single pools) step 3 never happens, so <code>maximumPoolSize</code> is ignored and the pool never grows beyond core.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Rejection policy</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>AbortPolicy</code> (default)</td><td>Throws <code>RejectedExecutionException</code></td></tr>
+      <tr><td><code>CallerRunsPolicy</code></td><td>The submitting thread runs the task itself; this slows the producer down (natural back-pressure)</td></tr>
+      <tr><td><code>DiscardPolicy</code></td><td>Silently drops the new task</td></tr>
+      <tr><td><code>DiscardOldestPolicy</code></td><td>Drops the oldest queued task and retries the new one</td></tr>
+    </tbody>
+  </table></div>
+  <p>The same task is also rejected after you call <code>shutdown()</code>.</p>
+
+  <h4>Why unbounded queues are risky</h4>
+  <p>A fixed pool of 10 threads with an unbounded queue never rejects anything. If tasks arrive faster than 10 threads can process them, the queue grows until the JVM dies with <code>OutOfMemoryError</code>, and users wait minutes for responses long before that. A <strong>bounded</strong> queue plus a rejection policy turns overload into a visible, controllable event: return HTTP 429/503, slow the caller, or drop low-value work. Likewise <code>newCachedThreadPool</code> bounds nothing on the thread side. Many style guides therefore say: build <code>ThreadPoolExecutor</code> yourself with a bounded queue.</p>
+
+  <h4>execute vs submit</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>execute(Runnable)</code></th><th><code>submit(...)</code></th></tr></thead>
+    <tbody>
+      <tr><td>Defined in</td><td><code>Executor</code></td><td><code>ExecutorService</code></td></tr>
+      <tr><td>Accepts</td><td><code>Runnable</code> only</td><td><code>Runnable</code> or <code>Callable</code></td></tr>
+      <tr><td>Returns</td><td><code>void</code></td><td>A <code>Future</code></td></tr>
+      <tr><td>Exception in the task</td><td>Goes to the thread's uncaught-exception handler (printed)</td><td>Captured inside the <code>Future</code>; <strong>silent unless you call <code>get()</code></strong></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Shutting down properly</h4>
+  <p>Non-daemon pool threads keep the JVM alive, so a program that forgets to shut down its pool never exits.</p>
+  <ul>
+    <li><code>shutdown()</code> — stop accepting new tasks; already queued and running tasks finish. Returns at once.</li>
+    <li><code>shutdownNow()</code> — stop accepting tasks, try to stop running ones by <em>interrupting</em> them, and return the list of tasks that never started.</li>
+    <li><code>awaitTermination(time, unit)</code> — block until all tasks finish or the time passes; returns <code>true</code> if the pool terminated.</li>
+  </ul>
+  <pre data-title="Graceful shutdown (pre-Java 19 style, still common)"><code class="language-java">pool.shutdown();                                    // no new tasks
+try {
+    if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+        pool.shutdownNow();                         // interrupt stragglers
+        if (!pool.awaitTermination(10, TimeUnit.SECONDS)) {
+            System.err.println("Pool did not terminate");
+        }
+    }
+} catch (InterruptedException e) {
+    pool.shutdownNow();
+    Thread.currentThread().interrupt();
+}</code></pre>
+  <p>Since Java 19, <code>ExecutorService.close()</code> does this "shutdown, then wait" for you, which is why try-with-resources works. If the waiting thread is interrupted, <code>close()</code> calls <code>shutdownNow()</code>.</p>
+
+  <h4>Scheduled tasks</h4>
+  <pre data-title="ScheduledDemo.java"><code class="language-java">ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
+scheduler.schedule(() -&gt; System.out.println("Run once after 1s"), 1, TimeUnit.SECONDS);
+
+// scheduleAtFixedRate: every 5 s measured from start to start
+// scheduleWithFixedDelay: 5 s pause AFTER each run finishes
+scheduler.scheduleWithFixedDelay(
+        () -&gt; System.out.println("Sync inventory"), 0, 5, TimeUnit.SECONDS);
+// ... later: scheduler.shutdown();</code></pre>
+  <p>If a repeating task throws an exception, later runs are cancelled silently. Wrap the body in <code>try/catch</code> and log. In Spring you use <code>@Scheduled</code>, which sits on the same idea.</p>
+
+  <h4>How many threads? Sizing pools</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Work type</th><th>Rule of thumb</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>CPU-bound</td><td>About the number of cores (<code>availableProcessors()</code>) or cores + 1</td><td>Threads are always busy; extra threads only add context switching</td></tr>
+      <tr><td>I/O-bound (blocking)</td><td>cores × (1 + wait time / compute time)</td><td>Threads mostly wait, so more can be productive; measure and tune. Or use virtual threads</td></tr>
+      <tr><td>Mixed</td><td>Separate pools for CPU and I/O work</td><td>A slow I/O task must not starve CPU tasks</td></tr>
+    </tbody>
+  </table></div>
+  <p>Example: 8 cores, each task computes 10 ms and waits 90 ms for the database. Compute-to-wait ratio is 9, so about 8 × (1 + 9) = 80 threads could keep the cores busy. Treat this as a starting point; the database connection pool size is usually the real limit.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Always shut down pools you create (try-with-resources, or <code>shutdown</code> in a lifecycle hook). Pools managed by Spring are closed with the application context.</li>
+      <li>Never block a pool thread waiting for another task in the <em>same</em> pool — with all workers waiting, no one runs the tasks they wait for (pool-induced deadlock).</li>
+      <li>Do not create a new pool per request; create one and reuse it.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Name your threads with a <code>ThreadFactory</code>, so logs and thread dumps are readable (<code>invoice-1</code>, not <code>pool-3-thread-7</code>).</li>
+      <li>Use a bounded queue and an explicit rejection policy for production pools; monitor queue size and active count.</li>
+      <li>Catch and log exceptions inside tasks, so failures are not lost.</li>
+      <li>In Spring Boot, configure a <code>TaskExecutor</code> (e.g. <code>ThreadPoolTaskExecutor</code>) bean rather than building raw pools.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>RejectedExecutionException</code> — pool shut down, or queue and max threads full (with <code>AbortPolicy</code>).</li>
+      <li><code>IllegalArgumentException</code> — e.g. <code>corePoolSize &gt; maximumPoolSize</code> or a non-positive pool size.</li>
+      <li>Core threads are not removed when idle unless <code>allowCoreThreadTimeOut(true)</code>.</li>
+      <li><code>shutdownNow()</code> only <em>interrupts</em>; a task that ignores interrupts keeps running.</li>
+      <li>Thread-local data of a pool thread survives between tasks (see <a href="#m6-threadlocal">ThreadLocal</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using Executors.newFixedThreadPool for unbounded traffic</p>
+    <p>"It never throws" is the problem, not the benefit. Under overload it hides the failure until memory runs out. Size the queue.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain ThreadPoolExecutor parameters and what happens when a task is submitted"</p>
+    <ul>
+      <li>Core size, max size, keep-alive, work queue, thread factory, rejection handler.</li>
+      <li>Order: core threads first, then the queue, then extra threads up to max, then rejection.</li>
+      <li>Unbounded queue means max size is never used and memory can run out.</li>
+      <li><code>execute</code> vs <code>submit</code>; <code>shutdown</code> vs <code>shutdownNow</code>.</li>
+      <li>Sizing: CPU-bound ≈ cores; I/O-bound larger, or virtual threads.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-callable-future">
+  <h3>Callable, Future and invokeAll</h3>
+  <p class="tldr">Callable is a task that returns a value and may throw a checked exception; submitting it to an executor gives you a Future, a handle you use to wait for the result, set a timeout or cancel.</p>
+
+  <p><code>Runnable.run()</code> returns nothing and cannot throw checked exceptions. When a task must give back a result, such as a price lookup, use <code>Callable&lt;V&gt;</code>.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>Runnable</code></th><th><code>Callable&lt;V&gt;</code></th></tr></thead>
+    <tbody>
+      <tr><td>Method</td><td><code>void run()</code></td><td><code>V call() throws Exception</code></td></tr>
+      <tr><td>Returns a result</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Checked exceptions</td><td>Cannot throw</td><td>Can throw</td></tr>
+      <tr><td>Package</td><td><code>java.lang</code> (Java 1.0)</td><td><code>java.util.concurrent</code> (Java 5)</td></tr>
+      <tr><td>Can be given to <code>new Thread</code></td><td>Yes</td><td>No (use an executor or <code>FutureTask</code>)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Future</h4>
+  <p>A <code>Future&lt;V&gt;</code> represents a result that may not exist yet.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>get()</code></td><td>Block until done; return the value or throw</td></tr>
+      <tr><td><code>get(time, unit)</code></td><td>Same, but throws <code>TimeoutException</code> if too slow</td></tr>
+      <tr><td><code>isDone()</code></td><td><code>true</code> when finished, failed or cancelled; does not block</td></tr>
+      <tr><td><code>cancel(mayInterrupt)</code></td><td>Try to cancel; with <code>true</code> the running thread is interrupted</td></tr>
+      <tr><td><code>isCancelled()</code></td><td>Was it cancelled before completion?</td></tr>
+      <tr><td><code>resultNow()</code>, <code>exceptionNow()</code>, <code>state()</code></td><td>Added in Java 19: read the result of a finished future without blocking or checked exceptions</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="FutureDemo.java"><code class="language-java">import java.util.concurrent.*;
+
+public class FutureDemo {
+    static int fetchPrice(String sku) throws InterruptedException {
+        Thread.sleep(500);                  // pretend this is a remote call
+        return sku.length() * 100;
+    }
+
+    public static void main(String[] args) throws Exception {
+        try (ExecutorService pool = Executors.newFixedThreadPool(2)) {
+            Future&lt;Integer&gt; f1 = pool.submit(() -&gt; fetchPrice("PHONE"));
+            Future&lt;Integer&gt; f2 = pool.submit(() -&gt; fetchPrice("CASE"));
+
+            System.out.println("Submitted; main is free to do other work");
+            System.out.println("Phone: " + f1.get());   // blocks until ready
+            System.out.println("Case : " + f2.get());
+
+            Future&lt;Integer&gt; slow = pool.submit(() -&gt; { Thread.sleep(5000); return 1; });
+            try {
+                slow.get(1, TimeUnit.SECONDS);
+            } catch (TimeoutException e) {
+                System.out.println("Too slow, cancelling");
+                slow.cancel(true);          // interrupts the sleeping task
+            }
+            System.out.println("cancelled=" + slow.isCancelled());
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Submitted; main is free to do other work
+Phone: 500
+Case : 400
+Too slow, cancelling
+cancelled=true</code></pre>
+  <p>Both prices were fetched in parallel, so the total wait was about 500 ms, not 1,000 ms. A lambda that returns a value becomes a <code>Callable</code>; one that returns nothing becomes a <code>Runnable</code>. If the compiler cannot tell (a lambda that just calls a method returning a value), cast or use a block with <code>return</code>.</p>
+
+  <h4>Exceptions in tasks: ExecutionException</h4>
+  <p>An exception thrown inside a submitted task is caught by the executor and stored in the Future. It reappears when you call <code>get()</code>, wrapped in <code>ExecutionException</code>; the real cause is <code>e.getCause()</code>.</p>
+  <pre data-title="Exception inside a task"><code class="language-java">Future&lt;Integer&gt; f = pool.submit(() -&gt; { throw new IllegalStateException("gateway down"); });
+try {
+    f.get();
+} catch (ExecutionException e) {
+    System.out.println("Task failed: " + e.getCause());   // the original exception
+} catch (InterruptedException e) {
+    Thread.currentThread().interrupt();
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Task failed: java.lang.IllegalStateException: gateway down</code></pre>
+
+  <h4>invokeAll and invokeAny</h4>
+  <ul>
+    <li><code>invokeAll(tasks)</code> runs a collection of <code>Callable</code>s and <strong>waits for all</strong> to finish; it returns a list of Futures in the same order as the tasks.</li>
+    <li><code>invokeAny(tasks)</code> returns the result of <strong>one task that completed successfully</strong> (usually the fastest) and cancels the rest. Use it for "ask three mirrors, use the first answer".</li>
+  </ul>
+  <pre data-title="InvokeAllDemo.java"><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+
+public class InvokeAllDemo {
+    public static void main(String[] args) throws Exception {
+        List&lt;Callable&lt;String&gt;&gt; calls = List.of(
+                () -&gt; "inventory ok",
+                () -&gt; "payment ok",
+                () -&gt; "address ok");
+
+        try (ExecutorService pool = Executors.newFixedThreadPool(3)) {
+            for (Future&lt;String&gt; f : pool.invokeAll(calls)) {   // waits for all
+                System.out.println(f.get());
+            }
+            System.out.println("First finisher: " + pool.invokeAny(calls));
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (invokeAny result can vary)"><code class="language-plaintext">inventory ok
+payment ok
+address ok
+First finisher: inventory ok</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li><code>Future.get()</code> blocks the calling thread. Use the timeout version when the caller must stay responsive.</li>
+      <li>Always handle <code>InterruptedException</code> (restore the flag) and <code>ExecutionException</code> (look at the cause).</li>
+      <li>Cancelling a task with <code>cancel(true)</code> only works if the task responds to interruption.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>ExecutionException</code> — the task threw. <code>TimeoutException</code> — <code>get(time)</code> ran out of time (the task keeps running unless cancelled). <code>CancellationException</code> — <code>get()</code> on a cancelled future (unchecked). <code>InterruptedException</code> — the <em>waiting</em> thread was interrupted.</li>
+      <li>A submitted <code>Runnable</code> that throws is <strong>silent</strong> unless somebody calls <code>get()</code> — a common source of "my background job never runs and nothing is logged".</li>
+      <li><code>Future</code> cannot be chained or combined and cannot be completed by hand. That is why <a href="#m6-completablefuture">CompletableFuture</a> exists.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: calling get() right after submit in a loop</p>
+    <p>Submitting a task and immediately calling <code>get()</code> makes the work sequential. First submit all tasks, collect the futures, then call <code>get()</code> on each (as in the example above), or use <code>invokeAll</code>.</p>
+  </div>
+
+  <h4 id="m6-callable-future-submit">The submit and execute overloads</h4>
+  <p>An <code>ExecutorService</code> gives you several ways to hand over work, and the difference matters for results and errors.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Call</th><th>Returns</th><th>If the task throws</th></tr></thead>
+    <tbody>
+      <tr><td><code>execute(Runnable)</code></td><td>Nothing</td><td>Exception goes to the thread's uncaught-exception handler (printed on stderr)</td></tr>
+      <tr><td><code>submit(Runnable)</code></td><td><code>Future&lt;?&gt;</code>; <code>get()</code> gives <code>null</code></td><td>Stored in the Future; silent until <code>get()</code></td></tr>
+      <tr><td><code>submit(Runnable, T result)</code></td><td><code>Future&lt;T&gt;</code> with the fixed result you passed</td><td>Stored in the Future</td></tr>
+      <tr><td><code>submit(Callable&lt;V&gt;)</code></td><td><code>Future&lt;V&gt;</code></td><td>Stored; <code>get()</code> throws <code>ExecutionException</code></td></tr>
+      <tr><td><code>invokeAll(tasks)</code></td><td><code>List&lt;Future&lt;V&gt;&gt;</code>, all finished</td><td>Stored per task</td></tr>
+      <tr><td><code>invokeAny(tasks)</code></td><td>One value <code>V</code></td><td>Failures are ignored while another task can still succeed</td></tr>
+    </tbody>
+  </table></div>
+  <p>The executor itself and its thread lifecycle are explained in <a href="#m6-executors">Executors and thread pools</a>; here we focus on the results.</p>
+
+  <h4>How a Future works inside: FutureTask</h4>
+  <p>When you submit a <code>Callable</code>, the executor wraps it in a <code>FutureTask</code>. A <code>FutureTask</code> is both a <code>Runnable</code> (the pool thread runs it) and a <code>Future</code> (you wait on it). It stores the outcome — a value or an exception — and wakes everyone blocked in <code>get()</code> when the task completes. You can use it without a pool too, which is the way to give a <code>Callable</code> to a plain <code>Thread</code>:</p>
+  <pre data-title="FutureTaskDemo.java"><code class="language-java">FutureTask&lt;String&gt; task = new FutureTask&lt;&gt;(() -&gt; "report ready");
+new Thread(task, "report-thread").start();
+System.out.println(task.get());          // report ready  (blocks until done)
+System.out.println(task.isDone());       // true</code></pre>
+
+  <h4>The life of a Future</h4>
+  <p>A Future ends in exactly one of three ways, and since Java 19 you can ask which with <code>future.state()</code>, which returns <code>Future.State</code>: <code>RUNNING</code>, <code>SUCCESS</code>, <code>FAILED</code> or <code>CANCELLED</code>.</p>
+  <ul>
+    <li><strong>Completed normally</strong>: <code>get()</code> returns the value.</li>
+    <li><strong>Failed</strong>: <code>get()</code> throws <code>ExecutionException</code> with the original exception as the cause.</li>
+    <li><strong>Cancelled</strong>: <code>get()</code> throws <code>CancellationException</code>. <code>isDone()</code> is also <code>true</code> after a cancel.</li>
+  </ul>
+  <p><code>cancel(false)</code> only stops a task that has not started yet; a running task finishes normally. <code>cancel(true)</code> also interrupts the running thread, but the task must <em>check</em> for interruption (blocking calls like <code>sleep</code> do; a tight CPU loop does not unless it tests <code>Thread.currentThread().isInterrupted()</code>). <code>cancel</code> returns <code>false</code> if the task had already finished.</p>
+
+  <h4>invokeAll with a failing task and a time limit</h4>
+  <pre data-title="InvokeAllFailure.java"><code class="language-java">List&lt;Callable&lt;String&gt;&gt; calls = List.of(
+        () -&gt; "stock: 12",
+        () -&gt; { throw new IllegalStateException("price service down"); },
+        () -&gt; { Thread.sleep(3000); return "reviews: 4.5"; });
+
+try (ExecutorService pool = Executors.newFixedThreadPool(3)) {
+    List&lt;Future&lt;String&gt;&gt; results = pool.invokeAll(calls, 1, TimeUnit.SECONDS);
+    for (Future&lt;String&gt; f : results) {
+        try {
+            System.out.println("OK    " + f.get());
+        } catch (ExecutionException e) {
+            System.out.println("FAIL  " + e.getCause().getMessage());
+        } catch (CancellationException e) {
+            System.out.println("LATE  cancelled after the time limit");
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">OK    stock: 12
+FAIL  price service down
+LATE  cancelled after the time limit</code></pre>
+  <p>The timed <code>invokeAll</code> cancels every task that is not finished when the time is up. The returned futures are all in a done state, so <code>get()</code> never blocks here. Plain <code>invokeAll</code> never throws because a <em>task</em> failed; each failure waits in its own Future. <code>invokeAny</code> throws <code>ExecutionException</code> only if <em>every</em> task fails.</p>
+
+  <h4>Java 21: one cheap thread per task</h4>
+  <p>Because <code>Callable</code> tasks are mostly blocking calls (HTTP, database), they suit <a href="#m6-virtual-threads">virtual threads</a>. <code>Executors.newVirtualThreadPerTaskExecutor()</code> gives a new virtual thread per submitted task, so you can run thousands of blocking <code>Callable</code>s with the same <code>submit</code>/<code>get</code> code and no pool-size tuning.</p>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: sequential, because get() is called inside the loop</p><pre><code class="language-java">List&lt;Integer&gt; prices = new ArrayList&lt;&gt;();
+for (String sku : skus) {
+    prices.add(pool.submit(() -&gt; fetchPrice(sku)).get());   // waits every time
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: submit all first, then collect</p><pre><code class="language-java">List&lt;Future&lt;Integer&gt;&gt; futures = new ArrayList&lt;&gt;();
+for (String sku : skus) {
+    futures.add(pool.submit(() -&gt; fetchPrice(sku)));
+}
+List&lt;Integer&gt; prices = new ArrayList&lt;&gt;();
+for (Future&lt;Integer&gt; f : futures) {
+    prices.add(f.get());
+}</code></pre></div>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">More mistakes</p>
+    <ul>
+      <li>Catching <code>Exception</code> around <code>get()</code> and printing <code>e.getMessage()</code>. For an <code>ExecutionException</code> that message is just the wrapper's text; log <code>e.getCause()</code>.</li>
+      <li>Using <code>submit</code> for fire-and-forget work and never calling <code>get()</code>. Errors vanish. Use <code>execute</code> with a handler, or log inside the task.</li>
+      <li>Swallowing <code>InterruptedException</code> around <code>get()</code> with an empty catch. Restore the flag with <code>Thread.currentThread().interrupt()</code>.</li>
+      <li>Forgetting to shut the executor down (or to use try-with-resources on Java 19+), which keeps the JVM alive.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Always call the timed <code>get(timeout, unit)</code> on calls that leave your process, and decide what a timeout means (default value, retry or error).</li>
+      <li>Keep tasks independent and side-effect free where you can; then <code>invokeAll</code> is easy to reason about.</li>
+      <li>Prefer <code>CompletableFuture</code> for pipelines (call A, then B, then combine); use plain <code>Future</code> for "run these N things and collect the answers".</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>A typical use is a product page that needs price, stock and reviews from three internal services. Submit three <code>Callable</code>s, wait with a 500 ms limit each, and show the page with a default for any part that failed. The same shape is used for fan-out searches, batch file parsing and report generation. Note that Spring's <code>@Async</code> methods return <code>CompletableFuture</code>, which implements <code>Future</code> too.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Runnable vs Callable", "What is a Future? What does get() throw?"</p>
+    <ul>
+      <li>Callable returns a value and may throw checked exceptions; Runnable does neither.</li>
+      <li>Future is a handle to an async result: <code>get</code>, <code>get(timeout)</code>, <code>cancel</code>, <code>isDone</code>.</li>
+      <li><code>get()</code> throws <code>ExecutionException</code> (wrap of the real error), <code>InterruptedException</code>, and <code>TimeoutException</code> in the timed version.</li>
+      <li>Limits of Future: blocking, no chaining, no callbacks — solved by <code>CompletableFuture</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-completablefuture">
+  <h3>CompletableFuture: async pipelines</h3>
+  <p class="tldr">CompletableFuture lets you start async work, chain steps on its result without blocking, combine several futures, and handle errors in the same pipeline.</p>
+
+  <p>A plain <code>Future</code> makes you wait. <code>CompletableFuture&lt;T&gt;</code> (Java 8) implements <code>Future</code> and also <code>CompletionStage</code>: you attach <strong>callbacks</strong> that run when the result arrives, like a stream pipeline for asynchronous values. It can also be completed by hand with <code>complete(value)</code> or <code>completeExceptionally(ex)</code>.</p>
+
+  <h4>Starting a task</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td><code>supplyAsync(Supplier)</code></td><td>Run async and produce a value</td></tr>
+      <tr><td><code>runAsync(Runnable)</code></td><td>Run async, no value (<code>CompletableFuture&lt;Void&gt;</code>)</td></tr>
+      <tr><td><code>completedFuture(value)</code></td><td>An already-finished future (useful in tests)</td></tr>
+      <tr><td><code>new CompletableFuture&lt;&gt;()</code></td><td>An empty future you complete yourself</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Transforming and chaining</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Takes</th><th>Meaning (like in streams / Optional)</th></tr></thead>
+    <tbody>
+      <tr><td><code>thenApply(fn)</code></td><td><code>T → U</code></td><td><code>map</code>: transform the result</td></tr>
+      <tr><td><code>thenAccept(consumer)</code></td><td><code>T → void</code></td><td>Use the result, return <code>CompletableFuture&lt;Void&gt;</code></td></tr>
+      <tr><td><code>thenRun(runnable)</code></td><td>nothing</td><td>Run something after, ignore the result</td></tr>
+      <tr><td><code>thenCompose(fn)</code></td><td><code>T → CompletableFuture&lt;U&gt;</code></td><td><code>flatMap</code>: the next step is itself async</td></tr>
+      <tr><td><code>thenCombine(other, bifn)</code></td><td><code>(T, U) → V</code></td><td>Wait for two independent futures, then merge</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>thenApply</code> vs <code>thenCompose</code>: if your function returns a plain value, use <code>thenApply</code>. If it returns another <code>CompletableFuture</code> (it calls another async service), use <code>thenCompose</code>; <code>thenApply</code> would give you a nested <code>CompletableFuture&lt;CompletableFuture&lt;U&gt;&gt;</code>. It is the same difference as <code>map</code> vs <code>flatMap</code> in <a href="#m5">streams</a>.</p>
+  <pre data-title="ChainDemo.java"><code class="language-java">import java.util.concurrent.CompletableFuture;
+
+public class ChainDemo {
+    static CompletableFuture&lt;String&gt; findUserId(String email) {
+        return CompletableFuture.supplyAsync(() -&gt; "U-" + email.length());
+    }
+    static CompletableFuture&lt;Integer&gt; loadCartTotal(String userId) {
+        return CompletableFuture.supplyAsync(() -&gt; 1499);
+    }
+
+    public static void main(String[] args) {
+        CompletableFuture&lt;String&gt; message =
+                findUserId("asha@mail.in")                    // step 1: async
+                .thenCompose(ChainDemo::loadCartTotal)        // step 2: async, needs step 1
+                .thenApply(total -&gt; total * 118 / 100)        // step 3: plain function (GST)
+                .thenApply(total -&gt; "Pay Rs " + total);       // step 4: format
+
+        System.out.println(message.join());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Pay Rs 1768</code></pre>
+
+  <h4>Combining many futures</h4>
+  <ul>
+    <li><code>thenCombine</code> — two futures into one value.</li>
+    <li><code>CompletableFuture.allOf(f1, f2, f3)</code> — returns <code>CompletableFuture&lt;Void&gt;</code> that completes when <strong>all</strong> are done; read each result with <code>join()</code> afterwards.</li>
+    <li><code>CompletableFuture.anyOf(f1, f2)</code> — completes when <strong>the first</strong> one completes; returns <code>CompletableFuture&lt;Object&gt;</code>.</li>
+  </ul>
+
+  <h4>Realistic example: three services in parallel</h4>
+  <p>A product page needs price, stock and reviews from three services, each taking about 300 ms. Sequential calls cost about 900 ms; in parallel about 300 ms.</p>
+  <pre data-title="ProductPage.java"><code class="language-java">import java.util.concurrent.*;
+
+public class ProductPage {
+    record Page(String price, String stock, String reviews) { }
+
+    static String slow(String what, String value) {
+        try { Thread.sleep(300); } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted calling " + what);
+        }
+        return value;
+    }
+
+    public static void main(String[] args) {
+        try (ExecutorService io = Executors.newFixedThreadPool(10)) {   // our own pool
+            long start = System.currentTimeMillis();
+
+            var price   = CompletableFuture.supplyAsync(() -&gt; slow("price", "Rs 999"), io);
+            var stock   = CompletableFuture.supplyAsync(() -&gt; slow("stock", "In stock"), io);
+            var reviews = CompletableFuture.supplyAsync(() -&gt; slow("reviews", "4.3 stars"), io)
+                    .orTimeout(1, TimeUnit.SECONDS)                    // Java 9+
+                    .exceptionally(ex -&gt; "reviews unavailable");       // fallback
+
+            Page page = CompletableFuture.allOf(price, stock, reviews)
+                    .thenApply(v -&gt; new Page(price.join(), stock.join(), reviews.join()))
+                    .join();
+
+            System.out.println(page);
+            System.out.println("took ~" + (System.currentTimeMillis() - start) / 100 * 100
+                    + " ms");
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (time varies a little)"><code class="language-plaintext">Page[price=Rs 999, stock=In stock, reviews=4.3 stars]
+took ~300 ms</code></pre>
+
+  <h4>Error handling</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Runs when</th><th>Can change the result?</th></tr></thead>
+    <tbody>
+      <tr><td><code>exceptionally(ex → value)</code></td><td>Only on failure</td><td>Yes: supplies a fallback value</td></tr>
+      <tr><td><code>handle((value, ex) → result)</code></td><td>Always (success or failure)</td><td>Yes: you produce the new result</td></tr>
+      <tr><td><code>whenComplete((value, ex) → void)</code></td><td>Always</td><td>No: for logging; the original result or failure passes through</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="ErrorDemo.java"><code class="language-java">CompletableFuture&lt;Integer&gt; risky = CompletableFuture.supplyAsync(() -&gt; {
+    if (true) throw new IllegalStateException("bank timeout");
+    return 100;
+});
+
+System.out.println(risky.exceptionally(ex -&gt; -1).join());
+System.out.println(risky.handle((v, ex) -&gt; ex == null ? "ok " + v
+        : "failed: " + ex.getClass().getSimpleName() + " / "
+          + ex.getCause().getMessage()).join());
+risky.whenComplete((v, ex) -&gt; System.out.println("logged, ex=" + (ex != null)));
+risky.join();   // still throws</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">-1
+failed: CompletionException / bank timeout
+logged, ex=true
+Exception in thread "main" java.util.concurrent.CompletionException: java.lang.IllegalStateException: bank timeout</code></pre>
+  <p>Note the wrapping: inside <code>handle</code> on a later stage, the exception arrives wrapped in <code>CompletionException</code> with your exception as its cause. Check <code>getCause()</code>.</p>
+
+  <h4>join() vs get()</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>join()</code></th><th><code>get()</code></th></tr></thead>
+    <tbody>
+      <tr><td>Checked exceptions</td><td>None: throws unchecked <code>CompletionException</code></td><td>Throws checked <code>InterruptedException</code> and <code>ExecutionException</code></td></tr>
+      <tr><td>Timeout version</td><td>No (use <code>orTimeout</code> / <code>completeOnTimeout</code>)</td><td>Yes, <code>get(time, unit)</code></td></tr>
+      <tr><td>Use in lambdas</td><td>Convenient (no checked exceptions)</td><td>Awkward</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Async variants and which thread runs what</h4>
+  <p>Every step has an <code>Async</code> twin (<code>thenApplyAsync</code>). The plain version may run on the thread that completed the previous stage, or on the caller if it was already complete. The <code>Async</code> version always submits to an executor. Without an executor argument, <code>supplyAsync</code> and the <code>Async</code> methods use <code>ForkJoinPool.commonPool()</code> — a shared pool sized to about the number of cores minus one, whose threads are <strong>daemon</strong> threads.</p>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: blocking I/O on the common pool</p>
+    <p>If you run slow blocking calls (database, HTTP) in <code>supplyAsync(...)</code> with no executor, they occupy the few common-pool threads. Parallel streams and other code share that pool and will slow down or stall. Pass your own executor, as in the example: <code>supplyAsync(task, ioExecutor)</code>. Also, because those threads are daemons, a <code>main</code> method that does not wait can end before the work does.</p>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Do not call <code>join()</code>/<code>get()</code> in the middle of a pipeline; chain with <code>thenApply</code>/<code>thenCompose</code> and block only once at the edge (or never, in a reactive/async controller).</li>
+      <li>An exception in any stage skips the following <code>thenApply</code> stages and flows to the first <code>exceptionally</code>/<code>handle</code>.</li>
+      <li>Use <code>thenCompose</code> when the function returns a <code>CompletableFuture</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Cancelling a <code>CompletableFuture</code> does not interrupt the running thread; it only completes the future exceptionally. Plan for cooperative stop yourself.</li>
+      <li>An exception that nobody observes (no <code>join</code>, no <code>handle</code>) disappears silently.</li>
+      <li><code>allOf</code> with zero arguments is already complete; one failing future makes the combined future fail, but the others keep running.</li>
+      <li><code>orTimeout</code>/<code>completeOnTimeout</code> exist since Java 9 and complete the future only; they do not stop the underlying work.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>Spring's <code>@Async</code> methods can return <code>CompletableFuture&lt;T&gt;</code>; aggregator or "backend for frontend" services use <code>allOf</code> to fan out to several microservices. With virtual threads (Java 21), many teams go back to plain blocking code in parallel tasks because it is easier to read — but <code>CompletableFuture</code> is still everywhere in existing code and libraries.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "thenApply vs thenCompose", "How do you run three calls in parallel?", "Where does supplyAsync run?"</p>
+    <ul>
+      <li><code>thenApply</code> = map (function returns a value); <code>thenCompose</code> = flatMap (function returns a future); <code>thenCombine</code> merges two independent futures.</li>
+      <li>Parallel calls: start each with <code>supplyAsync</code>, then <code>allOf(...).thenApply(...)</code> and read with <code>join()</code>.</li>
+      <li>Default executor is the common ForkJoinPool; for blocking I/O supply your own executor.</li>
+      <li>Errors: <code>exceptionally</code> (fallback), <code>handle</code> (both paths), <code>whenComplete</code> (side effect). <code>join()</code> throws <code>CompletionException</code>.</li>
+    </ul>
+  </div>
+</article>

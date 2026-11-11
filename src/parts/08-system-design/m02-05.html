@@ -1,0 +1,365 @@
+<article class="topic" id="m2-spring-patterns">
+  <h3>Where Spring uses design patterns</h3>
+  <p class="tldr">Spring is built from patterns: singleton beans, factories (the container), proxies for @Transactional, template classes like JdbcTemplate, observer-style application events, the DispatcherServlet front controller, HandlerAdapter, filter chains and strategy-based resolvers.</p>
+
+  <p>When you can name the pattern behind a Spring feature, the feature stops being magic, and you can predict its limits (such as the self-invocation trap). The table below is the quick map. Each row names the pattern, the Spring feature, and what the pattern explains.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pattern</th><th>Where in Spring</th><th>What it explains</th></tr></thead>
+    <tbody>
+      <tr><td>Singleton (container-managed)</td><td>Default bean scope</td><td>One shared bean per container; keep beans stateless</td></tr>
+      <tr><td>Factory / Abstract Factory</td><td><code>BeanFactory</code>, <code>ApplicationContext</code>, <code>FactoryBean</code>, <code>@Bean</code> methods</td><td>The container creates objects, you ask it for them</td></tr>
+      <tr><td>Dependency Injection (IoC)</td><td>Constructor injection, <code>@Autowired</code></td><td>The container wires collaborators (<a href="#m1-dip">DIP</a>)</td></tr>
+      <tr><td>Proxy</td><td><code>@Transactional</code>, <code>@Cacheable</code>, <code>@Async</code>, <code>@PreAuthorize</code>, Spring Data repositories</td><td>Advice runs around your method; self-invocation bypasses it (<a href="#m2-proxy">Proxy</a>)</td></tr>
+      <tr><td>Template Method (callbacks)</td><td><code>JdbcTemplate</code>, <code>TransactionTemplate</code>, <code>RestTemplate</code>, <code>JmsTemplate</code>, <code>AbstractApplicationContext.refresh()</code></td><td>Boilerplate in the template, your code in the callback (<a href="#m2-template-method">Template Method</a>)</td></tr>
+      <tr><td>Observer</td><td><code>ApplicationEventPublisher</code>, <code>@EventListener</code>, <code>ApplicationListener</code></td><td>Decoupled in-process events (<a href="#m2-observer">Observer</a>)</td></tr>
+      <tr><td>Front Controller</td><td><code>DispatcherServlet</code></td><td>One servlet receives all requests and routes them to controllers</td></tr>
+      <tr><td>Adapter</td><td><code>HandlerAdapter</code>, <code>HttpMessageConverter</code> style translation</td><td>Different kinds of handlers called the same way (<a href="#m2-adapter">Adapter</a>)</td></tr>
+      <tr><td>Chain of Responsibility</td><td>Servlet <code>Filter</code> chain, <code>SecurityFilterChain</code>, <code>HandlerInterceptor</code>s</td><td>Ordered handlers, any of which can stop the request (<a href="#m2-chain-of-responsibility">Chain</a>)</td></tr>
+      <tr><td>Strategy</td><td><code>ViewResolver</code>, <code>HandlerMethodArgumentResolver</code>, <code>HttpMessageConverter</code>, <code>PasswordEncoder</code>, <code>ResourceLoader</code></td><td>Pluggable algorithms (<a href="#m2-strategy">Strategy</a>)</td></tr>
+      <tr><td>Decorator</td><td><code>BeanPostProcessor</code> wrapping beans, <code>ContentCachingRequestWrapper</code>, <code>TransactionAwareDataSourceProxy</code></td><td>Add features by wrapping (<a href="#m2-decorator">Decorator</a>)</td></tr>
+      <tr><td>Facade</td><td><code>JdbcTemplate</code>, <code>JpaRepository</code>, SLF4J, <code>SpringApplication.run</code></td><td>One simple API over complex machinery (<a href="#m2-facade">Facade</a>)</td></tr>
+      <tr><td>Builder</td><td><code>UriComponentsBuilder</code>, <code>RestClient.builder()</code>, <code>SpringApplicationBuilder</code>, <code>User.withUsername()</code>, <code>MockMvcRequestBuilders</code></td><td>Fluent construction (<a href="#m2-builder">Builder</a>)</td></tr>
+      <tr><td>Composite</td><td><code>CompositePropertySource</code>, composite validators</td><td>Treat a group like one object (<a href="#m2-other-patterns">Composite</a>)</td></tr>
+      <tr><td>Prototype</td><td><code>@Scope("prototype")</code></td><td>A new instance per request for the bean (<a href="#m2-other-patterns">Prototype</a>)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Four examples in detail</h4>
+
+  <h5>1. Singleton beans</h5>
+  <p>The container creates each singleton bean once and hands out the same instance. It is a different mechanism from the GoF class (see <a href="#m2-singleton">Singleton</a>), but the same warning applies: shared state is shared by every thread.</p>
+
+  <h5>2. Proxies for @Transactional</h5>
+  <p>The proxy opens a transaction, calls your method and commits or rolls back (see the sequence diagram in <a href="#m2-proxy">Proxy</a>). Because it is a proxy, three rules follow: the call must come through the proxy (no self-invocation), the method must be public in the usual setup, and the class must not be final. When something "mysteriously" does not run in a transaction, check these first.</p>
+
+  <h5>3. JdbcTemplate</h5>
+  <p>It is both a Template Method (the fixed skeleton of acquire connection, prepare, execute, map, release) and a Facade over JDBC. Your <code>RowMapper</code> lambda is the variable step. It also translates checked <code>SQLException</code> into the unchecked <code>DataAccessException</code> hierarchy.</p>
+
+  <h5>4. Application events</h5>
+  <p>One bean publishes a plain object, and other beans react. The order service does not know who listens. Add <code>@Async</code> for non-blocking listeners and <code>@TransactionalEventListener</code> for commit-aware ones (see <a href="#m2-observer">Observer</a>).</p>
+
+  <h4>How a request flows: several patterns together</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant B as Browser
+  participant F as Filter chain
+  participant D as DispatcherServlet
+  participant H as HandlerAdapter
+  participant C as Controller
+  participant S as Service (proxy)
+  B->>F: HTTP request
+  F->>D: after security filters (Chain of Responsibility)
+  D->>D: find handler (HandlerMapping)
+  D->>H: invoke handler (Adapter)
+  H->>C: call controller method
+  C->>S: placeOrder (through Proxy)
+  S-->>C: result
+  C-->>H: return value
+  H-->>D: view or body (Strategy: converters)
+  D-->>B: HTTP response
+</pre>
+    <figcaption>One request touches Chain of Responsibility, Front Controller, Adapter, Proxy and Strategy</figcaption>
+  </figure>
+
+  <div class="co co-version">
+    <p class="co-t">Version note</p>
+    <p>These patterns are stable across Spring Boot 3.x and 4.x. Details that moved: the servlet API package is <code>jakarta.servlet</code> since Boot 3, and <code>RestTemplate</code> is in maintenance mode in favour of <code>RestClient</code> (Spring Framework 6.1+), which uses the Builder pattern. The Template and Strategy ideas are the same in both.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: patterns in Spring</p>
+    <ul>
+      <li><b>Which design patterns does Spring use?</b> Name at least five with the feature: Singleton (bean scope), Factory (<code>ApplicationContext</code>), Proxy (<code>@Transactional</code>), Template (<code>JdbcTemplate</code>), Observer (events), Front Controller (<code>DispatcherServlet</code>), Chain (filters), Strategy (resolvers).</li>
+      <li><b>How does Spring implement AOP?</b> With proxies (JDK dynamic or CGLIB), created by a <code>BeanPostProcessor</code>.</li>
+      <li><b>Is the DispatcherServlet a pattern?</b> Yes, Front Controller: a single entry point that delegates.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-other-patterns">
+  <h3>Other patterns in brief: Prototype, Composite, Flyweight, Iterator, Mediator, Memento, Visitor</h3>
+  <p class="tldr">Seven more GoF patterns are worth knowing by name and one-line idea: Prototype (copy an existing object), Composite (tree of parts treated like one), Flyweight (share small immutable objects), Iterator (traverse without exposing structure), Mediator (central coordinator), Memento (save and restore state) and Visitor (add operations to a class hierarchy from outside).</p>
+
+  <p>You will rarely write these from scratch, but interviewers ask about them, and you use several every day without knowing it. Learn the idea and one Java example for each.</p>
+
+  <dl class="terms">
+    <dt>Prototype (creational)</dt>
+    <dd>Create new objects by copying an existing one instead of building from scratch. Useful when construction is expensive or when you need many variations of a configured template (a default invoice, a game enemy). In Java: <code>clone()</code>, copy constructors or a <code>copy()</code>/<code>toBuilder()</code> method. See shallow vs deep copy in <a href="02-core-java.html#m2">Core Java</a>. Spring: <code>@Scope("prototype")</code> makes the container return a fresh instance for each request (it is "prototype scope", not exactly the GoF copy).</dd>
+
+    <dt>Composite (structural)</dt>
+    <dd>Compose objects into a tree, and treat single objects and groups through the same interface. A file system (file and folder both have <code>size()</code>), a menu with sub-menus, a UI component tree, an organisation chart, a product bundle containing products. A call on the root goes recursively to all children.
+<pre data-title="Composite.java"><code class="language-java">interface FileNode { long size(); }
+record FileLeaf(String name, long bytes) implements FileNode {
+    public long size() { return bytes; }
+}
+record Folder(String name, java.util.List&lt;FileNode&gt; children) implements FileNode {
+    public long size() { return children.stream().mapToLong(FileNode::size).sum(); }
+}</code></pre>
+    JDK: Swing/AWT <code>Container</code> holds <code>Component</code>s; <code>Map.putAll</code> style bulk operations on collections of collections. Spring Security has composite delegating classes.</dd>
+
+    <dt>Flyweight (structural)</dt>
+    <dd>Share many small, identical, <em>immutable</em> objects to save memory, by separating the shared intrinsic state from the per-use extrinsic state. In Java: the <code>Integer</code> cache (<code>Integer.valueOf(100)</code> returns a cached object for -128 to 127), the <code>String</code> pool, <code>Boolean.TRUE</code>, enum constants. Use it when you have millions of similar objects (characters in a text editor, tiles in a game map).</dd>
+
+    <dt>Iterator (behavioural)</dt>
+    <dd>Give sequential access to the elements of a collection without exposing its structure. Java built it in: <code>Iterable</code> and <code>Iterator</code> (<code>hasNext</code>, <code>next</code>, <code>remove</code>) power the enhanced <code>for</code> loop. To make your class loopable, implement <code>Iterable&lt;T&gt;</code>. Iterators of <code>ArrayList</code> are <em>fail-fast</em>: structural modification during iteration throws <code>ConcurrentModificationException</code>. See <a href="02-core-java.html#m4">Collections</a>.</dd>
+
+    <dt>Mediator (behavioural)</dt>
+    <dd>Replace many-to-many direct links between objects with one coordinator, so objects talk only to the mediator. Examples: a chat room (users send to the room, which relays), an air-traffic controller, a UI form where the dialog enables the Submit button when fields are valid. Java: <code>java.util.Timer</code> coordinates tasks; <code>ExecutorService</code> sits between submitters and threads; Spring's <code>DispatcherServlet</code> mediates between handlers and views; message brokers do the same between services. Risk: the mediator becomes a god object.</dd>
+
+    <dt>Memento (behavioural)</dt>
+    <dd>Capture and store an object's internal state in an opaque snapshot so it can be restored later, without breaking encapsulation. Used for undo, checkpoints and "save game". The object (originator) creates the memento; a caretaker keeps a stack of them; only the originator can read the contents. Java: serialization snapshots, <code>record</code> copies of immutable state. It complements <a href="#m2-command">Command</a> undo: Command reverses an operation, Memento restores a saved state.</dd>
+
+    <dt>Visitor (behavioural)</dt>
+    <dd>Add new operations to a class hierarchy without changing the classes, by moving each operation into a visitor with one <code>visit</code> method per type. The elements have a single <code>accept(visitor)</code> method (double dispatch). Good when the types are stable but operations change often (a compiler walking a syntax tree, tax rules over different item types). Bad when new types appear often, because every visitor must change. JDK: <code>java.nio.file.FileVisitor</code> with <code>Files.walkFileTree</code>. In modern Java (17+), sealed interfaces plus a pattern-matching <code>switch</code> give a lighter alternative.</dd>
+  </dl>
+
+  <h4>Quick example: Iterator for a custom class</h4>
+  <pre data-title="Playlist.java"><code class="language-java">import java.util.Iterator;
+import java.util.List;
+
+public class Playlist implements Iterable&lt;String&gt; {
+    private final List&lt;String&gt; songs;
+    public Playlist(List&lt;String&gt; songs) { this.songs = List.copyOf(songs); }
+
+    @Override
+    public Iterator&lt;String&gt; iterator() {
+        return new Iterator&lt;&gt;() {
+            private int index = 0;
+            public boolean hasNext() { return index &lt; songs.size(); }
+            public String next() { return songs.get(index++); }
+        };
+    }
+}
+
+// for (String s : new Playlist(List.of("A", "B"))) System.out.println(s);</code></pre>
+
+  <h4>Other patterns you may hear of</h4>
+  <p>Interpreter (evaluate a small language), Bridge (separate abstraction from implementation so both vary: the notification-channel example in <a href="#m1-composition-inheritance">composition over inheritance</a> is a Bridge in spirit), and Null Object (an object that does nothing, instead of <code>null</code>: <code>Collections.emptyList()</code>, a <code>NoOpNotifier</code>). Beyond GoF: Repository, Dependency Injection, Specification, Circuit Breaker and Saga appear in architecture (<a href="#m6">Module 6</a>).</p>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: the "less common" patterns</p>
+    <ul>
+      <li>Expect one-line definitions: Composite = tree treated uniformly; Flyweight = shared immutable objects; Visitor = new operation without changing the classes.</li>
+      <li>Give the JDK example each: <code>Integer</code> cache for Flyweight, <code>Iterator</code> for Iterator, <code>FileVisitor</code> for Visitor.</li>
+      <li>Admit when you have not used one, but show you know the problem it solves.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-selection">
+  <h3>Pattern selection cheat sheet: if you need this, consider that</h3>
+  <p class="tldr">Start from the problem you feel in the code (a growing switch, a huge constructor, a foreign API, a repeated skeleton) and map it to the pattern that fixes it; if you cannot name the problem, you do not need the pattern yet.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>If you need ...</th><th>Consider</th><th>Quick reason</th></tr></thead>
+    <tbody>
+      <tr><td>Exactly one shared instance of a resource</td><td>Singleton (or a Spring singleton bean)</td><td>Holder idiom or enum; prefer the DI container</td></tr>
+      <tr><td>To hide which class gets created</td><td>Static factory / Simple Factory / Factory Method</td><td>Callers depend on the interface</td></tr>
+      <tr><td>A family of matching objects</td><td>Abstract Factory</td><td>Keeps products consistent</td></tr>
+      <tr><td>To build an object with many optional parts</td><td>Builder</td><td>Readable, immutable result</td></tr>
+      <tr><td>To copy a configured object</td><td>Prototype / copy constructor</td><td>Avoid expensive set-up</td></tr>
+      <tr><td>To use a class whose interface does not match</td><td>Adapter</td><td>Translate, keep vendor code in one class</td></tr>
+      <tr><td>To add features to an object at run time, in combinations</td><td>Decorator</td><td>Wrap with the same interface</td></tr>
+      <tr><td>One easy entry point to many classes</td><td>Facade</td><td>Hide orchestration</td></tr>
+      <tr><td>To control or defer access to an object (lazy, secure, remote, transactional)</td><td>Proxy</td><td>Same interface, gatekeeper</td></tr>
+      <tr><td>To treat a tree of parts like one object</td><td>Composite</td><td>Uniform interface, recursion</td></tr>
+      <tr><td>To share millions of identical small objects</td><td>Flyweight</td><td>Save memory</td></tr>
+      <tr><td>To swap algorithms or rules (replace a growing <code>switch</code>)</td><td>Strategy</td><td>One class per rule</td></tr>
+      <tr><td>To change behaviour as status changes</td><td>State</td><td>One class per state</td></tr>
+      <tr><td>To notify many parties of a change</td><td>Observer / events</td><td>Subject does not know listeners</td></tr>
+      <tr><td>To queue, schedule, log or undo operations</td><td>Command</td><td>Request as an object</td></tr>
+      <tr><td>A pipeline where each step may stop the request</td><td>Chain of Responsibility</td><td>Filters, validators, approvals</td></tr>
+      <tr><td>The same algorithm order with different steps</td><td>Template Method</td><td>Fixed skeleton, hooks</td></tr>
+      <tr><td>To traverse a structure without exposing it</td><td>Iterator</td><td>Implement <code>Iterable</code></td></tr>
+      <tr><td>Many objects talking to many others</td><td>Mediator</td><td>One coordinator</td></tr>
+      <tr><td>Save and restore state</td><td>Memento</td><td>Snapshots for undo</td></tr>
+      <tr><td>New operations over a stable class hierarchy</td><td>Visitor (or sealed types and <code>switch</code>)</td><td>Operation outside the classes</td></tr>
+      <tr><td>To avoid <code>null</code> checks for "nothing to do"</td><td>Null Object</td><td>Do-nothing implementation</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Easily confused pairs</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pair</th><th>Difference in one line</th></tr></thead>
+    <tbody>
+      <tr><td>Strategy vs State</td><td>Strategy: client picks an algorithm. State: the object changes its own behaviour as its state changes.</td></tr>
+      <tr><td>Strategy vs Template Method</td><td>Composition (swap whole algorithm) vs inheritance (fill in steps).</td></tr>
+      <tr><td>Factory vs Builder</td><td>Factory picks which class; Builder assembles one complex object in steps.</td></tr>
+      <tr><td>Decorator vs Proxy</td><td>Decorator adds features chosen by the client; Proxy controls access.</td></tr>
+      <tr><td>Adapter vs Facade</td><td>Adapter converts one interface; Facade simplifies many classes.</td></tr>
+      <tr><td>Observer vs Mediator</td><td>Observer: one subject, many listeners. Mediator: many peers talk through a coordinator.</td></tr>
+      <tr><td>Command vs Strategy</td><td>Command: one request as an object (with data, maybe undo). Strategy: a reusable algorithm.</td></tr>
+      <tr><td>Singleton vs static class</td><td>A Singleton is a real object (implements interfaces, can be passed, lazily created); a static class cannot.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">A 4-question test before you add a pattern</p>
+    <ol class="steps">
+      <li>What exact pain am I feeling in the code today?</li>
+      <li>Is there a simpler fix (a method, a parameter, a lambda, a record)?</li>
+      <li>Will a teammate understand it faster with the pattern than without it?</li>
+      <li>Can I give it a name that the team already knows?</li>
+    </ol>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: patterns in interviews</p>
+    <p>For a low-level design question (<a href="#m3">Module 3</a>) you will usually need Strategy (pricing, payment, parking fees), State (vending machine, order, elevator), Observer (notifications), Factory (creating vehicles or notifiers), Singleton (a manager or logger) and Builder (complex requests). Name the pattern aloud and say which pain it removes.</p>
+  </div>
+</article>
+
+<article class="topic recap" id="m2-interview">
+  <h3>Interview questions — Design patterns</h3>
+
+  <details class="qa">
+    <summary>What is a design pattern, and what are the three categories?</summary>
+    <div class="qa-a">
+      <p>A design pattern is a named, reusable solution to a common design problem, with structure and trade-offs; it is a description, not code to copy. The Gang of Four grouped 23 patterns into creational (how objects are created: Singleton, Factory, Builder), structural (how objects are composed: Adapter, Decorator, Facade, Proxy) and behavioural (how objects interact: Strategy, Observer, Command, State, Chain of Responsibility, Template Method).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you write a thread-safe Singleton? Why does double-checked locking need <code>volatile</code>?</summary>
+    <div class="qa-a">
+      <p>Best choices: the holder idiom (a private static nested class holding the instance) or a single-element enum. Double-checked locking also works if the field is <code>volatile</code>. Without it, the assignment <code>instance = new X()</code> can be reordered, so another thread might see a non-null reference to an object whose constructor has not finished. <code>volatile</code> forbids that reordering and gives safe publication.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How can a Singleton be broken, and how do you prevent each way?</summary>
+    <div class="qa-a">
+      <p>Reflection (<code>setAccessible(true)</code> on the constructor): throw from the constructor if an instance exists, or use an enum. Serialization (each deserialization creates a new object): add <code>readResolve()</code> returning the instance. Cloning: do not implement <code>Cloneable</code>, or throw from <code>clone()</code>. Multiple class loaders also create one instance per loader. An enum singleton resists the first three.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between a Spring singleton bean and the GoF Singleton?</summary>
+    <div class="qa-a">
+      <p>A GoF Singleton is enforced by the class itself (private constructor) and is one per class loader, accessed globally with <code>getInstance()</code>. A Spring singleton is enforced by the container: one instance per bean definition per container, injected where needed, and the class itself can still be instantiated with <code>new</code>. Spring singletons are shared across threads, so they must be stateless or thread-safe.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Factory Method versus Abstract Factory?</summary>
+    <div class="qa-a">
+      <p>Factory Method defines one creation method that subclasses override to decide the product (inheritance). Abstract Factory is an interface with several creation methods that produce a family of related products, such as <code>TaxCalculator</code> and <code>InvoiceFormatter</code> for one country, and you swap the whole factory. A Simple Factory is neither: one class with a <code>switch</code> that returns the right product.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you use Builder, and how does it compare with a telescoping constructor?</summary>
+    <div class="qa-a">
+      <p>Use Builder when a class has many parameters, several optional, and you want immutability and readable code. Telescoping constructors (many overloads) are unreadable and easy to call with swapped arguments; setters leave a half-built, mutable object. A builder collects values by name, validates in <code>build()</code> and returns an immutable object. Examples: <code>HttpRequest.newBuilder()</code>, Lombok <code>@Builder</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Adapter vs Decorator vs Proxy vs Facade?</summary>
+    <div class="qa-a">
+      <p>Adapter changes an interface so incompatible classes work together. Decorator keeps the interface and adds behaviour, stackable at run time. Proxy keeps the interface and controls access (lazy loading, security, caching, transactions). Facade gives a new, simpler interface over many classes. Examples: <code>InputStreamReader</code>; <code>BufferedReader</code>; the Spring <code>@Transactional</code> proxy; SLF4J or an <code>OrderFacade</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does <code>@Transactional</code> work, and why does a call from another method of the same class not start a transaction?</summary>
+    <div class="qa-a">
+      <p>Spring wraps the bean in a proxy (JDK dynamic proxy for interfaces, or a CGLIB subclass; Boot uses CGLIB by default). The proxy begins the transaction, calls your method, and commits or rolls back (rollback on runtime exceptions by default). A call using <code>this</code> inside the class goes directly to the target object and skips the proxy, so no transaction logic runs. Fix by moving the method to another bean, or by using AspectJ weaving.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How would you replace a long <code>if/else</code> on payment type with a pattern?</summary>
+    <div class="qa-a">
+      <p>Use Strategy: define a <code>PaymentStrategy</code> interface and one class per method. In Spring, make each a <code>@Component</code> and inject a <code>List</code> or <code>Map</code> of them into the service, which picks by key. Adding a method means adding a class. If the choice depends on the order's lifecycle (not the client's pick), use State instead.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Strategy vs State?</summary>
+    <div class="qa-a">
+      <p>The structure is the same: a context delegates to an interface. In Strategy, the client chooses an algorithm, and strategies are independent of each other. In State, the object changes its own state object as events happen, and the states usually know the transitions. Use State for order life cycles and vending machines; use Strategy for pricing and payment rules.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain Observer and its Spring implementation. What is the catch?</summary>
+    <div class="qa-a">
+      <p>A subject notifies registered listeners about changes without knowing them. In Spring, publish an event with <code>ApplicationEventPublisher</code> and handle it with <code>@EventListener</code>. Catches: listeners run synchronously on the publisher's thread by default (and inside its transaction), so a slow or failing listener affects the publisher; use <code>@Async</code> or <code>@TransactionalEventListener(AFTER_COMMIT)</code>. Also beware of forgotten listeners that leak memory. For cross-service events you need a message broker.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the Command pattern used for, and which Java type is a command?</summary>
+    <div class="qa-a">
+      <p>Command turns a request into an object with <code>execute()</code> (and <code>undo()</code>). It lets you queue, schedule, log, retry or undo operations and decouples the sender from the receiver. <code>Runnable</code> and <code>Callable</code> are commands, and <code>ExecutorService</code> is the invoker. A text editor's undo stack of command objects is the standard example.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Where does Chain of Responsibility appear in Spring and servlets?</summary>
+    <div class="qa-a">
+      <p>Servlet filters: each <code>Filter</code> receives a <code>FilterChain</code> and calls <code>chain.doFilter</code> to continue or returns to stop. Spring Security is a <code>SecurityFilterChain</code> of ordered filters (CORS, CSRF, authentication, authorization). <code>HandlerInterceptor</code>s in Spring MVC are similar. A handler that does not call the next one ends the chain, for example to return 401.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is Template Method, and how is it different from Strategy?</summary>
+    <div class="qa-a">
+      <p>Template Method defines the fixed order of steps in a final method of a base class; subclasses implement some steps (abstract methods or hooks). Examples: <code>AbstractList</code>, <code>HttpServlet.service</code>, <code>JdbcTemplate</code> with callbacks. It varies steps by inheritance, decided at compile time. Strategy varies a whole algorithm by composition, decided at run time. Prefer Strategy when you need flexibility or want to avoid inheritance.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Which patterns would you name when designing a notification system?</summary>
+    <div class="qa-a">
+      <p>Strategy or Factory for channels (email, SMS, push), Observer or events to trigger notifications from business actions, Decorator for retry, logging or rate limiting around a channel, Template Method for shared message-building steps, Builder for the message object, and Chain of Responsibility for fallback channels. Mention that you would start simple and add patterns only as the need appears.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m2-cheatsheet">
+  <h3>Cheat sheet — Design patterns</h3>
+  <ul class="cheat">
+    <li><b>Pattern</b> named, reusable solution to a recurring design problem; learn the problem first.</li>
+    <li><b>Categories</b> creational (creation), structural (composition), behavioural (interaction).</li>
+    <li><b>Singleton</b> one instance; holder idiom or enum; DCL needs <code>volatile</code>; break by reflection, serialization, clone; prefer a Spring bean.</li>
+    <li><b>Spring singleton</b> one per container per bean definition; must be stateless or thread-safe.</li>
+    <li><b>Static factory</b> <code>of</code>, <code>valueOf</code>, <code>from</code>, <code>getInstance</code>, <code>create</code>, <code>copyOf</code>; named, can cache, can return subtypes.</li>
+    <li><b>Simple Factory</b> one <code>switch</code> that returns products; not GoF.</li>
+    <li><b>Factory Method</b> subclass decides which product; <b>Abstract Factory</b> family of related products.</li>
+    <li><b>Builder</b> step-by-step construction, validate in <code>build()</code>, immutable result; Lombok <code>@Builder</code>; skip for 2-3 fields.</li>
+    <li><b>Adapter</b> converts an interface (third-party SDK to your interface); object adapter over class adapter.</li>
+    <li><b>Decorator</b> same interface, adds behaviour, stackable; <code>BufferedReader</code>; order matters.</li>
+    <li><b>Facade</b> one simple API over a subsystem; SLF4J, <code>JdbcTemplate</code>, <code>OrderFacade</code>; keep it thin.</li>
+    <li><b>Proxy</b> same interface, controls access: virtual, protection, remote, caching.</li>
+    <li><b>Spring AOP</b> JDK proxy (interfaces) or CGLIB (subclass; Boot default); self-invocation bypasses the proxy.</li>
+    <li><b>Strategy</b> interchangeable algorithms; replaces <code>switch</code>; <code>Comparator</code>; inject <code>Map</code>/<code>List</code> of beans.</li>
+    <li><b>Observer</b> subject notifies listeners; Spring <code>@EventListener</code>; sync by default; <code>Observable</code> is deprecated.</li>
+    <li><b>Command</b> request as object; undo/redo, queues; <code>Runnable</code>, <code>Callable</code>.</li>
+    <li><b>State</b> one class per state, object swaps its state; order life cycle, vending machine.</li>
+    <li><b>State vs Strategy</b> object changes state itself vs client picks algorithm.</li>
+    <li><b>Chain of Responsibility</b> ordered handlers that may stop the request; servlet filters, Spring Security chain.</li>
+    <li><b>Template Method</b> final skeleton plus abstract steps and hooks; <code>AbstractList</code>; Hollywood principle.</li>
+    <li><b>Template callbacks</b> <code>JdbcTemplate</code>, <code>TransactionTemplate</code>: skeleton in the template, your lambda varies the step.</li>
+    <li><b>Adapter / Decorator / Proxy / Facade</b> converts / enhances / controls / simplifies.</li>
+    <li><b>Others</b> Prototype (copy), Composite (tree), Flyweight (share), Iterator, Mediator, Memento (snapshot), Visitor.</li>
+    <li><b>Do not over-engineer</b> no pattern without a pain; lambdas and records replace much ceremony.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m2-practice">
+  <h3>Practice — Design patterns</h3>
+  <ol class="steps">
+    <li><strong>Singleton five ways (easy).</strong> Write an <code>AppConfig</code> singleton using eager init, <code>synchronized</code>, double-checked locking, the holder idiom and an enum. Write a test with 100 threads calling <code>getInstance()</code> and assert that all references are the same. Done when all five variants pass.</li>
+    <li><strong>Break and fix a singleton (medium).</strong> Break your class-based singleton with reflection, serialization and clone, then fix each. Done when the enum version cannot be broken by the same code and the others fail loudly or return the original.</li>
+    <li><strong>Replace a switch with Strategy (easy/medium).</strong> Take a <code>PriceCalculator</code> with a <code>switch</code> on <code>REGULAR</code>, <code>PREMIUM</code>, <code>STUDENT</code>. Refactor it into a <code>PricingStrategy</code> interface, then with Spring inject a <code>Map&lt;String, PricingStrategy&gt;</code>. Done when a new customer type is a new class only.</li>
+    <li><strong>Factory and Builder (medium).</strong> Build a <code>NotifierFactory</code> that returns email, SMS or push senders, and a <code>NotificationRequest</code> with a builder (required: recipient, message; optional: subject, priority, scheduled time). Done when invalid requests fail in <code>build()</code>.</li>
+    <li><strong>Add logging with a Decorator (medium).</strong> Take a <code>UserRepository</code> interface and add <code>LoggingUserRepository</code> (log each call and its time) and <code>CachingUserRepository</code> as decorators. Done when you can stack them in either order and explain the difference in the log.</li>
+    <li><strong>Adapter for a payment SDK (medium).</strong> Define <code>PaymentGateway</code>, then adapt two fake vendor SDKs with different method names, units and error codes. Done when the checkout code compiles without importing either vendor class.</li>
+    <li><strong>Observer with Spring events (medium).</strong> Publish an <code>OrderPlacedEvent</code>; write three listeners (email, loyalty, analytics). Make one listener <code>@Async</code> and one <code>@TransactionalEventListener(AFTER_COMMIT)</code>. Done when a rolled-back order sends no email.</li>
+    <li><strong>State machine (medium/hard).</strong> Implement an order (<code>NEW → PAID → SHIPPED → DELIVERED</code>, cancel from NEW or PAID) with the State pattern and write a test for every illegal transition. Then redo it as an enum with abstract methods and compare the code size.</li>
+    <li><strong>Chain and Template Method (medium/hard).</strong> Build an order-validation chain (five checks, ordered cheap-first) and a servlet-style filter chain that logs timing. Then write a <code>ReportExporter</code> template with CSV and HTML subclasses. Done when adding a check or a format needs no change to existing classes.</li>
+    <li><strong>Proxy and the self-invocation trap (hard).</strong> Write a JDK dynamic proxy that logs the duration of any interface method. Then, in a Spring Boot app, reproduce a <code>@Transactional(REQUIRES_NEW)</code> method called from the same class, show in the logs that no new transaction starts, and fix it by moving the method to another bean. Done when you can explain the fix with a sequence diagram.</li>
+  </ol>
+</article>

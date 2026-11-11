@@ -1,0 +1,489 @@
+<article class="topic" id="m3-parking-lot">
+  <h3>Design a parking lot</h3>
+  <p class="tldr">Model vehicles, spots, floors, tickets and a pricing Strategy; park a vehicle by finding a free spot of the right type, and make the spot claim atomic so two cars never get the same spot.</p>
+
+  <h4>Requirements and assumptions</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>A lot has several floors; each floor has spots of types BIKE, CAR and TRUCK.</li>
+    <li>On entry the system finds a free spot for the vehicle type and issues a ticket.</li>
+    <li>On exit the system computes the fee from the parking duration and frees the spot.</li>
+    <li>The lot reports free spots per type.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> thread-safe (several gates run at once), easy to add new pricing rules and vehicle types.</p>
+  <p><strong>Assumptions:</strong> one lot, in-memory, a vehicle uses exactly one spot of its own type, fee is hourly and any started hour is charged, payment is out of scope, one entry gate chooses the spot (no reservation in advance).</p>
+
+  <h4>Entities</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Class</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td><code>VehicleType</code> (enum)</td><td>BIKE, CAR, TRUCK; also the spot size class</td></tr>
+      <tr><td><code>Vehicle</code></td><td>Plate number and type</td></tr>
+      <tr><td><code>ParkingSpot</code></td><td>One spot: id, type, and whether it is taken</td></tr>
+      <tr><td><code>ParkingFloor</code></td><td>Owns spots; finds and claims a free one</td></tr>
+      <tr><td><code>Ticket</code></td><td>Vehicle, spot, entry time</td></tr>
+      <tr><td><code>PricingStrategy</code></td><td>Interface: duration and type to fee</td></tr>
+      <tr><td><code>ParkingLot</code></td><td>Facade: <code>park</code> and <code>unpark</code>; tracks active tickets</td></tr>
+    </tbody>
+  </table></div>
+
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class ParkingLot {
+    -List~ParkingFloor~ floors
+    -Map~String, Ticket~ active
+    -PricingStrategy pricing
+    +park(Vehicle v) Ticket
+    +unpark(String ticketId) long
+  }
+  class ParkingFloor {
+    -List~ParkingSpot~ spots
+    +claimSpot(Vehicle v) Optional~ParkingSpot~
+    +freeCount(VehicleType t) long
+  }
+  class ParkingSpot {
+    -String id
+    -VehicleType type
+    +tryPark(Vehicle v) boolean
+    +free() void
+  }
+  class Vehicle {
+    -String plate
+    -VehicleType type
+  }
+  class Ticket {
+    -String id
+    -Instant entry
+  }
+  class PricingStrategy {
+    &lt;&lt;interface&gt;&gt;
+    +fee(VehicleType t, Duration d) long
+  }
+  class HourlyPricing
+  ParkingLot "1" *-- "many" ParkingFloor
+  ParkingFloor "1" *-- "many" ParkingSpot
+  ParkingLot --> PricingStrategy
+  PricingStrategy &lt;|.. HourlyPricing
+  Ticket --> Vehicle
+  Ticket --> ParkingSpot
+  ParkingLot --> Ticket
+</pre>
+    <figcaption>The lot is a facade over floors; pricing is a Strategy</figcaption>
+  </figure>
+
+  <h4>Key design decisions</h4>
+  <ul>
+    <li><strong>Strategy for pricing</strong> (<a href="#m2">Module 2</a>): hourly today, flat-rate or weekend-rate tomorrow. <code>ParkingLot</code> never changes (open/closed principle, <a href="#m1">Module 1</a>).</li>
+    <li><strong>Enum for types</strong> instead of a <code>Vehicle</code> subclass per type: the types differ only by data (the rate and the spot size), not behaviour. Subclasses would be inheritance for its own sake.</li>
+    <li><strong>The spot owns its own occupancy</strong> and uses an atomic compare-and-set, so claiming a spot is one indivisible step.</li>
+    <li><strong>Inject a <code>Clock</code></strong> so tests can move time instead of sleeping.</li>
+    <li>A spot-allocation strategy (nearest to entrance, lowest floor first) can be a second Strategy if asked; here floors are scanned in order.</li>
+  </ul>
+
+  <h4>Core code: model</h4>
+  <pre data-title="ParkingModel.java"><code class="language-java">import java.time.Instant;
+import java.util.concurrent.atomic.AtomicReference;
+
+enum VehicleType { BIKE, CAR, TRUCK }
+
+record Vehicle(String plate, VehicleType type) { }
+
+class ParkingSpot {
+    private final String id;
+    private final VehicleType type;
+    private final AtomicReference&lt;Vehicle&gt; parked = new AtomicReference&lt;&gt;();
+
+    ParkingSpot(String id, VehicleType type) {
+        this.id = id;
+        this.type = type;
+    }
+
+    String id() { return id; }
+    VehicleType type() { return type; }
+    boolean isFree() { return parked.get() == null; }
+
+    /** Atomic: only one thread can move the spot from empty to occupied. */
+    boolean tryPark(Vehicle v) {
+        return v.type() == type &amp;&amp; parked.compareAndSet(null, v);
+    }
+
+    void free() { parked.set(null); }
+}
+
+record Ticket(String id, Vehicle vehicle, ParkingSpot spot, Instant entry) { }</code></pre>
+
+  <h4>Core code: pricing and floor</h4>
+  <pre data-title="PricingAndFloor.java"><code class="language-java">import java.time.Duration;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+interface PricingStrategy {
+    long fee(VehicleType type, Duration parkedFor);   // result in paise
+}
+
+class HourlyPricing implements PricingStrategy {
+    private final Map&lt;VehicleType, Long&gt; ratePerHour = new EnumMap&lt;&gt;(VehicleType.class);
+
+    HourlyPricing() {
+        ratePerHour.put(VehicleType.BIKE, 1_000L);
+        ratePerHour.put(VehicleType.CAR, 3_000L);
+        ratePerHour.put(VehicleType.TRUCK, 6_000L);
+    }
+
+    public long fee(VehicleType type, Duration parkedFor) {
+        long minutes = Math.max(1, parkedFor.toMinutes());
+        long hours = (minutes + 59) / 60;               // any started hour counts
+        return hours * ratePerHour.get(type);
+    }
+}
+
+class ParkingFloor {
+    private final List&lt;ParkingSpot&gt; spots;
+
+    ParkingFloor(List&lt;ParkingSpot&gt; spots) { this.spots = List.copyOf(spots); }
+
+    Optional&lt;ParkingSpot&gt; claimSpot(Vehicle v) {
+        for (ParkingSpot s : spots) {
+            if (s.isFree() &amp;&amp; s.tryPark(v)) return Optional.of(s);  // CAS decides the winner
+        }
+        return Optional.empty();
+    }
+
+    long freeCount(VehicleType t) {
+        return spots.stream().filter(s -&gt; s.type() == t &amp;&amp; s.isFree()).count();
+    }
+}</code></pre>
+
+  <h4>Core code: the lot (facade)</h4>
+  <pre data-title="ParkingLot.java"><code class="language-java">import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+class ParkingLot {
+    private final List&lt;ParkingFloor&gt; floors;
+    private final PricingStrategy pricing;
+    private final Clock clock;
+    private final Map&lt;String, Ticket&gt; active = new ConcurrentHashMap&lt;&gt;();
+    private final Set&lt;String&gt; platesInside = ConcurrentHashMap.newKeySet();
+
+    ParkingLot(List&lt;ParkingFloor&gt; floors, PricingStrategy pricing, Clock clock) {
+        this.floors = List.copyOf(floors);
+        this.pricing = pricing;
+        this.clock = clock;
+    }
+
+    Ticket park(Vehicle v) {
+        if (!platesInside.add(v.plate())) {                  // atomic duplicate check
+            throw new IllegalStateException("Vehicle already inside: " + v.plate());
+        }
+        for (ParkingFloor f : floors) {
+            var spot = f.claimSpot(v);
+            if (spot.isPresent()) {
+                Ticket t = new Ticket(UUID.randomUUID().toString(), v,
+                                      spot.get(), Instant.now(clock));
+                active.put(t.id(), t);
+                return t;
+            }
+        }
+        platesInside.remove(v.plate());                      // undo on failure
+        throw new IllegalStateException("Lot full for " + v.type());
+    }
+
+    long unpark(String ticketId) {
+        Ticket t = active.remove(ticketId);                  // atomic: one exit per ticket
+        if (t == null) throw new IllegalArgumentException("Unknown ticket " + ticketId);
+        Duration d = Duration.between(t.entry(), Instant.now(clock));
+        long fee = pricing.fee(t.vehicle().type(), d);
+        t.spot().free();
+        platesInside.remove(t.vehicle().plate());
+        return fee;
+    }
+}</code></pre>
+  <pre data-title="ParkingDemo.java"><code class="language-java">import java.time.Clock;
+import java.util.List;
+
+public class ParkingDemo {
+    public static void main(String[] args) {
+        var floor = new ParkingFloor(List.of(
+                new ParkingSpot("F0-1", VehicleType.CAR),
+                new ParkingSpot("F0-2", VehicleType.BIKE)));
+        var lot = new ParkingLot(List.of(floor), new HourlyPricing(), Clock.systemUTC());
+
+        Ticket t = lot.park(new Vehicle("KA01AB1234", VehicleType.CAR));
+        System.out.println("Spot: " + t.spot().id());
+        System.out.println("Fee: " + lot.unpark(t.id()));
+        System.out.println("Free cars: " + floor.freeCount(VehicleType.CAR));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Spot: F0-1
+Fee: 3000
+Free cars: 1</code></pre>
+
+  <h4>Concurrency</h4>
+  <ul>
+    <li>Two gates can reach the same free spot. <code>compareAndSet(null, v)</code> lets only one succeed; the loser moves to the next spot.</li>
+    <li><code>active.remove(ticketId)</code> is atomic, so a ticket cannot be used for two exits (no double refund or double free).</li>
+    <li><code>platesInside.add</code> returns false for a duplicate, an atomic "is this car already in?" check.</li>
+  </ul>
+  <div class="co co-conv">
+    <p class="co-t">Use atomics for one flag, locks for several fields</p>
+    <p>An <code>AtomicReference</code> is perfect when one value changes. If a spot also tracked "reserved until" and "owner", you would use a lock or an immutable state object swapped with CAS.</p>
+  </div>
+
+  <h4>Edge cases</h4>
+  <ul>
+    <li>Lot full for one type but free for another: message names the type.</li>
+    <li>Lost or unknown ticket: <code>IllegalArgumentException</code>; a real system has a lost-ticket fee and manual lookup.</li>
+    <li>Same ticket scanned twice at exit: the second call finds nothing and fails cleanly.</li>
+    <li>Parked less than a minute: charged one hour (minimum rule is a pricing concern, so it is in the strategy).</li>
+    <li>Day boundary and long stays: use <code>Duration</code>, not clock hours.</li>
+  </ul>
+
+  <h4>Extensions interviewers ask</h4>
+  <ul>
+    <li><strong>EV charging spots:</strong> add <code>EV_CAR</code> to the enum or a <code>SpotFeature</code> set on <code>ParkingSpot</code>; add a charging fee in a decorator over <code>PricingStrategy</code>.</li>
+    <li><strong>Bigger vehicle in a bigger spot:</strong> replace the type equality in <code>tryPark</code> with a <code>canFit</code> method and try the smallest fitting spot first.</li>
+    <li><strong>Spot allocation policy:</strong> a <code>SpotAllocationStrategy</code> interface (nearest to the lift, fill floor by floor).</li>
+    <li><strong>Display board:</strong> an Observer on spot changes (<a href="#m2">Module 2</a>).</li>
+    <li><strong>Multiple entry and exit gates:</strong> already safe because state lives in the lot, not in gates.</li>
+    <li><strong>Persistence:</strong> a <code>TicketRepository</code> interface; the DB gets a unique constraint on active (spot) so two tickets cannot share a spot.</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">How to present this in 45 minutes</p>
+    <ol>
+      <li>5 min: ask about types, floors, pricing, concurrency; state assumptions.</li>
+      <li>8 min: draw the diagram; say "pricing is a Strategy, spots own their occupancy".</li>
+      <li>20 min: code <code>ParkingSpot</code>, <code>PricingStrategy</code>, <code>ParkingLot.park/unpark</code>.</li>
+      <li>7 min: explain the CAS claim, edge cases, then the EV extension.</li>
+    </ol>
+  </div>
+</article>
+
+<article class="topic" id="m3-tic-tac-toe">
+  <h3>Design tic-tac-toe (and how Snake and Ladder differs)</h3>
+  <p class="tldr">Keep game state (board, players, current turn, status) in one Game class, validate every move, and detect a win in O(1) with row, column and diagonal counters instead of scanning the board.</p>
+
+  <h4>Requirements and assumptions</h4>
+  <ul>
+    <li>Two players, X and O, alternate turns on an N×N board (default 3×3); X starts.</li>
+    <li>A move is rejected if it is out of range, on an occupied cell, by the wrong player, or after the game ended.</li>
+    <li>The game ends when a player fills a whole row, column or diagonal (win), or the board is full (draw).</li>
+    <li>Assumptions: console or API driven, no AI opponent, no undo for now, single-threaded game (one game object per match, moves arrive one at a time).</li>
+  </ul>
+
+  <h4>Entities</h4>
+  <ul>
+    <li><code>Mark</code> (enum X, O) and <code>GameStatus</code> (enum IN_PROGRESS, WON, DRAW).</li>
+    <li><code>Player</code> (name, mark).</li>
+    <li><code>Board</code>: the grid and the win detection. It knows nothing about players' names or turns.</li>
+    <li><code>Game</code>: owns the board and players, enforces turn order, exposes <code>makeMove</code>.</li>
+  </ul>
+
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class Game {
+    -Board board
+    -List~Player~ players
+    -int turn
+    -GameStatus status
+    -Player winner
+    +makeMove(Player p, int row, int col) GameStatus
+  }
+  class Board {
+    -Mark[][] cells
+    -int[] rowSum
+    -int[] colSum
+    +place(int r, int c, Mark m) boolean
+    +isFull() boolean
+  }
+  class Player {
+    -String name
+    -Mark mark
+  }
+  class Mark {
+    &lt;&lt;enumeration&gt;&gt;
+    X
+    O
+  }
+  class GameStatus {
+    &lt;&lt;enumeration&gt;&gt;
+    IN_PROGRESS
+    WON
+    DRAW
+  }
+  Game "1" *-- "1" Board
+  Game "1" o-- "2" Player
+  Player --> Mark
+  Game --> GameStatus
+</pre>
+    <figcaption>Game coordinates turns; Board only knows cells and win lines</figcaption>
+  </figure>
+
+  <h4>Key design decisions</h4>
+  <ul>
+    <li><strong>Separate Board from Game</strong> (single responsibility, <a href="#m1">Module 1</a>): the board validates geometry; the game validates turn order. Either can change alone.</li>
+    <li><strong>O(1) win check.</strong> Give X the value +1 and O the value −1. Keep a running sum per row, per column and for both diagonals. After a move only the sums touched by that cell change; if any reaches N or −N, that player wins. Scanning the board is O(N) per move, which is also fine in an interview, but counters impress.</li>
+    <li><strong>Return the status</strong> from <code>makeMove</code>, so the caller prints or reacts; the game has no console code inside (keeps it testable and reusable in a REST controller).</li>
+    <li><strong>Patterns:</strong> none are needed, and saying so is a good sign. If asked for different board sizes or win rules, a <code>WinRule</code> Strategy fits; for undo, the Command pattern (<a href="#m2">Module 2</a>).</li>
+  </ul>
+
+  <h4>Core code</h4>
+  <pre data-title="Board.java"><code class="language-java">enum Mark { X, O }
+
+enum GameStatus { IN_PROGRESS, WON, DRAW }
+
+record Player(String name, Mark mark) { }
+
+class Board {
+    private final int n;
+    private final Mark[][] cells;
+    private final int[] rowSum, colSum;
+    private int diagSum, antiSum, filled;
+
+    Board(int n) {
+        this.n = n;
+        this.cells = new Mark[n][n];
+        this.rowSum = new int[n];
+        this.colSum = new int[n];
+    }
+
+    /** Places a mark and returns true if this move completes a line. */
+    boolean place(int r, int c, Mark m) {
+        if (r &lt; 0 || r &gt;= n || c &lt; 0 || c &gt;= n) {
+            throw new IllegalArgumentException("Cell out of range: " + r + "," + c);
+        }
+        if (cells[r][c] != null) {
+            throw new IllegalStateException("Cell already taken: " + r + "," + c);
+        }
+        cells[r][c] = m;
+        filled++;
+        int v = (m == Mark.X) ? 1 : -1;
+        rowSum[r] += v;
+        colSum[c] += v;
+        if (r == c) diagSum += v;
+        if (r + c == n - 1) antiSum += v;
+        return Math.abs(rowSum[r]) == n || Math.abs(colSum[c]) == n
+            || Math.abs(diagSum) == n || Math.abs(antiSum) == n;
+    }
+
+    boolean isFull() { return filled == n * n; }
+}</code></pre>
+  <pre data-title="Game.java"><code class="language-java">import java.util.List;
+
+class Game {
+    private final Board board;
+    private final List&lt;Player&gt; players;
+    private int turn = 0;
+    private GameStatus status = GameStatus.IN_PROGRESS;
+    private Player winner;
+
+    Game(int size, Player first, Player second) {
+        this.board = new Board(size);
+        this.players = List.of(first, second);
+    }
+
+    GameStatus makeMove(Player p, int row, int col) {
+        if (status != GameStatus.IN_PROGRESS) {
+            throw new IllegalStateException("Game is over");
+        }
+        if (!players.get(turn).equals(p)) {
+            throw new IllegalStateException("Not " + p.name() + "'s turn");
+        }
+        boolean won = board.place(row, col, p.mark());   // may throw; turn does not change
+        if (won) {
+            status = GameStatus.WON;
+            winner = p;
+        } else if (board.isFull()) {
+            status = GameStatus.DRAW;
+        } else {
+            turn = 1 - turn;                              // switch only after a valid move
+        }
+        return status;
+    }
+
+    Player winner() { return winner; }
+}
+
+public class TicTacToeDemo {
+    public static void main(String[] args) {
+        Player a = new Player("Asha", Mark.X), b = new Player("Ravi", Mark.O);
+        Game g = new Game(3, a, b);
+        g.makeMove(a, 0, 0); g.makeMove(b, 1, 0);
+        g.makeMove(a, 0, 1); g.makeMove(b, 1, 1);
+        System.out.println(g.makeMove(a, 0, 2));
+        System.out.println(g.winner().name());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">WON
+Asha</code></pre>
+
+  <h4>Edge cases</h4>
+  <ul>
+    <li>Invalid move (taken cell, out of range): exception thrown <em>before</em> the turn switches, so the same player retries.</li>
+    <li>Move after the game ended: rejected.</li>
+    <li>The winning move that also fills the board: win is checked first, so it is a win, not a draw.</li>
+    <li>Both diagonals on odd boards share the centre cell; the counters handle that naturally.</li>
+  </ul>
+
+  <h4>Concurrency</h4>
+  <p>One game is a turn-based conversation, so moves are naturally serial. If two clients can call <code>makeMove</code> on the same game (a web service), make the method <code>synchronized</code>; the turn check then rejects the stale caller. Games are independent, so different games never contend.</p>
+
+  <h4>Snake and Ladder: what changes</h4>
+  <p>The same split works: <code>Board</code> (size, snakes and ladders as a <code>Map&lt;Integer, Integer&gt;</code> from start cell to end cell), <code>Dice</code>, <code>Player</code> (name, position) and <code>Game</code> (turn queue, status). A turn is: roll the dice, compute <code>pos + roll</code>; if it exceeds the last cell the player stays; otherwise follow a snake or ladder if one starts there. The first to land exactly on the last cell wins.</p>
+  <pre data-title="SnakeBoard.java"><code class="language-java">import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
+
+class SnakeBoard {
+    private final int last;
+    private final Map&lt;Integer, Integer&gt; jumps = new HashMap&lt;&gt;();  // snakes and ladders
+
+    SnakeBoard(int last) { this.last = last; }
+
+    void addJump(int from, int to) {
+        if (from == to || from &lt; 1 || to &lt; 1 || from &gt;= last) {
+            throw new IllegalArgumentException("Bad jump " + from + "->" + to);
+        }
+        jumps.put(from, to);
+    }
+
+    int move(int position, int roll) {
+        int next = position + roll;
+        if (next &gt; last) return position;              // needs an exact roll
+        return jumps.getOrDefault(next, next);          // follow snake or ladder once
+    }
+}
+
+class Dice {
+    private final Random random = new Random();
+    int roll() { return random.nextInt(6) + 1; }
+}</code></pre>
+  <p>Make <code>Dice</code> an interface if you want deterministic tests (inject a fixed sequence). Validate that jumps do not form a loop (a ladder ending on a snake head that leads back to the ladder start).</p>
+
+  <h4>Extensions interviewers ask</h4>
+  <ul>
+    <li><strong>N players or bigger boards:</strong> the players list and the board size are already parameters. For N×N with a win length K &lt; N (Gomoku style), counters no longer work; scan around the last move in four directions.</li>
+    <li><strong>Undo:</strong> keep a stack of <code>Move</code> commands; undo reverses counters (subtract the same value) and steps the turn back.</li>
+    <li><strong>Computer player:</strong> a <code>MoveStrategy</code> interface (random, minimax).</li>
+    <li><strong>Replay and history:</strong> store moves in a list; replay is a fold over the list.</li>
+  </ul>
+  <div class="co co-interview">
+    <p class="co-t">How to present this in 45 minutes</p>
+    <ol>
+      <li>5 min: board size, players, win rule, undo yes or no.</li>
+      <li>5 min: draw Game, Board, Player, enums; say why Board and Game are separate.</li>
+      <li>20 min: code <code>Board.place</code> with the counters, then <code>Game.makeMove</code>.</li>
+      <li>10 min: show a run, discuss invalid moves, then undo with Command and the AI Strategy.</li>
+    </ol>
+  </div>
+</article>

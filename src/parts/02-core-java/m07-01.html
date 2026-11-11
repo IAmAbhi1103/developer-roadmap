@@ -1,0 +1,491 @@
+<div class="mintro">
+  <p>You can write Java for years without thinking about the JVM — until the day an app dies with <code>OutOfMemoryError</code>, a request freezes for two seconds during a GC pause, or a <code>HashMap</code> "loses" an object. This module explains what the JVM does with your code: where variables and objects live, how memory is reclaimed, how classes are loaded, and why <code>equals</code> and <code>hashCode</code> must agree. It is an interview module first (these questions appear in nearly every Java interview) and a production-debugging module second.</p>
+  <p>It builds on <a href="#m1">Module 1</a> (references, pass-by-value, strings) and <a href="#m2">Module 2</a> (objects and classes). It pairs with <a href="#m4">Module 4</a> (how <code>HashMap</code> uses <code>hashCode</code>) and <a href="#m6">Module 6</a> (each thread has its own stack).</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>draw the JVM architecture and say what the heap, the stacks, Metaspace and the execution engine do;</li>
+    <li>trace a small program and say exactly where each variable, object, static field and string lives;</li>
+    <li>explain generational garbage collection, GC roots and the main collectors (G1, ZGC and others), and choose between them;</li>
+    <li>recognise the common memory leaks and find them with a heap dump;</li>
+    <li>use the important JVM flags and tools (<code>-Xmx</code>, <code>jcmd</code>, <code>jstack</code>, JFR);</li>
+    <li>explain class loading, parent delegation and the difference between <code>ClassNotFoundException</code> and <code>NoClassDefFoundError</code>;</li>
+    <li>write correct <code>equals</code> and <code>hashCode</code> and show what breaks in a <code>HashSet</code> when you do not.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m7-jvm-architecture">
+  <h3>JVM architecture: class loader, memory areas and execution engine</h3>
+  <p class="tldr">The JVM has three main parts — a class loader subsystem that brings classes in, runtime data areas (heap, stacks, Metaspace) that hold data, and an execution engine (interpreter, JIT compiler, garbage collector) that runs the code.</p>
+
+  <p>The <strong>JVM</strong> is a program (written mostly in C++) that provides a complete environment for bytecode: memory, threads, security checks and an instruction executor. The Java language specification only defines what the JVM must do; vendors implement it. The most common implementation is <strong>HotSpot</strong> (used in Oracle JDK, OpenJDK, Temurin, Corretto and others), and everything here describes HotSpot.</p>
+  <figure class="fig">
+<pre class="diagram">
+┌───────────────────────────── JVM process ───────────────────────────┐
+│ Class loader subsystem                                              │
+│   bootstrap ─▶ platform ─▶ application   (load, link, initialize)   │
+├─────────────────────────────────────────────────────────────────────┤
+│ Runtime data areas                                                  │
+│  Shared by all threads                  Per thread                  │
+│  ┌──────────────────────────────┐      ┌──────────────────────────┐ │
+│  │ Heap: objects, arrays,       │      │ JVM stack: one frame per │ │
+│  │       String pool, statics   │      │   method call            │ │
+│  │ Metaspace: class metadata,   │      │ PC register: current     │ │
+│  │   method code (native mem.)  │      │   instruction            │ │
+│  └──────────────────────────────┘      │ Native method stack      │ │
+│                                        └──────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────┤
+│ Execution engine                                                    │
+│   Interpreter  |  JIT compiler (C1, C2)  |  Garbage collector       │
+├─────────────────────────────────────────────────────────────────────┤
+│ JNI (Java Native Interface)  ◀──▶  native libraries (C, C++)        │
+└─────────────────────────────────────────────────────────────────────┘
+</pre>
+    <figcaption>HotSpot JVM at a glance</figcaption>
+  </figure>
+
+  <h4>1. Class loader subsystem</h4>
+  <p>Finds <code>.class</code> files (in folders, JARs, modules, or from the network), loads them into memory when first needed, checks them and prepares them for use. Details are in <a href="#m7-class-loading">Class loading</a>.</p>
+
+  <h4>2. Runtime data areas</h4>
+  <dl class="terms">
+    <dt>Heap</dt>
+    <dd>One area shared by all threads. Every object and every array created with <code>new</code> lives here, as do the String pool and the static fields of classes (HotSpot keeps them inside each class's <code>Class</code> object). The garbage collector manages it. Size is set with <code>-Xms</code> (initial) and <code>-Xmx</code> (maximum).</dd>
+    <dt>Metaspace (method area)</dt>
+    <dd>Stores class metadata: the structure of each class, method bytecode, the runtime constant pool. Before Java 8 this was the fixed-size <strong>PermGen</strong> inside the heap; since Java 8 it is <strong>Metaspace</strong> in native (OS) memory and grows on demand. It can still run out (<code>OutOfMemoryError: Metaspace</code>), typically when an app keeps generating or reloading classes. Limit it with <code>-XX:MaxMetaspaceSize</code>.</dd>
+    <dt>JVM stack (one per thread)</dt>
+    <dd>A stack of <strong>frames</strong>. Each method call pushes a frame holding its local variables, an operand stack and a reference to the constant pool; returning pops it. Size per thread is set with <code>-Xss</code>.</dd>
+    <dt>PC register (one per thread)</dt>
+    <dd>Holds the address of the bytecode instruction that the thread is executing right now.</dd>
+    <dt>Native method stack (one per thread)</dt>
+    <dd>Used when the thread runs native (non-Java) code via JNI. In HotSpot it is part of the same thread stack.</dd>
+  </dl>
+  <p>Note which areas are <strong>shared</strong> (heap, Metaspace — so they need care with threads) and which are <strong>per thread</strong> (stack, PC register). This is why local variables are naturally thread-safe and objects on the heap are not.</p>
+
+  <h4>3. Execution engine</h4>
+  <ul>
+    <li><strong>Interpreter.</strong> Reads bytecode one instruction at a time and executes it. Starts instantly but is slow.</li>
+    <li><strong>JIT compiler.</strong> Compiles frequently run bytecode into native machine code at runtime (see below).</li>
+    <li><strong>Garbage collector.</strong> Finds objects that nothing can reach and frees their memory (<a href="#m7-gc">Garbage collection</a>).</li>
+  </ul>
+
+  <h4>4. JNI</h4>
+  <p>The <strong>Java Native Interface</strong> lets Java call code written in C or C++ and lets native code call Java. The JDK itself uses it for file, network and OS operations. You rarely write JNI yourself, but native memory (outside the heap) is one reason a Java process can use more memory than <code>-Xmx</code>.</p>
+
+  <h4>JIT compilation: C1, C2 and tiered compilation</h4>
+  <p>The JVM counts how often each method is called and each loop runs. Methods that cross a threshold are <strong>hot</strong> and get compiled to machine code by the <strong>JIT (just-in-time) compiler</strong>. HotSpot has two JIT compilers:</p>
+  <ul>
+    <li><strong>C1</strong> (client compiler) compiles quickly with light optimisation.</li>
+    <li><strong>C2</strong> (server compiler) compiles slowly but applies heavy optimisation, using profile data collected while the code ran.</li>
+  </ul>
+  <p><strong>Tiered compilation</strong> (the default) combines both: code starts in the interpreter, moves to C1 when warm, and to C2 when very hot. The result is a fast start-up and a high peak speed. Typical C2 optimisations are <strong>inlining</strong> (copying a small method's body into its caller), removing dead code, and unrolling loops. If an assumption turns out wrong (for example a new subclass is loaded), the JVM <strong>deoptimises</strong>: it throws away the compiled code and falls back to the interpreter.</p>
+  <p>Consequences you can see: the first requests to a freshly started service are slower (<strong>warm-up</strong>); micro-benchmarks written with a simple <code>System.nanoTime()</code> loop are misleading (use JMH); and short-lived command-line tools never reach peak speed. <code>-XX:+PrintCompilation</code> prints what gets compiled.</p>
+
+  <h4>Escape analysis</h4>
+  <p>When C2 compiles a method, <strong>escape analysis</strong> checks whether an object created inside it ever "escapes" — is stored in a field, returned or passed somewhere the JIT cannot see. If it does not escape, the JIT can skip the heap allocation and keep the object's fields in CPU registers (<strong>scalar replacement</strong>), or remove locks on it (<strong>lock elision</strong>). So a short-lived <code>new Point(x, y)</code> in a hot loop may cost nothing. Objects are not literally moved to the stack; they simply disappear. Do not write ugly code to "save allocations"; write clear code first and measure.</p>
+
+  <h4>Where the memory of a Java process goes</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Area</th><th>Lives in</th><th>Controlled by</th><th>Out-of-memory message</th></tr></thead>
+    <tbody>
+      <tr><td>Heap</td><td>JVM-managed memory</td><td><code>-Xms</code>, <code>-Xmx</code></td><td><code>Java heap space</code></td></tr>
+      <tr><td>Metaspace</td><td>Native memory</td><td><code>-XX:MaxMetaspaceSize</code></td><td><code>Metaspace</code></td></tr>
+      <tr><td>Thread stacks</td><td>Native memory</td><td><code>-Xss</code>, number of threads</td><td><code>StackOverflowError</code>, or <code>unable to create native thread</code></td></tr>
+      <tr><td>JIT code cache, GC structures, direct buffers</td><td>Native memory</td><td>Various <code>-XX</code> flags</td><td>Rarely hit</td></tr>
+    </tbody>
+  </table></div>
+  <p>So the real memory used by a Java process (the RSS you see in <code>top</code> or Task Manager) is always larger than <code>-Xmx</code>. In containers, leave headroom (see the <a href="#m7-leaks-flags-tools">flags article</a>).</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: heap and Metaspace are shared; stack and registers are per thread</p>
+    <p>Anything on the heap can be reached by several threads and needs synchronisation or immutability. Local variables on a thread's stack are private to it.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>"PermGen" appears in old tutorials and interview questions. It was removed in Java 8 (replaced by Metaspace); <code>-XX:PermSize</code> flags are ignored by modern JVMs.</li>
+      <li>The JVM spec describes a "method area"; HotSpot implements it as Metaspace. The String pool and static fields moved into the heap in Java 7 and 8.</li>
+      <li>Other JVMs exist (Eclipse OpenJ9, GraalVM) with different internals; the model above still holds.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain the JVM architecture"</p>
+    <ul>
+      <li>Three parts: class loader subsystem, runtime data areas, execution engine (plus JNI and native libraries).</li>
+      <li>Data areas: heap and Metaspace shared; stack, PC register and native stack per thread.</li>
+      <li>Execution engine: interpreter for fast start, JIT (C1 then C2, tiered) for hot code, garbage collector for memory.</li>
+      <li>Add the details that show depth: Metaspace replaced PermGen in Java 8; string pool is on the heap; escape analysis can remove allocations.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m7-stack-heap">
+  <h3>Stack vs heap: where variables and objects live</h3>
+  <p class="tldr">Local variables and method-call frames live on a thread's stack; objects, arrays and the String pool live on the shared heap; a local reference variable sits on the stack and points to its object on the heap.</p>
+
+  <h4>The two main memory areas</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Stack</th><th>Heap</th></tr></thead>
+    <tbody>
+      <tr><td>Holds</td><td>Frames: local variables, parameters, operand stack, return address</td><td>Objects, arrays, boxed values, String pool</td></tr>
+      <tr><td>Owner</td><td>One per thread (private)</td><td>One per JVM (shared by all threads)</td></tr>
+      <tr><td>Lifetime</td><td>Until the method returns</td><td>Until the object is unreachable and garbage collected</td></tr>
+      <tr><td>Cleanup</td><td>Automatic: frame is popped</td><td>Garbage collector</td></tr>
+      <tr><td>Speed</td><td>Very fast (just move a pointer)</td><td>Slower to allocate and manage</td></tr>
+      <tr><td>Size</td><td>Small (typically 512 KB to 1 MB per thread, set by <code>-Xss</code>)</td><td>Large (by default a quarter of physical memory, set by <code>-Xmx</code>)</td></tr>
+      <tr><td>When full</td><td><code>StackOverflowError</code></td><td><code>OutOfMemoryError: Java heap space</code></td></tr>
+      <tr><td>Thread safety</td><td>Naturally safe (private)</td><td>Needs care</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A worked example</h4>
+  <p>Follow this small program from <code>main</code> into <code>compute</code>:</p>
+  <pre data-title="Shop.java"><code class="language-java">public class Shop {
+    static int orders = 0;                       // static field
+
+    static class Product {
+        String name;                             // instance fields live inside the object
+        double price;
+        Product(String name, double price) { this.name = name; this.price = price; }
+    }
+
+    public static void main(String[] args) {
+        int qty = 3;                             // primitive local
+        String label = "Pen";                    // reference to a pooled literal
+        Product p = new Product("Pen", 12.5);    // reference local + object on heap
+        int total = compute(p, qty);             // call: new frame
+        orders++;
+        System.out.println(total);
+    }
+
+    static int compute(Product item, int q) {
+        double sum = item.price * q;             // 37.5
+        return (int) sum;
+    }
+}</code></pre>
+  <figure class="fig">
+<pre class="diagram">
+ Thread "main" stack                    Heap
+┌───────────────────────────┐     ┌─────────────────────────────────┐
+│ frame: compute()          │     │ String pool                     │
+│   sum  = 37.5             │     │   "Pen"  ◀──────────┐           │
+│   q    = 3                │     │     ▲               │           │
+│   item ───────────────────┼──┐  │     │ name          │           │
+├───────────────────────────┤  │  │  ┌──┴────────────┐  │           │
+│ frame: main()             │  └─▶│  │ Product       │  │           │
+│   total = (not yet set)   │     │  │  name  ───────┼──┘           │
+│   p ──────────────────────┼────▶│  │  price = 12.5 │              │
+│   label ──────────────────┼──┐  │  └───────────────┘              │
+│   qty = 3                 │  └─▶│   (label also points to "Pen")  │
+│   args ──▶ String[0]      │     │ Class Shop (Class object):      │
+└───────────────────────────┘     │   static orders = 0             │
+                                  └─────────────────────────────────┘
+</pre>
+    <figcaption>State while <code>compute()</code> runs: two frames on the stack, objects on the heap</figcaption>
+  </figure>
+  <p>Read the picture like this:</p>
+  <ul>
+    <li><code>qty</code>, <code>q</code> and <code>sum</code> are primitives: the number itself is stored in the frame.</li>
+    <li><code>p</code>, <code>item</code> and <code>label</code> are references: the stack holds only the reference. <code>p</code> and <code>item</code> hold copies of the same reference, so they point to one <code>Product</code> — this is exactly <a href="#m1-pass-by-value">pass-by-value</a>.</li>
+    <li>The <code>Product</code> object is on the heap. Its fields are inside the object: the primitive <code>price</code> by value, and <code>name</code> as a reference to the pooled <code>"Pen"</code>.</li>
+    <li>When <code>compute</code> returns, its frame is popped and <code>sum</code>, <code>q</code>, <code>item</code> disappear. The <code>Product</code> survives because <code>p</code> still points to it.</li>
+    <li>When <code>main</code> ends, <code>p</code> goes away; the <code>Product</code> becomes unreachable and the GC can free it later.</li>
+  </ul>
+
+  <h4>Where does each thing live?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Item</th><th>Location</th></tr></thead>
+    <tbody>
+      <tr><td>Local primitive (<code>int qty</code>)</td><td>Stack frame (the value)</td></tr>
+      <tr><td>Local reference (<code>Product p</code>)</td><td>Stack frame (the reference); the object is on the heap</td></tr>
+      <tr><td>Object created with <code>new</code></td><td>Heap</td></tr>
+      <tr><td>Instance field (primitive or reference)</td><td>Inside its object, on the heap</td></tr>
+      <tr><td>Array (even <code>int[]</code>)</td><td>Heap; the variable holding it is a reference</td></tr>
+      <tr><td>Static field</td><td>With the class: in HotSpot, in the <code>Class</code> object on the heap (conceptually the "method area")</td></tr>
+      <tr><td>String literal</td><td>String pool (part of the heap since Java 7)</td></tr>
+      <tr><td><code>new String("x")</code>, strings built at runtime</td><td>Normal heap</td></tr>
+      <tr><td>Boxed <code>Integer</code></td><td>Heap (small values come from the cache)</td></tr>
+      <tr><td>Lambda captured values</td><td>Inside the lambda object on the heap</td></tr>
+      <tr><td>Class definitions, method bytecode</td><td>Metaspace</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Stack frames in more detail</h4>
+  <p>Each frame has: an array of <strong>local variables</strong> (parameters first, with <code>this</code> as slot 0 in instance methods); an <strong>operand stack</strong>, a small work area where bytecode instructions push operands and pop results; and a link to the constant pool of the class. For <code>a + b</code> the bytecode is: load <code>a</code> onto the operand stack, load <code>b</code>, add (pops two, pushes the result), store into a local. You can see this with <code>javap -c</code>. A thread's stack is a chain of frames; the stack trace printed with an exception is a readout of that chain.</p>
+
+  <h4>StackOverflowError</h4>
+  <p>Each thread's stack has a fixed maximum size. Infinite or very deep recursion keeps pushing frames until it is full:</p>
+  <pre data-title="StackDemo.java"><code class="language-java">public class StackDemo {
+    static int depth = 0;
+
+    static void recurse() {
+        depth++;
+        recurse();                      // no base case
+    }
+
+    public static void main(String[] args) {
+        try {
+            recurse();
+        } catch (StackOverflowError e) {
+            System.out.println("Overflow after about " + depth + " calls");
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (number varies)"><code class="language-plaintext">Overflow after about 10000-20000 calls</code></pre>
+  <p>(The exact depth depends on frame size, JVM and <code>-Xss</code>; typical values are in the thousands to tens of thousands.) <code>StackOverflowError</code> is an <code>Error</code>, not an <code>Exception</code>. Fixes: add or correct the base case, convert recursion to a loop, or (rarely) increase <code>-Xss</code>. Common real-world causes: mutual recursion between <code>toString()</code> methods of two objects that reference each other, bidirectional JPA entities serialised to JSON, and a getter that calls itself.</p>
+
+  <h4>OutOfMemoryError</h4>
+  <pre data-title="HeapDemo.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class HeapDemo {
+    public static void main(String[] args) {
+        List&lt;byte[]&gt; hog = new ArrayList&lt;&gt;();
+        while (true) {
+            hog.add(new byte[1024 * 1024]);      // keep 1 MB blocks reachable forever
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Terminal (run with a small heap)"><code class="language-shell">$ java -Xmx64m HeapDemo.java
+Exception in thread "main" java.lang.OutOfMemoryError: Java heap space</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Message</th><th>Meaning</th><th>Typical cause</th></tr></thead>
+    <tbody>
+      <tr><td><code>Java heap space</code></td><td>The heap is full of reachable objects</td><td>Leak, loading a huge file or result set into memory, heap too small</td></tr>
+      <tr><td><code>GC overhead limit exceeded</code></td><td>GC runs almost all the time and frees almost nothing</td><td>Same as above, just before heap space is exhausted (mostly Parallel GC)</td></tr>
+      <tr><td><code>Metaspace</code></td><td>Too many classes</td><td>Class loader leak, heavy dynamic class generation or redeploys</td></tr>
+      <tr><td><code>unable to create native thread</code></td><td>OS cannot give another thread stack</td><td>Thread leak, unbounded thread creation</td></tr>
+      <tr><td><code>Requested array size exceeds VM limit</code></td><td>Array too large</td><td>Bug in size calculation</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>StackOverflowError</code></th><th><code>OutOfMemoryError</code></th></tr></thead>
+    <tbody>
+      <tr><td>Area</td><td>Thread stack</td><td>Heap, Metaspace or native memory</td></tr>
+      <tr><td>Cause</td><td>Too deep recursion or call chain</td><td>Too many live objects / classes / threads</td></tr>
+      <tr><td>Affects</td><td>One thread</td><td>Whole JVM (other threads may fail next)</td></tr>
+      <tr><td>Recoverable?</td><td>Usually; the thread unwinds</td><td>Rarely; restart is safest</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: a reference is never the object</p>
+    <p>A variable of a class type holds a reference (or <code>null</code>). Assigning, passing and returning copies the reference, not the object. Two references to one object see each other's changes.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>"Primitives live on the stack" is only true for <em>local</em> primitives. A primitive field of an object lives inside that object on the heap, and the elements of an <code>int[]</code> are on the heap.</li>
+      <li>Escape analysis can remove an allocation altogether (<a href="#m7-jvm-architecture">JVM architecture</a>). The model above is what the language guarantees, not what the JIT physically does.</li>
+      <li>Catching <code>OutOfMemoryError</code> is almost never a good idea: the JVM may be in an inconsistent state. Let it crash and restart (<code>-XX:+ExitOnOutOfMemoryError</code>) after saving a heap dump.</li>
+      <li>Virtual threads (Java 21) have small stacks stored on the heap that grow and shrink; the stack-versus-heap picture changes slightly there (<a href="#m6">Module 6</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Believing that objects can be created on the stack in Java as in C++ (<code>Product p(...)</code>). In Java, <code>new</code> always means heap (as far as the language is concerned).</li>
+      <li>Saying "the object is passed by reference". The reference is copied.</li>
+      <li>Treating <code>StackOverflowError</code> as a memory-size problem when it is a recursion bug.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Stack vs heap" and "StackOverflowError vs OutOfMemoryError"</p>
+    <ul>
+      <li>Stack: per thread, frames with locals, fast, freed on return. Heap: shared, objects, managed by GC.</li>
+      <li>Walk through <code>Product p = new Product(...)</code>: reference <code>p</code> on the stack, object on the heap.</li>
+      <li>Static fields with the class data; string literals in the pool in the heap; Metaspace holds class metadata.</li>
+      <li>SOE = too deep call chain (fix recursion). OOM = too much live data (fix leak, size, or algorithm). Name two OOM messages.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m7-gc">
+  <h3>Garbage collection: generations, roots, collectors and references</h3>
+  <p class="tldr">The garbage collector frees objects that can no longer be reached from a GC root; the heap is split into young and old generations because most objects die young, and modern collectors (G1, ZGC) do most of their work concurrently to keep pauses short.</p>
+
+  <p>In Java you create objects with <code>new</code> and never free them. The <strong>garbage collector (GC)</strong> does it. An object is garbage when no live part of the program can reach it any more. This removes whole classes of bugs (use-after-free, double free) but introduces GC pauses and tuning.</p>
+
+  <h4>Reachability and GC roots</h4>
+  <p>Java does not use reference counting (which fails on cycles). The GC starts from a set of <strong>GC roots</strong> and follows references; everything it can reach is <strong>live</strong>, everything else is garbage. The roots include:</p>
+  <ul>
+    <li>local variables and parameters in every thread's stack frames;</li>
+    <li>static fields of loaded classes;</li>
+    <li>active threads and JNI references;</li>
+    <li>other internal JVM references (such as class loaders and monitor locks).</li>
+  </ul>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  R1[Stack variable] --> A[Order]
+  R2[Static field] --> B[Cache]
+  A --> C[Customer]
+  B --> C
+  D[Unreferenced object] --> E[Its helper]
+</pre>
+    <figcaption>Order, Cache and Customer are reachable from roots; the last two objects are garbage even though one still points to the other</figcaption>
+  </figure>
+  <p>The basic algorithm is <strong>mark and sweep</strong>: <em>mark</em> every reachable object, then reclaim the rest. Most collectors also <strong>compact</strong> or <strong>copy</strong> the survivors so free memory is one contiguous block (no fragmentation).</p>
+
+  <h4>The generational hypothesis</h4>
+  <p>Studies of real programs show that <strong>most objects die young</strong> (a request object, a temporary string, an iterator) and a few live very long (caches, connection pools, Spring beans). So the heap is divided into generations and the young one is collected often and cheaply:</p>
+  <figure class="fig">
+<pre class="diagram">
+          Young generation                       Old generation
+┌──────────────────────────┬────────┬────────┐ ┌────────────────────┐
+│          Eden            │   S0   │   S1   │ │  Tenured (old)     │
+│  new objects start here  │survivor│survivor│ │  long-lived objects│
+└──────────────────────────┴────────┴────────┘ └────────────────────┘
+ minor GC: Eden + one survivor ─▶ other survivor,        major/full GC:
+ old enough survivors are promoted ─────────────────────▶ whole heap
+</pre>
+    <figcaption>Classic generational heap layout (G1 uses the same idea with many small regions)</figcaption>
+  </figure>
+  <ol class="steps">
+    <li>New objects are allocated in <strong>Eden</strong> (allocation is just a pointer bump, very fast).</li>
+    <li>When Eden is full, a <strong>minor GC</strong> runs. It copies the live objects from Eden and the current survivor space into the other <strong>survivor space</strong> and frees Eden completely. Cost depends on the number of <em>live</em> objects, not on the garbage, so it is quick.</li>
+    <li>Each survivor object has an <strong>age</strong>, increased at every minor GC it survives. When the age passes a threshold (at most 15 by default, and the JVM adapts it), the object is <strong>promoted</strong> to the old generation. Very large objects may be placed in the old generation directly.</li>
+    <li>When the old generation fills up, an <strong>old-generation collection</strong> (a <strong>major GC</strong>) is needed. A <strong>full GC</strong> collects the entire heap, including young and old generations and Metaspace, and is the slowest, with the longest pauses.</li>
+  </ol>
+
+  <h4>Stop-the-world pauses</h4>
+  <p>Some GC steps need the application threads to stop so that the object graph does not change while the GC walks it. This is a <strong>stop-the-world (STW) pause</strong>. Users see it as a request that suddenly takes 800 ms. The aim of modern collectors is to keep pauses short by doing most work <strong>concurrently</strong> with your threads. Throughput (how much CPU goes to your code) and latency (pause length) pull in opposite directions; different collectors choose different balances.</p>
+
+  <h4>The collectors</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Collector</th><th>Flag</th><th>Character</th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td>Serial</td><td><code>-XX:+UseSerialGC</code></td><td>Single GC thread, simple, STW</td><td>Tiny heaps, single-CPU containers, small tools</td></tr>
+      <tr><td>Parallel</td><td><code>-XX:+UseParallelGC</code></td><td>Many GC threads, maximum throughput, longer pauses</td><td>Batch jobs where total time matters more than pauses</td></tr>
+      <tr><td>G1 (Garbage-First)</td><td><code>-XX:+UseG1GC</code></td><td>Heap split into regions; collects the regions with most garbage first; pause-time goal (<code>-XX:MaxGCPauseMillis</code>, default 200 ms)</td><td><strong>Default</strong> since Java 9 on typical server machines; a good general choice</td></tr>
+      <tr><td>ZGC</td><td><code>-XX:+UseZGC</code></td><td>Almost fully concurrent; very short pauses, works on very large heaps; generational in modern JDKs</td><td>Latency-sensitive services, big heaps</td></tr>
+      <tr><td>Shenandoah</td><td><code>-XX:+UseShenandoahGC</code></td><td>Concurrent compaction, low pauses</td><td>Low-latency services; available in many OpenJDK builds, but not in every vendor's JDK</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li>The JVM picks <strong>Serial</strong> instead of G1 automatically on a very small machine or container (roughly fewer than two CPUs or about 1.8 GB of memory).</li>
+    <li><strong>CMS</strong> (Concurrent Mark Sweep), common in old tutorials, was removed in Java 14.</li>
+    <li>Do not tune GC blindly. Start with the default (G1), set <code>-Xmx</code> sensibly, measure with GC logs, and change collector or flags only with data. Print GC activity with <code>-Xlog:gc</code> (Java 9+).</li>
+  </ul>
+  <pre class="out" data-title="Example of -Xlog:gc output (values vary)"><code class="language-plaintext">[0.512s][info][gc] GC(3) Pause Young (Normal) (G1 Evacuation Pause) 56M-&gt;12M(128M) 4.215ms
+[7.904s][info][gc] GC(9) Pause Full (System.gc()) 90M-&gt;11M(128M) 31.820ms</code></pre>
+  <p>Read it as: a young pause took 4 ms and the heap dropped from 56 MB to 12 MB (of 128 MB committed). A pause marked <code>System.gc()</code> shows that someone called the method explicitly.</p>
+
+  <h4>System.gc(), finalize() and Cleaner</h4>
+  <ul>
+    <li><code>System.gc()</code> is only a <strong>hint</strong>; the JVM may ignore it, and when it runs it often causes a full GC pause. Do not call it in application code. (Some libraries do; <code>-XX:+DisableExplicitGC</code> turns it off.)</li>
+    <li><code>finalize()</code> was meant to clean up before an object is collected. It is unpredictable (no guarantee when or whether it runs), slow, and can resurrect objects. It has been <strong>deprecated for removal</strong> since Java 18. Never write it.</li>
+    <li>For resources (files, sockets, DB connections) use <strong>try-with-resources</strong> with <code>AutoCloseable</code>, so they are closed at a known point. For a safety net around native resources, use <code>java.lang.ref.Cleaner</code>:</li>
+  </ul>
+  <pre data-title="NativeBuffer.java"><code class="language-java">import java.lang.ref.Cleaner;
+
+public class NativeBuffer implements AutoCloseable {
+    private static final Cleaner CLEANER = Cleaner.create();
+
+    // The cleanup action must NOT refer to the NativeBuffer, or it can never be collected
+    private static class State implements Runnable {
+        public void run() { System.out.println("native memory freed"); }
+    }
+
+    private final Cleaner.Cleanable cleanable;
+
+    public NativeBuffer() {
+        this.cleanable = CLEANER.register(this, new State());
+    }
+
+    @Override
+    public void close() {
+        cleanable.clean();               // runs the action once, now
+    }
+}</code></pre>
+
+  <h4>Reference types</h4>
+  <p>A normal variable is a <strong>strong reference</strong>: while it exists, the object is kept. <code>java.lang.ref</code> offers weaker references that the GC may clear:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Collected when</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td>Strong (<code>Object o = new Object()</code>)</td><td>Never while reachable</td><td>Everything normal</td></tr>
+      <tr><td><code>SoftReference</code></td><td>The JVM is short of memory (before <code>OutOfMemoryError</code>)</td><td>Memory-sensitive caches</td></tr>
+      <tr><td><code>WeakReference</code></td><td>At the next GC, if only weakly reachable</td><td><code>WeakHashMap</code>, canonical-object maps, listeners</td></tr>
+      <tr><td><code>PhantomReference</code></td><td>After the object is finalised; <code>get()</code> always returns null</td><td>Post-mortem cleanup (<code>Cleaner</code> is built on it)</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="WeakDemo.java"><code class="language-java">import java.lang.ref.WeakReference;
+import java.util.Map;
+import java.util.WeakHashMap;
+
+public class WeakDemo {
+    public static void main(String[] args) throws Exception {
+        Object big = new Object();
+        WeakReference&lt;Object&gt; weak = new WeakReference&lt;&gt;(big);
+        System.out.println(weak.get() != null);      // true: big still strongly held
+
+        big = null;                                  // drop the only strong reference
+        System.gc();                                 // a hint, but works in practice here
+        Thread.sleep(100);
+        System.out.println(weak.get());              // null (normally)
+
+        Map&lt;Object, String&gt; cache = new WeakHashMap&lt;&gt;();
+        Object key = new Object();
+        cache.put(key, "metadata");
+        key = null;                                  // no strong reference to the key remains
+        System.gc();
+        Thread.sleep(100);
+        System.out.println(cache.size());            // 0 (normally): the entry vanished
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (GC timing is not guaranteed)"><code class="language-plaintext">true
+null
+0</code></pre>
+  <p>A <code>WeakHashMap</code> removes an entry when its <em>key</em> is no longer strongly reachable. If the value refers to the key strongly, the entry never disappears — a common mistake.</p>
+
+  <h4>Helping the GC (and not hurting it)</h4>
+  <ul>
+    <li>Keep objects' scopes small. Local variables disappear when the method returns; you do not need to write <code>x = null</code> (except for a long-lived field that you want to release, or an element removed from your own array-based structure).</li>
+    <li>Do not hold on to data you no longer need: clear caches, unregister listeners, cap collection sizes.</li>
+    <li>Avoid creating huge numbers of short-lived objects in hot loops (boxing, string concatenation) — they are cheap, but not free.</li>
+    <li>Stream large results and process in batches instead of loading millions of rows into a list.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: reachability, not scope, decides what is collected</p>
+    <p>An object is collectable when no GC root can reach it, even if it was never explicitly dereferenced or if it points to other garbage. A static field holding a collection keeps everything in it alive for the life of the class.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Objects in a cycle (A points to B, B to A) are still collected if nothing reaches the cycle.</li>
+      <li>"Humongous" objects (very large arrays) are allocated specially in G1 and can cause extra GC work if you create many.</li>
+      <li>A thread that is still running keeps its <code>Runnable</code>, and everything that <code>Runnable</code> references, alive.</li>
+      <li>GC can run at any time between any two bytecode instructions; never rely on it for program correctness or timing.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Calling <code>System.gc()</code> "to free memory". It rarely helps and often hurts.</li>
+      <li>Relying on <code>finalize()</code> to close files or connections.</li>
+      <li>Increasing <code>-Xmx</code> to hide a leak: the app just dies later, with a bigger heap dump.</li>
+      <li>Setting a huge young generation or many GC flags copied from a blog without measuring.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How does garbage collection work? Which collectors do you know?"</p>
+    <ul>
+      <li>Objects not reachable from GC roots are garbage; mark and sweep/copy/compact; generational because most objects die young.</li>
+      <li>Eden + two survivors + old; minor GC copies live objects, age increments, promotion to old; full GC is the expensive one; stop-the-world pauses.</li>
+      <li>Collectors: Serial, Parallel (throughput), G1 (default, balanced, regions), ZGC and Shenandoah (low latency). CMS was removed.</li>
+      <li><code>System.gc()</code> is a hint; <code>finalize()</code> is deprecated for removal — use try-with-resources and <code>Cleaner</code>.</li>
+      <li>Soft, weak and phantom references; <code>WeakHashMap</code>.</li>
+      <li>Follow-up: "Can you force GC?" No. "Can a Java program leak memory?" Yes — see the next article.</li>
+    </ul>
+  </div>
+</article>

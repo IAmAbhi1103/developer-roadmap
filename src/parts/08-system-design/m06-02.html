@@ -1,0 +1,581 @@
+<article class="topic" id="m6-delivery-semantics">
+  <h3>Delivery semantics: at-most-once, at-least-once, effectively once</h3>
+  <p class="tldr">A message system can promise at-most-once (may lose), at-least-once (may duplicate) or
+  exactly-once; true exactly-once delivery over an unreliable network is not achievable, so you combine
+  at-least-once delivery with idempotent consumers to get "effectively once" processing.</p>
+
+  <h4>The core problem</h4>
+  <p>A producer sends a message and waits for an acknowledgement (ack). Three things can go wrong: the
+  message is lost on the way, the consumer crashes before finishing, or the ack is lost after the work was
+  done. In the last case the sender cannot tell "never arrived" from "arrived but the ack vanished". It must
+  choose: send again (risking a duplicate) or do not send again (risking a loss). That choice is the whole
+  topic.</p>
+
+  <h4>The three guarantees</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Guarantee</th><th>How it works</th><th>Failure outcome</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td>At-most-once</td><td>Send once, never retry. Consumer acks before processing</td><td>Message can be lost, never duplicated</td><td>Metrics, logs, location pings where a gap is fine</td></tr>
+      <tr><td>At-least-once</td><td>Retry until acked. Consumer acks after processing</td><td>Message can be processed twice, never lost</td><td>Default for orders, payments, notifications</td></tr>
+      <tr><td>Exactly-once</td><td>Each message has exactly one effect</td><td>No loss, no duplicate effect</td><td>Money movement, inventory</td></tr>
+    </tbody>
+  </table></div>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant P as Producer
+  participant B as Broker
+  participant C as Consumer
+  P->>B: message M1
+  B->>C: deliver M1
+  C->>C: process M1 (stock reduced)
+  C--xB: ack lost
+  B->>C: redeliver M1 after timeout
+  C->>C: process M1 again
+  Note over C: duplicate unless the consumer is idempotent
+</pre>
+    <figcaption>At-least-once delivery: a lost ack causes a redelivery and a second run</figcaption>
+  </figure>
+
+  <h4>The order of ack and processing decides the guarantee</h4>
+  <ul>
+    <li><strong>Ack first, then process</strong> (at-most-once): if the consumer crashes after the ack, the
+    message is gone.</li>
+    <li><strong>Process first, then ack</strong> (at-least-once): if the consumer crashes after processing
+    but before the ack, the broker redelivers and the work runs again.</li>
+  </ul>
+  <p>Kafka makes this concrete: a consumer commits its <em>offset</em> (its position in the log). Commit
+  before processing gives at-most-once; commit after processing gives at-least-once. RabbitMQ and SQS use
+  acknowledgements and visibility timeouts in the same way.</p>
+
+  <h4>Is exactly-once real?</h4>
+  <p>Over an unreliable network, delivering a message exactly once is impossible in the general case (a
+  version of the "two generals" problem). What systems can offer is <strong>exactly-once
+  <em>processing effect</em></strong>, which is the combination:</p>
+  <p class="co-t">at-least-once delivery + deduplication / idempotency = effectively once</p>
+  <p>Kafka provides features for this inside its own world: an <em>idempotent producer</em> (the broker
+  drops duplicate sends from the same producer session) and <em>transactions</em> that write results and
+  commit offsets atomically in a read-process-write pipeline between Kafka topics. Those guarantees stop at
+  Kafka's boundary. The moment a consumer writes to a database, sends an email or calls a payment API, you
+  need your own idempotency.</p>
+
+  <h4>Making a consumer effectively once</h4>
+  <ol class="steps">
+    <li>Give every message a stable unique id created by the producer (a UUID or a business id such as
+    <code>orderId + eventType</code>). Never create it in the consumer.</li>
+    <li>In one database transaction, insert the id into a <code>processed_message</code> table and apply the
+    business change.</li>
+    <li>A duplicate violates the unique constraint; catch it, skip the work, and ack the message.</li>
+    <li>Ack only after the transaction commits.</li>
+    <li>Expire old ids after a safe window (longer than the broker's maximum redelivery time).</li>
+  </ol>
+  <p>The SQL version is in the <a href="#m6-idempotency">Idempotency</a> article. Other options: an upsert
+  by natural key, or optimistic locking with a version number.</p>
+
+  <h4>Deduplication windows and ordering</h4>
+  <p>A dedupe store cannot grow forever, so it keeps ids for a window (a day, a week). A duplicate that
+  arrives after the window gets through, so choose the window longer than the longest possible redelivery.
+  Also remember <strong>ordering</strong>: retries and parallel consumers can reorder messages. Kafka orders
+  only inside a partition, so choose the partition key (for example <code>orderId</code>) so that all
+  events of one order go to one partition. Consumers that need order should process one partition
+  sequentially, and should still guard against stale updates with a version or timestamp check.</p>
+
+  <h4>Poison messages and dead-letter queues</h4>
+  <p>A message that always fails (bad JSON, a bug) will be retried forever under at-least-once and can block
+  the queue. After N attempts, move it to a <strong>dead-letter queue</strong> (DLQ), alert, and inspect it
+  later. Fix the bug, then replay from the DLQ; idempotent consumers make replay safe.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Exception: at-most-once is sometimes the right answer</p>
+    <p>For a driver's GPS ping every 4 seconds, losing one ping is harmless and the next one replaces it.
+    Retrying would only add load and delay. Fire-and-forget is correct there.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Believing a broker flag called "exactly-once" protects your database and email side effects.</li>
+      <li>Non-idempotent consumers on an at-least-once queue (double refund, double email).</li>
+      <li>Auto-committing offsets before the work finishes.</li>
+      <li>Generating the dedupe id from a timestamp or random value inside the consumer.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>State the three guarantees and what breaks in each.</li>
+      <li>Say: "Exactly-once delivery is not possible over a network; I use at-least-once plus an idempotent
+      consumer to get exactly-once effects."</li>
+      <li>Mention ack-after-processing, the processed-message table, DLQ and partition keys for ordering.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-saga">
+  <h3>Distributed transactions: why not 2PC, and the saga pattern</h3>
+  <p class="tldr">Two-phase commit gives atomic commits across databases but blocks and depends on a
+  coordinator, so microservices use sagas instead: a chain of local transactions where each step has a
+  compensating action that undoes it if a later step fails.</p>
+
+  <h4>The problem</h4>
+  <p>In a monolith, "place order" is one <code>@Transactional</code> method: insert the order, take
+  payment, reduce stock; if anything fails, the database rolls everything back. With database-per-service
+  (see <a href="#m6-monolith-microservices">Monolith vs microservices</a>) those three writes live in three
+  databases owned by three services. There is no single transaction around them. What if payment succeeds
+  and then inventory says "out of stock"? You must undo the payment.</p>
+
+  <h4>Two-phase commit (2PC)</h4>
+  <p><strong>2PC</strong> uses a coordinator and works in two phases.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant K as Coordinator
+  participant A as Orders DB
+  participant B as Payments DB
+  participant C as Inventory DB
+  K->>A: prepare
+  K->>B: prepare
+  K->>C: prepare
+  A-->>K: yes
+  B-->>K: yes
+  C-->>K: yes
+  Note over K: all voted yes, decision is COMMIT
+  K->>A: commit
+  K->>B: commit
+  K->>C: commit
+</pre>
+    <figcaption>Two-phase commit: collect votes (prepare), then tell everyone to commit or abort</figcaption>
+  </figure>
+  <p>In phase 1 each participant does the work, writes it to its log, <strong>locks</strong> the rows and
+  votes yes or no. In phase 2, if all voted yes the coordinator orders commit; if any voted no (or timed
+  out) it orders abort.</p>
+  <p>Why it is avoided in microservices:</p>
+  <ul>
+    <li><strong>Blocking.</strong> After voting yes, a participant must wait for the decision and keeps its
+    locks. If the coordinator crashes now, participants are stuck "in doubt" until it returns, and other
+    transactions queue behind those locks.</li>
+    <li><strong>Coordinator is a single point of failure</strong> and a latency cost (extra round trips,
+    forced disk writes at each step).</li>
+    <li><strong>Availability drops.</strong> All participants must be up and fast for any commit to succeed,
+    which is a CP choice in <a href="#m4">CAP terms</a>.</li>
+    <li><strong>Not every system supports it.</strong> Most message brokers, SaaS APIs (a payment gateway)
+    and many NoSQL stores cannot join an XA transaction.</li>
+  </ul>
+  <p>2PC (XA transactions) still exists inside some databases and in tightly controlled setups, and
+  distributed SQL databases use consensus-based commits internally. But for service-to-service business
+  workflows, the standard answer is the saga.</p>
+
+  <h4>The saga idea</h4>
+  <p>A <strong>saga</strong> is a sequence of <em>local</em> transactions, one per service. Each step commits
+  on its own and then triggers the next. If a step fails, the saga runs <strong>compensating
+  transactions</strong> for the steps that already committed, in reverse order. A compensation is a new
+  business action that semantically undoes the earlier one: "refund the payment", "release the reserved
+  stock", "cancel the order". It is not a database rollback; the first change was already visible.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Step</th><th>Local transaction</th><th>Compensation if a later step fails</th></tr></thead>
+    <tbody>
+      <tr><td>1 Orders</td><td>Create order as PENDING</td><td>Mark order CANCELLED</td></tr>
+      <tr><td>2 Payment</td><td>Authorise or capture ₹1,200</td><td>Refund or void the authorisation</td></tr>
+      <tr><td>3 Inventory</td><td>Reserve 2 units</td><td>Release the 2 units</td></tr>
+      <tr><td>4 Shipping</td><td>Create shipment</td><td>Cancel the shipment</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Happy path and failure path (orchestrated)</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant O as Order orchestrator
+  participant P as Payment
+  participant I as Inventory
+  participant S as Shipping
+  O->>P: charge order 42
+  P-->>O: charged
+  O->>I: reserve stock
+  I-->>O: reserved
+  O->>S: create shipment
+  S-->>O: created
+  O->>O: mark order CONFIRMED
+</pre>
+    <figcaption>Orchestrated saga, happy path: each step is a local commit</figcaption>
+  </figure>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant O as Order orchestrator
+  participant P as Payment
+  participant I as Inventory
+  O->>P: charge order 42
+  P-->>O: charged
+  O->>I: reserve stock
+  I-->>O: failed, out of stock
+  O->>P: refund order 42
+  P-->>O: refunded
+  O->>O: mark order CANCELLED
+</pre>
+    <figcaption>Failure path: inventory fails, so the orchestrator runs the compensation for payment</figcaption>
+  </figure>
+
+  <h4>Choreographed saga</h4>
+  <p>Without a central orchestrator, services react to each other's events. On failure, the failing service
+  publishes a failure event and earlier services listen and compensate.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant O as Order
+  participant P as Payment
+  participant I as Inventory
+  O->>P: event OrderPlaced
+  P->>I: event PaymentCaptured
+  I->>P: event StockReservationFailed
+  P->>P: refund payment
+  P->>O: event PaymentRefunded
+  O->>O: mark order CANCELLED
+</pre>
+    <figcaption>Choreographed saga: the failure event travels backwards and each service undoes its own work</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Orchestrated saga</th><th>Choreographed saga</th></tr></thead>
+    <tbody>
+      <tr><td>Who knows the flow</td><td>The orchestrator</td><td>Nobody fully; it is spread out</td></tr>
+      <tr><td>Best for</td><td>Many steps, branches, timeouts</td><td>Two to four simple steps</td></tr>
+      <tr><td>Observability</td><td>Easy: one state machine</td><td>Hard: reconstruct from events</td></tr>
+      <tr><td>Risk</td><td>Orchestrator logic grows large</td><td>Cyclic dependencies, lost overview</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Design rules for sagas</h4>
+  <ul>
+    <li><strong>Every step and every compensation must be idempotent</strong> and retryable: messages repeat
+    (<a href="#m6-delivery-semantics">Delivery semantics</a>).</li>
+    <li><strong>Compensations must always be able to succeed.</strong> "Refund" can be retried until it works;
+    design so that it cannot be refused.</li>
+    <li><strong>Persist the saga state</strong> (which step, what status) so a restarted orchestrator
+    continues where it stopped. A status column on the order plus a saga log table is the minimum.</li>
+    <li><strong>Order steps to put the hard-to-undo ones last.</strong> Reserve stock and authorise payment
+    first; do irreversible things (ship, send final email) at the end. Prefer a <em>pending</em> or
+    <em>reserved</em> state that can be released over a final state that must be reversed.</li>
+    <li><strong>Handle timeouts:</strong> a step that never answers needs a deadline, then a retry or a
+    compensation.</li>
+    <li><strong>Publish step results reliably</strong> with the <a href="#m6-outbox-cdc">outbox pattern</a>.</li>
+  </ul>
+
+  <h4>Eventual consistency in practice</h4>
+  <p>Sagas have no isolation: between steps, other requests can see the half-finished state (an order
+  PENDING, stock reserved but payment not yet confirmed). This is <strong>eventual consistency</strong>. You
+  manage it in the design: show states such as "processing" to the user, use <strong>semantic locks</strong>
+  (the reserved flag stops another request taking the same stock), and make reads tolerate pending data.
+  Typical user-facing flow: return <code>202 Accepted</code> with an order id, let the client poll or receive
+  a push when the order is CONFIRMED or CANCELLED.</p>
+  <pre data-title="OrderStatus.java"><code class="language-java">public enum OrderStatus {
+    PENDING,            // saga started
+    PAYMENT_CAPTURED,   // step 2 done
+    STOCK_RESERVED,     // step 3 done
+    CONFIRMED,          // all steps done
+    CANCELLING,         // compensating
+    CANCELLED           // compensation finished
+}</code></pre>
+
+  <div class="co co-exc">
+    <p class="co-t">Exception: when to still use a local transaction</p>
+    <p>If two pieces of data always change together, they probably belong in the same service and database.
+    Needing sagas everywhere is a sign that service boundaries are drawn wrong.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Compensations that are not idempotent (double refund).</li>
+      <li>No saga state, so a crash leaves orders stuck in PENDING forever. Run a sweeper job for stuck
+      sagas.</li>
+      <li>Treating compensation as a database rollback. Customers may already have seen an email or a
+      notification; the compensation may need to send an apology too.</li>
+      <li>Hand-building a big orchestrator when a workflow engine would do.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Explain 2PC in two sentences and its blocking weakness, then say sagas trade atomicity and
+      isolation for availability.</li>
+      <li>Walk through the order → payment → inventory → shipping failure path, naming each compensation.</li>
+      <li>Add: idempotent steps, persisted saga state, outbox for reliable events, eventual consistency in
+      the UI.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-outbox-cdc">
+  <h3>Transactional outbox and change data capture</h3>
+  <p class="tldr">Saving to the database and publishing to a broker are two writes that cannot be one
+  transaction; the outbox pattern writes the event into an outbox table in the same database transaction
+  as the business change, and a relay (a poller or change data capture) publishes it afterwards.</p>
+
+  <h4>The dual-write problem</h4>
+  <p>The order service must save the order and publish <code>OrderPlaced</code>. As code it looks innocent:</p>
+  <pre data-title="OrderService.java"><code class="language-java">@Transactional
+public void placeOrder(Order order) {
+    orderRepository.save(order);                 // 1. database write
+    broker.publish(new OrderPlaced(order.id())); // 2. broker write
+}</code></pre>
+  <p>The two writes are not atomic. If the app crashes between 1 and 2, the order exists but no event is
+  sent: payment and shipping never start. If you publish first and the commit then fails, you announced an
+  order that does not exist. Even publishing inside the transaction does not help; the broker is not part
+  of the database transaction, and the commit can still fail after the publish. This is the
+  <strong>dual-write problem</strong>.</p>
+
+  <h4>The outbox solution</h4>
+  <p>Write the event to an <code>outbox</code> table <em>in the same local transaction</em> as the business
+  data. A single database commit makes both durable, or neither. A separate process then reads new outbox
+  rows and publishes them to the broker.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A[Order service] -->|one transaction| DB[(Orders DB)]
+  DB --- T1[orders table]
+  DB --- T2[outbox table]
+  R[Relay or CDC] -->|read new rows| T2
+  R -->|publish| K[Broker]
+  K --> C[Consumers]
+</pre>
+    <figcaption>The order row and the outbox row commit together; a relay moves the outbox row to the broker</figcaption>
+  </figure>
+  <pre data-title="outbox.sql"><code class="language-sql">CREATE TABLE outbox (
+    id            BIGSERIAL PRIMARY KEY,
+    event_id      UUID         NOT NULL UNIQUE,      -- consumers use this to dedupe
+    aggregate_id  VARCHAR(64)  NOT NULL,             -- e.g. the order id, used as message key
+    event_type    VARCHAR(64)  NOT NULL,             -- e.g. OrderPlaced
+    payload       JSONB        NOT NULL,
+    created_at    TIMESTAMP    NOT NULL DEFAULT now(),
+    published_at  TIMESTAMP                          -- null until sent
+);</code></pre>
+  <pre data-title="OrderService.java"><code class="language-java">@Transactional
+public void placeOrder(Order order) {
+    orderRepository.save(order);
+    outboxRepository.save(new OutboxEvent(
+        UUID.randomUUID(), order.id().toString(), "OrderPlaced", toJson(order)));
+    // one commit: either both rows exist or neither does
+}</code></pre>
+
+  <h4>Two ways to relay</h4>
+  <p><strong>1. Polling publisher.</strong> A scheduled job selects unpublished rows, sends them, then marks
+  them published. Simple, no extra infrastructure. Downsides: polling delay and load on the database. With
+  several relay instances, claim rows safely using <code>SELECT ... FOR UPDATE SKIP LOCKED</code> in
+  PostgreSQL.</p>
+  <pre data-title="OutboxRelay.java"><code class="language-java">@Scheduled(fixedDelay = 500)
+@Transactional
+public void publishPending() {
+    List&lt;OutboxEvent&gt; batch = outboxRepository.lockNextBatch(100);   // FOR UPDATE SKIP LOCKED
+    for (OutboxEvent e : batch) {
+        broker.send(e.aggregateId(), e.eventType(), e.payload());   // key = aggregate id
+        e.markPublished();
+    }
+}</code></pre>
+  <p>If the app crashes after sending but before marking, the event is sent again after restart. That is
+  fine: delivery is at-least-once and consumers dedupe by <code>event_id</code>
+  (<a href="#m6-delivery-semantics">Delivery semantics</a>).</p>
+  <p><strong>2. Change data capture (CDC).</strong> Every database writes all changes to its transaction log
+  (PostgreSQL's WAL, MySQL's binlog). A CDC tool reads that log and turns each committed row change into an
+  event, with no polling queries. <strong>Debezium</strong> is the best-known open-source CDC tool; it runs
+  on Kafka Connect and can read the outbox table and publish each new row to a Kafka topic. Benefits: low
+  delay, low load on the database, order preserved as in the log. Costs: another system to run, and the log
+  retention and connector offsets to monitor.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Polling publisher</th><th>CDC (Debezium)</th></tr></thead>
+    <tbody>
+      <tr><td>Setup</td><td>A scheduled job</td><td>Kafka Connect plus connector</td></tr>
+      <tr><td>Latency</td><td>Poll interval (hundreds of ms)</td><td>Very low</td></tr>
+      <tr><td>Database load</td><td>Repeated queries</td><td>Reads the log, light</td></tr>
+      <tr><td>Ordering</td><td>By id or time, needs care</td><td>Follows commit order</td></tr>
+      <tr><td>Best for</td><td>Small and medium systems</td><td>High volume, many consumers</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Other uses of CDC</h4>
+  <p>CDC is useful beyond outbox: keep a search index (Elasticsearch) in sync with the database, invalidate
+  caches when rows change, feed a data warehouse, or replicate to another store without changing the
+  application code. It turns "the database changed" into a stream everyone can use
+  (<a href="#m5">Module 5</a> has the cache and search building blocks).</p>
+
+  <h4>Housekeeping</h4>
+  <ul>
+    <li>Delete or archive published outbox rows regularly, or the table grows without limit.</li>
+    <li>Use the aggregate id as the message key so events of one order stay in order inside a Kafka
+    partition.</li>
+    <li>Version your event payloads; consumers upgrade at different times.</li>
+    <li>Monitor the oldest unpublished row: it shows relay lag.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: never publish to the broker directly from inside the business transaction</p>
+    <p>Write to the outbox; let the relay publish. Consumers must still be idempotent, because the outbox
+    gives at-least-once delivery, not exactly-once.</p>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>This pattern sits under almost every saga and every "publish event after save" feature. The Spring
+    and Kafka side is in <a href="04-spring-boot.html#m7">Spring Boot · Module 7</a>. Related idea for the
+    receiving side: the inbox (processed-message) table.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>State the dual-write problem with the crash-between-two-writes story.</li>
+      <li>Explain the outbox in one sentence, then polling vs Debezium.</li>
+      <li>Close with: at-least-once publishing, so idempotent consumers.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-resilience">
+  <h3>Resilience: timeouts, circuit breakers, bulkheads and load shedding</h3>
+  <p class="tldr">A failure in one dependency must not become a failure of everything: set timeouts on every
+  call, stop calling a broken service with a circuit breaker, isolate resources with bulkheads, serve a
+  fallback when possible, and shed excess load before you fall over.</p>
+
+  <h4>A cascading failure story</h4>
+  <p>The checkout service calls the recommendation service to show "you may also like". One evening the
+  recommendation database slows down: responses now take 30 seconds instead of 50 ms. Checkout has no
+  timeout, so each request waits. Checkout has 200 worker threads; at 100 requests per second, all 200 are
+  stuck within about two seconds. Checkout now cannot serve <em>any</em> request, even ones that never need
+  recommendations. The API gateway sees checkout timing out, retries, and doubles the traffic. The
+  front-end calls other services that also call checkout; they exhaust their threads too. A slow
+  non-critical feature has brought down the shop. This is a <strong>cascading failure</strong>. The tools
+  below each cut one link in that chain.</p>
+
+  <h4>1. Timeouts everywhere</h4>
+  <p>Every remote call needs a timeout. Waiting forever is the most common root cause of cascades. Know the
+  two kinds:</p>
+  <ul>
+    <li><strong>Connect timeout:</strong> how long to wait to establish the connection. Keep it short (often
+    a few hundred milliseconds to one second), because a healthy server accepts connections fast.</li>
+    <li><strong>Read (response) timeout:</strong> how long to wait for data after the request is sent. Base it
+    on the callee's real latency: for example the 99th percentile plus a margin (if p99 is 200 ms, use
+    around 500 ms to 1 s), not 60 seconds.</li>
+  </ul>
+  <p>Also set a timeout on database calls, connection-pool borrow time, and queue waits. Pass a
+  <strong>deadline</strong> down the chain: if the user's request has 2 s in total and 1.5 s is gone, the
+  next service should not start work that needs 1 s.</p>
+  <pre data-title="Timeouts.java"><code class="language-java">import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.URI;
+import java.time.Duration;
+
+HttpClient client = HttpClient.newBuilder()
+    .connectTimeout(Duration.ofMillis(500))          // connect timeout
+    .build();
+
+HttpRequest req = HttpRequest.newBuilder(URI.create("http://recs/v1/for/42"))
+    .timeout(Duration.ofSeconds(1))                  // request (response) timeout
+    .GET()
+    .build();</code></pre>
+
+  <h4>2. Circuit breaker</h4>
+  <p>Like an electrical fuse. If a dependency keeps failing, stop calling it for a while: fail immediately
+  (fast), give it time to recover, and test it carefully before going back. This saves your threads and
+  avoids hammering a sick service.</p>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Closed
+  Closed --> Open: failure rate above threshold
+  Open --> HalfOpen: wait time over
+  HalfOpen --> Closed: trial calls succeed
+  HalfOpen --> Open: a trial call fails
+</pre>
+    <figcaption>Circuit breaker states: closed (normal), open (fail fast), half-open (trial calls)</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Closed:</strong> calls pass; the breaker counts failures and slow calls in a sliding window
+    (for example the last 100 calls).</li>
+    <li><strong>Open:</strong> when the failure rate crosses a threshold (say 50%), calls fail instantly
+    without touching the dependency, for a wait period (say 30 s).</li>
+    <li><strong>Half-open:</strong> after the wait, a few trial calls go through. If they succeed, close; if
+    they fail, open again.</li>
+  </ul>
+  <p>Treat <em>slow</em> calls as failures too, because slowness is what drains threads. The Resilience4j
+  configuration and annotations are in <a href="04-spring-boot.html#m7">Spring Boot · Module 7</a>.</p>
+
+  <h4>3. Bulkheads</h4>
+  <p>On a ship, watertight compartments stop a leak from sinking the whole vessel. A <strong>bulkhead</strong>
+  limits the resources one dependency or one customer can use, so a failure stays inside its compartment.</p>
+  <ul>
+    <li><strong>Separate thread pools or concurrency limits per dependency:</strong> at most 20 concurrent
+    calls to recommendations, 50 to payments. When recommendations hang, only those 20 slots are stuck; the
+    other 180 workers keep serving checkout.</li>
+    <li><strong>Separate connection pools</strong> per downstream or per workload.</li>
+    <li><strong>Separate deployments</strong> for critical and non-critical traffic, or per-tenant quotas, so
+    one noisy client cannot starve the rest.</li>
+  </ul>
+
+  <h4>4. Fallbacks and graceful degradation</h4>
+  <p>When a call fails or the breaker is open, return something useful instead of an error: a cached
+  response, a default value, a simplified result, or skip the feature. The checkout page without
+  recommendations still sells things. <strong>Graceful degradation</strong> means the product loses features
+  one by one, not all at once. Decide in advance which features are critical (payment) and which are optional
+  (recommendations, reviews, "recently viewed"), and wrap the optional ones in timeout plus fallback.</p>
+  <pre data-title="Fallback.java"><code class="language-java">List&lt;Product&gt; recs;
+try {
+    recs = recsClient.forUser(userId);          // has timeout and circuit breaker
+} catch (Exception e) {
+    recs = popularProductsCache.top(10);        // fallback: generic popular items
+}</code></pre>
+
+  <h4>5. Load shedding and rate limiting</h4>
+  <p>Every server has a limit. Past it, accepting more work makes <em>everything</em> slower, and latency
+  explodes until requests time out; goodput (useful work done) collapses. <strong>Load shedding</strong>
+  means deliberately rejecting some requests early, with a quick 503 or 429, so the rest succeed. Choose what
+  to drop: low-priority traffic first (analytics, background refresh), then by client, and protect critical
+  paths like payment. Techniques: a limit on in-flight requests, a bounded queue (reject when full instead of
+  queueing without bound), and watching latency or CPU to start shedding. It pairs with <strong>rate
+  limiting</strong> at the edge, which caps each client's rate before it reaches the system
+  (<a href="#m5">Module 5</a> covers algorithms; the <a href="#m7-rate-limiter">distributed rate limiter
+  design</a> builds one).</p>
+  <ul>
+    <li>A bounded queue gives <strong>back-pressure</strong>: producers learn to slow down.</li>
+    <li>Return <code>Retry-After</code> so clients back off (<a href="#m6-retries">Retries</a>).</li>
+    <li>Reject early: the cheapest request is the one you refuse before doing work.</li>
+  </ul>
+
+  <h4>Putting the tools together</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Tool</th><th>Protects against</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>Timeout</td><td>Waiting forever on a hung call</td><td>Some calls cut off that would have finished</td></tr>
+      <tr><td>Retry + backoff + jitter</td><td>Short transient failures</td><td>Extra load; needs idempotency</td></tr>
+      <tr><td>Circuit breaker</td><td>Repeated calls to a dead dependency</td><td>Tuning; may open too eagerly</td></tr>
+      <tr><td>Bulkhead</td><td>One dependency eating all resources</td><td>Idle capacity in unused pools</td></tr>
+      <tr><td>Fallback</td><td>Total failure of an optional feature</td><td>Stale or generic results</td></tr>
+      <tr><td>Load shedding</td><td>Overload past capacity</td><td>Some users get errors on purpose</td></tr>
+    </tbody>
+  </table></div>
+  <p>A sensible order for one outbound call is: bulkhead limit, circuit breaker, then a time-limited call,
+  with retry only for safe, transient failures, and a fallback at the end. Finally, test it: kill a
+  dependency in staging (<em>chaos testing</em>) and check that the system degrades as planned.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Default timeouts that are infinite or minutes long.</li>
+      <li>Circuit breaker around an operation that is not safe to skip (it hides real errors without a
+      plan).</li>
+      <li>A shared thread pool for all dependencies, so no bulkhead exists.</li>
+      <li>Fallbacks that call another fragile service.</li>
+      <li>Retries inside the breaker multiplying load on the failing dependency.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Tell the cascade story in three sentences: slow dependency, threads exhausted, everything down.</li>
+      <li>Name the six tools and draw the circuit breaker's three states.</li>
+      <li>Give numbers: timeouts from p99, bulkhead of 20 concurrent calls, breaker opens at 50% failures.</li>
+      <li>Say what you degrade: optional features first, payment last.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,387 @@
+<article class="topic" id="m2-url-walkthrough">
+  <h3>What happens when you type a URL and press Enter: the full walkthrough</h3>
+  <p class="tldr">The browser parses the URL, resolves the domain through DNS, opens a TCP connection and
+  a TLS session, sends an HTTP request that passes a CDN or load balancer to your Spring Boot app
+  and its database, receives the response, then parses and renders it, fetching more assets and
+  API data as it goes.</p>
+
+  <h4>Why interviewers love this question</h4>
+  <p>One question touches DNS, TCP, TLS, HTTP, load balancing, your backend framework, the database
+  and browser rendering. It shows how deep your understanding goes and which part you know best. The
+  trick is a clear order, then depth where you are strong. Use the 14 steps below as your skeleton.
+  The case: you type <code>https://shop.example.com/products</code> for a React front end backed by
+  a Spring Boot API.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant U as Browser
+  participant D as DNS resolver
+  participant E as CDN and load balancer
+  participant A as Spring Boot app
+  participant DB as Database
+  U->>U: Parse URL, check HSTS and caches
+  U->>D: DNS query for shop.example.com
+  D->>U: IP address of the CDN or load balancer
+  U->>E: TCP handshake SYN, SYN-ACK, ACK
+  U->>E: TLS handshake, certificate check
+  U->>E: GET /products over HTTPS
+  E->>A: Forward request to a healthy instance
+  A->>A: Filters, security, DispatcherServlet, controller, service
+  A->>DB: SQL SELECT through the connection pool
+  DB->>A: Rows
+  A->>E: 200 OK with JSON or HTML
+  E->>U: Response, maybe cached at the edge
+  U->>U: Parse HTML, build DOM and CSSOM, layout, paint
+  U->>E: Fetch CSS, JS, images, then API calls
+</pre>
+    <figcaption>The path of one page load from keystroke to pixels</figcaption>
+  </figure>
+
+  <h4>Step 1: URL parsing, HSTS and the shortcut checks</h4>
+  <p>The browser first decides whether you typed a URL or a search term. If it is a URL it splits it
+  into scheme (<code>https</code>), host, port (443 by default), path and query. If you typed just
+  <code>shop.example.com</code>, the browser consults its <strong>HSTS</strong> list: if the site
+  asked to be HTTPS-only (or is preloaded in the browser), the browser silently upgrades
+  <code>http://</code> to <code>https://</code> and skips the insecure first request. It also checks
+  for a cached copy of the resource (HTTP cache) and for a service worker that may answer
+  directly. A fresh cached copy ends the story here.</p>
+
+  <h4>Step 2: DNS resolution</h4>
+  <p>The browser needs the IP of <code>shop.example.com</code>. It looks in, in order: its own DNS
+  cache, the OS cache and <code>hosts</code> file, the home router's cache, and then asks the
+  recursive resolver of your ISP or a public one (see <a href="#m2-dns">DNS</a>). On a miss the
+  resolver walks root → TLD (<code>.com</code>) → authoritative server and gets back an A (or AAAA)
+  record. It caches it by TTL. For a big site the answer is the address of a CDN edge or load
+  balancer near you, not of one application server. Typical cost: from nothing (cached) to a few
+  tens of milliseconds.</p>
+
+  <h4>Step 3: TCP connection</h4>
+  <p>With the IP, the browser asks the OS for a socket to port 443. The OS picks an ephemeral source
+  port and runs the <a href="#m2-tcp-connection">three-way handshake</a> (SYN, SYN-ACK, ACK). The
+  path crosses your NIC, Wi-Fi or Ethernet, the router (which NATs your private address), then ISP
+  and internet routers; at each hop the MAC addresses are rewritten and the TTL decreases.
+  ARP is used to find the gateway's MAC on your LAN. This step costs one round trip. If the browser
+  already has an open connection to this host (HTTP/2 or keep-alive), it skips steps 3 and 4.
+  With HTTP/3 the transport and TLS steps merge on top of UDP and QUIC.</p>
+
+  <h4>Step 4: TLS handshake</h4>
+  <p>Inside that TCP connection the browser sends a ClientHello (with SNI and key share). The
+  server answers with its choice, its certificate chain and a proof of key ownership. The browser
+  verifies the chain against its trusted CAs and the hostname, then both sides derive the same
+  symmetric keys (<a href="#m2-https-tls">TLS 1.3</a>, one extra RTT). From this point everything is
+  encrypted, and ALPN has also agreed which HTTP version to use (HTTP/2 typically).</p>
+
+  <h4>Step 5: The HTTP request</h4>
+  <p>The browser sends something like <code>GET /products HTTP/2</code> with the <code>Host</code>,
+  <code>Accept</code>, <code>Accept-Encoding: gzip, br</code>, <code>User-Agent</code> and any
+  matching <code>Cookie</code> headers. If the site is a single-page app, this first request returns
+  a small HTML shell; the data comes later via API calls.</p>
+
+  <h4>Step 6: CDN, reverse proxy and load balancer</h4>
+  <p>The request reaches the server's front door. A <strong>CDN</strong> (content delivery network)
+  edge near you may answer static files from its cache immediately. Otherwise a
+  <strong>reverse proxy</strong> such as Nginx or a cloud <strong>load balancer</strong> terminates
+  TLS (decrypts), may apply a WAF (web application firewall) and rate limits, chooses a healthy
+  instance (round robin, least connections) and forwards the request over the private network,
+  often as plain HTTP/1.1, adding headers such as <code>X-Forwarded-For</code> so the app knows the
+  client's real IP. See <a href="08-system-design.html#m5">System Design · Module 5</a> for load
+  balancing and CDNs, and <a href="07-devops.html#m2">DevOps · Module 2</a> for Nginx.</p>
+
+  <h4>Step 7: Inside the Spring Boot application</h4>
+  <p>The embedded Tomcat accepts the connection on a thread (or, with virtual threads, a cheap
+  one). The request passes the <strong>servlet filter chain</strong> (character encoding, CORS,
+  Spring Security: authenticate the cookie or JWT, authorise the user, logging filters). Then the
+  <code>DispatcherServlet</code> maps <code>GET /products</code> to a <code>@RestController</code>
+  method through handler mapping; argument resolvers bind path variables, query parameters and the
+  request body (JSON → Java object via Jackson). The controller calls a <code>@Service</code> that
+  holds the business logic and (with <code>@Transactional</code>) starts a transaction. The service
+  calls a <code>Repository</code>. Details: <a href="04-spring-boot.html#m2">Spring Boot · Module 2</a>.</p>
+
+  <h4>Step 8: The database (and cache)</h4>
+  <p>The service may first check a cache such as Redis. On a miss, the repository borrows a
+  connection from the pool (HikariCP), and Hibernate sends SQL such as
+  <code>SELECT ... FROM product WHERE active = true</code> over a TCP connection to the database
+  (PostgreSQL port 5432). The database parses and plans the query, uses an index, reads pages from
+  its buffer cache or disk and returns rows. The connection returns to the pool, the transaction
+  commits or rolls back, and the rows are mapped to entities, then to DTOs. See
+  <a href="03-sql-databases.html#m5">SQL · Module 5</a>.</p>
+
+  <h4>Step 9: The response travels back</h4>
+  <p>Jackson serialises the DTOs to JSON, the controller returns <code>200 OK</code> with headers
+  such as <code>Content-Type: application/json</code>, <code>Cache-Control</code> and perhaps
+  <code>Content-Encoding: gzip</code>. The response goes back through the filters, Tomcat, the load
+  balancer (which re-encrypts it if needed and may add headers), possibly through the CDN (which may
+  cache it), over TCP segments split to the MSS, and each segment is acknowledged. Your browser's
+  TLS layer decrypts it and hands the bytes to the HTTP layer.</p>
+
+  <h4>Step 10: Browser parsing and rendering</h4>
+  <p>The browser's rendering engine turns bytes into pixels (see
+  <a href="06-frontend.html#m1">Frontend · Module 1</a>):</p>
+  <ol class="steps">
+    <li>Parse the HTML into the <strong>DOM</strong> tree. The parser stops at plain
+    <code>&lt;script&gt;</code> tags unless they use <code>defer</code> or <code>async</code>.</li>
+    <li>Parse CSS into the <strong>CSSOM</strong>. CSS blocks rendering until loaded.</li>
+    <li>Combine DOM and CSSOM into the <strong>render tree</strong> (only visible elements with
+    their computed styles).</li>
+    <li><strong>Layout</strong> (reflow): compute each box's size and position.</li>
+    <li><strong>Paint</strong> the pixels, then <strong>composite</strong> layers on the GPU.</li>
+  </ol>
+
+  <h4>Step 11: More requests</h4>
+  <p>While parsing, the browser finds links to CSS, JavaScript bundles, fonts and images. Each is
+  another request, usually reusing the open HTTP/2 connection (multiplexing) and often served from
+  the CDN or the browser cache. When the React bundle runs, it calls your API with
+  <code>fetch('/api/products')</code>, repeating steps 5 to 9 for JSON, then updates the DOM and the
+  browser repaints. Cookies, a CORS preflight (<code>OPTIONS</code>) for cross-origin calls and
+  authentication headers can add requests. Finally the connection is kept alive or closed by the
+  idle timeout (the FIN exchange).</p>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: know where time goes</p>
+    <p>Roughly: DNS (0 to tens of ms), TCP (1 RTT), TLS 1.3 (1 RTT), server time (your code and
+    database), transfer time (size ÷ throughput), browser parse and render. Every layer has a
+    caching escape hatch: DNS cache, HTTP cache, CDN, Redis, DB buffer cache. Mention caching at
+    each step.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">What changes in other cases</p>
+    <ul>
+      <li><strong>Cached or HSTS</strong>: steps are skipped; a fresh cache entry means no request
+      at all, and a stale one triggers a conditional request that returns 304.</li>
+      <li><strong>Redirects</strong>: <code>http</code> → <code>https</code> (301) or
+      <code>example.com</code> → <code>www</code> costs a full extra round trip.</li>
+      <li><strong>Proxy or VPN</strong>: the browser connects to the proxy first; HTTPS goes through
+      an HTTP <code>CONNECT</code> tunnel.</li>
+      <li><strong>Failure points</strong>: DNS fail (<code>UnknownHostException</code>), TCP refused
+      or timeout, TLS certificate error, 4xx/5xx from the app, slow query (504 from the
+      proxy).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-url-spoken-answer">
+  <h3>The 3–4 minute spoken answer, and follow-up questions</h3>
+  <p class="tldr">A strong answer follows the request in order, spends a sentence or two per stage,
+  names the key protocol at each, and signals depth you can expand on; practise it aloud until it
+  runs for three to four minutes.</p>
+
+  <h4>How to structure it</h4>
+  <ol class="steps">
+    <li>Open with a one-line map: "I'll go from the browser, through the network, to the server and
+    back."</li>
+    <li>Cover all stages in order. Do not dive into one stage before finishing the skeleton.</li>
+    <li>Add one specific detail per stage that proves you understand (TTL, SYN, SNI, filter chain,
+    connection pool, render tree).</li>
+    <li>Close with the caching and optimisation points, and offer to go deeper on any part.</li>
+  </ol>
+  <p>Speaking pace is about 130 words a minute, so 3–4 minutes is 400–500 words. The model answer
+  below is about that length. Adapt the backend part to your own project.</p>
+
+  <h4>Model answer</h4>
+  <blockquote>
+    <p>"Let me walk through it from the keyboard to the screen. First the browser parses the URL
+    into scheme, host, port and path. If the site is on the HSTS list, it upgrades to HTTPS straight
+    away. It also checks its HTTP cache, and if there is a fresh copy, it may not go to the network at
+    all.</p>
+    <p>Next it needs an IP address, so it does a DNS lookup. It checks the browser cache, the OS
+    cache and the hosts file, then asks the recursive resolver. If the resolver has no cached answer,
+    it asks a root server, which points to the .com TLD server, which points to the authoritative
+    server for the domain. That returns an A record with a TTL, and every layer caches it.</p>
+    <p>With the IP, the browser opens a TCP connection to port 443: the three-way handshake of SYN,
+    SYN-ACK and ACK, which costs one round trip. Then the TLS handshake. In TLS 1.3 the client
+    sends its supported ciphers and a key share, the server replies with its key share and
+    certificate, the browser validates the certificate chain against trusted CAs and checks the
+    hostname, and both sides derive the same symmetric key. From then on, everything is encrypted,
+    and the HTTP version is negotiated, usually HTTP/2.</p>
+    <p>Now the browser sends the HTTP request, for example GET /products with headers and cookies.
+    It usually reaches a CDN or a load balancer first. The CDN can serve static content from its
+    cache. For dynamic requests, the load balancer terminates TLS, picks a healthy instance and
+    forwards the request to my Spring Boot application.</p>
+    <p>In the application, the request passes through the servlet filters, which handle things like
+    CORS and Spring Security authentication. Then the DispatcherServlet routes it to the right
+    controller method, which binds the parameters and calls the service layer. The service holds the
+    business logic, may check a Redis cache and, if needed, calls the repository. Through the
+    connection pool, Hibernate sends a SQL query to the database. The database uses an index, finds
+    the rows and returns them. The service maps them to DTOs and the controller returns them as JSON
+    with a 200 status.</p>
+    <p>The response travels back the same way: through the load balancer, maybe cached by the CDN,
+    split into TCP segments and decrypted by the browser. Then the browser renders: it parses HTML
+    into the DOM, CSS into the CSSOM, merges them into a render tree, calculates layout and paints
+    pixels. While doing so it discovers CSS, JavaScript, fonts and images and fetches them, mostly
+    in parallel over one HTTP/2 connection. If it is a React app, the JavaScript then calls my API
+    for data and re-renders. Caching happens at nearly every step, from DNS to the CDN to the
+    browser cache, which is what makes the web fast."</p>
+  </blockquote>
+
+  <h4>Follow-up questions and short answers</h4>
+  <dl class="terms">
+    <dt>What if the DNS server is down or slow?</dt><dd>The OS tries the next configured resolver.
+    Public resolvers are replicated; cached answers still work until the TTL ends. The user sees a
+    "site can't be reached" or <code>UnknownHostException</code> in Java.</dd>
+    <dt>Where is TLS terminated, and why?</dt><dd>Usually at the load balancer or reverse proxy, so
+    certificates are managed in one place and the app is not burdened by crypto. For zero trust
+    setups it is re-encrypted to the app.</dd>
+    <dt>How does HTTP/2 change this?</dt><dd>One connection for all resources, multiplexed, with
+    header compression. No need to open six connections, so fewer handshakes.</dd>
+    <dt>What if it is HTTP and not HTTPS?</dt><dd>No TLS step; data is readable and modifiable on
+    the way. Browsers mark it "Not secure".</dd>
+    <dt>How would you make the page faster?</dt><dd>Fewer round trips: keep-alive/HTTP/2/HTTP/3,
+    CDN, DNS prefetch, compression, caching headers, smaller JS bundles, database indexes and a
+    Redis cache.</dd>
+    <dt>How does the server know which of many sites you want?</dt><dd>The <code>Host</code> header
+    (and SNI at the TLS layer).</dd>
+    <dt>What if the server is in another country?</dt><dd>Higher RTT multiplies every handshake
+    round trip; that is why CDNs and regional deployments matter.</dd>
+    <dt>What happens to session state with many servers?</dt><dd>Use a shared session store such as
+    Redis or stateless tokens; sticky sessions are a fallback.</dd>
+    <dt>What does ARP do in this flow?</dt><dd>It resolves your gateway's MAC address on the local
+    network so the first frame can leave your LAN.</dd>
+    <dt>Where does NAT happen?</dt><dd>At your home router (and maybe your ISP) rewriting the private
+    source IP and port.</dd>
+    <dt>What is the difference between the browser cache and the CDN?</dt><dd>The browser cache is
+    private to one user's device; the CDN cache is shared by many users and sits near them.</dd>
+    <dt>What happens on a POST form submit instead of a GET?</dt><dd>The body carries the data; the
+    server responds with 201 or a redirect (the Post/Redirect/Get pattern to avoid resubmission on
+    refresh).</dd>
+  </dl>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes to avoid</p>
+    <ul>
+      <li>Starting with "the browser sends an HTTP request" and skipping DNS, TCP and TLS.</li>
+      <li>Memorising a script: interviewers interrupt. Remember the order, not the sentences.</li>
+      <li>Spending three minutes on one stage and rushing the rest. Skeleton first, depth when
+      asked.</li>
+      <li>Saying TCP "sends the website". TCP only moves bytes; HTTP gives them meaning.</li>
+    </ul>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: tune it to the role</p>
+    <p>For a backend role, linger on filters, the controller-service-repository path, connection
+    pooling and caching. For frontend, on parsing and the render tree. For a DevOps or system design
+    round, on DNS, load balancer, CDN and TLS termination. A one-sentence "I can go deeper into any
+    part" invites the follow-up you prepared for.</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-network-security">
+  <h3>Network security basics: firewalls, proxies, VPNs and common attacks</h3>
+  <p class="tldr">Firewalls filter traffic by rules, proxies stand in for clients or servers, VPNs
+  tunnel traffic privately across the internet, and the classic attacks (DDoS, MITM, DNS and ARP
+  spoofing, SYN flood) are defended by filtering, rate limiting, encryption and certificates.</p>
+
+  <h4>Security goals</h4>
+  <p>Security is usually described by the <strong>CIA triad</strong>: <strong>confidentiality</strong>
+  (only the right people read the data), <strong>integrity</strong> (data is not altered) and
+  <strong>availability</strong> (the service stays up). Attacks target one of the three. Good design
+  is <strong>defence in depth</strong>: many layers, so one failure is not fatal.</p>
+
+  <h4>Firewalls</h4>
+  <p>A <strong>firewall</strong> allows or blocks traffic using rules, normally "default deny": only
+  what is explicitly allowed gets through.</p>
+  <ul>
+    <li><strong>Packet-filtering</strong> (layer 3/4): rules on source/destination IP, port and
+    protocol. Example: allow TCP 443 from anywhere, TCP 22 only from the office IP, block the
+    rest.</li>
+    <li><strong>Stateful</strong>: remembers connections, so replies to allowed outbound requests
+    are let back in automatically. Most firewalls today.</li>
+    <li><strong>Application-layer / WAF</strong> (layer 7): understands HTTP and blocks SQL injection
+    or XSS patterns. A "next-generation firewall" adds deep packet inspection and intrusion
+    prevention.</li>
+  </ul>
+  <p>Firewalls can run on a host (<code>iptables</code>/<code>nftables</code>, Windows Firewall), at
+  the network edge, or in the cloud (security groups and network ACLs; see
+  <a href="07-devops.html#m2">DevOps · Module 2</a>). A <strong>DMZ</strong> is a separate network
+  zone for public-facing servers, so a breach there does not give direct access to the internal
+  network.</p>
+
+  <h4>Proxies</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Sits in front of</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Forward proxy</strong></td><td>Clients</td><td>Clients go through it to reach
+      the internet: filtering, caching, hiding client IPs, corporate policy.</td></tr>
+      <tr><td><strong>Reverse proxy</strong></td><td>Servers</td><td>Clients talk to it, not the
+      servers: load balancing, TLS termination, caching, protection (Nginx, HAProxy, cloud load
+      balancers).</td></tr>
+    </tbody>
+  </table></div>
+  <p>Remember: a forward proxy hides the <em>client</em>, a reverse proxy hides the
+  <em>server</em>.</p>
+
+  <h4>VPN</h4>
+  <p>A <strong>VPN</strong> (Virtual Private Network) creates an encrypted <strong>tunnel</strong>
+  between your device and a VPN gateway. Your traffic is encapsulated inside the tunnel packets, so
+  the local network or ISP cannot read it, and the destination sees the gateway's IP. Uses: remote
+  employees reaching the office network (remote-access VPN), joining two office networks
+  (site-to-site), or privacy on public Wi-Fi. Common protocols include IPsec, OpenVPN and
+  WireGuard. A VPN moves trust to the VPN provider; it does not make you anonymous or fix an
+  insecure site.</p>
+
+  <h4>Common attacks in one line each</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Attack</th><th>What happens</th><th>Defence</th></tr></thead>
+    <tbody>
+      <tr><td><strong>DoS / DDoS</strong></td><td>Flood a service with traffic or requests from
+      one source (DoS) or thousands of hijacked machines (DDoS) until real users cannot get in</td>
+      <td>CDN and DDoS protection (absorb at the edge), rate limiting, autoscaling, WAF</td></tr>
+      <tr><td><strong>Man-in-the-middle (MITM)</strong></td><td>Attacker sits between two parties,
+      reading or altering their traffic (rogue Wi-Fi, ARP/DNS spoofing)</td>
+      <td>TLS with certificate validation, HSTS, avoid untrusted networks</td></tr>
+      <tr><td><strong>DNS spoofing / cache poisoning</strong></td><td>False DNS data is planted so a
+      domain resolves to the attacker's IP</td><td>HTTPS (the fake server lacks a valid
+      certificate), DNSSEC, trusted resolvers</td></tr>
+      <tr><td><strong>ARP spoofing</strong></td><td>Attacker sends fake ARP replies claiming "the
+      gateway's IP is at my MAC", diverting local traffic through them</td>
+      <td>Switch features (dynamic ARP inspection), static ARP for critical hosts, TLS on top</td></tr>
+      <tr><td><strong>SYN flood</strong></td><td>Huge numbers of SYNs with fake source addresses fill
+      the server's half-open queue, which never completes handshakes</td>
+      <td>SYN cookies (no state until the final ACK), bigger backlog, rate limits, upstream
+      filtering</td></tr>
+      <tr><td><strong>Port scan</strong></td><td>Probing which ports are open to find services to
+      attack</td><td>Firewall, close unused ports</td></tr>
+      <tr><td><strong>Phishing</strong></td><td>A fake site or message tricks users into giving
+      credentials</td><td>User training, MFA, email filtering</td></tr>
+      <tr><td><strong>Sniffing</strong></td><td>Capturing plain-text traffic (HTTP, FTP, Telnet)</td>
+      <td>Use encrypted protocols (HTTPS, SSH)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Attacks on the application itself (SQL injection, XSS, CSRF) are covered in
+  <a href="04-spring-boot.html#m4">Spring Boot · Module 4</a>.</p>
+
+  <h4>How HTTPS and certificates defend</h4>
+  <p>TLS makes sniffing useless (encryption), makes tampering detectable (integrity) and blocks
+  impersonation (the certificate must match the domain and chain to a trusted CA). If an attacker
+  poisons DNS or ARP and steers you to their machine, they cannot present a valid certificate for
+  <code>bank.example</code>, so the browser warns. This is why you should never click through a
+  certificate warning. HSTS stops downgrade attacks, and certificate pinning or mTLS tighten trust
+  further for apps and services.</p>
+
+  <h4>Practical checklist for a developer</h4>
+  <ul>
+    <li>Expose only needed ports; default-deny firewall rules; databases never public.</li>
+    <li>Use HTTPS everywhere, redirect HTTP, enable HSTS.</li>
+    <li>Secrets in environment or a vault, not in code or URLs.</li>
+    <li>Rate-limit login and public APIs; put a WAF/CDN in front.</li>
+    <li>Keep software patched; use SSH keys, not passwords; disable Telnet and plain FTP.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Limits of these defences</p>
+    <ul>
+      <li>Firewalls cannot stop an attack that arrives on an allowed port (a bad request to
+      port 443) without a WAF or app-level checks.</li>
+      <li>DDoS defence needs capacity upstream; a single server cannot absorb a large flood.</li>
+      <li>SYN cookies lose some TCP options; they are used only under attack.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a firewall / VPN / proxy / DDoS?"</p>
+    <ul>
+      <li>One-sentence definitions, then the layer or direction (forward vs reverse proxy).</li>
+      <li>For each attack, say what is exploited (ARP trust, DNS trust, handshake state) and the
+      fix.</li>
+      <li>Tie it together: HTTPS plus validated certificates defeats most MITM attempts.</li>
+    </ul>
+  </div>
+</article>

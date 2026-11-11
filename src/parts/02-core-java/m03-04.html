@@ -1,0 +1,698 @@
+<article class="topic" id="m3-best-practices">
+  <h3>Exception handling best practices</h3>
+  <p class="tldr">Handle an exception only where you can do something useful, keep the cause and the
+  context, log it once, and never swallow it silently.</p>
+
+  <p>Knowing the syntax of try and catch is the easy part. What separates clean exception handling from
+  the kind that wakes a team up at 3 a.m. is a set of habits. This article lists them in the order you
+  will meet them in a real code review. Each one has a reason, and most have a wrong-and-right pair.</p>
+
+  <h4>1. Never swallow an exception</h4>
+  <p>An empty catch block makes the problem disappear while the program carries on in a broken state. The
+  payment failed, but the code continues as if it had succeeded; the bug shows up three screens later and
+  nobody can say why.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: the failure vanishes</p><pre><code class="language-java">try {
+    inventory.reserve(orderId);
+} catch (Exception e) {
+    // TODO handle later
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: decide something, or let it travel</p><pre><code class="language-java">try {
+    inventory.reserve(orderId);
+} catch (OutOfStockException e) {
+    return OrderResult.rejected("Item is out of stock");   // a real decision
+}
+// every other failure propagates to the central handler</code></pre></div>
+  </div>
+  <p>Printing is not handling either. <code>e.printStackTrace()</code> writes to <code>System.err</code>,
+  outside your log format, level and files, and the code still continues as if all was well. If ignoring
+  an exception is truly correct (best-effort cleanup, for example), say so in a comment and name the
+  variable <code>ignored</code>.</p>
+
+  <h4>2. Catch specific exceptions, not Exception or Throwable</h4>
+  <p><code>catch (Exception e)</code> also catches every <code>RuntimeException</code>: the
+  <code>NullPointerException</code> or <code>ClassCastException</code> that is a bug you want to see, not
+  hide. It catches <code>InterruptedException</code>, which you must not swallow (see item 10).
+  <code>catch (Throwable t)</code> adds <code>OutOfMemoryError</code> and <code>StackOverflowError</code>.
+  Name the exceptions you really know how to handle.</p>
+<pre data-title="Specific catches"><code class="language-java">try {
+    BigDecimal rate = rateClient.fetch(currency);
+    return amount.multiply(rate);
+} catch (RateServiceUnavailableException e) {      // I know how to handle this one:
+    return amount.multiply(lastKnownRate(currency));   // fall back to the cached rate
+}   // a NullPointerException here is a bug: let it surface</code></pre>
+  <div class="co co-exc">
+    <p class="co-t">Exception: boundaries may catch everything</p>
+    <p>The outermost layer of a thread — a web request handler, a scheduled job, a message listener, a
+    thread-pool task — must not die from one bad request. There, and only there, catch
+    <code>Exception</code> (or even <code>Throwable</code>) to log it and move on to the next unit of work.
+    In Spring Boot this is the <code>@ExceptionHandler(Exception.class)</code> method of your global
+    handler.</p>
+  </div>
+
+  <h4>3. Log or rethrow — not both</h4>
+  <p>If every layer logs the exception and then rethrows it, one failure produces three or four log
+  entries with the same stack trace. Searching the logs becomes a maze, and it looks as if three
+  separate things failed.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: every layer logs and rethrows</p><pre><code class="language-java">// repository
+catch (SQLException e) {
+    log.error("DB error", e);
+    throw new DataAccessFailureException("DB error", e);
+}
+// service
+catch (DataAccessFailureException e) {
+    log.error("Could not place order", e);
+    throw new OrderFailedException("Could not place order", e);
+}
+// controller
+catch (OrderFailedException e) {
+    log.error("Request failed", e);
+    return ResponseEntity.status(500).build();
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: wrap with context, log once at the top</p><pre><code class="language-java">// repository: translate and keep the cause, no logging
+catch (SQLException e) {
+    throw new DataAccessFailureException("Could not save order " + id, e);
+}
+// service: no try/catch at all, the exception just flows
+// controller advice: the one place that logs
+log.error("Request failed", ex);</code></pre></div>
+  </div>
+  <p>Rule of thumb: a catch block does one of three things — <em>handle</em> the exception completely,
+  <em>rethrow or wrap</em> it, or <em>log</em> it because it is the final stop. Never two of them at
+  once.</p>
+
+  <h4>4. Log the exception itself, at the right level</h4>
+  <p>Pass the exception object as the last argument to the logger so that the stack trace and all
+  "Caused by" sections are printed — see the wrong-and-right pair in
+  <a href="#m3-stack-trace">Reading a stack trace</a>. Use <code>ERROR</code> for unexpected failures that
+  need attention. An expected business outcome, such as "insufficient balance", is not an error of the
+  system; log it at <code>INFO</code> or <code>WARN</code>, or not at all. Logging is covered in
+  <a href="#m8">Module 8</a>.</p>
+
+  <h4>5. Write messages with context</h4>
+  <p>The message is the first thing a person reads at 3 a.m. It should answer: <em>what were we trying
+  to do, with which values, and what was expected?</em></p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Poor message</th><th>Useful message</th></tr></thead>
+    <tbody>
+      <tr><td><code>"Error"</code></td><td><code>"Could not save order 1042 for customer 77"</code></td></tr>
+      <tr><td><code>"Invalid input"</code></td><td><code>"Quantity must be between 1 and 10 but was
+      25"</code></td></tr>
+      <tr><td><code>"File not found"</code></td><td><code>"Config file not found: /etc/shop/app.properties"</code></td></tr>
+      <tr><td><code>"Null value"</code></td><td><code>"couponCode must not be null"</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Never put secrets in a message: passwords, tokens, OTPs, full card numbers. Messages travel into logs,
+  monitoring tools and sometimes API responses.</p>
+
+  <h4>6. Fail fast: validate at the door</h4>
+  <p>Check arguments at the top of a method and in constructors, so that a bad value is rejected where it
+  enters instead of causing a confusing failure far away. An object should never exist in an invalid
+  state.</p>
+<pre data-title="Money.java — validation in a record"><code class="language-java">import java.math.BigDecimal;
+import java.util.Objects;
+
+public record Money(BigDecimal amount, String currency) {
+    public Money {                       // compact constructor: runs before the fields are set
+        Objects.requireNonNull(amount, "amount must not be null");
+        Objects.requireNonNull(currency, "currency must not be null");
+        if (amount.signum() &lt; 0) {
+            throw new IllegalArgumentException("amount must not be negative: " + amount);
+        }
+    }
+}</code></pre>
+  <div class="co co-note">
+    <p class="co-t">Note: assert is not validation</p>
+    <p>The <code>assert</code> statement is for internal invariants ("this can never be negative here"). It
+    is switched off by default and only active with <code>java -ea</code>, so it must never validate
+    arguments of public methods or user input. Use exceptions for that.</p>
+  </div>
+
+  <h4>7. Use standard exceptions when they fit</h4>
+  <p>Callers already understand the JDK's exceptions. Throw a standard one when it describes the
+  situation exactly:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Exception</th><th>Throw it when</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>IllegalArgumentException</code></td><td>An argument has a value the method cannot
+      accept</td><td><code>age &lt; 0</code>, an unknown country code</td></tr>
+      <tr><td><code>IllegalStateException</code></td><td>The object is in the wrong state for this
+      call</td><td>withdrawing from a closed account; starting a job twice</td></tr>
+      <tr><td><code>NullPointerException</code></td><td>A required argument is <code>null</code> — via
+      <code>Objects.requireNonNull</code></td><td>a constructor receiving a null name</td></tr>
+      <tr><td><code>UnsupportedOperationException</code></td><td>An optional operation is not supported by
+      this class</td><td><code>add</code> on an immutable list</td></tr>
+      <tr><td><code>IndexOutOfBoundsException</code></td><td>An index is outside the valid range</td>
+      <td><code>Objects.checkIndex(i, size)</code></td></tr>
+      <tr><td><code>NoSuchElementException</code></td><td>There is no (more) element to return</td>
+      <td><code>iterator.next()</code> at the end of the data</td></tr>
+    </tbody>
+  </table></div>
+  <p>Do not throw <code>RuntimeException</code>, <code>Exception</code> or <code>Throwable</code> directly:
+  they say nothing and cannot be caught selectively. Do not throw <code>Error</code> types such as
+  <code>OutOfMemoryError</code> yourself either.</p>
+
+  <h4>8. Do not use exceptions for normal control flow</h4>
+  <p>An exception means "something unexpected happened". Using it as a normal way to leave a loop or to
+  report an everyday outcome is slow (building the stack trace costs time), hard to read, and hides real
+  bugs because the same catch block also swallows genuine errors.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: exceptions as flow</p><pre><code class="language-java">// finding the end of an array by crashing into it
+try {
+    int i = 0;
+    while (true) {
+        total += prices[i++];
+    }
+} catch (ArrayIndexOutOfBoundsException e) {
+    // done
+}
+
+// "not found" is an everyday outcome, not an exception
+try {
+    return repository.getByEmail(email);
+} catch (UserNotFoundException e) {
+    return null;
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: ordinary control flow</p><pre><code class="language-java">for (int price : prices) {
+    total += price;
+}
+
+// the return type says "may be absent"
+Optional&lt;User&gt; user = repository.findByEmail(email);</code></pre></div>
+  </div>
+  <p>Catching a <code>NumberFormatException</code> to reject a bad input at the edge of the program is
+  fine. Doing it millions of times in a loop just to test "is this a number?" is not — validate first, or
+  write a small helper that returns an <code>OptionalInt</code>.</p>
+
+  <h4>9. Clean up reliably</h4>
+  <p>Close files, connections and streams with <a href="#m3-try-with-resources">try-with-resources</a>;
+  release locks and reset shared state in <code>finally</code>. Never <code>return</code> or throw from a
+  finally block (see <a href="#m3-finally-puzzles">the puzzles</a>).</p>
+
+  <h4>10. Respect InterruptedException</h4>
+  <p>When another thread interrupts a thread that is sleeping or waiting, Java throws
+  <code>InterruptedException</code> and <em>clears</em> the thread's interrupted flag. That flag is how
+  executors and frameworks ask your code to stop. If you swallow the exception, the request is lost and
+  the thread keeps running. Either let the exception propagate, or restore the flag:</p>
+<pre data-title="Handling InterruptedException"><code class="language-java">try {
+    Thread.sleep(500);
+} catch (InterruptedException e) {
+    Thread.currentThread().interrupt();       // restore the flag
+    throw new IllegalStateException("Interrupted while waiting for the payment gateway", e);
+}</code></pre>
+  <p>Threads are covered in <a href="#m6">Module 6</a>.</p>
+
+  <h4>11. Throw early, catch late — at the right boundary</h4>
+  <p>Detect problems as early as you can (item 6). But catch them as <em>late</em> as possible: at the level
+  that has enough knowledge to decide — retry, show a message, return an error response. Deep inside a
+  utility method nobody knows what the user should see. Real applications use a few fixed boundaries:</p>
+  <ul>
+    <li>the web layer — one global handler turns exceptions into HTTP responses (see
+    <a href="#m3-exceptions-spring">the Spring Boot article</a>),</li>
+    <li>a job or message listener — catch, log, then continue with the next message,</li>
+    <li>a thread-pool task — an exception inside <code>submit()</code> is stored in the
+    <code>Future</code> and lost if nobody calls <code>get()</code>, so catch and log inside the task,</li>
+    <li>a safety net for everything else, so that no thread dies without a trace:</li>
+  </ul>
+<pre data-title="Last line of defence"><code class="language-java">Thread.setDefaultUncaughtExceptionHandler((thread, ex) -&gt;
+        log.error("Uncaught exception in thread {}", thread.getName(), ex));</code></pre>
+
+  <h4>12. Document what can be thrown</h4>
+  <p>Describe the exceptions callers should expect with Javadoc <code>@throws</code>, including unchecked
+  ones such as <code>IllegalArgumentException</code>. The method signature shows only the checked
+  ones.</p>
+
+  <h4>13. Prefer empty results and Optional to null</h4>
+  <p>Do not return <code>null</code> to signal "nothing" or "failure". Return an empty collection or an
+  <code>Optional</code>, and throw an exception for real errors. See
+  <a href="#m3-null-handling">NullPointerException, requireNonNull and Optional</a>.</p>
+
+  <h4>The checklist</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Do</th><th>Do not</th></tr></thead>
+    <tbody>
+      <tr><td>Catch the specific type you can handle</td><td>Catch <code>Exception</code> or
+      <code>Throwable</code> in business code</td></tr>
+      <tr><td>Wrap with context and keep the cause</td><td>Throw a new exception without the cause</td></tr>
+      <tr><td>Log once, at the boundary, with the stack trace</td><td>Log and rethrow at every layer</td></tr>
+      <tr><td>Validate arguments early</td><td>Let bad values travel deep into the code</td></tr>
+      <tr><td>Use standard exceptions where they fit</td><td>Throw <code>RuntimeException</code> or
+      <code>Exception</code> directly</td></tr>
+      <tr><td>Return <code>Optional</code> or empty collections</td><td>Use exceptions for everyday outcomes
+      or return <code>null</code></td></tr>
+      <tr><td>Use try-with-resources</td><td>Return or throw inside <code>finally</code></td></tr>
+      <tr><td>Restore the interrupt flag</td><td>Swallow <code>InterruptedException</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-real">
+    <p class="co-t">Real project: what a clean setup looks like</p>
+    <p>Input is validated at the edge of the API. Services throw unchecked domain exceptions with clear
+    messages. Repositories translate technical exceptions (SQL, HTTP clients) and keep the cause. One
+    <code>@RestControllerAdvice</code> maps each exception type to an HTTP status and a JSON error body,
+    and logs unexpected ones once, with a request id, so a support engineer can find the single log entry
+    for a failed request in seconds.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you handle exceptions in a real project?"</p>
+    <ul>
+      <li>Validate early and throw specific exceptions with good messages; use standard exceptions where
+      they fit, custom ones for business failures.</li>
+      <li>Never swallow; catch only what you can handle; wrap with the cause when changing layers.</li>
+      <li>Handle centrally at the boundary (for example <code>@RestControllerAdvice</code>) and log once
+      with the stack trace; do not leak internals to clients.</li>
+      <li>Use try-with-resources for cleanup, restore the interrupt flag, and keep exceptions out of
+      normal control flow.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-null-handling">
+  <h3>NullPointerException, requireNonNull and Optional</h3>
+  <p class="tldr">Most NullPointerExceptions come from a null that should have been rejected earlier:
+  validate inputs with Objects.requireNonNull, return Optional or an empty collection instead of null, and
+  read the helpful NPE message to find the exact null.</p>
+
+  <p><code>null</code> means "no object". Calling a method on it has no meaning, so the JVM throws a
+  <code>NullPointerException</code> (NPE). It is the most common exception in Java programs. The inventor
+  of null references, Tony Hoare, called it his "billion-dollar mistake", and Java still has it, so you
+  need to know where nulls come from and how to keep them out of your code.</p>
+
+  <h4>Where NullPointerExceptions come from</h4>
+  <ul>
+    <li>Calling an instance method on <code>null</code>: <code>email.trim()</code>.</li>
+    <li>Reading or writing a field of <code>null</code>: <code>customer.address.city</code>.</li>
+    <li>Using <code>null</code> as an array: <code>scores[0]</code> or <code>scores.length</code>.</li>
+    <li><strong>Unboxing</strong> a null wrapper: <code>int qty = map.get(key)</code> when the key is
+    missing.</li>
+    <li>A for-each loop over a <code>null</code> collection or array.</li>
+    <li><code>throw null</code>, <code>synchronized (null)</code>, and a <code>switch</code> on a null
+    string or enum (unless it has a <code>case null</code>).</li>
+    <li>Library methods that reject <code>null</code> on purpose, such as <code>List.of(...)</code> and
+    <code>Optional.of(null)</code> (table below).</li>
+  </ul>
+
+  <h4>The helpful NullPointerException message</h4>
+  <p>Before Java 14 the message was empty and you had to guess which part of
+  <code>a.b().c.d()</code> was null. Java 14 added <strong>helpful NullPointerExceptions</strong> (JEP
+  358); since Java 15 they are on by default. The JVM now describes the failed action and the null
+  expression. The text is built only when something asks for the message, so it costs nothing until
+  then.</p>
+<pre data-title="NpeMessages.java (compiled with javac -g)"><code class="language-java">import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class NpeMessages {
+
+    static class Address {
+        String city;
+    }
+
+    static class Customer {
+        String name;
+        Address address;
+
+        String getName() {
+            return name;
+        }
+    }
+
+    public static void main(String[] args) {
+        Customer customer = new Customer();
+        String email = null;
+        int[] scores = null;
+        Map&lt;String, Integer&gt; stock = new HashMap&lt;&gt;();
+        List&lt;String&gt; tags = null;
+
+        List&lt;Runnable&gt; cases = List.of(
+                () -&gt; email.trim(),
+                () -&gt; customer.getName().length(),
+                () -&gt; System.out.println(customer.address.city),
+                () -&gt; System.out.println(scores[0]),
+                () -&gt; { int qty = stock.get("P-100"); },
+                () -&gt; { for (String t : tags) { System.out.println(t); } }
+        );
+        for (Runnable r : cases) {
+            try {
+                r.run();
+            } catch (NullPointerException e) {
+                System.out.println(e.getMessage());
+            }
+        }
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">Cannot invoke "String.trim()" because "email" is null
+Cannot invoke "String.length()" because the return value of "NpeMessages$Customer.getName()" is null
+Cannot read field "city" because "customer.address" is null
+Cannot load from int array because "scores" is null
+Cannot invoke "java.lang.Integer.intValue()" because the return value of "java.util.Map.get(Object)" is null
+Cannot invoke "java.util.List.iterator()" because "tags" is null</code></pre>
+  <p>Each message has two halves. The first half says what the code tried (<em>Cannot invoke
+  "String.trim()"</em>, <em>Cannot read field "city"</em>, <em>Cannot load from int array</em>). The
+  <em>because</em> half names the null expression: a variable, a field path, or the return value of a
+  method. The fifth line shows the classic hidden unboxing: you wrote <code>int qty = stock.get(...)</code>
+  and the JVM calls <code>Integer.intValue()</code> on the null that <code>get</code> returned. The last
+  line shows that a for-each loop calls <code>iterator()</code>.</p>
+  <div class="co co-exc">
+    <p class="co-t">Edge case: local variable names need javac -g</p>
+    <p>The class file contains local variable names only when it was compiled with <code>-g</code>. Without
+    it you see placeholders such as <code>"&lt;local4&gt;"</code> instead of <code>"email"</code>. Maven,
+    Gradle and IntelliJ compile with <code>-g</code> by default, so in normal projects you see the real
+    names. Field names, method names and class names are always shown.</p>
+  </div>
+
+  <h4>Fail fast with Objects.requireNonNull</h4>
+  <p>The best NPE is the one thrown <em>where the null enters</em>, with a clear message, not 200 lines
+  later where it is finally used. <code>java.util.Objects</code> has helpers for this and for null-safe
+  code in general:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>requireNonNull(obj)</code></td><td>Returns <code>obj</code>, or throws an NPE with no
+      message</td></tr>
+      <tr><td><code>requireNonNull(obj, "message")</code></td><td>The same, with your message — the usual
+      form</td></tr>
+      <tr><td><code>requireNonNull(obj, supplier)</code></td><td>The message is built only when needed</td></tr>
+      <tr><td><code>requireNonNullElse(obj, other)</code></td><td>Returns <code>obj</code>, or
+      <code>other</code> when <code>obj</code> is null</td></tr>
+      <tr><td><code>requireNonNullElseGet(obj, supplier)</code></td><td>Same, but computes the default
+      lazily</td></tr>
+      <tr><td><code>isNull(obj)</code> / <code>nonNull(obj)</code></td><td>Predicates for method
+      references, as in <code>filter(Objects::nonNull)</code></td></tr>
+      <tr><td><code>toString(obj, "default")</code></td><td>Text of <code>obj</code>, or the default when
+      null</td></tr>
+      <tr><td><code>equals(a, b)</code></td><td>Null-safe equality; two nulls are equal</td></tr>
+    </tbody>
+  </table></div>
+<pre data-title="Customer.java"><code class="language-java">import java.util.Objects;
+
+public class Customer {
+    private final String name;
+    private final String email;
+
+    public Customer(String name, String email) {
+        this.name = Objects.requireNonNull(name, "name must not be null");
+        this.email = Objects.requireNonNull(email, "email must not be null");
+    }
+}
+
+// new Customer("Asha", null) throws immediately:
+// java.lang.NullPointerException: email must not be null
+//     at Customer.&lt;init&gt;(Customer.java:9)</code></pre>
+  <p>By convention a <code>null</code> argument is reported with <code>NullPointerException</code>, not
+  <code>IllegalArgumentException</code>, and <code>requireNonNull</code> does exactly that. The message
+  shows which argument was wrong, and the stack trace points at the constructor, not at the code that
+  eventually used the value.</p>
+
+  <h4>Return empty collections and Optional, not null</h4>
+  <p>A method that returns <code>null</code> forces every caller to remember a check. Two simple rules
+  remove most of the problem:</p>
+  <ul>
+    <li><strong>Collections and arrays:</strong> return an empty one (<code>List.of()</code>,
+    <code>Collections.emptyList()</code>, <code>new String[0]</code>), never <code>null</code>. Callers can
+    then loop without a check.</li>
+    <li><strong>A single value that may be absent:</strong> return <code>Optional&lt;T&gt;</code>. The type
+    tells the caller that "no result" is possible, and the compiler makes them deal with it.</li>
+  </ul>
+<pre data-title="Optional instead of null"><code class="language-java">public Optional&lt;Customer&gt; findByEmail(String email) {
+    // ... returns Optional.empty() when nobody has this email
+}
+
+// no null checks, no NPE
+String city = findByEmail("asha@example.com")
+        .map(Customer::getAddress)
+        .map(Address::getCity)
+        .orElse("unknown");</code></pre>
+  <p>Use <code>Optional</code> as a <em>return type</em>. Do not use it for fields, method parameters or
+  inside collections, and never call <code>get()</code> without checking. The full API, including
+  <code>orElse</code> vs <code>orElseGet</code> and <code>orElseThrow</code>, is in
+  <a href="#m5">Module 5</a>.</p>
+
+  <h4>Defensive habits that work</h4>
+  <ul>
+    <li><strong>Put the known value first:</strong> <code>"PAID".equals(status)</code> never throws when
+    <code>status</code> is null, but <code>status.equals("PAID")</code> does.</li>
+    <li><strong>Use <code>Objects.equals(a, b)</code></strong> when both sides may be null.</li>
+    <li><strong>Use defaults</strong> for lookups: <code>map.getOrDefault(key, 0)</code> instead of
+    unboxing a possible null.</li>
+    <li><strong>Print safely:</strong> <code>String.valueOf(obj)</code> and string concatenation turn a
+    null into the text <code>"null"</code> instead of throwing.</li>
+    <li><strong>Initialize fields</strong> (<code>private final List&lt;Item&gt; items = new
+    ArrayList&lt;&gt;();</code>) so they are never null.</li>
+    <li><strong>Check where the null comes from</strong> — a missing map key, a database NULL, a JSON field
+    that was absent — instead of adding <code>!= null</code> everywhere.</li>
+  </ul>
+
+  <h4>Which classes accept null?</h4>
+  <p>The surprising rows are the sorted, concurrent and immutable collections: they reject nulls that
+  <code>ArrayList</code> and <code>HashMap</code> accept. See <a href="#m4">Module 4</a> for the collections
+  themselves.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Class</th><th>Null element or key</th><th>Null value</th></tr></thead>
+    <tbody>
+      <tr><td><code>ArrayList</code>, <code>LinkedList</code>, <code>HashSet</code></td><td>Allowed</td>
+      <td>—</td></tr>
+      <tr><td><code>HashMap</code>, <code>LinkedHashMap</code></td><td>One null key allowed</td><td>Allowed</td></tr>
+      <tr><td><code>TreeMap</code>, <code>TreeSet</code></td><td>NPE</td><td><code>TreeMap</code>
+      allows null values</td></tr>
+      <tr><td><code>ArrayDeque</code>, <code>PriorityQueue</code></td><td>NPE</td><td>—</td></tr>
+      <tr><td><code>Hashtable</code>, <code>ConcurrentHashMap</code></td><td>NPE</td><td>NPE</td></tr>
+      <tr><td><code>List.of</code>, <code>Set.of</code>, <code>Map.of</code>, <code>List.copyOf</code></td>
+      <td>NPE — even for <code>contains(null)</code> and <code>get(null)</code></td><td>NPE</td></tr>
+      <tr><td><code>Arrays.asList</code>, <code>Collections.unmodifiableList</code>,
+      <code>Stream.toList()</code></td><td>Allowed</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes with null</p>
+    <ul>
+      <li><strong>Catching <code>NullPointerException</code></strong> to deal with a null. An NPE is a bug
+      signal. Find out why the value is null and fix that, or check it explicitly.</li>
+      <li><strong>Returning <code>null</code> from a method that returns a collection.</strong> Return an
+      empty one.</li>
+      <li><strong>Hidden unboxing:</strong> <code>int stock = stockByItem.get(itemId);</code> throws when
+      the item is unknown. Use <code>getOrDefault(itemId, 0)</code>.</li>
+      <li><strong><code>Optional.of(value)</code> with a possibly-null value</strong> throws
+      immediately. Use <code>Optional.ofNullable(value)</code>.</li>
+      <li><strong>Passing null as a "not given" marker</strong> in a long parameter list. Use an overload,
+      a builder, or <code>Optional</code> in the return of a getter instead.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: let tools catch nulls before the JVM does</p>
+    <p>IntelliJ's inspections warn about possible <code>NullPointerException</code>s while you type. Null
+    annotations (such as the JSpecify <code>@Nullable</code>) document intent and are checked by IDEs and
+    static analysers like SpotBugs or NullAway. Kotlin builds the idea into the language. None of this
+    changes the bytecode — it only finds mistakes earlier.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you avoid NullPointerException?"</p>
+    <ul>
+      <li>Do not create nulls: initialize fields, return empty collections, return
+      <code>Optional</code> for "may be absent".</li>
+      <li>Reject them early: <code>Objects.requireNonNull</code> in constructors and public methods.</li>
+      <li>Write null-safe code: <code>"literal".equals(x)</code>, <code>Objects.equals</code>,
+      <code>getOrDefault</code>, <code>Optional.map(...).orElse(...)</code>.</li>
+      <li>When it happens anyway, read the helpful NPE message (Java 14+, default since 15): it names the
+      exact null expression.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-exceptions-spring">
+  <h3>From exception to HTTP response in Spring Boot</h3>
+  <p class="tldr">In a Spring Boot API, services throw domain exceptions and one @RestControllerAdvice class
+  turns each type into an HTTP status and a JSON error body — no try/catch in controllers.</p>
+
+  <p>This is a first look; the Spring Boot page covers it fully in
+  <a href="04-spring-boot.html#m2">Spring Boot · Module 2</a>. It belongs here because it is where
+  everything in this module pays off: custom exceptions, unchecked exceptions, wrapping, and "handle at the
+  boundary".</p>
+
+  <h4>The idea</h4>
+  <p>A web request passes through a controller, a service and a repository. Any of them can fail. If each
+  controller method had its own try/catch, the code would be full of repeated error handling and every
+  endpoint would answer errors a little differently. Spring lets you write the error handling once, in a
+  class outside the controllers.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant D as DispatcherServlet
+  participant K as OrderController
+  participant S as OrderService
+  participant A as GlobalExceptionHandler
+  C->>D: GET /orders/42
+  D->>K: call getOrder(42)
+  K->>S: findOrder(42)
+  S-->>K: throws OrderNotFoundException
+  K-->>D: exception propagates
+  D->>A: find a matching handler
+  A-->>D: ResponseEntity 404 with ApiError
+  D-->>C: HTTP 404 with JSON body
+</pre>
+    <figcaption>The exception travels up past the controller and is turned into a response by the handler</figcaption>
+  </figure>
+
+  <h4>The code</h4>
+  <p>The service throws a domain exception. The controller has no error handling at all.</p>
+<pre data-title="OrderNotFoundException.java"><code class="language-java">public class OrderNotFoundException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+
+    public OrderNotFoundException(long id) {
+        super("Order " + id + " not found");
+    }
+}</code></pre>
+<pre data-title="OrderService.java and OrderController.java (fragments)"><code class="language-java">@Service
+public class OrderService {
+    // ... repository injected by the constructor ...
+
+    public OrderDto findOrder(long id) {
+        return repository.findById(id)
+                .map(OrderDto::from)
+                .orElseThrow(() -&gt; new OrderNotFoundException(id));
+    }
+}
+
+@RestController
+@RequestMapping("/orders")
+public class OrderController {
+    // ... service injected by the constructor ...
+
+    @GetMapping("/{id}")
+    public OrderDto getOrder(@PathVariable long id) {
+        return orderService.findOrder(id);     // no try/catch: failures flow to the advice
+    }
+}</code></pre>
+  <p>The error body is a tiny record, and the handler class is the one place that maps exceptions to
+  responses:</p>
+<pre data-title="ApiError.java"><code class="language-java">public record ApiError(String code, String message) { }</code></pre>
+<pre data-title="GlobalExceptionHandler.java"><code class="language-java">import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    @ExceptionHandler(OrderNotFoundException.class)
+    public ResponseEntity&lt;ApiError&gt; handleNotFound(OrderNotFoundException ex) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(new ApiError("ORDER_NOT_FOUND", ex.getMessage()));
+    }
+
+    @ExceptionHandler(InsufficientBalanceException.class)
+    public ResponseEntity&lt;ApiError&gt; handleInsufficientBalance(InsufficientBalanceException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ApiError("INSUFFICIENT_BALANCE", ex.getMessage()));
+    }
+
+    @ExceptionHandler(Exception.class)          // the safety net: everything unexpected
+    public ResponseEntity&lt;ApiError&gt; handleUnexpected(Exception ex) {
+        log.error("Unexpected error", ex);       // logged once, with the stack trace
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(new ApiError("INTERNAL_ERROR", "Something went wrong. Please try again later."));
+    }
+}</code></pre>
+<pre class="out" data-title="Response for GET /orders/42 when order 42 does not exist"><code class="language-http">HTTP/1.1 404 Not Found
+Content-Type: application/json
+
+{"code":"ORDER_NOT_FOUND","message":"Order 42 not found"}</code></pre>
+  <p>Spring picks the most specific <code>@ExceptionHandler</code> for the exception that arrives, so the
+  <code>Exception.class</code> handler only receives what no other handler wants. The unexpected case
+  deliberately does not send <code>ex.getMessage()</code> to the client: it might contain SQL, file paths
+  or other internals. The details go to the log; the client gets a generic message.</p>
+
+  <h4>What happens without a handler</h4>
+  <p>Spring MVC translates its own exceptions by default: a wrong HTTP method gives
+  <code>405</code>, an unsupported content type <code>415</code>, an unreadable JSON body <code>400</code>.
+  Any other exception that nobody handles ends as <code>500 Internal Server Error</code> through Boot's
+  <code>/error</code> endpoint. The default JSON body has fields such as <code>timestamp</code>,
+  <code>status</code>, <code>error</code> and <code>path</code>; Boot leaves out the exception message and
+  the stack trace unless you switch them on with the <code>server.error.include-*</code> properties — do
+  not do that in production.</p>
+
+  <h4>Choosing the status code</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Situation</th><th>Typical exception</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Invalid or unreadable input</td><td><code>MethodArgumentNotValidException</code>,
+      <code>HttpMessageNotReadableException</code></td><td>400 Bad Request</td></tr>
+      <tr><td>Not logged in, bad token</td><td><code>AuthenticationException</code> (Spring Security)</td>
+      <td>401 Unauthorized</td></tr>
+      <tr><td>Logged in but not allowed</td><td><code>AccessDeniedException</code> (Spring Security)</td>
+      <td>403 Forbidden</td></tr>
+      <tr><td>Resource does not exist</td><td>Your <code>OrderNotFoundException</code></td><td>404 Not
+      Found</td></tr>
+      <tr><td>Duplicate value or conflict with current state</td><td><code>DataIntegrityViolationException</code>,
+      your <code>InsufficientBalanceException</code></td><td>409 Conflict</td></tr>
+      <tr><td>A bug or anything unexpected</td><td>Any other <code>Exception</code></td><td>500 Internal
+      Server Error</td></tr>
+      <tr><td>A service you call is down</td><td>A wrapped client exception</td><td>502, 503 or 504</td></tr>
+    </tbody>
+  </table></div>
+  <p>Spring Security's 401 and 403 are produced in its filter chain, before MVC, so they are configured
+  separately (<a href="04-spring-boot.html#m4">Spring Boot · Module 4</a>). Teams differ on edge cases:
+  some map "insufficient balance" to 422 or 400. What matters is to choose a rule and apply it
+  consistently.</p>
+
+  <h4>Lighter alternatives</h4>
+  <ul>
+    <li><strong><code>@ResponseStatus</code> on the exception class</strong> — the status is fixed for that
+    type, without any handler method:
+<pre><code class="language-java">@ResponseStatus(HttpStatus.NOT_FOUND)
+public class OrderNotFoundException extends RuntimeException { /* ... */ }</code></pre></li>
+    <li><strong><code>ResponseStatusException</code></strong> — thrown directly, no custom class:
+    <code>throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Order 42 not found")</code>. It is
+    quick, but it ties service code to HTTP; domain exceptions plus an advice keep layers clean.</li>
+    <li><strong><code>ProblemDetail</code></strong> — Spring Framework 6 and later can return the standard
+    "problem details" JSON format (<code>type</code>, <code>title</code>, <code>status</code>,
+    <code>detail</code>, <code>instance</code>) with content type
+    <code>application/problem+json</code>, defined by RFC 9457 (which replaced RFC 7807). A handler
+    method can return <code>ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage())</code>
+    instead of a custom error class.</li>
+  </ul>
+
+  <div class="co co-version">
+    <p class="co-t">Boot 3.x and 4.x</p>
+    <p>The annotations on this page (<code>@RestControllerAdvice</code>, <code>@ExceptionHandler</code>,
+    <code>@ResponseStatus</code>) work the same in Spring Boot 3.x and 4.x. Boot 4 is built on Spring
+    Framework 7. Boot 3 and 4 use the <code>jakarta.*</code> packages for validation and servlet classes,
+    not <code>javax.*</code>.</p>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for error responses</p>
+    <ul>
+      <li>Never send stack traces, SQL text or internal class names to a client.</li>
+      <li>Use one error body shape for the whole API (for example <code>code</code> plus
+      <code>message</code>, or <code>ProblemDetail</code>).</li>
+      <li>Log unexpected exceptions once, with the stack trace and a request or trace id.</li>
+      <li>Unchecked exceptions let <code>@Transactional</code> roll back by default; a checked exception
+      commits unless you configure <code>rollbackFor</code> (see
+      <a href="#m3-custom-exceptions">custom exceptions</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you handle exceptions in a Spring Boot REST API?"</p>
+    <ul>
+      <li>Throw domain exceptions (unchecked) from services; no try/catch in controllers.</li>
+      <li>One <code>@RestControllerAdvice</code> with <code>@ExceptionHandler</code> methods maps each
+      exception to a status and a consistent JSON body; a last <code>Exception.class</code> handler
+      returns 500 with a generic message and logs the details.</li>
+      <li>Mention <code>@ResponseStatus</code>, <code>ResponseStatusException</code> and
+      <code>ProblemDetail</code> as alternatives, and that validation errors become 400.</li>
+      <li>Add: never leak internals; log once; unchecked exceptions and transaction rollback.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,501 @@
+<article class="topic" id="m1-log-analysis">
+  <h3>Log analysis with awk, sed, sort, uniq and xargs</h3>
+  <p class="tldr">Combine <code>grep</code>, <code>awk</code>, <code>sort</code> and <code>uniq -c</code> to count
+  errors, rank URLs and find the slowest requests in seconds; use <code>sed</code> for quick edits and
+  <code>xargs</code> to run a command per line.</p>
+
+  <p>When production misbehaves, nobody opens a 500 MB log in an editor. You ask questions with a
+  pipeline: how many errors? which URL fails most? which client is noisy? how slow is the slowest request?
+  This article shows the patterns on two realistic logs.</p>
+
+  <h4>awk in five minutes</h4>
+  <p><code>awk</code> reads text line by line, splits each line into <strong>fields</strong> (by
+  whitespace, by default) and runs your code. <code>$1</code> is the first field, <code>$NF</code> the
+  last, <code>$0</code> the whole line, <code>NR</code> the line number. The shape is
+  <code>awk 'CONDITION { ACTION }' file</code>; <code>BEGIN</code> and <code>END</code> blocks run before
+  the first and after the last line.</p>
+  <pre data-title="awk basics"><code class="language-shell">$ echo "alice 30 mumbai" | awk '{print $1, $3}'
+alice mumbai
+$ echo "a,b,c" | awk -F, '{print $2}'
+b
+$ awk 'NR &lt;= 2' names.txt
+$ awk '$2 &gt; 100 {print $1}' data.txt
+$ awk '{s += $2} END {print s}' data.txt</code></pre>
+  <p><code>-F,</code> sets the field separator. Conditions such as <code>$7 ~ /^5/</code> use a regular
+  expression match; <code>==</code>, <code>&gt;</code>, <code>&amp;&amp;</code> work as in Java.</p>
+
+  <h4>Example 1: an Nginx access log with request time</h4>
+  <p>Suppose you added a log format that ends with the request time in seconds
+  (<code>$request_time</code>), so each line looks like this:</p>
+  <pre data-title="access.log (8 lines)"><code class="language-plaintext">203.0.113.7 [11/Nov/2026:10:15:30 +0530] "GET /api/orders HTTP/1.1" 200 512 0.043
+203.0.113.7 [11/Nov/2026:10:15:31 +0530] "GET /api/orders/42 HTTP/1.1" 200 230 0.021
+198.51.100.4 [11/Nov/2026:10:15:33 +0530] "POST /api/orders HTTP/1.1" 201 180 0.350
+198.51.100.4 [11/Nov/2026:10:15:40 +0530] "GET /api/orders HTTP/1.1" 500 95 1.920
+192.0.2.9 [11/Nov/2026:10:15:42 +0530] "GET /api/products HTTP/1.1" 200 2048 0.087
+203.0.113.7 [11/Nov/2026:10:15:50 +0530] "GET /api/orders HTTP/1.1" 200 512 0.040
+192.0.2.9 [11/Nov/2026:10:15:51 +0530] "GET /api/orders/99 HTTP/1.1" 404 60 0.012
+198.51.100.4 [11/Nov/2026:10:15:58 +0530] "POST /api/orders HTTP/1.1" 500 95 2.410</code></pre>
+  <p>Splitting on whitespace gives: <code>$1</code> client IP, <code>$2 $3</code> the time,
+  <code>$4</code> the method (with a leading quote), <code>$5</code> the path, <code>$6</code> the
+  protocol, <code>$7</code> the status, <code>$8</code> bytes, <code>$9</code> request time.</p>
+  <pre data-title="Questions and answers"><code class="language-shell">$ wc -l access.log
+8 access.log
+$ awk '{print $7}' access.log | sort | uniq -c | sort -rn
+      4 200
+      2 500
+      1 404
+      1 201
+$ awk '$7 ~ /^5/ {print $1}' access.log | sort | uniq -c
+      2 198.51.100.4
+$ awk '{print $9, $5}' access.log | sort -rn | head -3
+2.410 /api/orders
+1.920 /api/orders
+0.350 /api/orders
+$ awk '{s += $9; n++} END {printf "average %.3f s over %d requests\n", s/n, n}' access.log
+average 0.610 s over 8 requests
+$ awk '{print $5}' access.log | sort | uniq -c | sort -rn | head -3
+      4 /api/orders
+      1 /api/products
+      1 /api/orders/99</code></pre>
+  <p>The first line of the status count is the pattern to memorise:
+  <code>... | sort | uniq -c | sort -rn</code> = "count each distinct value, biggest first". It works for
+  IPs, URLs, status codes, user ids, exception names. The 500s all come from one client IP on
+  <code>/api/orders</code> and are also the slowest requests: a good lead.</p>
+
+  <h4>Example 2: a Spring Boot application log</h4>
+  <p>Default Spring Boot log lines have the shape
+  <code>TIMESTAMP LEVEL PID --- [thread] logger : message</code>. Questions you ask the app log:</p>
+  <pre data-title="Application log questions"><code class="language-shell">$ grep -c " ERROR " app.log
+18
+$ grep " ERROR " app.log | awk '{print $1}' | cut -c1-16 | sort | uniq -c
+      2 2026-11-11T09:5
+     14 2026-11-11T10:0
+      2 2026-11-11T10:1
+$ grep -E "Exception|Error" app.log | sed -E 's/.*(java\.[a-zA-Z.]+Exception).*/\1/' \
+    | sort | uniq -c | sort -rn | head -3
+     11 java.net.SocketTimeoutException
+      4 java.sql.SQLTransientConnectionException
+      1 java.lang.NullPointerException
+$ grep -A 15 "OrderService : Order 991 failed" app.log | head -20</code></pre>
+  <p>The second command cuts the timestamp to ten-minute buckets (first 16 characters) to see
+  <em>when</em> errors spike. The third pulls the exception class name out of each line and ranks them.
+  The numbers shown are sample output. A trailing backslash continues the command on the next line.</p>
+
+  <h4>sed: edit streams</h4>
+  <p><code>sed</code> is a stream editor. Its most common use is substitution:
+  <code>s/old/new/</code> (first match per line) and <code>s/old/new/g</code> (all matches).</p>
+  <pre data-title="sed one-liners"><code class="language-shell">$ echo "port=8080" | sed 's/8080/9090/'
+port=9090
+$ sed -n '100,120p' app.log
+$ sed '/^#/d' application.properties
+$ sed -i.bak 's/localhost/db.internal/' application.properties
+$ sed -n '/10:09:4/,/10:09:5/p' app.log</code></pre>
+  <ul>
+    <li><code>sed -n '100,120p'</code> prints only lines 100-120 (a quick way to view a part of a big
+    file).</li>
+    <li><code>sed '/^#/d'</code> deletes comment lines.</li>
+    <li><code>sed -i</code> edits the file <em>in place</em>; <code>-i.bak</code> keeps a backup copy
+    first. Test without <code>-i</code> before you change a file.</li>
+    <li>The last example prints a time window between two patterns.</li>
+  </ul>
+
+  <h4>xargs: turn lines into arguments</h4>
+  <p>Some commands take arguments, not stdin. <code>xargs</code> reads lines from a pipe and puts them on
+  the command line.</p>
+  <pre data-title="xargs"><code class="language-shell">$ find . -name "*.tmp" | xargs rm
+$ find . -name "*.log" -print0 | xargs -0 grep -l "OutOfMemory"
+$ grep -rl "TODO" src/ | xargs wc -l
+$ echo "a b c" | xargs -n 1 echo item
+item a
+item b
+item c</code></pre>
+  <p>If file names can contain spaces, use <code>-print0</code> with <code>xargs -0</code> (null
+  separators). <code>find ... -exec cmd {} +</code> does a similar job without <code>xargs</code>.</p>
+
+  <h4>Putting it together: a 30-second triage</h4>
+  <ol class="steps">
+    <li>Is it up? <code>systemctl status billing</code> and <code>ss -tulpn | grep 8080</code>.</li>
+    <li>When did it fail? <code>journalctl -u billing --since "1 hour ago" | grep -n ERROR | head</code>.</li>
+    <li>What is the top error? The <code>sed</code> + <code>uniq -c</code> pipeline above.</li>
+    <li>Context: <code>grep -B 3 -A 15 "first error text" app.log</code>.</li>
+    <li>Who and what is affected? Group the access log by IP, URL and status.</li>
+  </ol>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: build pipelines one stage at a time</p>
+    <p>Run the first command alone, check the output, add <code>| next</code>, check again. When a
+    pipeline gives a strange answer, you can see exactly which stage broke it. Save the good ones as
+    shell aliases or small scripts.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: wrong column numbers</p>
+    <p>Log formats put spaces inside quotes (<code>"GET /api HTTP/1.1"</code>) or in the date, so
+    <code>$7</code> in one log is <code>$9</code> in another. Print the fields first with
+    <code>head -1 access.log | awk '{for (i=1; i&lt;=NF; i++) print i, $i}'</code> and use what you see.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Sorting numbers needs <code>sort -n</code>; plain <code>sort</code> is alphabetical, so
+      <code>10</code> comes before <code>9</code>.</li>
+      <li>A locale can change sort order; use <code>LC_ALL=C sort</code> for strict byte order and a
+      faster sort on huge files.</li>
+      <li><code>sed -i</code> differs on macOS (needs <code>-i ''</code>). On Linux and WSL the examples
+      here work as written.</li>
+      <li>Multi-line stack traces break "one line = one event" analysis. Count only the first line of
+      each event (the one with a timestamp), or use <code>grep -A</code> for context.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How would you find the top 5 IPs hitting your server?"</p>
+    <ul>
+      <li><code>awk '{print $1}' access.log | sort | uniq -c | sort -rn | head -5</code></li>
+      <li>Explain each stage: extract the field, group equal values, count, order, limit.</li>
+      <li>Similar for slow requests: sort on the time column with <code>sort -k9 -nr</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-packages-env">
+  <h3>Installing software with apt, Java setup and environment variables</h3>
+  <p class="tldr"><code>apt update</code> refreshes the package list, <code>apt install</code> installs from it;
+  environment variables such as <code>JAVA_HOME</code> and <code>PATH</code> configure programs and are
+  set in <code>~/.bashrc</code>, systemd env files or <code>.env</code> files.</p>
+
+  <h4>Package managers</h4>
+  <p>On Ubuntu you do not download installers from websites. A <strong>package manager</strong> installs
+  signed software from trusted <strong>repositories</strong>, resolves dependencies, and updates
+  everything with one command. On Ubuntu and Debian it is <code>apt</code>.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>sudo apt update</code></td><td>Download the latest <em>list</em> of available packages and versions. Installs nothing.</td></tr>
+      <tr><td><code>sudo apt upgrade</code></td><td>Install newer versions of packages you already have.</td></tr>
+      <tr><td><code>sudo apt install nginx</code></td><td>Install a package and its dependencies.</td></tr>
+      <tr><td><code>sudo apt remove nginx</code></td><td>Remove the program, keep its config files.</td></tr>
+      <tr><td><code>sudo apt purge nginx</code></td><td>Remove the program and its config.</td></tr>
+      <tr><td><code>sudo apt autoremove</code></td><td>Remove dependencies nobody needs now.</td></tr>
+      <tr><td><code>apt search keyword</code></td><td>Search package names and descriptions.</td></tr>
+      <tr><td><code>apt show nginx</code></td><td>Details of a package; <code>apt list --installed</code> lists what you have.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The classic mistake: <code>apt update</code> and <code>apt upgrade</code> are different.
+  <code>update</code> only refreshes the catalogue; <code>upgrade</code> changes software. Run
+  <code>update</code> before <code>install</code> on a fresh machine, or you may get <em>Unable to locate
+  package</em> or an old version.</p>
+  <pre data-title="Install a few tools"><code class="language-shell">$ sudo apt update
+Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease
+Reading package lists... Done
+$ sudo apt install -y nginx htop curl unzip
+$ nginx -v
+nginx version: nginx/1.24.0 (Ubuntu)
+$ apt search openjdk-21 | head -3</code></pre>
+  <p><code>-y</code> answers "yes" automatically; use it in scripts. Red Hat family systems use
+  <code>dnf install</code>/<code>yum install</code> instead; Alpine uses <code>apk add</code>.</p>
+
+  <h4>Installing Java</h4>
+  <pre data-title="OpenJDK from the Ubuntu repository"><code class="language-shell">$ sudo apt update
+$ apt search openjdk | grep -E "^openjdk-[0-9]+-jdk/"
+$ sudo apt install -y openjdk-21-jdk
+$ java -version
+openjdk version "21.0.5" 2024-10-15
+OpenJDK Runtime Environment (build 21.0.5+11-Ubuntu-1ubuntu1)
+OpenJDK 64-Bit Server VM (build 21.0.5+11-Ubuntu-1ubuntu1, mixed mode, sharing)
+$ javac -version
+javac 21.0.5
+$ readlink -f $(which java)
+/usr/lib/jvm/java-21-openjdk-amd64/bin/java</code></pre>
+  <p>Package names include the Java version (<code>openjdk-17-jdk</code>, <code>openjdk-21-jdk</code>);
+  use <code>apt search</code> to see what your Ubuntu release offers. The version numbers above are
+  sample output. On a server that only <em>runs</em> an app, a JRE (<code>-jre-headless</code>) is
+  enough; on a build machine you need the JDK. Temurin (Eclipse Adoptium) is another common
+  distribution; it provides its own apt repository (see adoptium.net for the current instructions). If
+  several Java versions are installed, choose the default with
+  <code>sudo update-alternatives --config java</code>.</p>
+
+  <h4>Environment variables</h4>
+  <p>An <strong>environment variable</strong> is a named value that every program started from a shell
+  inherits. Apps read them for configuration: database URLs, passwords, profiles, ports. This is how the
+  "twelve-factor" approach keeps config out of code. Spring Boot maps them automatically: the variable
+  <code>SPRING_DATASOURCE_URL</code> sets <code>spring.datasource.url</code>, and
+  <code>SERVER_PORT</code> sets <code>server.port</code>.</p>
+  <pre data-title="Working with variables"><code class="language-shell">$ NAME=asha
+$ echo $NAME
+asha
+$ bash -c 'echo "child sees: $NAME"'
+child sees:
+$ export NAME=asha
+$ bash -c 'echo "child sees: $NAME"'
+child sees: asha
+$ printenv HOME
+/home/ubuntu
+$ env | grep JAVA
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+$ unset NAME
+$ SPRING_PROFILES_ACTIVE=prod java -jar app.jar</code></pre>
+  <p>A plain assignment (<code>NAME=asha</code>) is local to the current shell. <code>export</code> marks
+  it for child processes, such as <code>java</code>. A variable placed before a command
+  (<code>VAR=x cmd</code>) lives only for that command.</p>
+
+  <h4>PATH and JAVA_HOME</h4>
+  <p><code>PATH</code> is a colon-separated list of directories. When you type <code>java</code>, the
+  shell searches them in order for an executable with that name. <code>JAVA_HOME</code> is a convention:
+  it points to the JDK folder, and tools such as Maven and Gradle read it.</p>
+  <pre data-title="Set them for your user in ~/.bashrc"><code class="language-bash"># append these lines to ~/.bashrc
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+export PATH="$JAVA_HOME/bin:$PATH"
+export PATH="$HOME/bin:$PATH"</code></pre>
+  <pre data-title="Apply and check"><code class="language-shell">$ source ~/.bashrc
+$ echo $JAVA_HOME
+/usr/lib/jvm/java-21-openjdk-amd64
+$ echo $PATH
+/usr/lib/jvm/java-21-openjdk-amd64/bin:/home/ubuntu/bin:/usr/local/sbin:/usr/local/bin:...</code></pre>
+  <p>Put your folder <em>first</em> (<code>NEW:$PATH</code>) to override a system program; put it last to
+  keep the system one as the default. Never write <code>PATH="..."</code> without including the old
+  <code>$PATH</code>, or you will lose <code>ls</code>, <code>cd</code> and everything else.</p>
+
+  <h4>.bashrc, .profile and .env files</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>File</th><th>Read when</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>~/.bashrc</code></td><td>Each new interactive bash terminal</td><td>Aliases, prompt, <code>PATH</code>, <code>JAVA_HOME</code> for interactive use</td></tr>
+      <tr><td><code>~/.profile</code></td><td>Login shells (SSH login, console)</td><td>Variables for your login session; Ubuntu's default <code>.profile</code> also loads <code>.bashrc</code></td></tr>
+      <tr><td><code>/etc/environment</code></td><td>System-wide, at login</td><td>Simple <code>KEY=value</code> lines for all users</td></tr>
+      <tr><td><code>EnvironmentFile=</code> in a unit</td><td>When a service starts</td><td>Variables for a systemd service (not read from <code>.bashrc</code>!)</td></tr>
+    </tbody>
+  </table></div>
+  <p>A <strong>.env file</strong> is a plain text file of <code>KEY=value</code> lines, common in
+  projects and Docker. To load it into your shell, <code>source</code> it with auto-export on:</p>
+  <pre data-title="Loading a .env file"><code class="language-shell">$ cat .env
+DB_HOST=localhost
+DB_PASSWORD=s3cret
+$ set -a
+$ source .env
+$ set +a
+$ echo $DB_HOST
+localhost</code></pre>
+  <p><code>set -a</code> exports every variable defined while it is on. Treat <code>.env</code> as a
+  secret: <code>chmod 600 .env</code> and add it to <code>.gitignore</code>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: expecting a systemd service to see your .bashrc</p>
+    <p>A service starts without your shell, so <code>JAVA_HOME</code> from <code>.bashrc</code> is not set.
+    Give it variables with <code>Environment=</code> or <code>EnvironmentFile=</code>
+    (<a href="#m1-systemd">systemd article</a>) and use full paths. Same for cron jobs, which run with a
+    tiny <code>PATH</code>.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: spaces around = and unquoted values</p>
+    <p><code>NAME = asha</code> fails (<code>NAME: command not found</code>). Write
+    <code>NAME=asha</code>. Quote values with spaces: <code>GREETING="hello world"</code>.</p>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: no secrets in code, Git, or command lines</p>
+    <p>Passwords passed as command arguments show up in <code>ps aux</code> and shell history. Put them
+    in a file with <code>600</code> or <code>640</code> permissions, or in a secret manager (Module 5).</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>E: Could not get lock /var/lib/dpkg/lock-frontend</code> — another apt process is
+      running (often automatic updates on a fresh EC2). Wait a minute and retry; do not delete the
+      lock file.</li>
+      <li><code>E: Unable to locate package x</code> — run <code>apt update</code>, check the spelling
+      and the Ubuntu release.</li>
+      <li>The repository version of a tool can be old. For the latest versions, use the vendor's own
+      repository or a container image, and check the vendor documentation.</li>
+      <li>Environment changes in <code>.bashrc</code> need a new terminal or
+      <code>source ~/.bashrc</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is the difference between apt update and apt upgrade?"</p>
+    <ul>
+      <li><code>update</code> refreshes the package index; <code>upgrade</code> installs newer versions of
+      installed packages.</li>
+      <li>Environment variables: how you pass config to a Spring Boot app, what <code>export</code> does,
+      and why a service does not read <code>.bashrc</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-ssh">
+  <h3>SSH: keys, config, EC2, scp, rsync and hardening</h3>
+  <p class="tldr">SSH gives you an encrypted shell on a remote machine; use a key pair instead of a password,
+  save hosts in <code>~/.ssh/config</code>, copy files with <code>scp</code> or <code>rsync</code>, and turn
+  off password and root login on servers.</p>
+
+  <h4>What SSH is</h4>
+  <p><strong>SSH</strong> (Secure Shell) lets you run commands on a remote machine as if you sat in front
+  of it, over an encrypted connection, on TCP port 22. It also carries file copies (<code>scp</code>,
+  <code>rsync</code>) and port forwards. Every Linux server you manage — EC2, a VPS, a Raspberry Pi — is
+  reached this way.</p>
+  <pre data-title="Basic login"><code class="language-shell">$ ssh ubuntu@203.0.113.10
+The authenticity of host '203.0.113.10 (203.0.113.10)' can't be established.
+ED25519 key fingerprint is SHA256:abc...xyz.
+Are you sure you want to continue connecting (yes/no/[fingerprint])? yes
+Warning: Permanently added '203.0.113.10' (ED25519) to the list of known hosts.
+ubuntu@203.0.113.10's password:
+$ ssh -p 2222 ubuntu@server.example.com
+$ ssh ubuntu@203.0.113.10 "uptime"
+ 10:40:01 up 3 days,  2:11,  1 user,  load average: 0.05, 0.03, 0.01
+$ exit</code></pre>
+  <p>The first connection asks you to trust the server's <strong>host key</strong>; the client saves it
+  in <code>~/.ssh/known_hosts</code> and warns loudly if it ever changes (which can mean a rebuilt server
+  or a man-in-the-middle attack). Adding a command after the host runs it and returns.</p>
+
+  <h4>How key-based authentication works</h4>
+  <p>Passwords can be guessed by bots; a key cannot. You make a <strong>key pair</strong>: a
+  <em>private key</em> that never leaves your machine, and a <em>public key</em> you copy to the
+  server's <code>~/.ssh/authorized_keys</code>.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Your laptop
+  participant S as Server
+  C->>S: Connect, I am ubuntu, here is my public key
+  S->>S: Is this key in authorized_keys?
+  S->>C: Challenge: prove you own the private key
+  C->>S: Signature made with the private key
+  S->>C: Signature valid, access granted
+</pre>
+    <figcaption>Key-based login: the private key is never sent</figcaption>
+  </figure>
+  <p>The server only checks the signature with the public key. Even a stolen public key is useless
+  without the private one. Protect the private key (<code>chmod 600</code>), and consider a
+  <strong>passphrase</strong> that encrypts it on disk.</p>
+
+  <h4>Create and install a key</h4>
+  <pre data-title="ssh-keygen and ssh-copy-id"><code class="language-shell">$ ssh-keygen -t ed25519 -C "asha@laptop"
+Generating public/private ed25519 key pair.
+Enter file in which to save the key (/home/asha/.ssh/id_ed25519):
+Enter passphrase (empty for no passphrase):
+Your identification has been saved in /home/asha/.ssh/id_ed25519
+Your public key has been saved in /home/asha/.ssh/id_ed25519.pub
+$ ls ~/.ssh
+id_ed25519  id_ed25519.pub  known_hosts
+$ ssh-copy-id ubuntu@203.0.113.10
+$ ssh ubuntu@203.0.113.10
+Welcome to Ubuntu 24.04 LTS</code></pre>
+  <p><code>ed25519</code> is the modern, short and fast key type; <code>id_ed25519</code> is private,
+  <code>.pub</code> is public (safe to share, for example in GitHub settings). <code>ssh-copy-id</code>
+  appends your public key to the server's <code>authorized_keys</code> using your password once.</p>
+
+  <h4>Connect to AWS EC2 with a .pem key</h4>
+  <p>When you launch an EC2 instance, AWS lets you create a <strong>key pair</strong> and downloads the
+  private key as a <code>.pem</code> file (you can download it only once). AWS puts the public half on the
+  instance for the default user. The default user depends on the image: <code>ubuntu</code> for Ubuntu,
+  <code>ec2-user</code> for Amazon Linux.</p>
+  <ol class="steps">
+    <li>Move the file somewhere safe: <code>mv ~/Downloads/billing-key.pem ~/.ssh/</code></li>
+    <li>Restrict it: <code>chmod 600 ~/.ssh/billing-key.pem</code></li>
+    <li>Find the instance's public IP or DNS name in the EC2 console.</li>
+    <li>Make sure the security group allows inbound TCP 22 from <em>your</em> IP
+    (<a href="#m2-firewalls">Firewalls</a>).</li>
+    <li>Connect: <code>ssh -i ~/.ssh/billing-key.pem ubuntu@203.0.113.10</code></li>
+  </ol>
+  <pre data-title="First EC2 login"><code class="language-shell">$ ssh -i ~/.ssh/billing-key.pem ubuntu@ec2-203-0-113-10.ap-south-1.compute.amazonaws.com
+ubuntu@ip-172-31-5-20:~$ hostname
+ip-172-31-5-20
+ubuntu@ip-172-31-5-20:~$ sudo apt update</code></pre>
+  <p>Errors and meanings: <code>Permission denied (publickey)</code> = wrong user name or wrong key;
+  <code>Connection timed out</code> = the security group, firewall or IP is wrong (the packets never
+  arrive); <code>Connection refused</code> = the machine answered but nothing listens on that port.</p>
+
+  <h4>~/.ssh/config: host aliases</h4>
+  <pre data-title="~/.ssh/config"><code class="language-plaintext">Host billing
+    HostName 203.0.113.10
+    User ubuntu
+    IdentityFile ~/.ssh/billing-key.pem
+    Port 22
+
+Host *
+    ServerAliveInterval 60</code></pre>
+  <pre data-title="Now it is short"><code class="language-shell">$ ssh billing
+$ scp app.jar billing:/tmp/
+$ ssh billing "systemctl is-active billing"
+active</code></pre>
+  <p>The alias works for <code>ssh</code>, <code>scp</code>, <code>rsync</code> and Git over SSH.
+  <code>ServerAliveInterval</code> sends a keep-alive so idle sessions are not dropped. Keep the file at
+  <code>600</code>.</p>
+
+  <h4>Copying files: scp and rsync</h4>
+  <pre data-title="scp"><code class="language-shell">$ scp target/billing-1.0.1.jar billing:/tmp/
+billing-1.0.1.jar            100%   56MB   9.1MB/s   00:06
+$ scp -i ~/.ssh/billing-key.pem notes.txt ubuntu@203.0.113.10:/home/ubuntu/
+$ scp billing:/var/log/nginx/access.log .
+$ scp -r config/ billing:/tmp/config
+$ scp -P 2222 file.txt user@host:/tmp/</code></pre>
+  <p>The form is <code>scp SOURCE DESTINATION</code>; a remote path is <code>host:path</code>. Note:
+  <code>scp</code> uses uppercase <code>-P</code> for the port, <code>ssh</code> uses lowercase
+  <code>-p</code>. <code>rsync</code> is better for repeated copies, because it sends only what changed:</p>
+  <pre data-title="rsync"><code class="language-shell">$ rsync -avz --progress dist/ billing:/var/www/app/
+$ rsync -avz --delete dist/ billing:/var/www/app/
+$ rsync -avzn dist/ billing:/var/www/app/
+$ rsync -avz -e "ssh -i ~/.ssh/billing-key.pem" ./backup/ ubuntu@203.0.113.10:/backup/</code></pre>
+  <p><code>-a</code> archive (keeps permissions and times), <code>-v</code> verbose, <code>-z</code>
+  compress, <code>--delete</code> removes files on the target that no longer exist in the source,
+  <code>-n</code> is a dry run (shows what would happen). A trailing slash on the source matters:
+  <code>dist/</code> copies the <em>contents</em>, <code>dist</code> copies the folder itself.</p>
+
+  <h4>Port forwarding (brief)</h4>
+  <p>An SSH <strong>tunnel</strong> forwards a local port to a port on the server, through the encrypted
+  connection. It lets you reach a database that listens only on <code>127.0.0.1</code> of the server,
+  without opening it to the internet.</p>
+  <pre data-title="Local port forward"><code class="language-shell">$ ssh -L 5433:localhost:5432 billing
+$ psql -h localhost -p 5433 -U billing billing</code></pre>
+  <p>While the SSH session is open, <code>localhost:5433</code> on your laptop connects to PostgreSQL on
+  the server. Add <code>-N</code> to open the tunnel without a shell.</p>
+
+  <h4>Hardening basics</h4>
+  <p>Any server with a public IP is probed by bots within minutes. After you can log in with a key,
+  tighten <code>/etc/ssh/sshd_config</code>:</p>
+  <pre data-title="/etc/ssh/sshd_config (lines to set)"><code class="language-plaintext">PasswordAuthentication no
+PermitRootLogin no
+PubkeyAuthentication yes</code></pre>
+  <pre data-title="Test, then reload"><code class="language-shell">$ sudo sshd -t
+$ sudo systemctl reload ssh</code></pre>
+  <p>On Ubuntu the service is called <code>ssh</code>; on Red Hat style systems it is
+  <code>sshd</code>. <strong>Keep your current session open</strong> and test a second login in a new
+  terminal before closing the first one, so a typo cannot lock you out. Also: allow port 22 only from
+  your IP in the firewall; keep the system updated; use <code>fail2ban</code> if you want automatic
+  blocking; never share a private key between people (add each person's public key instead).</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: committing or sharing a private key</p>
+    <p>A <code>.pem</code> or <code>id_ed25519</code> in Git, a chat or an email means anyone can log in.
+    If it happens, remove the public key from <code>authorized_keys</code> / replace the EC2 key pair and
+    create a new one. Only the <code>.pub</code> file is safe to share.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!</code> — the server's host key differs
+      from <code>known_hosts</code>. If you rebuilt the server, remove the old line with
+      <code>ssh-keygen -R 203.0.113.10</code>. If you did not, stop and investigate.</li>
+      <li>A stopped and restarted EC2 instance usually gets a new public IP unless you attach an Elastic
+      IP; update your config.</li>
+      <li>On WSL, a key stored under <code>/mnt/c</code> keeps wide permissions and SSH refuses it. Copy it
+      into <code>~/.ssh</code> in the Linux filesystem and run <code>chmod 600</code>.</li>
+      <li>Windows 10/11 also ships an OpenSSH client in PowerShell, with the same commands.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How does SSH key authentication work, and how do you secure SSH?"</p>
+    <ul>
+      <li>Public key on the server, private key on the client; the client proves it holds the private key
+      by signing a challenge; the key itself is never sent.</li>
+      <li>Hardening: keys only, no root login, restrict port 22 to known IPs, updates, optionally
+      fail2ban and a non-default setup behind a bastion host.</li>
+      <li>Say that private keys must be <code>600</code> and never committed.</li>
+    </ul>
+  </div>
+</article>

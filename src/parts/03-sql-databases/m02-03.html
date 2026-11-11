@@ -1,0 +1,697 @@
+<article class="topic" id="m2-subqueries">
+  <h3>Subqueries: scalar, IN, derived tables and ANY/ALL</h3>
+  <p class="tldr">A <strong>subquery</strong> is a <code>SELECT</code> inside another statement, in
+  parentheses. It can return one value (scalar), a list (for <code>IN</code>) or a whole table (a derived table
+  in <code>FROM</code>). Use it when one query needs the answer of another.</p>
+
+  <h4>Why and where</h4>
+  <p>"Employees who earn more than the company average" needs two steps: compute the average, then compare.
+  With a subquery you write both in one statement and the database runs the inner part first (or rewrites it
+  into a join). A subquery can sit in three places:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Position</th><th>Must return</th><th>Example use</th></tr></thead>
+    <tbody>
+      <tr><td><code>WHERE</code> / <code>HAVING</code></td><td>one value, or one column for <code>IN</code></td><td>compare with an average</td></tr>
+      <tr><td><code>FROM</code></td><td>any table (needs an alias)</td><td>aggregate, then join the result</td></tr>
+      <tr><td><code>SELECT</code> list</td><td>exactly one value</td><td>a per-row lookup or count</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Scalar subquery</h4>
+  <p>A <strong>scalar subquery</strong> returns one row with one column, and can be used wherever a single value
+  fits.</p>
+  <pre data-title="Earning more than the company average"><code class="language-sql">SELECT first_name, salary
+FROM employees
+WHERE salary &gt; (SELECT AVG(salary) FROM employees)
+ORDER BY salary DESC, emp_id;</code></pre>
+  <pre class="out" data-title="Output (average is 137083.33)"><code class="language-plaintext"> first_name |  salary
+------------+-----------
+ Meera      | 300000.00
+ Vikram     | 220000.00
+ Karan      | 160000.00
+ Ananya     | 150000.00
+ Priya      | 150000.00
+ Rahul      | 150000.00
+(6 rows)</code></pre>
+  <p>The inner query does not depend on the outer one, so it runs once. If it returns two or more rows where
+  one value is expected, the statement fails:</p>
+  <pre data-title="The 'more than one row' error"><code class="language-sql">SELECT first_name FROM employees
+WHERE salary = (SELECT salary FROM employees WHERE dept_id = 1);
+-- ERROR:  more than one row returned by a subquery used as an expression</code></pre>
+  <p>MySQL says <code>ERROR 1242 (21000): Subquery returns more than 1 row</code>. Fix by using an aggregate
+  (<code>MAX(salary)</code>), <code>IN</code>, or <code>LIMIT 1</code> with an <code>ORDER BY</code> when you
+  truly want one row. If the subquery returns <em>no</em> row, the scalar value is NULL, and the comparison
+  matches nothing. If it returns two columns you get <code>ERROR:  subquery has too many columns</code>.</p>
+
+  <h4>Subquery with IN</h4>
+  <p><code>IN (subquery)</code> tests whether a value appears in the single column the subquery returns.
+  Products that were sold at least once:</p>
+  <pre data-title="IN with a subquery"><code class="language-sql">SELECT product_id, name
+FROM products
+WHERE product_id IN (SELECT product_id FROM order_items)
+ORDER BY product_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> product_id |        name
+------------+---------------------
+          1 | Wireless Mouse
+          2 | Mechanical Keyboard
+          3 | USB-C Cable
+          4 | Notebook A5
+          5 | Gel Pen Pack
+          6 | Water Bottle
+(6 rows)</code></pre>
+  <p>The Desk Lamp (id 7) was never sold. The inner query returns product ids with duplicates, which does not
+  matter: <code>IN</code> only asks "is it there?" and never multiplies the outer rows (unlike a join). The
+  negated form <code>NOT IN</code> has the NULL trap described in
+  <a href="#m2-join-traps">Join traps</a>.</p>
+
+  <h4>Derived tables: a subquery in FROM</h4>
+  <p>A subquery in <code>FROM</code> acts as a temporary table for this one statement. It <strong>must have an
+  alias</strong> (required by MySQL, and by PostgreSQL before version 16). It is the usual way to aggregate first
+  and then join or filter on the result. Employees paid above their own department's average:</p>
+  <pre data-title="Aggregate in a derived table, then join"><code class="language-sql">SELECT e.first_name, e.salary, d.avg_salary
+FROM employees AS e
+JOIN (SELECT dept_id, ROUND(AVG(salary), 2) AS avg_salary
+      FROM employees
+      GROUP BY dept_id) AS d ON d.dept_id = e.dept_id
+WHERE e.salary &gt; d.avg_salary
+ORDER BY e.emp_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name |  salary   | avg_salary
+------------+-----------+------------
+ Vikram     | 220000.00 |  144000.00
+ Ananya     | 150000.00 |  128333.33
+ Sunita     | 120000.00 |   80000.00
+ Priya      | 150000.00 |  144000.00
+ Rahul      | 150000.00 |  144000.00
+ Karan      | 160000.00 |  128333.33
+(6 rows)</code></pre>
+  <p>Meera is missing: her <code>dept_id</code> is NULL, so she matches no group. This is also where the logical
+  order bites: you cannot compare a salary with <code>AVG(salary)</code> in the same query level, because the
+  aggregate does not exist at <code>WHERE</code> time, but you can compare with a column of a derived table that
+  was already computed. Nested derived tables get hard to read; <a href="#m3-cte">CTEs</a> are the cleaner way
+  to write them.</p>
+
+  <h4>Subquery in the SELECT list</h4>
+  <p>A scalar subquery in the select list computes one extra value per row, for example the share of the
+  company payroll:</p>
+  <pre data-title="Scalar subquery in SELECT"><code class="language-sql">SELECT first_name,
+       salary,
+       ROUND(100 * salary / (SELECT SUM(salary) FROM employees), 1) AS pct_of_payroll
+FROM employees
+WHERE dept_id = 3
+ORDER BY emp_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name |  salary   | pct_of_payroll
+------------+-----------+----------------
+ Sunita     | 120000.00 |            7.3
+ Farhan     |  65000.00 |            4.0
+ Isha       |  55000.00 |            3.3
+(3 rows)</code></pre>
+  <p>(Window functions do this more elegantly: <a href="#m3-window-frames">percent of total</a>.)</p>
+
+  <h4>ANY and ALL</h4>
+  <p><code>ANY</code> (same as <code>SOME</code>) is true if the comparison holds for at least one value of the
+  subquery; <code>ALL</code> if it holds for every value. <code>= ANY (…)</code> is the same as
+  <code>IN</code>. Employees who earn more than everyone in Sales:</p>
+  <pre data-title="ALL"><code class="language-sql">SELECT first_name, salary
+FROM employees
+WHERE salary &gt; ALL (SELECT salary FROM employees WHERE dept_id = 2)
+ORDER BY salary DESC;</code></pre>
+  <pre class="out" data-title="Output (Sales maximum is 160000)"><code class="language-plaintext"> first_name |  salary
+------------+-----------
+ Meera      | 300000.00
+ Vikram     | 220000.00
+(2 rows)</code></pre>
+  <p><code>salary &gt; ALL (…)</code> equals <code>salary &gt; (SELECT MAX(…))</code>; the second form is easier
+  to read, so ALL and ANY are rare in practice. Beware: if the subquery returns an empty set, <code>ALL</code>
+  is true for every row and <code>ANY</code> is false. A NULL inside the list makes <code>ALL</code> unknown.</p>
+
+  <h4>Subquery, join or CTE?</h4>
+  <p>The optimizer often rewrites a subquery into a join, so do not choose for speed alone. Choose for
+  readability: a scalar comparison is clearest as a subquery, a lookup of columns is clearest as a join, and a
+  multi-step calculation is clearest as a CTE.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: know how many rows and columns a subquery returns</p>
+    <p>After <code>=</code>, <code>&gt;</code>, <code>&lt;</code>: one row, one column. After <code>IN</code>: one
+    column, any number of rows. In <code>FROM</code>: anything, with an alias. In <code>SELECT</code>: one row,
+    one column.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using = where IN is needed</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: breaks as soon as 2 rows come back</p><pre><code class="language-sql">WHERE dept_id = (SELECT dept_id FROM departments WHERE location = 'Pune')</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: IN accepts any number of rows</p><pre><code class="language-sql">WHERE dept_id IN (SELECT dept_id FROM departments WHERE location = 'Pune')</code></pre></div>
+    </div>
+    <p>The wrong version works today because only one department is in Pune, and fails the day a second one
+    opens. Code that works only by luck is a bug waiting.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>MySQL (before 8.0.14 in many cases) could not use <code>LIMIT</code> inside an <code>IN</code> subquery
+      (<code>This version of MySQL doesn't yet support 'LIMIT &amp; IN/ALL/ANY/SOME subquery'</code>); wrap it
+      in a derived table.</li>
+      <li>MySQL does not let you <code>UPDATE</code> or <code>DELETE</code> a table while selecting from the same
+      table in a subquery (<code>ERROR 1093</code>); wrap the subquery in a derived table or use a join.</li>
+      <li>The subquery's columns are limited to its own <code>FROM</code> unless it is correlated (next
+      article).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Likely questions: "employees earning more than the average", "what error does a scalar subquery with two
+    rows give", "does a derived table need an alias" and "subquery vs join, which is faster" (usually the same
+    plan; measure with <code>EXPLAIN</code>).</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-correlated-exists">
+  <h3>Correlated subqueries and EXISTS</h3>
+  <p class="tldr">A <strong>correlated subquery</strong> uses a column of the outer query, so conceptually it
+  runs once per outer row. <code>EXISTS</code> is the most useful correlated test: it asks "does at least one row
+  match?" and stops at the first.</p>
+
+  <h4>How a correlated subquery runs</h4>
+  <p>In the earlier subqueries, the inner query stood alone. A correlated one refers to the outer row:</p>
+  <pre data-title="Paid more than the department average"><code class="language-sql">SELECT e.first_name, e.salary
+FROM employees AS e
+WHERE e.salary &gt; (SELECT AVG(x.salary)
+                  FROM employees AS x
+                  WHERE x.dept_id = e.dept_id)      -- refers to the outer row e
+ORDER BY e.emp_id;</code></pre>
+  <pre class="out" data-title="Output (6 rows)"><code class="language-plaintext"> first_name |  salary
+------------+-----------
+ Vikram     | 220000.00
+ Ananya     | 150000.00
+ Sunita     | 120000.00
+ Priya      | 150000.00
+ Rahul      | 150000.00
+ Karan      | 160000.00
+(6 rows)</code></pre>
+  <ol class="steps">
+    <li>Take the first outer row (Meera, <code>dept_id = NULL</code>).</li>
+    <li>Run the inner query with <code>e.dept_id</code> filled in from that row. Here nothing matches (NULL
+    equals nothing), so <code>AVG</code> is NULL, the comparison is unknown, and Meera is dropped.</li>
+    <li>Take the next outer row (Vikram, dept 1), average department 1 again (144000), compare, keep.</li>
+    <li>Repeat for every row.</li>
+  </ol>
+  <p>This "once per row" picture is the <em>meaning</em>. The optimizer often turns it into a join or computes
+  each department average once. But sometimes it cannot, and a correlated subquery on a big table is then
+  slow: 1 million outer rows means 1 million inner runs. The same result via a derived table (previous article)
+  computes the averages once.</p>
+
+  <h4>Correlated subquery in the SELECT list</h4>
+  <pre data-title="Headcount per department, including empty ones"><code class="language-sql">SELECT d.name,
+       (SELECT COUNT(*) FROM employees e WHERE e.dept_id = d.dept_id) AS headcount
+FROM departments AS d
+ORDER BY d.dept_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">    name     | headcount
+-------------+-----------
+ Engineering |         5
+ Sales       |         3
+ HR          |         3
+ Marketing   |         0
+(4 rows)</code></pre>
+  <p>Marketing shows 0 because a scalar <code>COUNT</code> over no rows is 0. This reads simply, but for big
+  tables prefer <code>LEFT JOIN … GROUP BY</code>.</p>
+
+  <h4>EXISTS</h4>
+  <p><code>EXISTS (subquery)</code> is true when the subquery returns at least one row, and false when it
+  returns none. What the subquery selects does not matter (convention: <code>SELECT 1</code>), the database only
+  checks whether a row exists and stops at the first match.</p>
+  <pre data-title="Customers who placed at least one order"><code class="language-sql">SELECT c.customer_id, c.name
+FROM customers AS c
+WHERE EXISTS (SELECT 1
+              FROM orders AS o
+              WHERE o.customer_id = c.customer_id)
+ORDER BY c.customer_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> customer_id |     name
+-------------+--------------
+           1 | Aarav Shah
+           2 | Diya Kapoor
+           3 | Kabir Singh
+           4 | Ishita Joshi
+           5 | Rohan Das
+(5 rows)</code></pre>
+  <p><code>NOT EXISTS</code> gives the opposite (customers 6 and 7), and is the safest anti-join
+  (<a href="#m2-join-traps">Join traps</a>). Because it is a yes/no test, <code>EXISTS</code> never multiplies
+  rows and is NULL-safe: it only looks at whether a row came back.</p>
+
+  <h4>IN vs EXISTS vs JOIN</h4>
+  <p>The same question, "customers with orders", written three ways:</p>
+  <pre data-title="Three forms"><code class="language-sql">-- IN
+SELECT name FROM customers WHERE customer_id IN (SELECT customer_id FROM orders);
+-- EXISTS
+SELECT name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id);
+-- JOIN (needs DISTINCT, otherwise one row per order)
+SELECT DISTINCT c.name FROM customers c JOIN orders o ON o.customer_id = c.customer_id;</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>IN</code></th><th><code>EXISTS</code></th><th><code>JOIN</code></th></tr></thead>
+    <tbody>
+      <tr><td>Rows returned</td><td>5 customers</td><td>5 customers</td><td>10 rows (one per order) unless <code>DISTINCT</code></td></tr>
+      <tr><td>Columns of the inner table</td><td>not available</td><td>not available</td><td>available</td></tr>
+      <tr><td>Negated form</td><td><code>NOT IN</code>: breaks on NULL</td><td><code>NOT EXISTS</code>: safe</td><td><code>LEFT JOIN … IS NULL</code></td></tr>
+      <tr><td>Best for</td><td>a short list, a simple filter</td><td>"has any" / "has none" tests</td><td>when you need the other table's columns</td></tr>
+    </tbody>
+  </table></div>
+  <p>On performance: modern PostgreSQL and MySQL 8 turn <code>IN</code> and <code>EXISTS</code> into a
+  <strong>semi join</strong> and usually pick the same plan, so the old advice "EXISTS is always faster" is
+  outdated. What does matter is an index on the inner table's join column (<code>orders.customer_id</code>).
+  Verify with <code>EXPLAIN</code> (<a href="#m5">Module 5</a>).</p>
+
+  <h4>More EXISTS patterns</h4>
+  <pre data-title="Employees who are on at least one project; departments with a running project"><code class="language-sql">SELECT first_name FROM employees e
+WHERE EXISTS (SELECT 1 FROM employee_projects ep WHERE ep.emp_id = e.emp_id);
+
+SELECT d.name FROM departments d
+WHERE EXISTS (SELECT 1 FROM projects p
+              WHERE p.dept_id = d.dept_id AND p.end_date IS NULL);</code></pre>
+  <p>The first returns 9 people (Sunita, Ananya, Priya, Rahul, Arjun, Divya, Karan, Neha, Farhan). The second
+  returns Engineering, HR and Marketing; the Sales project has ended. Also useful:
+  "<code>WHERE NOT EXISTS (…)</code> for the opposite", and the "relational division" question "customers who
+  bought <em>all</em> products of a category", written as a double <code>NOT EXISTS</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: qualify every column inside a correlated subquery</p>
+    <p>Inside <code>(SELECT … FROM employees x WHERE x.dept_id = e.dept_id)</code> use different aliases for the
+    outer and inner copies. If you leave a name unqualified, SQL resolves it to the innermost table first and the
+    "correlation" quietly becomes <code>x.dept_id = x.dept_id</code>, which is always true.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a correlated subquery in SELECT on a large table</p>
+    <p>A per-row subquery over a million-row table without an index on the inner join column is a slow query.
+    Rewrite it as a join with <code>GROUP BY</code>, or a window function. If you see N+1 queries from the
+    application, that is the same idea at another level: Hibernate's lazy loading runs one query per parent.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>EXISTS</code> is true even if the subquery's selected value is NULL; only the existence of a row
+      counts. <code>SELECT NULL</code>, <code>SELECT 1</code> and <code>SELECT *</code> behave alike.</li>
+      <li>A correlated subquery can reference only the enclosing query levels, not sibling tables in the outer
+      <code>FROM</code> (use <code>LATERAL</code> in PostgreSQL for that).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is a correlated subquery?" (depends on the outer row, conceptually runs per row.) "IN vs EXISTS?"
+    (same result for positive tests, EXISTS is NULL-safe when negated; planners treat both as semi joins.)
+    "Customers without orders", "departments with no employees" and "employees who earn more than their department
+    average" are the usual tasks.</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-set-operations">
+  <h3>UNION, UNION ALL, INTERSECT and EXCEPT</h3>
+  <p class="tldr">Set operators stack the results of two queries on top of each other. <code>UNION</code>
+  removes duplicates, <code>UNION ALL</code> keeps them and is faster, <code>INTERSECT</code> keeps rows found in
+  both, and <code>EXCEPT</code> keeps rows found only in the first.</p>
+
+  <h4>Joins go sideways, set operations go down</h4>
+  <p>A join adds <em>columns</em> from another table. A set operation adds <em>rows</em> from another query. Both
+  queries must produce the same number of columns, with compatible types in the same order. The column names
+  of the result come from the first query.</p>
+  <pre data-title="Cities where we have an office or a customer"><code class="language-sql">SELECT location AS city FROM departments
+UNION
+SELECT city FROM customers
+ORDER BY city;</code></pre>
+  <pre class="out" data-title="Output: UNION, 6 rows"><code class="language-plaintext">   city
+-----------
+ Ahmedabad
+ Bengaluru
+ Delhi
+ Kolkata
+ Mumbai
+ Pune
+(6 rows)</code></pre>
+
+  <h4>UNION vs UNION ALL</h4>
+  <p>The departments give 4 cities and the customers give 7 (Mumbai twice), so there are 11 rows in total.
+  <code>UNION</code> sorts or hashes the result to remove duplicates and returns 6 distinct cities.
+  <code>UNION ALL</code> simply appends and returns all 11:</p>
+  <pre data-title="UNION ALL keeps duplicates"><code class="language-sql">SELECT COUNT(*) FROM (
+    SELECT location AS city FROM departments
+    UNION ALL
+    SELECT city FROM customers
+) AS all_cities;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> count
+-------
+    11
+(1 row)</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>UNION</code></th><th><code>UNION ALL</code></th></tr></thead>
+    <tbody>
+      <tr><td>Duplicates</td><td>removed (whole rows)</td><td>kept</td></tr>
+      <tr><td>Cost</td><td>extra sort or hash step</td><td>none; just appends</td></tr>
+      <tr><td>Use when</td><td>you need a distinct list</td><td>sources cannot overlap, or you want every row</td></tr>
+    </tbody>
+  </table></div>
+  <p>Default to <code>UNION ALL</code> when you know the inputs are disjoint (this month's orders plus last
+  month's) and use <code>UNION</code> only when you really need de-duplication. Note that <code>UNION</code>
+  compares <em>whole rows</em>, so it also merges two different people who happen to have the same selected
+  values.</p>
+
+  <h4>A practical UNION ALL</h4>
+  <p>A single contact list of HR employees and Mumbai customers, with a label for the source:</p>
+  <pre data-title="Different tables, same shape"><code class="language-sql">SELECT first_name || ' ' || last_name AS name, email, 'employee' AS kind
+FROM employees WHERE dept_id = 3
+UNION ALL
+SELECT name, email, 'customer'
+FROM customers WHERE city = 'Mumbai'
+ORDER BY kind, name;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">      name       |           email            |   kind
+-----------------+----------------------------+----------
+ Aarav Shah      | aarav.shah@example.com     | customer
+ Sara Khan       | sara.khan@example.com      | customer
+ Farhan Shaikh   | farhan.shaikh@example.com  | employee
+ Isha Banerjee   | isha.banerjee@example.com  | employee
+ Sunita Patel    | sunita.patel@example.com   | employee
+(5 rows)</code></pre>
+  <p><code>ORDER BY</code> goes once, at the very end, and applies to the combined result; it can only use the
+  column names (or positions) of the output. To sort or limit one part, wrap it in parentheses or a subquery.</p>
+
+  <h4>INTERSECT and EXCEPT</h4>
+  <pre data-title="Common cities, and customer cities without an office"><code class="language-sql">SELECT location FROM departments
+INTERSECT
+SELECT city FROM customers
+ORDER BY 1;
+
+SELECT city FROM customers
+EXCEPT
+SELECT location FROM departments
+ORDER BY 1;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> location
+-----------
+ Bengaluru
+ Delhi
+ Mumbai
+ Pune
+(4 rows)
+
+   city
+-----------
+ Ahmedabad
+ Kolkata
+(2 rows)</code></pre>
+  <p><code>INTERSECT</code> is "in A <em>and</em> in B"; <code>EXCEPT</code> is "in A <em>but not</em> in B"
+  (Oracle calls it <code>MINUS</code>). Order matters for <code>EXCEPT</code>: A except B differs from B except
+  A. Both remove duplicates; PostgreSQL also has <code>INTERSECT ALL</code> and <code>EXCEPT ALL</code>. Unlike
+  <code>NOT IN</code>, <code>EXCEPT</code> treats NULLs as equal, so it is safe with NULLs. The same results can
+  be written with <code>IN</code>, <code>NOT EXISTS</code> or joins; set operators read more like the question.
+  Precedence: <code>INTERSECT</code> binds tighter than <code>UNION</code> and <code>EXCEPT</code>; use
+  parentheses.</p>
+
+  <h4>MySQL support</h4>
+  <p><code>UNION</code> and <code>UNION ALL</code> work everywhere. MySQL added <code>INTERSECT</code> and
+  <code>EXCEPT</code> only in version 8.0.31; before that you must write them with joins or
+  <code>NOT EXISTS</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: same column count, compatible types, same order</p>
+    <pre class="out"><code class="language-plaintext">SELECT dept_id FROM departments UNION SELECT name, city FROM customers;
+ERROR:  each UNION query must have the same number of columns
+
+SELECT dept_id FROM departments UNION SELECT name FROM customers;
+ERROR:  UNION types integer and character varying cannot be matched</code></pre>
+    <p>Cast when needed: <code>SELECT dept_id::TEXT …</code>. Columns are matched by position, not name, so a
+    swapped order silently mixes the data.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: UNION where UNION ALL is meant</p>
+    <p>Using <code>UNION</code> by habit costs a sort of the whole result and can quietly drop legitimate
+    duplicate rows (two orders of the same amount on the same day). Write <code>UNION ALL</code> unless you
+    want de-duplication.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>NULLs count as equal for removing duplicates in <code>UNION</code>, <code>INTERSECT</code> and
+      <code>EXCEPT</code> (different from <code>=</code>).</li>
+      <li>You cannot use <code>ORDER BY</code> on a column that is not in the output of a set operation.</li>
+      <li>A literal such as <code>NULL</code> in the first query takes its type from the other query in
+      PostgreSQL; add a cast if you get a type error.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"UNION vs UNION ALL" (duplicates, speed), "UNION vs JOIN" (rows vs columns), "how do you find rows in
+    table A that are not in table B" (<code>EXCEPT</code>, <code>NOT EXISTS</code>, <code>LEFT JOIN … IS
+    NULL</code>), and "what rules must the two queries follow" (column count, types, position).</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-case-when">
+  <h3>CASE WHEN: conditional logic in SQL</h3>
+  <p class="tldr"><code>CASE</code> is SQL's if/else: it returns the value of the first branch whose condition is
+  true. It works in <code>SELECT</code>, <code>WHERE</code>, <code>ORDER BY</code>, <code>GROUP BY</code>, inside
+  aggregates and in <code>UPDATE</code>.</p>
+
+  <h4>CASE is an expression, not a statement</h4>
+  <p>Beginners from Java expect <code>CASE</code> to be like an <code>if</code> statement that runs code. It is
+  not. It is an <strong>expression</strong>: it produces one value, like <code>a + b</code> does. That is why
+  you can put it anywhere a value is allowed: a <code>SELECT</code> column, a <code>WHERE</code> condition, an
+  argument of <code>SUM</code>, a sort key, the right side of <code>SET</code>. In Java terms it is closer to
+  the ternary operator <code>cond ? x : y</code> (or a switch expression) than to an <code>if</code> block.</p>
+  <ol class="steps">
+    <li>The database takes the first <code>WHEN</code> and evaluates its condition for the current row.</li>
+    <li>If the condition is true, it returns the matching <code>THEN</code> value and stops. Later branches are
+    not looked at.</li>
+    <li>If it is false or unknown (NULL), it moves to the next <code>WHEN</code>.</li>
+    <li>If every branch fails, it returns the <code>ELSE</code> value, or NULL when there is no
+    <code>ELSE</code>.</li>
+  </ol>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Form</th><th>Shape</th><th>Compares with</th><th>Use it when</th></tr></thead>
+    <tbody>
+      <tr><td>Searched</td><td><code>CASE WHEN cond THEN x … END</code></td><td>any condition</td>
+      <td>ranges, several columns, <code>IS NULL</code></td></tr>
+      <tr><td>Simple</td><td><code>CASE expr WHEN v THEN x … END</code></td><td><code>=</code> only</td>
+      <td>mapping codes to labels</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Searched CASE and simple CASE</h4>
+  <p>The <strong>searched</strong> form tests any condition in each branch; the <strong>simple</strong> form
+  compares one expression with several values (like Java's <code>switch</code>).</p>
+  <pre data-title="Searched CASE: salary bands"><code class="language-sql">SELECT first_name, salary,
+       CASE
+           WHEN salary &gt;= 200000 THEN 'Senior'
+           WHEN salary &gt;= 100000 THEN 'Mid'
+           ELSE 'Junior'
+       END AS band
+FROM employees
+WHERE emp_id &lt;= 5
+ORDER BY emp_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name |  salary   |  band
+------------+-----------+--------
+ Meera      | 300000.00 | Senior
+ Vikram     | 220000.00 | Senior
+ Ananya     | 150000.00 | Mid
+ Sunita     | 120000.00 | Mid
+ Priya      | 150000.00 | Mid
+(5 rows)</code></pre>
+  <pre data-title="Simple CASE: same column against several values"><code class="language-sql">SELECT order_id,
+       CASE status
+           WHEN 'PLACED'    THEN 'We received your order'
+           WHEN 'SHIPPED'   THEN 'On the way'
+           WHEN 'DELIVERED' THEN 'Delivered'
+           ELSE 'Cancelled'
+       END AS message
+FROM orders;</code></pre>
+  <p>Rules of evaluation: branches are tested top to bottom and the <strong>first true one wins</strong>, so
+  order the conditions from most to least specific (Meera is 300000, which matches both the first and second
+  condition; she gets 'Senior'). If nothing matches and there is no <code>ELSE</code>, the result is
+  <strong>NULL</strong>. All <code>THEN</code>/<code>ELSE</code> values must have compatible types; mixing a
+  number and text fails with <code>ERROR:  CASE types integer and text cannot be matched</code>. In a simple
+  <code>CASE</code>, the comparison is <code>=</code>, so <code>WHEN NULL</code> never matches; use a searched
+  <code>CASE WHEN x IS NULL</code>.</p>
+
+  <h4>CASE in GROUP BY and aggregates</h4>
+  <p>To count people per band, compute the band in a derived table (or repeat the expression in
+  <code>GROUP BY</code>):</p>
+  <pre data-title="Count per band"><code class="language-sql">SELECT band, COUNT(*) AS people
+FROM (SELECT CASE WHEN salary &gt;= 200000 THEN 'Senior'
+                  WHEN salary &gt;= 100000 THEN 'Mid'
+                  ELSE 'Junior' END AS band
+      FROM employees) AS t
+GROUP BY band
+ORDER BY band;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">  band  | people
+--------+--------
+ Junior |      4
+ Mid    |      6
+ Senior |      2
+(3 rows)</code></pre>
+  <p>Inside an aggregate, <code>CASE</code> decides which rows count:
+  <code>SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END)</code>. This is conditional aggregation, covered
+  in <a href="#m2-conditional-aggregation">its own article</a>.</p>
+
+  <h4>Several bands as columns</h4>
+  <p>Put one <code>CASE</code> inside each aggregate and you get a ready cross-tab: employees per department,
+  split by salary band. Each row counts in exactly one band because the ranges do not overlap.</p>
+  <pre data-title="Bands per department"><code class="language-sql">SELECT dept_id,
+       SUM(CASE WHEN salary &gt;= 200000 THEN 1 ELSE 0 END)                       AS senior,
+       SUM(CASE WHEN salary &gt;= 100000 AND salary &lt; 200000 THEN 1 ELSE 0 END) AS mid,
+       SUM(CASE WHEN salary &lt; 100000 THEN 1 ELSE 0 END)                       AS junior
+FROM employees
+GROUP BY dept_id
+ORDER BY dept_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id | senior | mid | junior
+---------+--------+-----+--------
+       1 |      1 |   3 |      1
+       2 |      0 |   2 |      1
+       3 |      0 |   1 |      2
+  (null) |      1 |   0 |      0
+(4 rows)</code></pre>
+  <p>The column totals (2, 6, 4) match the band counts above. More about this pattern, including
+  <code>FILTER</code>, is in <a href="#m2-conditional-aggregation">Conditional aggregation</a>.</p>
+
+  <h4>Handling NULL with CASE</h4>
+  <p>A searched <code>CASE</code> can test <code>IS NULL</code>, which is how you turn "missing" into a label.
+  Grouping by that label needs the expression repeated, or the output position (PostgreSQL and MySQL both accept
+  <code>GROUP BY 1</code>; the logical order that allows aliases is in
+  <a href="#m2-logical-order">Logical order of a query</a>):</p>
+  <pre data-title="Customers with and without a phone"><code class="language-sql">SELECT CASE WHEN phone IS NULL THEN 'missing' ELSE 'present' END AS phone_status,
+       COUNT(*) AS customers
+FROM customers
+GROUP BY 1
+ORDER BY 1;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> phone_status | customers
+--------------+-----------
+ missing      |         3
+ present      |         4
+(2 rows)</code></pre>
+
+  <h4>CASE in ORDER BY</h4>
+  <p>Alphabetical order is rarely the business order. <code>CASE</code> lets you define your own:</p>
+  <pre data-title="Custom sort order"><code class="language-sql">SELECT order_id, status
+FROM orders
+ORDER BY CASE status
+             WHEN 'PLACED'    THEN 1
+             WHEN 'SHIPPED'   THEN 2
+             WHEN 'DELIVERED' THEN 3
+             ELSE 4
+         END,
+         order_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> order_id |  status
+----------+-----------
+        9 | PLACED
+       10 | PLACED
+        7 | SHIPPED
+        8 | SHIPPED
+        1 | DELIVERED
+        2 | DELIVERED
+        3 | DELIVERED
+        5 | DELIVERED
+        6 | DELIVERED
+        4 | CANCELLED
+(10 rows)</code></pre>
+
+  <h4>CASE in UPDATE</h4>
+  <p>One statement can apply different changes to different rows, and it is atomic:</p>
+  <pre data-title="Raises by band, in one pass"><code class="language-sql">BEGIN;
+UPDATE employees
+SET salary = salary * CASE WHEN salary &lt; 100000 THEN 1.10
+                           WHEN salary &lt; 200000 THEN 1.05
+                           ELSE 1.00 END;
+ROLLBACK;   -- practice only</code></pre>
+
+  <div class="co co-exc">
+    <p class="co-t">MySQL vs PostgreSQL: UPDATE with several columns</p>
+    <p>PostgreSQL evaluates every right-hand side with the <em>old</em> row values, so
+    <code>SET a = b, b = a</code> really swaps the two columns. MySQL applies assignments left to right and later
+    ones see the new values, so the same statement leaves both columns equal to the old <code>b</code>. When you
+    need a swap on MySQL, put the logic in one <code>CASE</code> on a single column or use a temporary
+    value.</p>
+  </div>
+
+  <h4>Guarding errors, and related functions</h4>
+  <pre data-title="Avoid division by zero"><code class="language-sql">SELECT 10 / 0;                                          -- ERROR:  division by zero
+SELECT CASE WHEN 0 = 0 THEN NULL ELSE 10 / 0 END;       -- NULL
+SELECT 10 / NULLIF(0, 0);                               -- NULL: NULLIF turns 0 into NULL</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Function</th><th>Meaning</th><th>Equivalent CASE</th></tr></thead>
+    <tbody>
+      <tr><td><code>COALESCE(a, b, c)</code></td><td>first non-NULL argument</td><td><code>CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ELSE c END</code></td></tr>
+      <tr><td><code>NULLIF(a, b)</code></td><td>NULL if a equals b, else a</td><td><code>CASE WHEN a = b THEN NULL ELSE a END</code></td></tr>
+      <tr><td><code>GREATEST</code>, <code>LEAST</code></td><td>largest / smallest of several values</td><td>chain of branches</td></tr>
+      <tr><td>MySQL <code>IF(c, x, y)</code>, <code>IFNULL(a, b)</code></td><td>MySQL shortcuts</td><td>not portable; use <code>CASE</code>, <code>COALESCE</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>CASE and the vendor shortcuts</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Need</th><th>Standard (works in both)</th><th>Shortcut and where it exists</th></tr></thead>
+    <tbody>
+      <tr><td>if / else</td><td><code>CASE WHEN c THEN x ELSE y END</code></td><td>MySQL <code>IF(c, x, y)</code>;
+      SQL Server <code>IIF</code></td></tr>
+      <tr><td>replace NULL</td><td><code>COALESCE(a, b)</code></td><td>MySQL <code>IFNULL</code>; Oracle
+      <code>NVL</code></td></tr>
+      <tr><td>map code to label</td><td>simple <code>CASE</code></td><td>Oracle <code>DECODE</code></td></tr>
+      <tr><td>custom sort order</td><td><code>ORDER BY CASE …</code></td><td>MySQL <code>FIELD(status, …)</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Interviewers sometimes ask for <code>IF</code> or <code>DECODE</code>. Name them, then say you prefer
+  <code>CASE</code> because it is standard SQL and portable. A Spring Boot app that may change databases should
+  keep to the standard forms.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every branch must produce the same kind of value</p>
+    <p>The database picks one result type for the whole <code>CASE</code>. <code>THEN 1 … ELSE 'none'</code>
+    fails in PostgreSQL with <code>ERROR:  CASE types integer and text cannot be matched</code>. Cast one side
+    (<code>CAST(n AS TEXT)</code>) or return the same type everywhere. Mixing <code>1</code> and
+    <code>1.5</code> is fine; the result becomes numeric.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">CASE and indexes</p>
+    <p>A <code>CASE</code> around a column in <code>WHERE</code> or <code>ORDER BY</code> hides the column from a
+    normal index, so large tables may be scanned and sorted fully. Prefer plain conditions in
+    <code>WHERE</code>: <code>(:status IS NULL OR status = :status)</code> instead of a <code>CASE</code> that
+    returns true or false. For a business sort order on a big table, store the rank in a column (or a small
+    lookup table with a <code>sort_order</code>) and sort by that.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: comparing with NULL inside CASE</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: never true</p><pre><code class="language-sql">SELECT name,
+       CASE phone WHEN NULL THEN 'missing' ELSE 'present' END AS s
+FROM customers;      -- Diya shows 'present'</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: IS NULL in a searched CASE</p><pre><code class="language-sql">SELECT name,
+       CASE WHEN phone IS NULL THEN 'missing' ELSE 'present' END AS s
+FROM customers;</code></pre></div>
+    </div>
+    <p>The simple form turns into <code>phone = NULL</code>, which is unknown, so the branch is skipped. Other
+    slips in the same family: forgetting <code>END</code> (a syntax error near the next keyword) and writing
+    <code>ELSE</code> before the last <code>WHEN</code>.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: always write ELSE, and format one branch per line</p>
+    <p>An explicit <code>ELSE</code> makes the "nothing matched" case a decision rather than an accident.
+    Keep <code>CASE</code> for simple mappings; if you have twenty branches, the mapping belongs in a lookup
+    table you can join to.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: overlapping branches in the wrong order</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: everyone is 'Junior'</p><pre><code class="language-sql">CASE WHEN salary &gt;= 0      THEN 'Junior'
+     WHEN salary &gt;= 100000 THEN 'Mid' END</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: most specific first</p><pre><code class="language-sql">CASE WHEN salary &gt;= 100000 THEN 'Mid'
+     ELSE 'Junior' END</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A false condition and an unknown (NULL) condition both skip the branch.</li>
+      <li>Branches are evaluated lazily, so a division inside a skipped branch normally does not run. Do not
+      rely on it: the optimizer may fold constants early.</li>
+      <li>The result type is the common type of all branches; <code>NULL</code> alone does not set a type.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Typical tasks: "grade students by marks", "count pass and fail in one query", "pivot rows to columns",
+    "swap values with one <code>UPDATE</code>" (<code>SET gender = CASE gender WHEN 'M' THEN 'F' ELSE 'M'
+    END</code>). Know that <code>CASE</code> returns NULL when nothing matches.</p>
+    <p>A strong answer also says: the first true branch wins, so branch order matters; all branches share one type; a simple <code>CASE</code> cannot test NULL; and <code>CASE</code> inside <code>SUM</code> is how you pivot. If asked to "avoid division by zero", show <code>NULLIF(b, 0)</code> as the short form of the <code>CASE</code>.</p>
+  </div>
+</article>

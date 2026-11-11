@@ -1,0 +1,653 @@
+<article class="topic" id="m8-junit">
+  <h3>JUnit 5: writing and running unit tests</h3>
+  <p class="tldr">A unit test is a small method that calls your code with known input and asserts the expected result; JUnit 5 finds methods marked <code>@Test</code>, runs them in isolation and reports which ones fail.</p>
+
+  <p>A <strong>unit test</strong> checks one small piece of behaviour (usually one method or class) automatically and quickly, without a database or network. Tests catch bugs when you write the code, and — more importantly — when someone changes it six months later. <strong>JUnit 5</strong> is the standard Java test framework (the Spring Boot test starter includes it). It consists of the <em>Platform</em> (runs tests), <em>Jupiter</em> (the API and engine you write against: <code>org.junit.jupiter.api</code>) and <em>Vintage</em> (runs old JUnit 4 tests). Spring-specific testing (<code>@SpringBootTest</code>, mocks, <code>MockMvc</code>) is covered in <a href="04-spring-boot.html#m5">Spring Boot · Module 5</a>.</p>
+
+  <h4>Setup</h4>
+  <p>Add the dependency with <code>test</code> scope (as in the <a href="#m8-maven">pom.xml above</a>): <code>org.junit.jupiter:junit-jupiter</code>, which brings the API, the engine and parameterised tests. Use a recent Surefire plugin (2.22 or newer) so Maven can run JUnit 5. Test classes go in <code>src/test/java</code>, in the same package as the class under test.</p>
+
+  <h4>A first test</h4>
+  <pre data-title="src/main/java/com/shop/PriceCalculator.java"><code class="language-java">package com.shop;
+
+public class PriceCalculator {
+    /** Price in paise after a percentage discount (0-100). */
+    public long finalPrice(long amount, int discountPercent) {
+        if (amount &lt; 0) {
+            throw new IllegalArgumentException("amount must not be negative");
+        }
+        if (discountPercent &lt; 0 || discountPercent &gt; 100) {
+            throw new IllegalArgumentException("discount must be between 0 and 100");
+        }
+        return amount - amount * discountPercent / 100;
+    }
+}</code></pre>
+  <pre data-title="src/test/java/com/shop/PriceCalculatorTest.java"><code class="language-java">package com.shop;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+class PriceCalculatorTest {
+
+    private PriceCalculator calculator;
+
+    @BeforeEach
+    void setUp() {
+        calculator = new PriceCalculator();       // fresh object for every test
+    }
+
+    @Test
+    @DisplayName("10% discount on 1000 gives 900")
+    void shouldApplyDiscount() {
+        // Arrange
+        long amount = 1000;
+        // Act
+        long result = calculator.finalPrice(amount, 10);
+        // Assert
+        assertEquals(900, result);
+    }
+
+    @Test
+    void shouldReturnSameAmountWhenNoDiscount() {
+        assertEquals(1000, calculator.finalPrice(1000, 0));
+    }
+
+    @Test
+    void shouldRejectNegativeAmount() {
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class,
+                () -&gt; calculator.finalPrice(-1, 10));
+        assertEquals("amount must not be negative", ex.getMessage());
+    }
+}</code></pre>
+  <p>Test classes and methods need not be <code>public</code> in JUnit 5 (package-private is fine), but must not be <code>private</code> or <code>static</code>. JUnit creates a <strong>new instance of the test class for every test method</strong>, so fields set in one test never leak into another.</p>
+  <p>Run tests from IntelliJ by clicking the green arrow beside the class or method, or with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F10</kbd> at the cursor. From Maven:</p>
+  <pre class="out" data-title="Terminal: one test fails"><code class="language-shell">$ mvn test
+[INFO] Running com.shop.PriceCalculatorTest
+[ERROR] PriceCalculatorTest.shouldApplyDiscount:25 expected: &lt;900&gt; but was: &lt;1000&gt;
+[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE</code></pre>
+  <p>A <strong>failure</strong> means an assertion was false. An <strong>error</strong> means an unexpected exception was thrown. Surefire writes reports to <code>target/surefire-reports</code>.</p>
+
+  <h4>Annotations</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>@Test</code></td><td>Marks a test method</td></tr>
+      <tr><td><code>@BeforeEach</code> / <code>@AfterEach</code></td><td>Run before / after every test method (create objects, clean up)</td></tr>
+      <tr><td><code>@BeforeAll</code> / <code>@AfterAll</code></td><td>Run once before / after all tests in the class; the method must be <code>static</code> (unless the lifecycle is per-class)</td></tr>
+      <tr><td><code>@DisplayName("…")</code></td><td>Readable name shown in reports</td></tr>
+      <tr><td><code>@Disabled("reason")</code></td><td>Skip a test or class (always give a reason)</td></tr>
+      <tr><td><code>@Nested</code></td><td>Group related tests in an inner class</td></tr>
+      <tr><td><code>@ParameterizedTest</code></td><td>Run the same test with several inputs</td></tr>
+      <tr><td><code>@RepeatedTest(n)</code>, <code>@Timeout</code></td><td>Repeat; fail if it takes too long</td></tr>
+      <tr><td><code>@Tag("slow")</code></td><td>Label tests so you can include or exclude groups</td></tr>
+    </tbody>
+  </table></div>
+  <p>JUnit 4 (<code>org.junit.Test</code>, <code>@Before</code>, <code>@After</code>, <code>@RunWith</code>) still exists in old projects; the names above are the JUnit 5 versions. Do not mix the two packages in one class.</p>
+
+  <h4>Assertions</h4>
+  <p>All are static methods of <code>org.junit.jupiter.api.Assertions</code>. Put the <strong>expected</strong> value first, <strong>actual</strong> second, so failure messages read correctly.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Assertion</th><th>Checks</th></tr></thead>
+    <tbody>
+      <tr><td><code>assertEquals(expected, actual)</code></td><td>Equal by <code>equals</code> (or numerically for primitives); overloads with a delta for doubles: <code>assertEquals(0.3, x, 1e-9)</code></td></tr>
+      <tr><td><code>assertNotEquals</code></td><td>Not equal</td></tr>
+      <tr><td><code>assertTrue(cond)</code>, <code>assertFalse(cond)</code></td><td>A boolean condition</td></tr>
+      <tr><td><code>assertNull</code>, <code>assertNotNull</code></td><td>Null checks</td></tr>
+      <tr><td><code>assertSame</code>, <code>assertNotSame</code></td><td>Same object (<code>==</code>)</td></tr>
+      <tr><td><code>assertArrayEquals</code></td><td>Arrays element by element</td></tr>
+      <tr><td><code>assertIterableEquals</code></td><td>Collections element by element, in order</td></tr>
+      <tr><td><code>assertThrows(Type.class, executable)</code></td><td>The code throws that exception type (returns it for more checks)</td></tr>
+      <tr><td><code>assertDoesNotThrow</code></td><td>The code throws nothing</td></tr>
+      <tr><td><code>assertAll(a1, a2, …)</code></td><td>Runs all assertions and reports <em>all</em> failures, not only the first</td></tr>
+      <tr><td><code>assertTimeout(duration, executable)</code></td><td>Finishes within the time</td></tr>
+      <tr><td><code>fail("message")</code></td><td>Fail explicitly</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="More assertions"><code class="language-java">@Test
+void shouldCheckSeveralThingsAtOnce() {
+    Customer c = new Customer("asha@mail.in", "Asha");
+    assertAll("customer",
+            () -&gt; assertEquals("asha@mail.in", c.email()),
+            () -&gt; assertEquals("Asha", c.name()),
+            () -&gt; assertNotNull(c.toString()));
+}
+
+@Test
+void shouldCompareDoubleWithTolerance() {
+    assertEquals(0.3, 0.1 + 0.2, 1e-9);        // not assertEquals(0.3, 0.1 + 0.2)
+}</code></pre>
+  <p>Libraries such as <strong>AssertJ</strong> (<code>assertThat(list).hasSize(3).contains("a")</code>) make assertions more readable; many Spring projects use it together with JUnit.</p>
+
+  <h4>Parameterised tests</h4>
+  <p>Instead of copying a test five times with different numbers, feed one test method a table of inputs.</p>
+  <pre data-title="Parameterised tests"><code class="language-java">import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+class PriceCalculatorParamTest {
+    private final PriceCalculator calculator = new PriceCalculator();
+
+    @ParameterizedTest(name = "{0} paise with {1}% off is {2}")
+    @CsvSource({
+            "1000, 10, 900",
+            "1000, 0, 1000",
+            "1000, 100, 0",
+            "999, 50, 500"          // 999 * 50 / 100 = 499 (integer division), 999 - 499
+    })
+    void shouldCalculateFinalPrice(long amount, int percent, long expected) {
+        assertEquals(expected, calculator.finalPrice(amount, percent));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 101, 1000})
+    void shouldRejectInvalidDiscount(int percent) {
+        assertThrows(IllegalArgumentException.class,
+                () -&gt; calculator.finalPrice(100, percent));
+    }
+}</code></pre>
+  <p>Other sources: <code>@MethodSource("method")</code> (a static method returning a stream of arguments — for objects), <code>@EnumSource</code>, <code>@NullAndEmptySource</code>, <code>@CsvFileSource</code>. Each row appears as a separate test in the report.</p>
+
+  <h4>Arrange-Act-Assert and naming</h4>
+  <ol class="steps">
+    <li><strong>Arrange</strong> — create the object under test and its input.</li>
+    <li><strong>Act</strong> — call the one method you are testing.</li>
+    <li><strong>Assert</strong> — check the result or the state.</li>
+  </ol>
+  <p>Keep the three parts visible (a blank line between them). A test checks <em>one behaviour</em>. Name tests after the behaviour: <code>shouldRejectNegativeAmount</code>, <code>givenExpiredCoupon_whenApply_thenThrows</code>, <code>returnsEmptyListForUnknownCustomer</code> — or use <code>@DisplayName</code> with a full sentence. A test name should tell you what broke without opening the file.</p>
+
+  <h4>What makes a good unit test (FIRST)</h4>
+  <ul>
+    <li><strong>Fast</strong> — milliseconds. Slow tests do not get run.</li>
+    <li><strong>Isolated</strong> — no dependence on test order, shared state, the clock, or external systems. Replace collaborators with fakes or mocks (Mockito, see Module 5 of Spring Boot).</li>
+    <li><strong>Repeatable</strong> — same result on every machine, every run (no randomness without a seed, no real dates).</li>
+    <li><strong>Self-validating</strong> — pass or fail by itself; no reading of console output.</li>
+    <li><strong>Timely</strong> — written with (or before) the code.</li>
+  </ul>
+  <p>Test the edges: zero, one, many, null, empty string, boundary values (0, 100, 101), and error paths — not only the happy path. Aim for meaningful coverage of business logic rather than a 100% number.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Test methods are <code>void</code>, take no arguments (except in parameterised tests), and are not <code>private</code> or <code>static</code>.</li>
+      <li>Tests must not depend on execution order; JUnit does not guarantee one.</li>
+      <li>Surefire only picks classes named <code>*Test</code>, <code>Test*</code>, <code>*Tests</code> or <code>*TestCase</code> by default.</li>
+      <li><code>@BeforeAll</code>/<code>@AfterAll</code> must be <code>static</code> in the default lifecycle.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Swapping expected and actual, which makes failure messages misleading.</li>
+      <li>Tests with no assertion (they pass but prove nothing).</li>
+      <li>Catching the exception manually in a <code>try/catch</code> and forgetting <code>fail()</code>; use <code>assertThrows</code>.</li>
+      <li>Sharing mutable state through <code>static</code> fields between tests.</li>
+      <li>Testing implementation details (private methods, call order) instead of behaviour, so every refactor breaks tests.</li>
+      <li>Using <code>assertEquals(double, double)</code> without a delta.</li>
+    </ul>
+  </div>
+
+  <div class="co co-version">
+    <p class="co-t">Version note</p>
+    <p>The examples use JUnit 5 (Jupiter) with the packages <code>org.junit.jupiter.api</code> and <code>org.junit.jupiter.params</code>. A newer major version, JUnit 6, was released in late 2025 and keeps the same annotations and packages for everyday use; check the project's dependency version before copying build settings, because the minimum Java version is higher. Spring Boot 3.x and 4.x set the JUnit version for you through their BOM.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you unit-test a method? JUnit 4 vs 5?"</p>
+    <ul>
+      <li>Arrange-Act-Assert; one behaviour per test; cover happy path, edge cases and exceptions (<code>assertThrows</code>).</li>
+      <li>Isolation: fresh object per test via <code>@BeforeEach</code>; mock external dependencies.</li>
+      <li>JUnit 5 has modular architecture (Platform, Jupiter, Vintage), <code>@BeforeEach</code> instead of <code>@Before</code>, <code>@ParameterizedTest</code>, <code>@Nested</code>, <code>assertAll</code>, lambdas in assertions, and extensions instead of runners.</li>
+      <li>Unit test vs integration test: speed, scope, and what is real (database, Spring context).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m8-jdbc">
+  <h3>JDBC basics: connecting, PreparedStatement and SQL injection</h3>
+  <p class="tldr">JDBC is Java's standard API for relational databases: a driver implements it, <code>DriverManager</code> gives you a <code>Connection</code>, and you run SQL through a <code>PreparedStatement</code> with <code>?</code> placeholders — never by concatenating user input.</p>
+
+  <p><strong>JDBC</strong> (Java Database Connectivity) is a set of interfaces in <code>java.sql</code>. Your code talks to the interfaces; a <strong>JDBC driver</strong> — a JAR provided by the database vendor — implements them for PostgreSQL, MySQL, Oracle and so on. Frameworks like Spring Data JPA, Hibernate and MyBatis all run on JDBC underneath, so understanding it explains what they do and why things go wrong.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A[Your code] --> B[JDBC API java.sql]
+  B --> C[JDBC driver JAR]
+  C -->|network protocol| D[(PostgreSQL / MySQL)]
+</pre>
+    <figcaption>Your code depends only on java.sql; the driver speaks the database's protocol</figcaption>
+  </figure>
+
+  <h4>The core types</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td><code>DriverManager</code></td><td>Finds a registered driver and opens a connection from a URL</td></tr>
+      <tr><td><code>Connection</code></td><td>One session with the database; controls transactions; creates statements</td></tr>
+      <tr><td><code>Statement</code></td><td>Runs a fixed SQL string</td></tr>
+      <tr><td><code>PreparedStatement</code></td><td>Precompiled SQL with <code>?</code> parameters, safe and reusable</td></tr>
+      <tr><td><code>CallableStatement</code></td><td>Calls stored procedures and functions</td></tr>
+      <tr><td><code>ResultSet</code></td><td>The rows returned by a query; a cursor you move with <code>next()</code></td></tr>
+      <tr><td><code>SQLException</code></td><td>Anything that goes wrong (checked exception)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Setting up</h4>
+  <p>Add the driver as a <code>runtime</code> dependency (see the <a href="#m8-maven">pom.xml</a>): <code>org.postgresql:postgresql</code>, or for MySQL <code>com.mysql:mysql-connector-j</code>. Since JDBC 4 (Java 6) the driver on the classpath registers itself, so the old line <code>Class.forName("org.postgresql.Driver")</code> is unnecessary. Create the table once:</p>
+  <pre data-title="schema.sql (PostgreSQL)"><code class="language-sql">CREATE TABLE customers (
+    id      BIGSERIAL PRIMARY KEY,          -- MySQL: BIGINT AUTO_INCREMENT PRIMARY KEY
+    name    VARCHAR(100)  NOT NULL,
+    email   VARCHAR(150)  NOT NULL UNIQUE,
+    city    VARCHAR(60),
+    balance NUMERIC(12,2) NOT NULL DEFAULT 0
+);</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Database</th><th>URL pattern</th></tr></thead>
+    <tbody>
+      <tr><td>PostgreSQL</td><td><code>jdbc:postgresql://localhost:5432/shop</code></td></tr>
+      <tr><td>MySQL</td><td><code>jdbc:mysql://localhost:3306/shop</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>The URL has the shape <code>jdbc:&lt;vendor&gt;://host:port/database?options</code>. The default ports are 5432 (PostgreSQL) and 3306 (MySQL).</p>
+
+  <h4>Connect and run a query</h4>
+  <pre data-title="FirstQuery.java"><code class="language-java">import java.sql.*;
+
+public class FirstQuery {
+    public static void main(String[] args) throws SQLException {
+        String url = "jdbc:postgresql://localhost:5432/shop";
+        String user = System.getenv("DB_USER");            // never hard-code secrets
+        String password = System.getenv("DB_PASSWORD");
+
+        String sql = "SELECT id, name, city FROM customers WHERE city = ?";
+
+        try (Connection con = DriverManager.getConnection(url, user, password);
+             PreparedStatement ps = con.prepareStatement(sql)) {
+
+            ps.setString(1, "Pune");                        // parameter index starts at 1
+
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {                         // move to the next row
+                    long id = rs.getLong("id");
+                    String name = rs.getString("name");
+                    String city = rs.getString("city");
+                    System.out.println(id + " " + name + " " + city);
+                }
+            }
+        }                                                   // all three closed automatically
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">1 Asha Rao Pune
+4 Vikram Shah Pune</code></pre>
+  <p>Three things to remember:</p>
+  <ul>
+    <li>Use <strong>try-with-resources</strong> so <code>ResultSet</code>, <code>PreparedStatement</code> and <code>Connection</code> are always closed, even on exceptions. Closing the connection also closes its statements, but closing each one explicitly is good hygiene.</li>
+    <li><strong>Parameter and column indexes start at 1</strong>, not 0. Prefer column names (<code>rs.getString("name")</code>) to numbers.</li>
+    <li><code>rs.next()</code> returns <code>false</code> when there are no more rows; the cursor starts <em>before</em> the first row, so you must call <code>next()</code> before reading.</li>
+  </ul>
+
+  <h4>PreparedStatement methods</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>executeQuery()</code></td><td><code>SELECT</code>; returns a <code>ResultSet</code></td></tr>
+      <tr><td><code>executeUpdate()</code></td><td><code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, DDL; returns the number of affected rows</td></tr>
+      <tr><td><code>execute()</code></td><td>Unknown or multiple results; returns <code>true</code> if the first result is a <code>ResultSet</code></td></tr>
+      <tr><td><code>setString</code>, <code>setInt</code>, <code>setLong</code>, <code>setBigDecimal</code>, <code>setBoolean</code></td><td>Bind a parameter by position</td></tr>
+      <tr><td><code>setObject(i, localDate)</code>, <code>setNull(i, Types.VARCHAR)</code></td><td>Dates and times (<code>java.time</code> types work with JDBC 4.2 drivers); explicit NULL</td></tr>
+      <tr><td><code>addBatch()</code> / <code>executeBatch()</code></td><td>Send many statements in one round trip</td></tr>
+    </tbody>
+  </table></div>
+  <p>On <code>ResultSet</code>: <code>getInt</code>, <code>getLong</code>, <code>getString</code>, <code>getBigDecimal</code>, <code>getBoolean</code>, <code>getObject("created", LocalDateTime.class)</code>. A SQL <code>NULL</code> becomes <code>null</code> for objects but <code>0</code>/<code>false</code> for primitive getters; call <code>rs.wasNull()</code> straight after, or use <code>getObject(col, Integer.class)</code>.</p>
+
+  <h4>Statement vs PreparedStatement vs CallableStatement</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>Statement</code></th><th><code>PreparedStatement</code></th><th><code>CallableStatement</code></th></tr></thead>
+    <tbody>
+      <tr><td>SQL</td><td>Complete string each time</td><td>Template with <code>?</code>, bound later</td><td><code>{call proc(?, ?)}</code></td></tr>
+      <tr><td>SQL injection</td><td>Vulnerable if you concatenate input</td><td>Safe for values</td><td>Safe for parameters</td></tr>
+      <tr><td>Performance</td><td>Parsed every time</td><td>Can be pre-parsed and reused</td><td>Runs a stored routine</td></tr>
+      <tr><td>Use for</td><td>Fixed DDL with no input</td><td><strong>Almost everything</strong></td><td>Stored procedures and functions</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="CallableStatement"><code class="language-java">try (CallableStatement cs = con.prepareCall("{call archive_orders(?)}")) {
+    cs.setInt(1, 2024);
+    cs.execute();
+}</code></pre>
+
+  <h4>SQL injection: the attack</h4>
+  <p><strong>SQL injection</strong> happens when user input becomes part of the SQL <em>text</em>. The input can then change the meaning of the query. This code builds the query by concatenation:</p>
+  <pre data-title="Vulnerable login"><code class="language-java">static boolean login(Connection con, String email, String password) throws SQLException {
+    String sql = "SELECT id FROM users WHERE email = '" + email
+               + "' AND password_hash = '" + password + "'";
+    try (Statement st = con.createStatement();
+         ResultSet rs = st.executeQuery(sql)) {
+        return rs.next();                     // any row found = logged in
+    }
+}</code></pre>
+  <p>With a normal input the SQL is <code>... WHERE email = 'asha@mail.in' AND password_hash = 'x'</code>. Now an attacker types <code>' OR '1'='1</code> as both fields:</p>
+  <pre class="out" data-title="The SQL that actually runs"><code class="language-sql">SELECT id FROM users WHERE email = '' OR '1'='1' AND password_hash = '' OR '1'='1'</code></pre>
+  <p>The condition is always true; the query returns rows and the attacker is "logged in" as the first user. Worse input like <code>'; DROP TABLE users; --</code> can delete data on databases and drivers that accept several statements in one call. SQL injection has been in the OWASP Top 10 for years and remains a common cause of real data breaches.</p>
+
+  <h4>The fix: PreparedStatement</h4>
+  <pre data-title="Safe login"><code class="language-java">static boolean login(Connection con, String email, String passwordHash) throws SQLException {
+    String sql = "SELECT id FROM users WHERE email = ? AND password_hash = ?";
+    try (PreparedStatement ps = con.prepareStatement(sql)) {
+        ps.setString(1, email);               // the value can never become SQL
+        ps.setString(2, passwordHash);
+        try (ResultSet rs = ps.executeQuery()) {
+            return rs.next();
+        }
+    }
+}</code></pre>
+  <p>With a prepared statement the SQL text (with its <code>?</code> placeholders) and the values travel separately. The database parses the structure first; later, the value <code>' OR '1'='1</code> is treated as one harmless string to compare with, not as code. (In real systems you also never store plain passwords: you hash them with BCrypt, covered in Spring Security.)</p>
+  <ul>
+    <li><strong>Placeholders work only for values</strong>, not for table names, column names or keywords like <code>ORDER BY</code> direction. If you must choose them from user input, validate against a fixed whitelist (<code>Set.of("name", "city")</code>) and build the text from your own constants.</li>
+    <li>For <code>LIKE</code>, put the wildcards in the value: <code>ps.setString(1, "%" + term + "%");</code>.</li>
+    <li>For <code>IN (...)</code> create as many <code>?</code> as there are values.</li>
+    <li>ORMs are safe when you use their parameter features (JPQL <code>:name</code>, Spring Data derived queries), but string-concatenated JPQL or native SQL is just as vulnerable.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: never build SQL by concatenating or formatting user input</p>
+    <p>Not with <code>+</code>, not with <code>String.format</code>, not with text blocks. Always bind values with <code>PreparedStatement</code> placeholders.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Read the URL, user and password from environment variables or configuration, not from source code.</li>
+      <li>Open a connection late, close it early (try-with-resources); in real services get connections from a pool (<a href="#m8-jdbc-dao">next article</a>).</li>
+      <li>Select only the columns you need instead of <code>SELECT *</code>; map rows into small objects (records) immediately.</li>
+      <li>Use <code>BigDecimal</code> for money (<code>NUMERIC</code> in the database), never <code>double</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Errors you will meet</p>
+    <ul>
+      <li><em>No suitable driver found for jdbc:…</em> — driver JAR missing from the classpath (wrong Maven scope), or a typo in the URL.</li>
+      <li><em>Connection refused</em> / <em>connection timed out</em> — database not running, wrong host or port, firewall.</li>
+      <li><em>password authentication failed</em> (PostgreSQL) / <em>Access denied</em> (MySQL) — wrong credentials.</li>
+      <li><em>relation "customers" does not exist</em> — wrong database or schema, table not created.</li>
+      <li><em>The column name x was not found in this ResultSet</em> — the column is not in the <code>SELECT</code> list or is misspelled.</li>
+      <li><em>Operation not allowed after ResultSet closed</em> — you used the <code>ResultSet</code> after closing its statement or connection.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is JDBC? Statement vs PreparedStatement? How do you prevent SQL injection?"</p>
+    <ul>
+      <li>JDBC is the standard API; the driver implements it; steps: connection, statement, execute, process <code>ResultSet</code>, close (try-with-resources).</li>
+      <li>PreparedStatement is precompiled, parameterised, reusable, faster for repeated calls and — most importantly — prevents SQL injection because values are sent separately from the SQL.</li>
+      <li>Demo the attack (<code>' OR '1'='1</code>) and the fix; mention whitelisting for identifiers and hashing passwords.</li>
+      <li>Index start at 1; <code>executeQuery</code> vs <code>executeUpdate</code>; <code>CallableStatement</code> for stored procedures.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m8-jdbc-dao">
+  <h3>JDBC in practice: CRUD DAO, transactions, batches and connection pools</h3>
+  <p class="tldr">A DAO class hides all JDBC code behind simple methods; use try-with-resources for every call, <code>setAutoCommit(false)</code> with <code>commit</code>/<code>rollback</code> for multi-step changes, batches for bulk inserts, and a connection pool such as HikariCP in real applications.</p>
+
+  <h4>The DAO pattern</h4>
+  <p>A <strong>DAO</strong> (Data Access Object) is a class whose only job is to read and write one kind of data. The rest of the application calls <code>customerDao.findById(7)</code> and never sees SQL or <code>Connection</code>. When the database changes, only the DAO changes; in tests you can replace it with a fake. Spring Data repositories are an automatic version of the same idea. Mapping each row to a <strong>record</strong> keeps the data object short and immutable.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A[Service layer] --> B[CustomerDao interface]
+  B --> C[JdbcCustomerDao]
+  C --> D[(Database)]
+</pre>
+    <figcaption>The service talks to an interface; only the JDBC class touches SQL</figcaption>
+  </figure>
+
+  <h4>A complete CRUD DAO</h4>
+  <pre data-title="Customer.java"><code class="language-java">public record Customer(long id, String name, String email, String city) {}</code></pre>
+  <pre data-title="CustomerDao.java"><code class="language-java">import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+public class CustomerDao {
+    private final String url;
+    private final String user;
+    private final String password;
+
+    public CustomerDao(String url, String user, String password) {
+        this.url = url;
+        this.user = user;
+        this.password = password;
+    }
+
+    private Connection connect() throws SQLException {
+        return DriverManager.getConnection(url, user, password);
+    }
+
+    // Row -&gt; object. The ResultSet is already positioned on a row.
+    private Customer map(ResultSet rs) throws SQLException {
+        return new Customer(
+                rs.getLong("id"),
+                rs.getString("name"),
+                rs.getString("email"),
+                rs.getString("city"));              // may be null
+    }
+
+    // CREATE
+    public Customer insert(String name, String email, String city) throws SQLException {
+        String sql = "INSERT INTO customers (name, email, city) VALUES (?, ?, ?)";
+        try (Connection con = connect();
+             PreparedStatement ps = con.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            ps.setString(1, name);
+            ps.setString(2, email);
+            ps.setString(3, city);
+            ps.executeUpdate();
+            try (ResultSet keys = ps.getGeneratedKeys()) {
+                keys.next();
+                return new Customer(keys.getLong("id"), name, email, city);
+            }
+        }
+    }
+
+    // READ one
+    public Optional&lt;Customer&gt; findById(long id) throws SQLException {
+        String sql = "SELECT id, name, email, city FROM customers WHERE id = ?";
+        try (Connection con = connect();
+             PreparedStatement ps = con.prepareStatement(sql)) {
+            ps.setLong(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? Optional.of(map(rs)) : Optional.empty();
+            }
+        }
+    }
+
+    // READ many
+    public List&lt;Customer&gt; findByCity(String city) throws SQLException {
+        String sql = "SELECT id, name, email, city FROM customers WHERE city = ? ORDER BY name";
+        List&lt;Customer&gt; result = new ArrayList&lt;&gt;();
+        try (Connection con = connect();
+             PreparedStatement ps = con.prepareStatement(sql)) {
+            ps.setString(1, city);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    result.add(map(rs));
+                }
+            }
+        }
+        return result;
+    }
+
+    // UPDATE
+    public boolean updateCity(long id, String newCity) throws SQLException {
+        String sql = "UPDATE customers SET city = ? WHERE id = ?";
+        try (Connection con = connect();
+             PreparedStatement ps = con.prepareStatement(sql)) {
+            ps.setString(1, newCity);
+            ps.setLong(2, id);
+            return ps.executeUpdate() == 1;           // rows affected
+        }
+    }
+
+    // DELETE
+    public boolean delete(long id) throws SQLException {
+        try (Connection con = connect();
+             PreparedStatement ps = con.prepareStatement("DELETE FROM customers WHERE id = ?")) {
+            ps.setLong(1, id);
+            return ps.executeUpdate() == 1;
+        }
+    }
+}</code></pre>
+  <pre data-title="Main.java"><code class="language-java">public class Main {
+    public static void main(String[] args) throws Exception {
+        CustomerDao dao = new CustomerDao("jdbc:postgresql://localhost:5432/shop",
+                System.getenv("DB_USER"), System.getenv("DB_PASSWORD"));
+
+        Customer saved = dao.insert("Asha Rao", "asha@mail.in", "Pune");
+        System.out.println(saved);
+        System.out.println(dao.findById(saved.id()).isPresent());
+        System.out.println(dao.findByCity("Pune"));
+        System.out.println(dao.updateCity(saved.id(), "Mumbai"));
+        System.out.println(dao.findById(saved.id()).orElseThrow().city());
+        System.out.println(dao.delete(saved.id()));
+        System.out.println(dao.findById(saved.id()));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (first run on an empty table)"><code class="language-plaintext">Customer[id=1, name=Asha Rao, email=asha@mail.in, city=Pune]
+true
+[Customer[id=1, name=Asha Rao, email=asha@mail.in, city=Pune]]
+true
+Mumbai
+true
+Optional.empty</code></pre>
+  <p>Notes: <code>RETURN_GENERATED_KEYS</code> asks the driver to return the database-generated id. In PostgreSQL you can also write <code>INSERT ... RETURNING id</code> and run it with <code>executeQuery</code>. This DAO opens a new connection per call, which is fine for learning but slow in real systems (see pools below).</p>
+
+  <h4>Transactions</h4>
+  <p>A <strong>transaction</strong> groups several statements so they either all succeed or none do (ACID, see <a href="03-sql-databases.html#m5">SQL · Module 5</a>). By default JDBC is in <strong>auto-commit</strong> mode: every statement is committed immediately. For a multi-step operation such as a money transfer, turn auto-commit off, then <code>commit()</code> on success and <code>rollback()</code> on failure.</p>
+  <pre data-title="Transfer money"><code class="language-java">public void transfer(long fromId, long toId, BigDecimal amount) throws SQLException {
+    String debitSql = "UPDATE customers SET balance = balance - ? WHERE id = ? AND balance &gt;= ?";
+    String creditSql = "UPDATE customers SET balance = balance + ? WHERE id = ?";
+
+    try (Connection con = connect()) {
+        con.setAutoCommit(false);                              // start a transaction
+        try (PreparedStatement debit = con.prepareStatement(debitSql);
+             PreparedStatement credit = con.prepareStatement(creditSql)) {
+
+            debit.setBigDecimal(1, amount);
+            debit.setLong(2, fromId);
+            debit.setBigDecimal(3, amount);
+            if (debit.executeUpdate() != 1) {
+                throw new SQLException("Insufficient balance or unknown account " + fromId);
+            }
+
+            credit.setBigDecimal(1, amount);
+            credit.setLong(2, toId);
+            if (credit.executeUpdate() != 1) {
+                throw new SQLException("Unknown account " + toId);
+            }
+
+            con.commit();                                      // both changes become permanent
+        } catch (SQLException e) {
+            con.rollback();                                    // undo the debit if anything failed
+            throw e;
+        }
+    }
+}</code></pre>
+  <p>If the credit fails after the debit succeeded, <code>rollback()</code> restores the sender's money. Without a transaction, the money would simply vanish. If the connection closes without <code>commit()</code>, uncommitted work is rolled back by most drivers, but do not rely on it. In Spring you replace all of this with <code>@Transactional</code> (<a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>). Isolation levels can be set with <code>con.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED)</code>.</p>
+
+  <h4>Batch inserts</h4>
+  <p>Sending 10,000 inserts one by one costs 10,000 network round trips. A <strong>batch</strong> queues the statements and sends them together:</p>
+  <pre data-title="Batch insert"><code class="language-java">public void insertAll(List&lt;Customer&gt; customers) throws SQLException {
+    String sql = "INSERT INTO customers (name, email, city) VALUES (?, ?, ?)";
+    try (Connection con = connect();
+         PreparedStatement ps = con.prepareStatement(sql)) {
+        con.setAutoCommit(false);
+        int count = 0;
+        for (Customer c : customers) {
+            ps.setString(1, c.name());
+            ps.setString(2, c.email());
+            ps.setString(3, c.city());
+            ps.addBatch();                       // queue, do not run yet
+            if (++count % 500 == 0) {
+                ps.executeBatch();               // send every 500 rows
+            }
+        }
+        ps.executeBatch();                       // send the remainder
+        con.commit();
+    }
+}</code></pre>
+  <p><code>executeBatch()</code> returns an <code>int[]</code> of update counts. Some drivers need an option to really rewrite batches into fewer statements (<code>reWriteBatchedInserts=true</code> for PostgreSQL, <code>rewriteBatchedStatements=true</code> for MySQL, both added to the JDBC URL). Keep batches to a few hundred or thousand rows to limit memory.</p>
+
+  <h4>Handling SQLException</h4>
+  <pre data-title="SQLException details"><code class="language-java">try {
+    dao.insert("Asha Rao", "asha@mail.in", "Pune");
+} catch (SQLException e) {
+    System.err.println("Message : " + e.getMessage());
+    System.err.println("SQLState: " + e.getSQLState());     // standard 5-char code
+    System.err.println("Vendor  : " + e.getErrorCode());    // database-specific code
+    if ("23505".equals(e.getSQLState())) {                   // PostgreSQL unique violation
+        throw new IllegalStateException("Email already registered", e);
+    }
+    throw new RuntimeException("Database error", e);          // keep the cause
+}</code></pre>
+  <ul>
+    <li><code>SQLException</code> is a <strong>checked</strong> exception. Do not swallow it with an empty catch; either handle it meaningfully or wrap it in your own unchecked exception with the original as the <em>cause</em>.</li>
+    <li>The <strong>SQLState</strong> is a five-character standard code whose first two characters give the class: <code>23xxx</code> is an integrity-constraint violation (<code>23505</code> is a duplicate key in PostgreSQL; MySQL reports duplicates with state <code>23000</code> and error code 1062), <code>08xxx</code> is a connection problem, <code>42xxx</code> is a syntax or access error.</li>
+    <li>Never show raw SQL errors to end users: they expose table names and structure. Log them, return a safe message.</li>
+  </ul>
+
+  <h4>Why connection pools exist</h4>
+  <p>Opening a database connection is expensive: a TCP connection, authentication, and session setup on the server — typically many milliseconds, which dwarfs a fast query. Databases also limit the number of simultaneous connections. A <strong>connection pool</strong> opens a fixed set of connections once and lends them out: <code>getConnection()</code> returns a pooled connection quickly, and <code>close()</code> does not really close it, it returns it to the pool.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Request threads            Pool (e.g. 10)            Database
+┌───────────────┐         ┌───────────────┐         ┌──────────┐
+│ thread 1  ────┼─borrow─▶│ conn 1 (busy) ├────────▶│          │
+│ thread 2  ────┼─borrow─▶│ conn 2 (busy) ├────────▶│  server  │
+│ thread 3  wait│         │ conn 3 (idle) │         │          │
+└───────────────┘◀─return─└───────────────┘         └──────────┘
+</pre>
+    <figcaption>Threads borrow and return a limited set of open connections</figcaption>
+  </figure>
+  <p><strong>HikariCP</strong> is the fast, standard pool and the default in Spring Boot. Spring Boot creates a pooled <code>DataSource</code> from <code>spring.datasource.url</code>, <code>username</code> and <code>password</code>; HikariCP's default maximum pool size is 10 (<code>spring.datasource.hikari.maximum-pool-size</code>). If all connections are busy, new requests wait and may time out. Pool configuration and tuning are in <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>. Your DAO code stays the same: replace <code>DriverManager.getConnection(...)</code> by <code>dataSource.getConnection()</code> and keep closing the connection in try-with-resources — that is what returns it to the pool.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Always close <code>Connection</code>, <code>PreparedStatement</code> and <code>ResultSet</code> (try-with-resources). A connection leak exhausts the pool and freezes the application.</li>
+      <li>In a transaction, <code>rollback()</code> on failure, and use one <code>Connection</code> for all steps — separate connections are separate transactions.</li>
+      <li>Never share a <code>Connection</code> between threads.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Leaving auto-commit on for a multi-statement business operation.</li>
+      <li>Forgetting to <code>commit()</code> after <code>setAutoCommit(false)</code>: data seems saved in your session but vanishes.</li>
+      <li>Returning a <code>ResultSet</code> from a method after its connection was closed; map to objects inside the method.</li>
+      <li>Running one query per row in a loop (the N+1 problem); use a JOIN or <code>IN</code>, or batch.</li>
+      <li>Reading a nullable <code>INT</code> column with <code>getInt</code> and treating the returned 0 as real.</li>
+      <li>Catching <code>SQLException</code> and only calling <code>e.printStackTrace()</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>Few teams write raw JDBC for every query today: Spring Data JPA or <code>JdbcTemplate</code> remove the boilerplate. But everything above still runs underneath: a pooled <code>DataSource</code>, prepared statements, transactions, batches and <code>SQLException</code> translation. Raw JDBC remains common for bulk loads, reports and tools. When a framework misbehaves, turning on SQL logging (<a href="#m8-logging">Logging</a>) shows the exact statements JDBC receives.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you handle transactions in JDBC? Why use a connection pool?"</p>
+    <ul>
+      <li><code>setAutoCommit(false)</code>, do the steps on one connection, <code>commit()</code>, <code>rollback()</code> in the catch block, then close.</li>
+      <li>Pool: connection creation is expensive and databases limit connections; the pool reuses them; <code>close()</code> returns to the pool; HikariCP is the default in Spring Boot.</li>
+      <li>Batch: <code>addBatch</code>/<code>executeBatch</code> reduce round trips.</li>
+      <li>DAO pattern separates persistence from business logic. Mention try-with-resources and checked <code>SQLException</code> with <code>getSQLState()</code>.</li>
+    </ul>
+  </div>
+</article>

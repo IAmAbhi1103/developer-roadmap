@@ -1,0 +1,463 @@
+<div class="mintro">
+  <p><strong>CI/CD</strong> means a robot does the boring, risky work for you on every change: build the
+  code, run the tests, package the app, and (if all is green) deploy it. <strong>GitHub Actions</strong> is
+  the CI/CD service built into GitHub; you describe the steps in a YAML file inside your repository and
+  GitHub runs them on its servers. Teams that do this ship smaller changes, more often, with fewer
+  production surprises — and it is a standard expectation in a developer's first week at a company.</p>
+  <p>This module uses what you already know: Git branches and pull requests
+  (<a href="01-git-github.html#m3">Git · Module 3</a>), Maven and tests
+  (<a href="02-core-java.html#m8">Core Java · Module 8</a>, <a href="04-spring-boot.html#m5">Spring Boot · Module 5</a>),
+  Docker images (<a href="#m3">Module 3</a>) and SSH deployment to a Linux server
+  (<a href="#m1">Module 1</a>). Cloud-specific deployment targets follow in <a href="#m5">Module 5</a>.</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>Explain CI, continuous delivery and continuous deployment, and why teams use them.</li>
+    <li>Read and write GitHub Actions workflows: triggers, jobs, steps, runners, contexts and secrets.</li>
+    <li>Build and test a Spring Boot project on every push and pull request, with caching and test reports.</li>
+    <li>Build a Docker image and push it to GitHub Container Registry (or Docker Hub) from the pipeline.</li>
+    <li>Deploy automatically on merge to <code>main</code> over SSH or through a deploy hook, with approvals.</li>
+    <li>Protect <code>main</code> with required checks, show a status badge, and describe Jenkins.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m4-ci-cd-concepts">
+  <h3>CI, continuous delivery and continuous deployment</h3>
+  <p class="tldr">Continuous Integration builds and tests every change automatically so the main branch always
+  works; continuous delivery keeps every green build ready to release with one click; continuous deployment
+  releases every green build to production automatically.</p>
+
+  <h4>The problem CI solves</h4>
+  <p>Without automation, a team of five works for two weeks on separate branches, merges everything on the
+  last day, and finds that the pieces do not fit together. One person's change breaks another's, the tests
+  were never run on the merged code, and a release needs a weekend. This is called <strong>integration
+  hell</strong>. The cure is to integrate small changes often and let a machine check each one.</p>
+
+  <h4>Three terms that sound alike</h4>
+  <dl class="terms">
+    <dt>Continuous Integration (CI)</dt><dd>Every push and pull request triggers an automatic build and test run
+    on a clean machine. Developers merge to the shared branch at least daily. The goal: <em>main is always
+    working</em>.</dd>
+    <dt>Continuous Delivery (CD)</dt><dd>After CI passes, the pipeline also produces a release-ready artifact
+    (a JAR or Docker image) and deploys it to a test/staging environment. Releasing to production is possible
+    at any time, but a <em>human clicks the button</em>.</dd>
+    <dt>Continuous Deployment (CD)</dt><dd>Every change that passes all automated checks goes to production
+    <em>automatically</em>, with no manual approval. It needs strong tests, monitoring and a fast rollback.</dd>
+  </dl>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>CI</th><th>Continuous delivery</th><th>Continuous deployment</th></tr></thead>
+    <tbody>
+      <tr><td>Builds and tests every change</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Creates a deployable artifact</td><td>Sometimes</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Deploys to staging</td><td>No</td><td>Automatically</td><td>Automatically</td></tr>
+      <tr><td>Deploys to production</td><td>No</td><td>On manual approval</td><td>Automatically</td></tr>
+      <tr><td>Typical team</td><td>Everyone</td><td>Banks, regulated products</td><td>Web products with strong tests</td></tr>
+    </tbody>
+  </table></div>
+  <p>"CD" is used for both delivery and deployment; ask which one people mean. In your Project 3 you will build
+  continuous deployment on a small scale: a merge to <code>main</code> deploys itself.</p>
+
+  <h4>A pipeline as a picture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  P["git push / pull request"] --> B[Build]
+  B --> T[Test]
+  T --> K[Package: JAR / Docker image]
+  K --> S[Deploy to staging]
+  S --> A{Approval?}
+  A -->|"yes"| PR[Deploy to production]
+  T -.->|"fail"| F[Notify developer]
+</pre>
+    <figcaption>A typical pipeline: each stage runs only if the previous one succeeded</figcaption>
+  </figure>
+  <p>A <strong>pipeline</strong> is the whole chain from commit to running software. Each stage is a gate. If
+  tests fail, nothing is packaged and nothing is deployed; the author gets an email or a red cross on the pull
+  request.</p>
+
+  <h4>Why CI matters for a team</h4>
+  <ul>
+    <li><strong>Fast feedback.</strong> You learn within minutes that your change breaks a test — while you
+    still remember the code.</li>
+    <li><strong>A neutral build machine.</strong> "Works on my machine" is replaced by "works on the CI
+    machine", which starts clean every time (right Java version, no leftover files).</li>
+    <li><strong>A safe main branch.</strong> Combined with branch protection, broken code cannot be merged.</li>
+    <li><strong>Repeatable releases.</strong> The same scripted steps run every time; no one forgets a step or
+    deploys from a laptop.</li>
+    <li><strong>Small, frequent releases.</strong> Small changes are easy to review and to roll back.</li>
+    <li><strong>Quality gates.</strong> Style checks, test coverage, security scans and dependency checks
+    run automatically on every pull request.</li>
+  </ul>
+
+  <h4>What CI/CD needs from you</h4>
+  <p>Automation is only as good as what it runs. You need tests that are fast and reliable (a flaky test that
+  fails randomly teaches everyone to ignore red builds), a build that works from a clean checkout with one
+  command (<code>./mvnw verify</code>), configuration kept out of the code (environment variables, secrets),
+  and a deployment you can repeat by script. Everything the pipeline does should also be doable by hand on
+  your laptop.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: a red main branch is the team's top priority</p>
+    <p>If the build on <code>main</code> fails, stop merging and fix or revert at once. Everyone else's pull
+    requests will otherwise fail for reasons they did not cause.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>CI proves only what your tests cover. A green build with weak tests gives false confidence.</li>
+      <li>Some changes (database migrations, breaking API changes) cannot simply be deployed and reverted;
+      they need careful steps even with a perfect pipeline.</li>
+      <li>Continuous deployment is not "no testing"; it is "all the testing is automatic".</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is the difference between CI, continuous delivery and continuous deployment?"</p>
+    <ul>
+      <li>CI: automatic build and test on every change. Delivery: always releasable, production deploy is a
+      manual decision. Deployment: every green change reaches production automatically.</li>
+      <li>Benefits: fast feedback, fewer integration problems, repeatable releases, smaller changes.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-actions-concepts">
+  <h3>GitHub Actions concepts: workflows, jobs, steps, runners and expressions</h3>
+  <p class="tldr">A workflow is a YAML file in <code>.github/workflows</code> that runs when an event happens;
+  it contains jobs (run on runners, in parallel unless you use <code>needs</code>), and each job is a list of
+  steps that either run a shell command (<code>run</code>) or use a ready-made action (<code>uses</code>).</p>
+
+  <h4>The building blocks</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  E["Event: push, pull_request, ..."] --> W["Workflow (YAML file)"]
+  W --> J1["Job: build (runner 1)"]
+  W --> J2["Job: docker (runner 2)"]
+  J1 --> S1["Step: uses actions/checkout"]
+  J1 --> S2["Step: run ./mvnw verify"]
+  J1 -.->|"needs"| J2
+</pre>
+    <figcaption>An event starts a workflow; jobs run on separate runners; steps run in order inside a job</figcaption>
+  </figure>
+  <dl class="terms">
+    <dt>Workflow</dt><dd>One YAML file in <code>.github/workflows/</code>. A repository can have many
+    (<code>ci.yml</code>, <code>deploy.yml</code>).</dd>
+    <dt>Event</dt><dd>What starts a workflow: a push, a pull request, a schedule, a manual click, a release.</dd>
+    <dt>Job</dt><dd>A group of steps that runs on one fresh runner machine. Jobs run in parallel by default.</dd>
+    <dt>Step</dt><dd>One task inside a job. Steps run in order and share the job's filesystem.</dd>
+    <dt>Action</dt><dd>A reusable, versioned unit of work (<code>uses: actions/checkout@v4</code>) written by
+    GitHub or the community, found in the Marketplace.</dd>
+    <dt>Runner</dt><dd>The machine that runs a job. <strong>GitHub-hosted</strong> runners
+    (<code>ubuntu-latest</code>, <code>windows-latest</code>, <code>macos-latest</code>) are fresh virtual
+    machines that GitHub provides; <strong>self-hosted</strong> runners are machines you install the runner
+    agent on (your own server, inside your network).</dd>
+  </dl>
+
+  <h4>A first workflow</h4>
+  <pre data-title=".github/workflows/hello.yml"><code class="language-yaml">name: Hello
+
+on: push
+
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say hello
+        run: echo "Hello from commit ${{ github.sha }} on ${{ github.ref_name }}"
+      - name: Show the runner
+        run: |
+          uname -a
+          java -version</code></pre>
+  <p>Push this file and open the repository's <strong>Actions</strong> tab: you see the run, each job and the
+  log of every step. The file must be on the repository's default branch (or the branch you push) to run.</p>
+
+  <h4>Run versus uses</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>run:</code></th><th><code>uses:</code></th></tr></thead>
+    <tbody>
+      <tr><td>What it is</td><td>A shell command or script</td><td>A packaged action: <code>owner/repo@version</code></td></tr>
+      <tr><td>Example</td><td><code>run: ./mvnw -B verify</code></td><td><code>uses: actions/setup-java@v4</code></td></tr>
+      <tr><td>Inputs</td><td>None (use env vars)</td><td><code>with:</code> block</td></tr>
+      <tr><td>Use for</td><td>Your own build commands</td><td>Checkout, Java setup, caching, Docker login, uploads</td></tr>
+    </tbody>
+  </table></div>
+  <p>A multi-line command uses <code>|</code> (each line is run in order; the step fails if a line fails).
+  The version after <code>@</code> is a tag, such as <code>v4</code> (a <em>major</em> version that receives
+  compatible updates), a full tag, or a commit SHA (the safest, immutable choice).</p>
+  <div class="co co-version">
+    <p class="co-t">Check each action's README for the latest major version</p>
+    <p>Official actions release new majors regularly (for example to move to a newer Node.js runtime). The
+    versions in these notes (<code>actions/checkout@v4</code>, <code>actions/setup-java@v4</code>,
+    <code>actions/upload-artifact@v4</code>, <code>docker/build-push-action@v6</code> and so on) were current
+    when written. Before you copy a workflow, open each action's page on GitHub and use the latest major shown
+    in its README. Dependabot can also open pull requests that update action versions for you.</p>
+  </div>
+
+  <h4>needs, if, env and outputs</h4>
+  <pre data-title="Jobs in order, conditions and environment variables"><code class="language-yaml">env:
+  JAVA_VERSION: "21"             # workflow-level variable
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "testing with Java $JAVA_VERSION"
+
+  package:
+    needs: test                  # waits for 'test'; skipped if 'test' fails
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "packaging"
+
+  deploy:
+    needs: [test, package]
+    if: github.ref == 'refs/heads/main'   # only on main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only when a previous step failed
+        if: failure()
+        run: echo "something earlier failed"
+      - run: echo "deploying"</code></pre>
+  <ul>
+    <li><code>needs</code> creates the order between jobs. Without it, jobs start at the same time.</li>
+    <li><code>if</code> decides whether a job or step runs. Status functions: <code>success()</code> (default),
+    <code>failure()</code>, <code>always()</code>, <code>cancelled()</code>.</li>
+    <li><code>env</code> can be set at workflow, job or step level; inner levels override outer ones.</li>
+    <li>Jobs run on different machines, so files from one job are not available in another. Pass files with
+    <strong>artifacts</strong> and small values with <strong>outputs</strong>.</li>
+  </ul>
+
+  <h4>Contexts and expressions</h4>
+  <p>Inside <code>${{ ... }}</code> you write an <strong>expression</strong> that reads a <strong>context</strong>
+  (an object with information) or calls a function. GitHub evaluates it before the step runs.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Expression</th><th>Gives</th></tr></thead>
+    <tbody>
+      <tr><td><code>${{ github.sha }}</code></td><td>The full commit SHA being built</td></tr>
+      <tr><td><code>${{ github.ref_name }}</code></td><td>Branch or tag name (<code>main</code>, <code>v1.2.0</code>)</td></tr>
+      <tr><td><code>${{ github.actor }}</code></td><td>The user who triggered the run</td></tr>
+      <tr><td><code>${{ github.repository }}</code></td><td><code>owner/repo</code></td></tr>
+      <tr><td><code>${{ github.event_name }}</code></td><td><code>push</code>, <code>pull_request</code>, ...</td></tr>
+      <tr><td><code>${{ secrets.DEPLOY_KEY }}</code></td><td>A secret value (masked in logs)</td></tr>
+      <tr><td><code>${{ vars.APP_URL }}</code></td><td>A non-secret configuration variable</td></tr>
+      <tr><td><code>${{ runner.os }}</code></td><td><code>Linux</code>, <code>Windows</code>, <code>macOS</code></td></tr>
+      <tr><td><code>${{ matrix.java }}</code></td><td>Current value in a matrix build</td></tr>
+      <tr><td><code>${{ hashFiles('**/pom.xml') }}</code></td><td>A hash of matching files (cache keys)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Matrix builds</h4>
+  <p>A <strong>matrix</strong> runs the same job several times with different values — for example tests on
+  Java 17 and 21, or on Linux and Windows. GitHub creates one job per combination.</p>
+  <pre data-title="Test on two Java versions"><code class="language-yaml">jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false            # let other combinations finish if one fails
+      matrix:
+        java: [17, 21]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - run: ./mvnw -B verify</code></pre>
+
+  <h4>Permissions, GITHUB_TOKEN and concurrency</h4>
+  <p>Every run gets a temporary <code>GITHUB_TOKEN</code>, valid only for that run and that repository. What it
+  may do is set by the <code>permissions</code> key. Follow least privilege: give read access by default and
+  add more only to jobs that need it.</p>
+  <pre data-title="Least privilege and cancelling old runs"><code class="language-yaml">permissions:
+  contents: read                 # default for all jobs
+
+concurrency:
+  group: ci-${{ github.ref }}    # one run per branch at a time
+  cancel-in-progress: true       # a new push cancels the older run
+
+jobs:
+  publish:
+    permissions:
+      contents: read
+      packages: write            # this job may push to GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "pushing"</code></pre>
+  <p>A <strong>concurrency group</strong> makes sure only one run of that group is active. For CI,
+  cancelling older runs on the same branch saves time and minutes. For <em>deployments</em>, use
+  <code>cancel-in-progress: false</code> so a deploy is never cut in half.</p>
+
+  <h4>Artifacts and caching in one line each</h4>
+  <ul>
+    <li><strong>Artifact</strong> — a file produced by a run (test reports, a JAR) that you can download or
+    pass to a later job: <code>actions/upload-artifact</code> and <code>actions/download-artifact</code>.</li>
+    <li><strong>Cache</strong> — files reused between runs (Maven's <code>~/.m2</code>) to make builds faster:
+    <code>actions/cache</code>, or built into <code>setup-java</code> and <code>setup-node</code>.</li>
+  </ul>
+
+  <h4>YAML basics and indentation pitfalls</h4>
+  <ul>
+    <li>Indentation is meaning. Use <strong>spaces</strong> (two per level), never tabs. A step must be
+    indented under <code>steps:</code>, and <code>with:</code> keys under their step.</li>
+    <li>A list item starts with <code>- </code>. In <code>steps</code>, each item is one step.</li>
+    <li>Quote strings that could be read as something else: <code>java-version: "21"</code> is fine either
+    way, but <code>"1.10"</code> must be quoted or it becomes the number 1.1. Quote values starting with
+    <code>${{</code> or containing <code>: </code> or <code>#</code> when in doubt.</li>
+    <li><code>on:</code> and <code>jobs:</code> are top-level keys; a missing or misplaced space is the usual
+    cause of "Invalid workflow file" errors.</li>
+    <li>A comment starts with <code>#</code>. The editor on github.com shows YAML errors before you commit;
+    VS Code with the GitHub Actions extension validates too.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: the workflow file is in the wrong place or has the wrong extension</p>
+    <p>It must be at <code>.github/workflows/name.yml</code> (or <code>.yaml</code>) in the repository root.
+    <code>.github/workflow/</code> (missing <code>s</code>) or a file in a sub-folder never runs, and no
+    error is shown.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: expecting files to exist in another job</p>
+    <p>Each job starts on a clean runner. A JAR built in <code>build</code> does not exist in
+    <code>deploy</code> unless you upload and download it as an artifact, or rebuild, or push an image to a
+    registry and pull it.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain GitHub Actions: workflow, job, step, runner."</p>
+    <ul>
+      <li>A workflow (YAML) is triggered by an event; it has jobs that run in parallel on separate runners
+      (<code>needs</code> orders them); each job has sequential steps that are <code>run</code> commands or
+      reusable <code>uses</code> actions.</li>
+      <li>Contexts such as <code>github.sha</code> and <code>secrets.X</code>; matrix for variations;
+      <code>permissions</code> for the token; <code>concurrency</code> to avoid overlapping runs.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-triggers">
+  <h3>Workflow triggers: push, pull_request, manual, schedule and tags</h3>
+  <p class="tldr">The <code>on:</code> key decides when a workflow runs — typically <code>push</code> and
+  <code>pull_request</code> with branch and path filters for CI, <code>workflow_dispatch</code> for a manual
+  button, <code>schedule</code> for cron jobs and tag or release events for versioned releases.</p>
+
+  <h4>push and pull_request</h4>
+  <pre data-title="CI on pushes to main and on every pull request"><code class="language-yaml">on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]</code></pre>
+  <p>With this, a push to <code>main</code> (including a merge) triggers the workflow, and so does any pull
+  request that targets <code>main</code> — on creation and on each new commit pushed to it.</p>
+  <ul>
+    <li><code>push</code> runs on the pushed commit of that branch.</li>
+    <li><code>pull_request</code> runs on a <em>merge preview</em> of the PR branch into the target branch, so
+    you test what <code>main</code> would look like after the merge. This is the check that branch protection
+    uses.</li>
+    <li>Feature branches without a pull request do not run, because of the filter. If you want CI on every
+    branch push, use <code>on: push</code> without <code>branches</code>; but then a PR commit runs twice (once
+    for push, once for the PR). Limiting <code>push</code> to <code>main</code> avoids this.</li>
+  </ul>
+
+  <h4>Filters: branches, paths and tags</h4>
+  <pre data-title="Only run when relevant files change"><code class="language-yaml">on:
+  push:
+    branches: [main, "release/**"]      # patterns: * and ** wildcards
+    paths:
+      - "src/**"
+      - "pom.xml"
+  pull_request:
+    branches: [main]
+    paths-ignore:                       # use paths OR paths-ignore for one event, not both
+      - "**.md"
+    types: [opened, synchronize, reopened]   # default types; shown explicitly</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Filter</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>branches</code> / <code>branches-ignore</code></td><td>Run only for (or never for) matching branch names</td></tr>
+      <tr><td><code>paths</code> / <code>paths-ignore</code></td><td>Run only when changed files match (e.g. do not run a backend build for a README edit)</td></tr>
+      <tr><td><code>tags</code></td><td>Run on pushes of matching tags, e.g. <code>v*</code></td></tr>
+      <tr><td><code>types</code></td><td>Which activity of the event: PR <code>opened</code>, <code>synchronize</code> (new commits), <code>reopened</code>, ...</td></tr>
+    </tbody>
+  </table></div>
+  <p>Careful with path filters and required checks: if a workflow is skipped because of its path filter, a
+  required status check from it stays "pending" and the PR cannot be merged. Either do not use path filters
+  on workflows that branch protection requires, or add a small always-running job that reports status.</p>
+
+  <h4>workflow_dispatch: a manual button</h4>
+  <pre data-title="Run by hand from the Actions tab, with an input"><code class="language-yaml">on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (e.g. a git SHA)"
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Deploying tag ${{ inputs.image_tag }}"</code></pre>
+  <p>The workflow appears with a <strong>Run workflow</strong> button in the Actions tab (the file must be on the
+  default branch). It is perfect for "deploy this tag" and rollbacks, or for jobs you want to test without
+  pushing commits. You can also trigger it with the GitHub CLI: <code>gh workflow run deploy.yml -f
+  image_tag=3f9c2ab</code>.</p>
+
+  <h4>schedule: cron</h4>
+  <pre data-title="Nightly build at 02:00 UTC"><code class="language-yaml">on:
+  schedule:
+    - cron: "0 2 * * *"      # minute hour day-of-month month day-of-week</code></pre>
+  <p>The cron time is always <strong>UTC</strong>. India Standard Time is UTC+5:30, so 02:00 UTC is
+  07:30 IST. Scheduled runs happen on the default branch, may start a few minutes late when GitHub is busy,
+  and GitHub may disable schedules on repositories with no activity for a long time. Use them for nightly
+  full test suites, dependency checks or clean-up jobs.</p>
+
+  <h4>Tags and releases</h4>
+  <pre data-title="Run when a version tag or a release is created"><code class="language-yaml">on:
+  push:
+    tags:
+      - "v*.*.*"             # v1.2.0, v2.0.1 ...
+  release:
+    types: [published]</code></pre>
+  <p>Create a tag with <code>git tag v1.2.0 &amp;&amp; git push origin v1.2.0</code>. The workflow can then
+  build the image with the tag name (<code>${{ github.ref_name }}</code>) and publish a GitHub Release. This
+  is the usual way to produce versioned releases.</p>
+
+  <h4>A few more events</h4>
+  <ul>
+    <li><code>workflow_call</code> — lets one workflow call another (<strong>reusable workflows</strong>), so
+    many repositories share one CI definition.</li>
+    <li><code>workflow_run</code> — start a workflow after another one finishes (for example deploy after CI).</li>
+    <li><code>pull_request_target</code> — runs with the base repository's permissions and secrets even for
+    forks; powerful and easy to misuse. Avoid it until you understand the security notes in the GitHub docs.</li>
+    <li><code>issues</code>, <code>issue_comment</code>, <code>repository_dispatch</code> — automation around
+    issues and external triggers.</li>
+  </ul>
+  <p>Documentation of every event and filter: <a href="https://docs.github.com/en/actions">docs.github.com/en/actions</a>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: workflow triggers itself, or runs twice per PR commit</p>
+    <ul>
+      <li>A workflow that pushes a commit with the default <code>GITHUB_TOKEN</code> does not trigger other
+      workflows (GitHub prevents loops), which surprises people who expect it to.</li>
+      <li><code>on: [push, pull_request]</code> without filters runs twice for a PR branch commit. Filter
+      <code>push</code> to <code>main</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Pull requests from forks run with a read-only token and no secrets, so steps that need secrets (deploy,
+      push image) must not run for them.</li>
+      <li>A workflow with <code>on: pull_request</code> uses the workflow file from the merge commit, so you can
+      test a changed workflow inside its own PR.</li>
+      <li>Commits whose message contains <code>[skip ci]</code> skip push and pull_request workflows (useful for
+      docs-only changes; check the GitHub docs for the exact supported phrases).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "When does your CI run, and how do you stop it running when only the README changed?"</p>
+    <ul>
+      <li>On pull requests to <code>main</code> and on pushes to <code>main</code>; manual
+      <code>workflow_dispatch</code>; optionally a nightly cron.</li>
+      <li>Use <code>paths</code>/<code>paths-ignore</code> filters, mindful of required status checks.</li>
+    </ul>
+  </div>
+</article>

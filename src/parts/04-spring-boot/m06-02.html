@@ -1,0 +1,519 @@
+<article class="topic" id="m6-caching">
+  <h3>Caching with @Cacheable, @CachePut and @CacheEvict</h3>
+  <p class="tldr">Spring's cache abstraction puts a proxy in front of a method so that repeated calls with the same arguments return a stored result; you choose the cache provider separately (a simple map, Caffeine or Redis) and must plan how entries are invalidated.</p>
+
+  <h4>What and why</h4>
+  <p>A <strong>cache</strong> keeps the result of expensive work (a slow query, a call to another service) so the next request gets it from memory. The job list page of Project 2 is read thousands of times and changes a few times a day: running the same SQL on every request wastes the database. Caching trades <em>freshness</em> for <em>speed</em>; the hard part is not storing, it is knowing when the stored value is wrong (<strong>invalidation</strong>). The general theory (cache-aside, write-through, eviction policies) is in <a href="08-system-design.html#m5">System Design · Module 5</a>.</p>
+
+  <h4>How it works</h4>
+  <p>Like <code>@Transactional</code>, caching is an AOP proxy feature (<a href="#m1">module 1</a>). Spring wraps your bean; when you call a cached method from another bean, the proxy computes a <strong>key</strong> from the arguments, looks in the named cache, and calls your method only on a miss.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Caller
+  participant P as Cache proxy
+  participant K as Cache
+  participant M as Real method
+  C->>P: findById(7)
+  P->>K: get("jobs", 7)
+  alt hit
+    K-->>P: Job 7
+    P-->>C: Job 7 (method not called)
+  else miss
+    P->>M: findById(7)
+    M-->>P: Job 7
+    P->>K: put("jobs", 7, Job 7)
+    P-->>C: Job 7
+  end
+</pre>
+  <figcaption>On a hit the real method is never called</figcaption>
+  </figure>
+
+  <h4>Setup</h4>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-cache&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <pre data-title="JobsApplication.java"><code class="language-java">@SpringBootApplication
+@EnableCaching                       // without this, the annotations do nothing
+public class JobsApplication {
+    public static void main(String[] args) { SpringApplication.run(JobsApplication.class, args); }
+}</code></pre>
+  <p>With no provider on the classpath, Boot uses a simple <code>ConcurrentHashMap</code> cache: good for learning and tests, but it never expires and has no size limit.</p>
+
+  <h4>The annotations</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation</th><th>What it does</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><code>@Cacheable</code></td><td>Return the cached value if present; otherwise call the method and store the result</td><td>Reads: <code>findById</code>, <code>search</code></td></tr>
+      <tr><td><code>@CachePut</code></td><td>Always call the method and store the result (no skip)</td><td>Update: refresh the entry after a change</td></tr>
+      <tr><td><code>@CacheEvict</code></td><td>Remove one entry (or all with <code>allEntries = true</code>)</td><td>Delete, or any change that makes entries stale</td></tr>
+      <tr><td><code>@Caching</code></td><td>Combine several of the above on one method</td><td>Update that evicts a list and puts an item</td></tr>
+      <tr><td><code>@CacheConfig</code></td><td>Class-level defaults (<code>cacheNames</code>)</td><td>Avoid repeating the cache name</td></tr>
+    </tbody>
+  </table></div>
+
+  <pre data-title="JobService.java"><code class="language-java">@Service
+@CacheConfig(cacheNames = "jobs")
+public class JobService {
+
+    private final JobRepository jobRepository;
+    private final JobMapper mapper;
+
+    public JobService(JobRepository jobRepository, JobMapper mapper) {
+        this.jobRepository = jobRepository;
+        this.mapper = mapper;
+    }
+
+    @Cacheable(key = "#id")                              // key = the argument
+    @Transactional(readOnly = true)
+    public JobResponse getJob(Long id) {
+        return mapper.toResponse(jobRepository.findById(id).orElseThrow(
+                () -&gt; new ResourceNotFoundException("Job " + id)));
+    }
+
+    @CachePut(key = "#id")                               // runs always, refreshes the entry
+    @Transactional
+    public JobResponse updateJob(Long id, JobRequest request) {
+        Job job = jobRepository.findById(id).orElseThrow();
+        mapper.update(job, request);
+        return mapper.toResponse(job);
+    }
+
+    @CacheEvict(key = "#id")
+    @Transactional
+    public void deleteJob(Long id) {
+        jobRepository.deleteById(id);
+    }
+
+    @CacheEvict(allEntries = true)                       // clear the whole "jobs" cache
+    public void clearAll() { }
+}</code></pre>
+
+  <h4>Keys and SpEL</h4>
+  <p>The default key is built from all method arguments (a single argument is the key itself; several become a <code>SimpleKey</code>; no arguments use a constant). You almost always want to write the key explicitly with <strong>SpEL</strong> (Spring Expression Language):</p>
+  <pre data-title="Key expressions"><code class="language-java">@Cacheable(key = "#id")                                   // a parameter by name
+@Cacheable(key = "#filter.city + ':' + #filter.page")     // property of a parameter
+@Cacheable(key = "T(java.util.Objects).hash(#city, #type)")
+@Cacheable(key = "#root.methodName + ':' + #id")          // method name in the key
+@Cacheable(key = "#user.id")                              // per-user cache</code></pre>
+  <p>Parameter names work only if the code is compiled with <code>-parameters</code> (Spring Boot's Maven and Gradle plugins do this) or you use <code>#p0</code>, <code>#a0</code> for positions. Two arguments that mean the same thing must produce the same key, and different things must never collide: a per-user result with a key that ignores the user would leak one user's data to another.</p>
+
+  <h4>condition and unless</h4>
+  <ul>
+    <li><code>condition</code> is checked <strong>before</strong> the call and decides whether caching applies at all: <code>@Cacheable(condition = "#id &gt; 0")</code>. If false, the method runs and nothing is read or stored.</li>
+    <li><code>unless</code> is checked <strong>after</strong> the call and can veto storing the result; it can use <code>#result</code>: <code>@Cacheable(unless = "#result == null || #result.isEmpty()")</code>.</li>
+  </ul>
+  <p>Use <code>unless</code> to avoid caching empty results or errors you do not want to remember. <code>@Cacheable</code> on a method that returns <code>Optional</code> caches the unwrapped value.</p>
+
+  <h4>@CacheEvict options and @Caching</h4>
+  <pre data-title="Evicting several caches"><code class="language-java">@Caching(
+    put   = { @CachePut(cacheNames = "jobs", key = "#result.id()") },
+    evict = { @CacheEvict(cacheNames = "jobList", allEntries = true) }
+)
+@Transactional
+public JobResponse createJob(JobRequest request) { ... }
+
+@CacheEvict(cacheNames = "jobs", key = "#id", beforeInvocation = true)
+public void forceReload(Long id) { ... }      // evict even if the method throws</code></pre>
+  <p>By default eviction happens <strong>after</strong> a successful call, so a method that throws leaves the cache intact. <code>beforeInvocation = true</code> evicts first. <code>allEntries = true</code> clears the cache; with Redis it can be slow on large caches because it scans keys.</p>
+
+  <h4>The two cache names pattern: items and lists</h4>
+  <p>A single-item cache (<code>jobs::7</code>) is easy to keep correct. A <strong>list or search cache</strong> (<code>jobList::Pune:page0</code>) is hard: any new job makes every list stale. Options: keep list caches short-lived (TTL of a minute), evict the whole list cache on any write (<code>allEntries = true</code>), or do not cache lists and cache only single items and expensive aggregates.</p>
+
+  <h4>Concurrency: sync = true</h4>
+  <p>When a popular entry expires, many requests may miss at once and all hit the database (a <strong>cache stampede</strong>). <code>@Cacheable(sync = true)</code> makes one thread compute the value while the others wait. It works only with one cache name and is not supported with <code>unless</code>. For Redis it locks per JVM, not across servers.</p>
+
+  <h4>The self-invocation pitfall</h4>
+  <p>Exactly the same as <code>@Transactional</code>: the call must go through the proxy.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: same-class call skips the cache</p><pre><code class="language-java">@Service
+public class JobService {
+    public JobResponse view(Long id) {
+        return getJob(id);               // this.getJob(): proxy bypassed, NOT cached
+    }
+    @Cacheable("jobs")
+    public JobResponse getJob(Long id) { ... }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: call from another bean</p><pre><code class="language-java">@RestController
+public class JobController {
+    private final JobService jobService;
+    @GetMapping("/api/jobs/{id}")
+    JobResponse get(@PathVariable Long id) {
+        return jobService.getJob(id);    // goes through the proxy: cached
+    }
+}</code></pre></div>
+  </div>
+  <p>Also: only <code>public</code> methods, and the bean must be created by Spring (not <code>new</code>).</p>
+
+  <h4>Providers: simple, Caffeine, Redis</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Simple (default)</th><th>Caffeine</th><th>Redis</th></tr></thead>
+    <tbody>
+      <tr><td>Where</td><td>JVM memory</td><td>JVM memory</td><td>Separate server</td></tr>
+      <tr><td>Shared between instances</td><td>No</td><td>No</td><td><strong>Yes</strong></td></tr>
+      <tr><td>Size limit and TTL</td><td>None</td><td>Yes (size, expire after write/access)</td><td>TTL; memory limit on the server</td></tr>
+      <tr><td>Speed</td><td>Fastest</td><td>Fastest (no network)</td><td>Network call (about a millisecond)</td></tr>
+      <tr><td>Survives restart</td><td>No</td><td>No</td><td>Yes (depends on persistence)</td></tr>
+      <tr><td>Use for</td><td>Tests, demos</td><td>Single instance, or data where slight differences between instances are fine</td><td>Several instances, large data, shared state</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Caffeine</strong> is a high-performance local cache library. Add <code>com.github.ben-manes.caffeine:caffeine</code> next to the cache starter and Boot configures it:</p>
+  <pre data-title="application.yml (Caffeine)"><code class="language-yaml">spring:
+  cache:
+    type: caffeine
+    cache-names: jobs, companies                       # fixed set of caches
+    caffeine:
+      spec: maximumSize=1000,expireAfterWrite=10m      # size limit + TTL</code></pre>
+  <p>With several application instances, a local cache means each instance has its own copy: after an update on instance A, instance B still serves the old value until its TTL ends. That is acceptable for slowly changing data with a short TTL; for anything stricter use Redis (next article).</p>
+
+  <h4>What to cache, what not to cache</h4>
+  <ul>
+    <li><strong>Good candidates:</strong> read-heavy data that changes rarely (job categories, company profiles, config), results of expensive calculations, responses of slow third-party APIs.</li>
+    <li><strong>Bad candidates:</strong> data that must be exactly current (account balance, stock count), per-user data without the user in the key, huge results, anything cheap to compute, and entities with lazy associations (cache DTOs instead; <a href="#m3">module 3</a>).</li>
+    <li><strong>Cache DTOs/records, not JPA entities.</strong> A cached entity is detached, may have uninitialised lazy fields, and cannot be serialised cleanly.</li>
+    <li><strong>Always set a TTL.</strong> It is your safety net if an eviction is missed.</li>
+  </ul>
+
+  <h4>Invalidation strategy</h4>
+  <ol class="steps">
+    <li><strong>Time-based:</strong> every entry expires after a TTL (60 seconds to a few hours). Simple and always works; data may be a little stale.</li>
+    <li><strong>Event-based:</strong> evict or update on every write (<code>@CacheEvict</code>, <code>@CachePut</code>). Fresher, but you must cover every write path (also bulk updates, SQL scripts, other services).</li>
+    <li><strong>Combine both:</strong> evict on writes and keep a TTL as a backstop.</li>
+  </ol>
+
+  <h4>Transactions and caches</h4>
+  <p>Eviction runs when the method returns, which is <em>before</em> the transaction commits if the cache annotation and <code>@Transactional</code> sit on the same method. Another thread can then reload the old row and put the stale value back. For strictness, evict after commit (a <code>@TransactionalEventListener(phase = AFTER_COMMIT)</code>) or accept the short TTL.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Forgetting <code>@EnableCaching</code> and wondering why nothing is cached.</li>
+      <li>Caching without a TTL, so wrong data lives for ever.</li>
+      <li>A key that ignores a parameter (the second page returns the first page).</li>
+      <li>Caching a method that returns a mutable object, then modifying the object (with a local cache you modify the cached instance itself).</li>
+      <li>Caching exceptions or <code>null</code> by accident; use <code>unless</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>NoSuchCacheException</code> or "Cannot find cache named 'x'": the name is not in <code>spring.cache.cache-names</code> when the list is fixed.</li>
+      <li><code>@Cacheable</code> on a method with <code>void</code> return caches nothing useful.</li>
+      <li>A key of <code>null</code> (null argument) throws <code>IllegalArgumentException: Null key returned for cache operation</code>.</li>
+      <li>Caches that store <code>null</code>: Caffeine does not by default; Redis can (<code>cache-null-values</code>, default true).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How does <code>@Cacheable</code> work?" Proxy, key, cache lookup, call on miss. "Why does it not work when I call the method from the same class?" Proxy bypass. "<code>@CachePut</code> vs <code>@Cacheable</code>?" Always run and store vs skip on hit. "How do you avoid stale data?" TTL plus eviction on writes. "Local vs distributed cache?" Caffeine vs Redis trade-offs in the table above.</p>
+  </div>
+</article>
+
+<article class="topic" id="m6-redis-cache">
+  <h3>Redis as a cache: setup, TTL, JSON serialization and RedisTemplate</h3>
+  <p class="tldr">Add the Redis and cache starters, set spring.cache.type=redis with a TTL, configure JSON serialization so cached values are readable and safe to change, and use StringRedisTemplate directly for counters, locks and other non-cache uses.</p>
+
+  <h4>What Redis gives you</h4>
+  <p><strong>Redis</strong> is an in-memory key-value server. All your application instances talk to the same Redis, so a value cached by one is visible to all, and an eviction on one removes it for all. It is fast (sub-millisecond on a local network), supports TTL on every key, and also offers counters, sets, sorted sets, pub/sub and atomic operations. Keep it for data you can lose: a cache is a copy, the database stays the source of truth. More on Redis internals in <a href="03-sql-databases.html#m6">SQL · Module 6</a>.</p>
+
+  <h4>Setup</h4>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-data-redis&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-cache&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <pre data-title="application.yml"><code class="language-yaml">spring:
+  data:
+    redis:
+      host: localhost                  # the service name in Docker Compose, e.g. redis
+      port: 6379
+      password: ${REDIS_PASSWORD:}     # empty for local development
+      timeout: 2s
+  cache:
+    type: redis
+    redis:
+      time-to-live: 10m                # default TTL for every cache
+      key-prefix: "jobs-api::"
+      use-key-prefix: true
+      cache-null-values: false</code></pre>
+  <pre data-title="Run Redis locally"><code class="language-shell">$ docker run -d --name redis -p 6379:6379 redis:7
+$ docker exec -it redis redis-cli
+127.0.0.1:6379&gt; KEYS *
+1) "jobs-api::jobs::7"
+127.0.0.1:6379&gt; TTL "jobs-api::jobs::7"
+(integer) 583</code></pre>
+  <p>Use the property <code>spring.data.redis.*</code> on Boot 3.x and 4.x (older Boot 2 used <code>spring.redis.*</code>). The default client is Lettuce, which is thread-safe and works with the connection pooling Boot sets up.</p>
+
+  <h4>Serialization: the important detail</h4>
+  <p>Redis stores bytes. By default the Spring cache uses <strong>JDK serialization</strong>, which has three problems: your cached classes must implement <code>Serializable</code>; the stored bytes are unreadable in <code>redis-cli</code>; and a change to the class (a new field) can make old entries fail to deserialize after a deployment. Most projects switch to <strong>JSON</strong>.</p>
+  <pre data-title="CacheConfig.java"><code class="language-java">import java.time.Duration;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.cache.RedisCacheConfiguration;
+import org.springframework.data.redis.cache.RedisCacheManager;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext.SerializationPair;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+@Configuration
+@EnableCaching
+public class CacheConfig {
+
+    @Bean
+    RedisCacheConfiguration defaultCacheConfig() {
+        return RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofMinutes(10))
+                .disableCachingNullValues()
+                .serializeKeysWith(SerializationPair.fromSerializer(new StringRedisSerializer()))
+                .serializeValuesWith(SerializationPair.fromSerializer(
+                        new GenericJackson2JsonRedisSerializer()));
+    }
+
+    @Bean
+    RedisCacheManager cacheManager(RedisConnectionFactory factory,
+                                   RedisCacheConfiguration defaults) {
+        return RedisCacheManager.builder(factory)
+                .cacheDefaults(defaults)
+                .withCacheConfiguration("jobs", defaults.entryTtl(Duration.ofHours(1)))
+                .withCacheConfiguration("jobList", defaults.entryTtl(Duration.ofMinutes(1)))
+                .build();
+    }
+}</code></pre>
+  <p>The per-cache TTL is the main reason to define the manager yourself: categories can live for hours, search results for a minute. <code>GenericJackson2JsonRedisSerializer</code> writes the class name into the JSON (<code>@class</code>) so it can rebuild the right type. Records and immutable DTOs work with Jackson, but they must be deserializable (a record is fine). The stored JSON is readable:</p>
+  <pre class="out" data-title="redis-cli: GET jobs-api::jobs::7"><code class="language-json">{"@class":"com.example.jobs.job.JobResponse","id":7,"title":"Java Developer",
+ "company":"Acme","city":"Pune"}</code></pre>
+  <div class="co co-version">
+    <p class="co-t">Version note</p>
+    <p>Spring Boot 4 moves to Jackson 3, and Spring Data Redis 4 adds serializers for it next to the Jackson 2 ones. The idea above is the same on every version (key serializer = string, value serializer = JSON), but the exact serializer class name differs; check the Spring Data Redis reference for your version before you copy the code. Properties under <code>spring.cache.redis.*</code> do not change.</p>
+  </div>
+  <div class="co co-rule">
+    <p class="co-t">Rule: cached data is a contract between deployments</p>
+    <p>During a rolling deploy, old and new application versions share one Redis. If the new version changes a cached class, old entries may not deserialize and every request throws <code>SerializationException</code>. Include a version in the key prefix (<code>jobs-v2::</code>) when you change a cached class, or flush the cache on deployment. Also treat a Redis failure as a cache miss, not an error (below).</p>
+  </div>
+
+  <h4>If Redis is down</h4>
+  <p>By default a cache error becomes an exception and the request fails, although the database is healthy. For a cache that is only an optimisation, you can register a <code>CacheErrorHandler</code> that logs and continues:</p>
+  <pre data-title="Cache errors should not break requests"><code class="language-java">@Configuration
+public class CacheErrorConfig implements CachingConfigurer {
+
+    private static final Logger log = LoggerFactory.getLogger(CacheErrorConfig.class);
+
+    @Override
+    public CacheErrorHandler errorHandler() {
+        return new SimpleCacheErrorHandler() {
+            @Override
+            public void handleCacheGetError(RuntimeException ex, Cache cache, Object key) {
+                log.warn("Cache get failed: {} {}", cache.getName(), key, ex);   // act as a miss
+            }
+            @Override
+            public void handleCachePutError(RuntimeException ex, Cache cache, Object key,
+                                            Object value) {
+                log.warn("Cache put failed: {} {}", cache.getName(), key, ex);
+            }
+        };
+    }
+}</code></pre>
+  <p>Combine it with a short connection timeout (<code>spring.data.redis.timeout</code>) so a dead Redis does not hang every request for 60 seconds. Circuit breakers for this kind of problem appear in <a href="#m7-resilience4j">Resilience4j</a>.</p>
+
+  <h4>RedisTemplate and StringRedisTemplate</h4>
+  <p>The cache abstraction hides Redis. When you want Redis features directly, inject a template. <code>StringRedisTemplate</code> (keys and values are plain strings) is the simplest and the one you will use most; <code>RedisTemplate&lt;K, V&gt;</code> is generic and needs serializers configured.</p>
+  <pre data-title="OtpService.java: a value with an expiry"><code class="language-java">@Service
+public class OtpService {
+
+    private final StringRedisTemplate redis;
+
+    public OtpService(StringRedisTemplate redis) { this.redis = redis; }
+
+    public void store(String email, String otp) {
+        redis.opsForValue().set("otp:" + email, otp, Duration.ofMinutes(5));   // SET with TTL
+    }
+
+    public boolean verify(String email, String otp) {
+        String key = "otp:" + email;
+        String saved = redis.opsForValue().get(key);
+        if (saved != null &amp;&amp; saved.equals(otp)) {
+            redis.delete(key);                  // one-time use
+            return true;
+        }
+        return false;
+    }
+
+    public long viewCount(Long jobId) {
+        Long n = redis.opsForValue().increment("views:job:" + jobId);   // atomic INCR
+        return n == null ? 0 : n;
+    }
+}</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operations object</th><th>Redis type</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><code>opsForValue()</code></td><td>String</td><td>Cache entries, counters, OTP, tokens</td></tr>
+      <tr><td><code>opsForHash()</code></td><td>Hash</td><td>Small objects, sessions</td></tr>
+      <tr><td><code>opsForList()</code></td><td>List</td><td>Simple queues, recent items</td></tr>
+      <tr><td><code>opsForSet()</code></td><td>Set</td><td>Unique members, "already seen" checks</td></tr>
+      <tr><td><code>opsForZSet()</code></td><td>Sorted set</td><td>Leaderboards, sliding-window rate limits</td></tr>
+    </tbody>
+  </table></div>
+  <p>Typical real uses beyond caching: login/OTP tokens with expiry, rate-limit counters (<a href="#m6-rate-limiting">rate limiting</a>), distributed locks, a blacklist of revoked JWTs (<a href="#m4">module 4</a>), and Spring Session to share HTTP sessions between instances.</p>
+
+  <h4>Testing with Redis</h4>
+  <p>In tests, run a real Redis with Testcontainers (<code>@ServiceConnection</code> with <code>GenericContainer</code> for Redis, see <a href="#m5">module 5</a>) instead of mocking it; serialization bugs only show against the real thing. For unit tests that do not care, set <code>spring.cache.type=none</code>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Leaving JDK serialization on: unreadable values and <code>NotSerializableException</code> for DTOs.</li>
+      <li>No TTL at all: Redis memory grows until it evicts keys or runs out.</li>
+      <li>Running <code>KEYS *</code> on a production Redis (it blocks the single-threaded server); use <code>SCAN</code>.</li>
+      <li>Keeping the only copy of important data in Redis without persistence.</li>
+      <li>Hard-coded host <code>localhost</code> in a container; use the service name from Compose (<a href="#m7-compose">Compose</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>RedisConnectionFailureException: Unable to connect to Redis</code> when the server is down or the host is wrong.</li>
+      <li><code>SerializationException</code> when the stored JSON no longer matches the class.</li>
+      <li>A key with a prefix: <code>allEntries = true</code> deletes only keys that match the cache name prefix, so one cache does not clear another.</li>
+      <li>Redis eviction policy (<code>maxmemory-policy</code>) can drop keys even before their TTL when memory is full.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you set up Redis caching in Spring Boot?" Two starters, <code>spring.cache.type=redis</code>, <code>@EnableCaching</code>, TTL, JSON serializer. "Why not default serialization?" Needs Serializable, unreadable, brittle. "Redis down: what happens?" Add a <code>CacheErrorHandler</code> and timeouts. "Local vs distributed cache?" Consistency across instances. "What else is Redis used for?" OTP, counters, locks, sessions, rate limits.</p>
+  </div>
+</article>
+
+<article class="topic" id="m6-scheduling">
+  <h3>Scheduled jobs with @Scheduled</h3>
+  <p class="tldr">Enable scheduling, annotate a no-argument method with fixedRate, fixedDelay or a six-field cron expression, remember that the default scheduler uses one thread, and use a lock such as ShedLock when several instances must run the job only once.</p>
+
+  <h4>What and why</h4>
+  <p>Some work is not triggered by a user: close expired jobs every night, send a daily digest at 9 am, clear old uploads, retry failed emails. A <strong>scheduled job</strong> is a method that Spring calls repeatedly on a timetable, inside your application, with no extra tool.</p>
+  <pre data-title="JobExpiryTask.java"><code class="language-java">@Configuration
+@EnableScheduling                       // switches the feature on
+class SchedulingConfig { }
+
+@Component
+public class JobExpiryTask {
+
+    private static final Logger log = LoggerFactory.getLogger(JobExpiryTask.class);
+    private final JobService jobService;
+
+    public JobExpiryTask(JobService jobService) { this.jobService = jobService; }
+
+    @Scheduled(cron = "0 30 0 * * *", zone = "Asia/Kolkata")     // 00:30 IST every day
+    public void closeExpiredJobs() {
+        int closed = jobService.closeJobsPastDeadline();
+        log.info("Closed {} expired jobs", closed);
+    }
+}</code></pre>
+  <p>The annotated method must return <code>void</code> (a returned value is ignored) and take no parameters. The bean can be any Spring component.</p>
+
+  <h4>Timing options</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Attribute</th><th>Meaning</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>fixedRate</code></td><td>Start every N ms, measured from the <em>start</em> of the previous run</td><td><code>fixedRate = 60000</code></td></tr>
+      <tr><td><code>fixedDelay</code></td><td>Wait N ms after the previous run <em>finished</em></td><td><code>fixedDelay = 30000</code></td></tr>
+      <tr><td><code>initialDelay</code></td><td>Wait before the first run (with fixedRate/fixedDelay)</td><td><code>initialDelay = 10000</code></td></tr>
+      <tr><td><code>cron</code></td><td>A calendar expression</td><td><code>cron = "0 0 9 * * MON-FRI"</code></td></tr>
+      <tr><td><code>zone</code></td><td>Time zone for cron</td><td><code>zone = "Asia/Kolkata"</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Use <code>fixedDelay</code> when runs must never overlap and you want a rest between them (polling a table). Use <code>fixedRate</code> for a steady rhythm, but note that if a run takes longer than the period, the next run starts as soon as the previous ends, because by default runs of the same task never overlap on one scheduler thread. Both accept string forms that read properties or use Duration text: <code>@Scheduled(fixedDelayString = "${app.poll-delay:PT30S}")</code>.</p>
+  <pre data-title="Timing examples"><code class="language-java">@Scheduled(fixedRate = 60_000, initialDelay = 10_000)    // every minute, first after 10 s
+void heartbeat() { ... }
+
+@Scheduled(fixedDelayString = "${app.mail.retry-delay:PT5M}")   // 5 minutes after finishing
+void retryFailedEmails() { ... }
+
+@Scheduled(cron = "${app.digest.cron}", zone = "Asia/Kolkata")  // cron from configuration
+void dailyDigest() { ... }</code></pre>
+
+  <h4>Spring cron vs Unix cron</h4>
+  <p>Spring's cron has <strong>six fields</strong>, with seconds first; classic Unix cron has five.</p>
+  <pre class="out" data-title="Spring cron: second minute hour day-of-month month day-of-week"><code class="language-plaintext">┌──────── second (0-59)
+│ ┌────── minute (0-59)
+│ │ ┌──── hour (0-23)
+│ │ │ ┌── day of month (1-31)
+│ │ │ │ ┌ month (1-12 or JAN-DEC)
+│ │ │ │ │ ┌ day of week (MON-SUN, or 0-7)
+0 0 9 * * MON-FRI        weekdays at 09:00
+0 */15 * * * *           every 15 minutes
+0 0 2 1 * *              1st of every month at 02:00
+0 0 0 * * *              midnight; also written with the macro  @daily  /  "@midnight"</code></pre>
+  <p>Common surprises: a Unix expression like <code>0 9 * * 1-5</code> has five fields and Spring rejects it (<code>IllegalStateException: Encountered invalid @Scheduled method ... cron expression must consist of 6 fields</code>). Without <code>zone</code>, the time zone is the server's, which in a Docker container is usually UTC, so "9 am" silently means 2:30 pm in India. Always set <code>zone</code>. Spring also supports <code>L</code> (last day), <code>#</code> (nth weekday) and macros such as <code>@hourly</code>, <code>@daily</code>.</p>
+
+  <h4>The single-thread default and a thread pool</h4>
+  <p>By default all <code>@Scheduled</code> methods in the application share <strong>one thread</strong> (Boot's auto-configured <code>ThreadPoolTaskScheduler</code> has pool size 1). If one job takes ten minutes, every other job waits. Give the scheduler more threads:</p>
+  <pre data-title="application.yml"><code class="language-yaml">spring:
+  task:
+    scheduling:
+      thread-name-prefix: sched-
+      pool:
+        size: 5                          # default is 1</code></pre>
+  <p>Even with a pool, one <em>task</em> still does not run concurrently with itself. For truly parallel work, hand the job to an executor (<code>@Async</code>, <a href="#m6-async">next article</a>) and keep the scheduled method short. Exceptions: if a scheduled method throws, Spring logs it and the schedule continues (for <code>fixedRate</code>/<code>cron</code> the next run still happens). Catch exceptions yourself to log with context and to avoid half-finished batches.</p>
+
+  <h4>Running the job only once in a cluster</h4>
+  <p>If you run three instances of the application, <strong>every instance runs the scheduled job</strong>, so every candidate gets three digest emails. Options:</p>
+  <ul>
+    <li><strong>A lock in the database or Redis: ShedLock.</strong> A small library; before the job runs, an instance tries to write a lock row. Only the winner runs the job.</li>
+    <li><strong>One dedicated instance</strong> (a "worker" profile) runs scheduling; others disable it with a property or profile.</li>
+    <li><strong>An external scheduler</strong> (Kubernetes CronJob, Quartz cluster, a cloud scheduler) that triggers an HTTP endpoint or runs a container.</li>
+  </ul>
+  <pre data-title="ShedLock (brief): table, config and usage"><code class="language-java">// Table: shedlock(name varchar(64) primary key, lock_until timestamp,
+//                 locked_at timestamp, locked_by varchar(255))
+
+@Configuration
+@EnableScheduling
+@EnableSchedulerLock(defaultLockAtMostFor = "PT10M")
+class SchedulingConfig {
+    @Bean
+    LockProvider lockProvider(DataSource dataSource) {
+        return new JdbcTemplateLockProvider(dataSource);
+    }
+}
+
+@Scheduled(cron = "0 0 9 * * *", zone = "Asia/Kolkata")
+@SchedulerLock(name = "dailyDigest", lockAtMostFor = "PT5M", lockAtLeastFor = "PT1M")
+public void dailyDigest() { ... }</code></pre>
+  <p><code>lockAtMostFor</code> releases the lock even if the instance crashes; set it longer than the longest normal run. <code>lockAtLeastFor</code> stops a fast job from running again on another instance with a slightly different clock. ShedLock needs a lock provider (JDBC, Redis, Mongo and others) from its own dependencies; check its README for the current artifact names.</p>
+
+  <h4>Designing good scheduled jobs</h4>
+  <ul>
+    <li><strong>Idempotent:</strong> running twice must not do harm (the job may run twice after a crash or on two instances). Mark processed rows, or select rows with <code>status = 'PENDING'</code>.</li>
+    <li><strong>Batch size:</strong> process 100 rows at a time, not a million in one transaction.</li>
+    <li><strong>Log start, end and count</strong>, and add a counter or timer metric (<a href="#m6-micrometer">Micrometer</a>) so you notice when it stops.</li>
+    <li><strong>Transactions:</strong> the scheduled method has no transaction; call a <code>@Transactional</code> service method (from another bean, not <code>this</code>).</li>
+    <li><strong>Make it testable:</strong> put the logic in a service and test the service; test the schedule by calling the method directly.</li>
+    <li><strong>Virtual threads:</strong> with <code>spring.threads.virtual.enabled=true</code> Boot runs scheduled tasks on virtual threads too (<a href="#m6-async">Async</a>).</li>
+  </ul>
+  <p>Programmatic scheduling is possible with <code>TaskScheduler.schedule(runnable, trigger)</code>, useful when the schedule comes from the database.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Forgetting <code>@EnableScheduling</code> (nothing runs, no error).</li>
+      <li>A five-field cron, or no time zone.</li>
+      <li>Long job blocking a pool of one, so other jobs are late.</li>
+      <li>Three instances sending three emails.</li>
+      <li>Annotating a method that takes parameters.</li>
+      <li>Calling a <code>@Transactional</code> method of the same class (self-invocation).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"fixedRate vs fixedDelay?" Start-to-start vs end-to-start. "What if the app runs on three servers?" Every instance runs it; use ShedLock, a single worker, or an external scheduler. "Why did my 9 am job run at the wrong time?" Missing <code>zone</code>, server in UTC. "Default number of scheduler threads?" One.</p>
+  </div>
+</article>

@@ -1,0 +1,527 @@
+<div class="mintro">
+  <p>Low-level design (LLD) interviews ask you to turn a vague real-world idea ("design a parking lot") into classes, relationships and working Java code in about an hour. There is no single right answer. The interviewer watches how you ask questions, pick entities, apply the <a href="#m1">design principles</a> and <a href="#m2">patterns</a> where they help, handle two users clicking at the same time, and explain your choices.</p>
+  <p>This module first teaches how these interviews are scored and a repeatable method for them. It then covers the one topic that separates average from strong answers: concurrency, especially double booking. After that come ten classic problems, each with requirements, a class diagram, core code, edge cases and the follow-up questions interviewers love. Every problem reuses the same few ideas, so the tenth feels much easier than the first.</p>
+  <p>Background you may want open in another tab: <a href="02-core-java.html#m6">Core Java · Module 6 (multithreading)</a> and <a href="03-sql-databases.html#m5">SQL · Module 5 (how databases work inside)</a>.</p>
+  <ul>
+    <li>Run a 45–60 minute LLD interview from clarifying questions to final code, using a script.</li>
+    <li>Model any problem as entities, relationships, enums and a few well-placed patterns.</li>
+    <li>Explain and prevent double booking with locks, database constraints, versions and seat holds.</li>
+    <li>Write compilable core Java for ten standard problems: parking lot, tic-tac-toe, library, vending machine, elevator, LRU cache, Splitwise, BookMyShow, rate limiter and food delivery.</li>
+    <li>Answer the usual follow-ups ("make it thread safe", "add a new vehicle type", "support undo") without redesigning from scratch.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m3-how-lld-interviews-work">
+  <h3>How LLD interviews work and how they are scored</h3>
+  <p class="tldr">An LLD round is a 45–60 minute conversation where you gather requirements, model entities, draw a class diagram and write core code; interviewers score communication and design judgement at least as much as the final code.</p>
+
+  <h4>What the round looks like</h4>
+  <p>You get one sentence: "Design a parking lot" or "Design BookMyShow". The interviewer is deliberately vague. A whiteboard, a shared document or an IDE is open. You are expected to talk the whole time. At product companies and startups the round often ends with runnable code and a small <code>main</code> that proves it works. At service companies the round may stop at the class diagram and a few key methods. Either way the same skills are checked.</p>
+  <p>This is different from a <strong>high-level design (HLD)</strong> round. HLD is about servers, databases, caches and scale across machines. LLD is about classes, interfaces and methods inside one service. The LLD interviewer cares whether your code is easy to extend, test and read.</p>
+
+  <h4>The scoring rubric</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Area</th><th>What a strong candidate shows</th><th>Weak signal</th></tr></thead>
+    <tbody>
+      <tr><td>Requirement gathering</td><td>Asks 5–8 sharp questions, states assumptions, sets scope</td><td>Starts drawing at once</td></tr>
+      <tr><td>Object modelling</td><td>Nouns become classes with one clear job; sensible enums; correct relationships</td><td>One god class, or 30 tiny classes</td></tr>
+      <tr><td>Patterns used sensibly</td><td>Strategy, State, Observer only where a real variation exists, and says why</td><td>Pattern name-dropping, Singleton everywhere</td></tr>
+      <tr><td>Code quality</td><td>Clean names, small methods, interfaces, validation, no copy-paste</td><td>Public fields, giant <code>if/else</code> chains</td></tr>
+      <tr><td>Extensibility</td><td>Adding a vehicle type or pricing rule needs a new class, not edits in five places</td><td>Every change touches existing code</td></tr>
+      <tr><td>Concurrency</td><td>Spots shared state, protects the critical section, knows DB-level options</td><td>Never mentions threads</td></tr>
+      <tr><td>Communication</td><td>Thinks aloud, checks in, accepts hints, explains trade-offs</td><td>Silent coding, defensive about feedback</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A 45–60 minute plan</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A["Clarify (5-8 min)"] --> B["Entities and APIs (5 min)"]
+  B --> C["Class diagram (8-10 min)"]
+  C --> D["Core code (20-25 min)"]
+  D --> E["Edge cases and concurrency (5 min)"]
+  E --> F["Extensions and Q and A (5 min)"]
+</pre>
+    <figcaption>Time plan for a 60-minute round; shrink the code step for a 45-minute round</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><strong>Clarify (5–8 min).</strong> Ask questions, write the agreed requirements as bullets, mark what is out of scope.</li>
+    <li><strong>Entities and public API (5 min).</strong> List nouns, then the 3–5 methods the outside world calls, such as <code>park(vehicle)</code> and <code>unpark(ticket)</code>.</li>
+    <li><strong>Class diagram (8–10 min).</strong> Boxes, relationships, enums, where patterns plug in.</li>
+    <li><strong>Core code (20–25 min).</strong> Write the model, then the main flow. Skip getters and trivial classes; say "assume getters".</li>
+    <li><strong>Edge cases and concurrency (5 min).</strong> Walk the failure paths; name the shared state and how you protect it.</li>
+    <li><strong>Extensions (5 min).</strong> Answer "what if we add X". A good design absorbs it with one new class.</li>
+  </ol>
+
+  <h4>A script: what to say at each step</h4>
+  <dl class="terms">
+    <dt>Opening</dt><dd>"Before I design, I would like to confirm the scope. Let me ask a few questions, then I will state my assumptions."</dd>
+    <dt>After requirements</dt><dd>"So the core use cases are A, B and C. I will leave payments and notifications out unless you want them. Is that fine?"</dd>
+    <dt>Modelling</dt><dd>"I see these entities: ... The relationship between X and Y is one-to-many, so X holds a list of Y."</dd>
+    <dt>Choosing a pattern</dt><dd>"Pricing can change independently of parking, so I will put it behind a <code>PricingStrategy</code> interface. That keeps <code>ParkingLot</code> closed for modification."</dd>
+    <dt>Before coding</dt><dd>"I will code the model first, then the main flow, and leave getters and tests for the end."</dd>
+    <dt>Concurrency</dt><dd>"Two users can reach this method together. The shared state is X, so I protect this critical section with Y."</dd>
+    <dt>Closing</dt><dd>"Known limits: in-memory only, single JVM. For persistence I would add a repository interface and a DB constraint on Z."</dd>
+  </dl>
+
+  <h4>Clarifying questions that work for almost any problem</h4>
+  <ul>
+    <li>Who are the users or actors (customer, admin, system)? Which of them do we support first?</li>
+    <li>What are the three or four main use cases? What is explicitly out of scope (payments, UI, notifications)?</li>
+    <li>What are the variations (vehicle types, payment modes, split types)? Will new ones be added later?</li>
+    <li>What are the limits and sizes (capacity, number of floors, users)? This decides data structures.</li>
+    <li>Is it a single process or several servers? Do we need thread safety? Do we need persistence?</li>
+    <li>What happens on failure (lot full, item out of stock, payment declined)? Exception, error code or retry?</li>
+    <li>Do we need history, audit or reports?</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes that cost the offer</p>
+    <ul>
+      <li><strong>Jumping to code</strong> with no requirements or diagram. You will rewrite it half-way.</li>
+      <li><strong>God classes:</strong> one <code>ParkingLot</code> that parks, prices, prints tickets and talks to the database. See <a href="#m1">SRP</a>.</li>
+      <li><strong>Overusing patterns:</strong> a Factory for a class with one constructor, or Singleton for everything. Use a pattern when you can name the variation it protects.</li>
+      <li><strong>Ignoring concurrency</strong> in booking, inventory or counter problems.</li>
+      <li><strong>Using strings and ints</strong> where an enum or a small class is clearer.</li>
+      <li><strong>Silent coding:</strong> 15 minutes without a word. The interviewer cannot score what they cannot hear.</li>
+      <li><strong>Gold-plating:</strong> designing a payment gateway when the question was a vending machine.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">If the interviewer interrupts with a hint</p>
+    <p>Take it. Say "good point, that changes X" and adjust. Interviewers give hints when they want to see how you collaborate. Arguing, or ignoring the hint, scores worse than a flawed first design.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-lld-method">
+  <h3>The LLD method: requirements to code, with a worked example</h3>
+  <p class="tldr">Follow five steps every time: requirements, entities, class diagram, core code, edge cases; here the method is applied to a small shopping cart with discounts.</p>
+
+  <h4>The five steps</h4>
+  <ol class="steps">
+    <li><strong>Requirements.</strong> Split into <em>functional</em> (what the system does) and <em>non-functional</em> (thread safety, extensibility, performance). Write assumptions down.</li>
+    <li><strong>Entities.</strong> Underline the nouns in the requirements: they are candidate classes. Verbs become methods. Things with a fixed set of values become <code>enum</code>s. Things that vary by behaviour become interfaces.</li>
+    <li><strong>Class diagram.</strong> Decide relationships: <em>has-a</em> (composition/aggregation), <em>is-a</em> (inheritance, used sparingly), <em>uses</em> (dependency). See <a href="#m1">Module 1 on UML</a>.</li>
+    <li><strong>Core code.</strong> Model classes first (immutable where possible), then the one service class that runs the main use case. Depend on interfaces, inject them through the constructor.</li>
+    <li><strong>Edge cases.</strong> Null and empty input, limits, duplicates, failure paths, concurrent callers.</li>
+  </ol>
+
+  <div class="co co-tip">
+    <p class="co-t">Noun-verb trick</p>
+    <p>Not every noun is a class. "Customer name" is a field of <code>Customer</code>, not a class. Make a class only if it has its own data <em>and</em> behaviour, or its own identity and lifecycle. Not every verb is a method on the first noun you thought of: ask "who has the data needed to do this?" and put the method there.</p>
+  </div>
+
+  <h4>Worked example: shopping cart with discounts</h4>
+  <h5>1. Requirements (and assumptions)</h5>
+  <ul>
+    <li>A customer adds items with quantity to a cart and sees the total.</li>
+    <li>Discounts: a percentage off the whole cart, and "flat amount off if total is above a threshold". More rules will come later.</li>
+    <li>Assumptions: single currency, money kept in paise (<code>long</code>) to avoid floating point errors, one discount at a time, single user per cart (no concurrency).</li>
+  </ul>
+  <h5>2. Entities</h5>
+  <p>Nouns: cart, item, product, discount. Items have a price and quantity. Discount rules <em>vary</em>, so <code>DiscountRule</code> is an interface (the <a href="#m2">Strategy pattern</a>). Cart is the class that owns items and applies a rule.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class Cart {
+    -List~CartItem~ items
+    +add(Product p, int qty) void
+    +subtotal() long
+    +total(DiscountRule rule) long
+  }
+  class CartItem {
+    -Product product
+    -int quantity
+    +lineTotal() long
+  }
+  class Product {
+    -String name
+    -long pricePaise
+  }
+  class DiscountRule {
+    &lt;&lt;interface&gt;&gt;
+    +discount(long subtotal) long
+  }
+  class PercentOff
+  class FlatOffAboveThreshold
+  Cart "1" *-- "many" CartItem
+  CartItem --> Product
+  Cart ..> DiscountRule : uses
+  DiscountRule &lt;|.. PercentOff
+  DiscountRule &lt;|.. FlatOffAboveThreshold
+</pre>
+    <figcaption>Cart owns items; the discount rule is a swappable strategy</figcaption>
+  </figure>
+
+  <h5>3. Core code</h5>
+  <pre data-title="CartModel.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+record Product(String name, long pricePaise) { }
+
+record CartItem(Product product, int quantity) {
+    CartItem {
+        if (quantity &lt;= 0) throw new IllegalArgumentException("quantity must be positive");
+    }
+    long lineTotal() { return product.pricePaise() * quantity; }
+}
+
+interface DiscountRule {
+    long discount(long subtotalPaise);          // how much to subtract
+}
+
+class PercentOff implements DiscountRule {
+    private final int percent;
+    PercentOff(int percent) { this.percent = percent; }
+    public long discount(long subtotal) { return subtotal * percent / 100; }
+}
+
+class FlatOffAboveThreshold implements DiscountRule {
+    private final long threshold, flat;
+    FlatOffAboveThreshold(long threshold, long flat) {
+        this.threshold = threshold;
+        this.flat = flat;
+    }
+    public long discount(long subtotal) { return subtotal &gt;= threshold ? flat : 0; }
+}</code></pre>
+  <pre data-title="Cart.java"><code class="language-java">class Cart {
+    private final List&lt;CartItem&gt; items = new ArrayList&lt;&gt;();
+
+    void add(Product product, int quantity) {
+        items.add(new CartItem(product, quantity));
+    }
+
+    long subtotal() {
+        return items.stream().mapToLong(CartItem::lineTotal).sum();
+    }
+
+    long total(DiscountRule rule) {
+        long sub = subtotal();
+        long off = Math.min(rule.discount(sub), sub);   // never go below zero
+        return sub - off;
+    }
+}
+
+public class CartDemo {
+    public static void main(String[] args) {
+        Cart cart = new Cart();
+        cart.add(new Product("Keyboard", 150_000), 1);
+        cart.add(new Product("Mouse", 50_000), 2);
+        System.out.println(cart.total(new PercentOff(10)));
+        System.out.println(cart.total(new FlatOffAboveThreshold(200_000, 30_000)));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">225000
+220000</code></pre>
+
+  <h5>4. Edge cases and extensions</h5>
+  <ul>
+    <li>Quantity zero or negative: rejected in the record's compact constructor.</li>
+    <li>A discount larger than the subtotal: capped with <code>Math.min</code>.</li>
+    <li>Empty cart: subtotal 0, total 0, no exception.</li>
+    <li>"Add coupon codes": a new <code>DiscountRule</code> class. <code>Cart</code> does not change (open/closed principle).</li>
+    <li>"Combine two discounts": a <code>CompositeRule</code> that holds a list of rules (the Composite idea from <a href="#m2">Module 2</a>).</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: keep money in integers</p>
+    <p>Store paise or cents in a <code>long</code>, or use <code>BigDecimal</code>. <code>double</code> cannot represent 0.1 exactly, so totals drift by a paisa and tests fail in surprising ways.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: depend on interfaces, build in <code>main</code></p>
+    <p>Pass collaborators (rules, repositories, clocks) into constructors. In an interview this single habit shows dependency inversion, makes the code testable, and costs nothing.</p>
+  </div>
+  <h4>Why you need a method</h4>
+  <p>Most candidates fail an LLD round not because they do not know patterns, but because they start typing classes in the first minute. Halfway through they discover a requirement they never asked about, the design has no room for it, and the clock is running. A fixed method makes your thinking visible, keeps you from forgetting steps under stress, and gives the interviewer easy places to steer you. How the round is scored is explained in <a href="#m3-how-lld-interviews-work">How LLD interviews work</a>; this article is the step-by-step routine you follow inside that round.</p>
+
+  <h4>The interview flow with a time budget</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A["Clarify (5 min)"] --> B["Entities (5 min)"]
+  B --> C["Class diagram (10 min)"]
+  C --> D["Core code (20 min)"]
+  D --> E["Edge cases and extensions (5 min)"]
+</pre>
+    <figcaption>A typical 45-minute split; adjust if the interviewer asks for less code and more discussion</figcaption>
+  </figure>
+
+  <h4>Step 1 in detail: clarifying questions and what to say</h4>
+  <p>Never accept the one-line problem as the full problem. Ask short, specific questions, and say your assumption aloud so that the interviewer can correct you. A good set:</p>
+  <ul>
+    <li><strong>Scope:</strong> "Which features are in scope for today? I will cover X and Y, and leave Z as an extension. Is that fine?"</li>
+    <li><strong>Actors:</strong> "Who uses it: only customers, or admins too?"</li>
+    <li><strong>Rules:</strong> "Is there a limit, a time window, a priority order?" (for example, how many items, how long a loan lasts).</li>
+    <li><strong>Scale and concurrency:</strong> "Is it one process or many? Can two users act on the same item at the same time?"</li>
+    <li><strong>Persistence and interface:</strong> "Can I keep data in memory and skip the UI and database for now?"</li>
+    <li><strong>Extensibility:</strong> "Which part do you expect to change most? Pricing rules? Payment types?" This tells you where to put an interface.</li>
+  </ul>
+  <p>A sentence to say: "I will state my assumptions, then list entities, then draw the classes, then code the main flow. Stop me if you want a different order." It shows structure and invites guidance.</p>
+
+  <h4>Steps 2 and 3 in detail: from nouns to a diagram</h4>
+  <p>Write the requirement sentences on the board, underline nouns and circle verbs, then fill a small table. This is easy to explain aloud and hard to get wrong.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>In the requirement</th><th>Becomes</th><th>Example (cart)</th></tr></thead>
+    <tbody>
+      <tr><td>A noun with data and behaviour</td><td>Class</td><td><code>Cart</code>, <code>CartItem</code></td></tr>
+      <tr><td>A noun with only data</td><td>Field or record</td><td>price, quantity</td></tr>
+      <tr><td>A fixed set of values</td><td><code>enum</code></td><td><code>OrderStatus</code></td></tr>
+      <tr><td>"Different kinds of ..." / "rules will change"</td><td>Interface plus implementations</td><td><code>DiscountRule</code></td></tr>
+      <tr><td>A verb that belongs to one thing</td><td>Method on that class</td><td><code>cart.add()</code></td></tr>
+      <tr><td>A verb across several things</td><td>Service class</td><td><code>CheckoutService</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Say why each relationship is what it is: "A cart <em>owns</em> its items, so composition. A cart only <em>uses</em> a discount rule for one call, so a dependency." Pick a pattern only when a requirement points at it: "rules will change" suggests <a href="#m2-strategy">Strategy</a>; "status changes the behaviour" suggests <a href="#m2-state">State</a>; "notify several parties" suggests <a href="#m2-observer">Observer</a>. See the <a href="#m2-selection">selection cheat sheet</a>.</p>
+
+  <h4>Step 4 in detail: how to write the code</h4>
+  <ol class="steps">
+    <li>Start with enums and records (they are fast and show good habits).</li>
+    <li>Write the interfaces next, then one or two implementations, not all.</li>
+    <li>Write the service class with the main use case; inject collaborators through the constructor.</li>
+    <li>Add a short <code>main</code> that proves it works, with the expected output.</li>
+    <li>Say "I will skip getters and the remaining implementations; the pattern is the same." Interviewers prefer a clean core to a long dump.</li>
+  </ol>
+
+  <h4>Step 5 in detail: edge cases, concurrency and extensions</h4>
+  <p>Leave the last minutes for this; it is where senior candidates stand out. Walk through three lists out loud:</p>
+  <ul>
+    <li><strong>Bad input:</strong> null, empty, zero or negative values, unknown ids, duplicates.</li>
+    <li><strong>Concurrency:</strong> "Two users could check out the last item. The check and the update must be one atomic step. I would use <code>synchronized</code> on the item, or a database constraint if the data is persistent." The full toolbox is in <a href="#m3-concurrency-in-lld">Concurrency in LLD</a>.</li>
+    <li><strong>Extensions:</strong> name two changes and show where they go. "A coupon code is a new <code>DiscountRule</code>. A new payment method is a new class. Neither edits <code>Cart</code>."</li>
+  </ul>
+
+  <h4>Applying the method to a different problem</h4>
+  <p>"Design a notification service that sends email and SMS, and lets users choose channels." Nouns: user, notification, channel, preference. Channel varies, so it is an interface (<code>Channel</code> with <code>EmailChannel</code> and <code>SmsChannel</code>). Preferences are data held by the user. A <code>NotificationService.notify(user, message)</code> loops over the user's channels. Edge cases: a user with no channel, a failing channel (should the others still send?), retry, rate limit. Extension: push notification is one new class. The same five steps, five minutes of thinking, and the code writes itself.</p>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: jump into code and a pattern</p><pre><code class="language-java">// minute 1: "I will use a Factory and a Singleton"
+class NotificationFactory { /* ... */ }
+class NotificationManager { static NotificationManager instance; }</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: requirements decide the design</p><pre><code class="language-java">// minute 12: channels vary, so one small interface
+interface Channel { void send(String to, String text); }
+class NotificationService {
+    private final java.util.List&lt;Channel&gt; channels;
+    NotificationService(java.util.List&lt;Channel&gt; channels) { this.channels = channels; }
+}</code></pre></div>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Do not code before you have stated requirements and assumptions.</li>
+      <li>Every class must justify itself: data plus behaviour, or identity and lifecycle.</li>
+      <li>Money in integer units or <code>BigDecimal</code>; time through an injected <code>Clock</code> so tests can control it.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Keep one use case end to end instead of five half-written ones.</li>
+      <li>Keep the model free of I/O (no printing, no database calls inside entities).</li>
+      <li>Return results or throw clear exceptions; avoid returning <code>null</code> for failure.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases about the method itself</p>
+    <ul>
+      <li>If the interviewer says "just the class diagram", spend the saved time on relationships, multiplicity and extension points.</li>
+      <li>If the problem is a known one (parking lot, elevator), do not recite a memorised answer. Still ask your questions; the assumptions differ between interviewers.</li>
+      <li>If you get stuck, say what you would try next. Silence costs more than a wrong first guess.</li>
+    </ul>
+  </div>
+  
+  <div class="co co-interview">
+    <p class="co-t">Interview: using the method as an answer</p>
+    <ul>
+      <li><b>"How do you approach an LLD problem?"</b> Requirements and assumptions, entities from nouns, relationships and a class diagram, the core flow in code, then edge cases, concurrency and extensions. Mention that you ask questions first.</li>
+      <li><b>"What do you do when requirements are vague?"</b> Ask, state a default, and record it so you can change it later.</li>
+      <li><b>"How do you decide on an interface?"</b> Where the requirement says behaviour varies or will change.</li>
+      <li><b>"What would you improve with more time?"</b> Persistence, validation, tests, events and metrics.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-concurrency-in-lld">
+  <h3>Concurrency in LLD: preventing double booking</h3>
+  <p class="tldr">Double booking is a check-then-act race: two requests both see a seat free, then both book it; fix it by making the check and the write one atomic step using a lock, a database constraint, a row lock or a version column, and use holds with expiry for seats that are chosen but not yet paid.</p>
+
+  <h4>The race condition</h4>
+  <p>Booking code often reads: "if seat is free, mark it booked". The two steps (<em>check</em>, then <em>act</em>) are separate. If two threads interleave between them, both pass the check.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant A as User A
+  participant S as Seat 12
+  participant B as User B
+  A->>S: isFree()?
+  S-->>A: yes
+  B->>S: isFree()?
+  S-->>B: yes
+  A->>S: book(A)
+  B->>S: book(B)
+  Note over S: Both succeed. Seat sold twice.
+</pre>
+    <figcaption>Both users pass the check before either writes</figcaption>
+  </figure>
+  <pre data-title="Broken.java"><code class="language-java">class Seat {
+    private String bookedBy;                        // null means free
+
+    boolean book(String user) {
+        if (bookedBy == null) {                    // check
+            // another thread can run here
+            bookedBy = user;                       // act
+            return true;
+        }
+        return false;
+    }
+}</code></pre>
+  <p>The cure is always the same idea: make check and act <strong>atomic</strong>, so nobody can slip in between. How you do that depends on where the truth lives: in memory of one JVM, or in a database shared by many servers.</p>
+
+  <h4>Solution 1: in-memory locks (single JVM)</h4>
+  <p>See <a href="02-core-java.html#m6">Core Java · Module 6</a> for the basics of <code>synchronized</code>, <code>ReentrantLock</code> and the memory model.</p>
+  <pre data-title="SafeSeat.java"><code class="language-java">import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.locks.ReentrantLock;
+
+class SafeSeat {
+    private String bookedBy;
+
+    synchronized boolean book(String user) {       // lock on this seat object
+        if (bookedBy != null) return false;
+        bookedBy = user;
+        return true;
+    }
+
+    synchronized boolean isFreeUnsafe() { return bookedBy == null; }
+}
+
+class SeatMap {
+    // Lock-free style: putIfAbsent is atomic for ConcurrentHashMap
+    private final ConcurrentMap&lt;String, String&gt; owner = new ConcurrentHashMap&lt;&gt;();
+
+    boolean book(String seatId, String user) {
+        return owner.putIfAbsent(seatId, user) == null;   // null means we won
+    }
+}
+
+class MultiSeatBooking {
+    private final ReentrantLock lock = new ReentrantLock();   // one lock per show
+
+    boolean bookAll(java.util.List&lt;SafeSeat&gt; seats, String user) {
+        lock.lock();
+        try {
+            // check all first, then book all; needs to be one critical section
+            for (SafeSeat s : seats) if (!s.isFreeUnsafe()) return false;
+            seats.forEach(s -&gt; s.book(user));
+            return true;
+        } finally {
+            lock.unlock();                          // always unlock in finally
+        }
+    }
+}</code></pre>
+  <p>Look at the shape of the last class: when a booking touches <em>several</em> seats, one lock per seat is risky (deadlock if two users lock seats in opposite order). Two safe options: one lock per show (simple, less parallelism), or per-seat locks always taken in sorted seat-id order.</p>
+  <div class="co co-exc">
+    <p class="co-t">Why per-seat locks can deadlock</p>
+    <p>User A locks seat 5 then waits for seat 6. User B locks seat 6 then waits for seat 5. Neither moves. Fix: sort the seat ids and always lock in that order, or use <code>tryLock</code> with a timeout and roll back.</p>
+  </div>
+  <div class="co co-note">
+    <p class="co-t">In-memory locks stop at the JVM boundary</p>
+    <p>If you run two copies of your Spring Boot app behind a load balancer, <code>synchronized</code> in copy 1 knows nothing about copy 2. For a real booking system the database must be the referee.</p>
+  </div>
+
+  <h4>Solution 2: database constraints</h4>
+  <p>Make the invalid state impossible to store. A unique constraint on <code>(show_id, seat_id)</code> in a bookings table lets exactly one insert win; the loser gets a constraint violation, which you turn into "seat already taken".</p>
+  <pre data-title="schema.sql"><code class="language-sql">CREATE TABLE booking (
+    id        BIGSERIAL PRIMARY KEY,
+    show_id   BIGINT NOT NULL,
+    seat_id   BIGINT NOT NULL,
+    user_id   BIGINT NOT NULL,
+    created   TIMESTAMP NOT NULL DEFAULT now(),
+    CONSTRAINT uq_show_seat UNIQUE (show_id, seat_id)
+);
+
+-- Second insert for the same show and seat fails with a unique violation
+INSERT INTO booking (show_id, seat_id, user_id) VALUES (10, 12, 1);
+INSERT INTO booking (show_id, seat_id, user_id) VALUES (10, 12, 2);  -- error</code></pre>
+  <p>This is the strongest and simplest guard. In Spring you catch <code>DataIntegrityViolationException</code> and return a clean "seat taken" message. It works across any number of servers.</p>
+
+  <h4>Solution 3: pessimistic lock with SELECT ... FOR UPDATE</h4>
+  <p>Lock the rows you are about to change so others wait. Inside a transaction:</p>
+  <pre data-title="for-update.sql"><code class="language-sql">BEGIN;
+SELECT status FROM show_seat
+ WHERE show_id = 10 AND seat_id IN (12, 13)
+ ORDER BY seat_id            -- same order for everyone avoids deadlocks
+ FOR UPDATE;                  -- other transactions block here until we commit
+-- application checks every status = 'AVAILABLE'
+UPDATE show_seat SET status = 'BOOKED', user_id = 1
+ WHERE show_id = 10 AND seat_id IN (12, 13);
+COMMIT;</code></pre>
+  <p>Use it when conflicts are common (a hot show) and you want a guaranteed result without retries. The cost: waiting transactions hold connections. Keep the transaction short, never wait for the user inside it. Details are in <a href="03-sql-databases.html#m5">SQL · Module 5</a>.</p>
+
+  <h4>Solution 4: optimistic locking with a version column</h4>
+  <p>Do not lock. Read the row with its version; update only if the version is unchanged; if no row was updated, someone else won, so retry or fail.</p>
+  <pre data-title="optimistic.sql"><code class="language-sql">-- read: status = 'AVAILABLE', version = 7
+UPDATE show_seat
+   SET status = 'BOOKED', user_id = 1, version = version + 1
+ WHERE show_id = 10 AND seat_id = 12
+   AND status = 'AVAILABLE' AND version = 7;
+-- rows affected = 1 -> we won;  rows affected = 0 -> someone else changed it</code></pre>
+  <p>In JPA you add a <code>@Version</code> field and Hibernate does this for you, throwing <code>OptimisticLockException</code> on conflict. Optimistic locking is best when conflicts are rare.</p>
+
+  <h4>Solution 5: temporary holds with expiry</h4>
+  <p>Real users pick seats, then spend two minutes typing card details. You cannot keep a database lock for that long. Instead, introduce a middle state: <code>AVAILABLE → HELD → BOOKED</code>. A hold records <code>held_by</code> and <code>hold_expires_at</code>. Payment success turns it to BOOKED; timeout or failure turns it back.</p>
+  <pre data-title="hold.sql"><code class="language-sql">-- try to hold: succeeds if free, or if an old hold has expired
+UPDATE show_seat
+   SET status = 'HELD', held_by = 1, hold_expires_at = now() + interval '5 minutes'
+ WHERE show_id = 10 AND seat_id = 12
+   AND (status = 'AVAILABLE'
+        OR (status = 'HELD' AND hold_expires_at &lt; now()));
+-- rows affected = 1 -> hold granted</code></pre>
+  <p>A background job (or lazy check on read, as above) releases expired holds. The single conditional <code>UPDATE</code> is atomic, so two users cannot both get the hold.</p>
+
+  <h4>Solution 6: distributed locks (Redis), with caveats</h4>
+  <p>A <strong>distributed lock</strong> is a lock shared by many servers, often kept in Redis with <code>SET key value NX PX 30000</code> (set only if absent, auto-expire in 30 seconds). Only the holder who set the key may delete it, so the value is a unique token and the release checks it.</p>
+  <div class="co co-exc">
+    <p class="co-t">Caveats of distributed locks</p>
+    <ul>
+      <li>The lock expires on a timer. If the holder pauses (long GC, slow network) past the expiry, a second holder enters while the first still thinks it holds the lock.</li>
+      <li>A <strong>fencing token</strong> (a number that grows with each lock grant, checked by the database on write) protects against that stale holder.</li>
+      <li>A Redis failover can lose the key, so two clients may hold the lock. Multi-node schemes such as Redlock are debated for safety-critical use.</li>
+      <li>It adds a moving part. If a database constraint can do the job, prefer the constraint.</li>
+    </ul>
+  </div>
+
+  <h4>Comparison</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Technique</th><th>Works across servers</th><th>Best when</th><th>Main drawback</th></tr></thead>
+    <tbody>
+      <tr><td><code>synchronized</code> / <code>ReentrantLock</code></td><td>No</td><td>Single JVM, in-memory model, interviews</td><td>Useless with multiple instances</td></tr>
+      <tr><td><code>putIfAbsent</code> / atomic map ops</td><td>No</td><td>Single seat or key claims</td><td>Does not cover multi-seat bookings alone</td></tr>
+      <tr><td>Unique constraint</td><td>Yes</td><td>Always; the last line of defence</td><td>Needs error handling for the loser</td></tr>
+      <tr><td><code>SELECT ... FOR UPDATE</code></td><td>Yes</td><td>High contention, must succeed</td><td>Blocking, long transactions hurt</td></tr>
+      <tr><td>Optimistic version</td><td>Yes</td><td>Low contention</td><td>Retries under heavy contention</td></tr>
+      <tr><td>Hold with expiry</td><td>Yes (stored in DB or cache)</td><td>Human checkout steps</td><td>Needs expiry cleanup</td></tr>
+      <tr><td>Redis distributed lock</td><td>Yes</td><td>Coordinating non-DB work</td><td>Timing and failover caveats</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-interview">
+    <p class="co-t">How to answer "how do you avoid double booking?"</p>
+    <ol>
+      <li>Name the race: check-then-act on shared state.</li>
+      <li>In the code you write: lock the critical section (per show or sorted per-seat locks).</li>
+      <li>In production: a unique constraint as the final guard, a conditional update or row lock for the claim, a hold state with expiry for checkout.</li>
+      <li>Mention what you would not do: keep a DB transaction open while the user pays.</li>
+    </ol>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Locking a <em>new</em> object each call (<code>synchronized (new Object())</code>): nobody else shares it, so it protects nothing.</li>
+      <li>Using a <code>ConcurrentHashMap</code> but still doing <code>if (!map.containsKey(k)) map.put(k, v)</code>. That is check-then-act again; use <code>putIfAbsent</code> or <code>compute</code>.</li>
+      <li>Forgetting to release the hold or lock on the failure path.</li>
+    </ul>
+  </div>
+</article>

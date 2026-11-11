@@ -1,0 +1,678 @@
+<article class="topic" id="m1-demeter-tell-soc">
+  <h3>Law of Demeter, Tell Don't Ask and separation of concerns</h3>
+  <p class="tldr">Talk only to your direct collaborators (Law of Demeter), tell objects what to do instead of pulling their data out and deciding for them (Tell, Don't Ask), and keep different concerns such as web, business and data in different layers (separation of concerns).</p>
+
+  <p>These three ideas all reduce coupling. They say the same thing in different words: <strong>do not let one class know the inner structure of another</strong>.</p>
+
+  <h4>Law of Demeter ("don't talk to strangers")</h4>
+  <p>The <strong>Law of Demeter (LoD)</strong>, also called the principle of least knowledge, says a method should call methods only on:</p>
+  <ul>
+    <li>its own object (<code>this</code>),</li>
+    <li>its parameters,</li>
+    <li>objects it creates, and</li>
+    <li>its direct fields (its friends).</li>
+  </ul>
+  <p>It should not reach through one object to get another and call that one. The warning sign is a chain of getters, sometimes called a <em>train wreck</em>:</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: knows the whole chain</p><pre><code class="language-java">// OrderPrinter knows Order has a Customer, which has an Address, which has a City
+String city = order.getCustomer().getAddress().getCity();
+if (city.equals("Mumbai")) {
+    surcharge = 50;
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: ask your friend</p><pre><code class="language-java">// Order hides how the city is found
+if (order.isShippedTo("Mumbai")) {
+    surcharge = 50;
+}
+
+// in Order
+boolean isShippedTo(String city) {
+    return customer.livesIn(city);       // Customer hides Address
+}</code></pre></div>
+  </div>
+  <p>With the first version, a change in how <code>Customer</code> stores an address (say, a list of addresses with a default one) breaks every caller that walked the chain. With the second, only <code>Customer.livesIn</code> changes.</p>
+  <div class="co co-exc">
+    <p class="co-t">When chains are fine</p>
+    <ul>
+      <li><strong>Fluent APIs and builders</strong> return the same object: <code>sb.append("a").append("b")</code>, <code>stream.filter(...).map(...)</code>, <code>HttpRequest.newBuilder().uri(...).build()</code>. These are not Demeter violations, because every call is on the same kind of object.</li>
+      <li><strong>Plain data structures</strong> (records, DTOs, JSON trees) are meant to be navigated: <code>response.user().name()</code>.</li>
+      <li>Do not add dozens of one-line wrapper methods mechanically (<code>getCustomerAddressCity()</code>). Ask what the caller really wants to know (<code>isShippedTo</code>), and name that.</li>
+    </ul>
+  </div>
+
+  <h4>Tell, Don't Ask</h4>
+  <p>"Ask" style code pulls data out of an object, makes a decision outside, and pushes the result back. "Tell" style code sends a command and lets the object, which owns the data, decide. The first scatters business rules across callers; the second keeps each rule next to its data. This is encapsulation applied to behaviour.</p>
+  <pre data-title="TellDontAsk.java"><code class="language-java">// ASK: the caller owns the rule, and every caller must repeat it
+if (account.getBalance() &gt;= amount &amp;&amp; account.getStatus() == Status.ACTIVE) {
+    account.setBalance(account.getBalance() - amount);
+} else {
+    throw new IllegalStateException("Cannot withdraw");
+}
+
+// TELL: the account owns the rule
+account.withdraw(amount);
+
+// in Account
+void withdraw(long amount) {
+    if (status != Status.ACTIVE) throw new IllegalStateException("Account not active");
+    if (amount &gt; balance) throw new IllegalStateException("Insufficient funds");
+    balance -= amount;
+}</code></pre>
+  <p>Notice the symptoms of "ask": many getters and setters, and "service" classes full of <code>if</code>s that inspect entities. Such an entity with no behaviour is sometimes called an <strong>anemic domain model</strong>. It is not always wrong (simple CRUD apps live with it), but when rules become complex, move them into the objects that own the data.</p>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Queries are fine: <code>order.total()</code> asks for a value. The problem is asking for data in order to <em>decide something the object could decide</em>.</li>
+      <li>Strict Tell, Don't Ask can push presentation logic into entities. Keep formatting and UI decisions out of domain classes.</li>
+      <li>JPA entities and DTOs need getters for frameworks; the principle still applies to the methods you add by hand.</li>
+    </ul>
+  </div>
+
+  <h4>Separation of concerns (SoC)</h4>
+  <p>A <strong>concern</strong> is a distinct job: showing data, applying business rules, storing data, logging, security. Separation of concerns means each concern lives in its own part of the system with a clear boundary. It is SRP at the scale of layers and modules.</p>
+  <figure class="fig">
+<pre class="diagram">
+  HTTP request
+       │
+       ▼
+┌───────────────────────────┐
+│ Controller (web concern)  │  parse request, validate shape, return JSON
+└─────────────┬─────────────┘
+              ▼
+┌───────────────────────────┐
+│ Service (business rules)  │  price, check stock, decide, coordinate
+└─────────────┬─────────────┘
+              ▼
+┌───────────────────────────┐
+│ Repository (data access)  │  SQL / JPA, nothing else
+└───────────────────────────┘
+</pre>
+    <figcaption>The classic three layers: each layer knows only the one below</figcaption>
+  </figure>
+  <p>The rules of layering: a controller never builds SQL; a repository never decides discounts; a service never touches <code>HttpServletRequest</code>. Cross-cutting concerns (logging, transactions, security, caching) are separated through <strong>aspects</strong> and filters, not repeated in each method. In Spring that is what <code>@Transactional</code> and Spring Security do for you, using <a href="#m2-proxy">proxies</a>.</p>
+  <pre data-title="Layers.java"><code class="language-java">@RestController
+class OrderController {
+    private final OrderService service;
+    OrderController(OrderService service) { this.service = service; }
+
+    @PostMapping("/orders")
+    ResponseEntity&lt;OrderResponse&gt; place(@RequestBody @Valid PlaceOrderRequest req) {
+        Order order = service.place(req.toCommand());      // no business rules here
+        return ResponseEntity.status(201).body(OrderResponse.from(order));
+    }
+}</code></pre>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes to avoid</p>
+    <ul>
+      <li>Business rules inside controllers or in JavaScript only, because "it was quick".</li>
+      <li>Returning JPA entities from controllers, so the database shape leaks into the public API.</li>
+      <li>Putting <code>@Transactional</code> or SQL in controllers.</li>
+      <li>Splitting into so many layers that a simple field copies through six classes (accidental complexity; KISS).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: coupling principles</p>
+    <ul>
+      <li><b>Law of Demeter?</b> A method should talk only to itself, its parameters, its fields and objects it creates. Avoid <code>a.getB().getC().doIt()</code>. Mention fluent builders as an allowed exception.</li>
+      <li><b>Tell, Don't Ask?</b> Put the rule in the object that owns the data: <code>account.withdraw(x)</code> rather than reading the balance and setting it from outside.</li>
+      <li><b>Separation of concerns?</b> Controller, service and repository layers, each with one job; cross-cutting concerns handled by aspects.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-composition-inheritance">
+  <h3>Composition over inheritance: from inheritance explosion to Strategy</h3>
+  <p class="tldr">Use inheritance for a few real is-a relations; for behaviour that varies along several independent directions, hold the behaviours as fields (composition) and combine them at run time, which avoids a class explosion.</p>
+
+  <p>The basics are in <a href="02-core-java.html#m2">Core Java · Module 2</a>: has-a versus is-a, the fragile base class, aggregation and composition. This article is the design view: how a hierarchy grows out of control, and the standard refactoring that fixes it.</p>
+
+  <h4>The problem: inheritance explosion</h4>
+  <p>You are building a notification system. First it sends email. Then SMS. Then someone asks for urgent messages, which must be sent immediately and logged. A natural first design extends the class for every combination:</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class Notification
+  class EmailNotification
+  class SmsNotification
+  class UrgentEmailNotification
+  class UrgentSmsNotification
+  class ScheduledEmailNotification
+  class ScheduledSmsNotification
+  Notification &lt;|-- EmailNotification
+  Notification &lt;|-- SmsNotification
+  EmailNotification &lt;|-- UrgentEmailNotification
+  SmsNotification &lt;|-- UrgentSmsNotification
+  EmailNotification &lt;|-- ScheduledEmailNotification
+  SmsNotification &lt;|-- ScheduledSmsNotification
+</pre>
+    <figcaption>Two axes of variation (channel and timing) produce channels × timings classes</figcaption>
+  </figure>
+  <p>There are two independent axes: the <em>channel</em> (email, SMS, push) and the <em>priority</em> (normal, urgent, scheduled). With 3 channels and 3 priorities, inheritance needs 9 classes, and each new channel adds 3 more. The urgent logic is copied in every urgent class. This is the <strong>class explosion</strong>. Worse, the behaviour is fixed at compile time: a message cannot be switched from normal to urgent while running.</p>
+
+  <h4>The refactoring: extract each axis and compose</h4>
+  <ol class="steps">
+    <li>Find each direction of variation: channel and delivery policy.</li>
+    <li>Make an interface for each one.</li>
+    <li>Give the main class one field per interface, set in the constructor.</li>
+    <li>Delete the subclasses; combine by passing different parts.</li>
+  </ol>
+  <pre data-title="NotificationComposition.java"><code class="language-java">interface Channel {
+    void deliver(String to, String message);
+}
+
+class EmailChannel implements Channel {
+    public void deliver(String to, String message) {
+        System.out.println("EMAIL to " + to + ": " + message);
+    }
+}
+class SmsChannel implements Channel {
+    public void deliver(String to, String message) {
+        System.out.println("SMS to " + to + ": " + message);
+    }
+}
+
+interface DeliveryPolicy {
+    void send(Runnable deliverAction);
+}
+
+class Immediate implements DeliveryPolicy {
+    public void send(Runnable deliverAction) { deliverAction.run(); }
+}
+class Delayed implements DeliveryPolicy {
+    private final long millis;
+    Delayed(long millis) { this.millis = millis; }
+    public void send(Runnable deliverAction) {
+        java.util.concurrent.CompletableFuture
+            .runAsync(deliverAction, java.util.concurrent.CompletableFuture
+                .delayedExecutor(millis, java.util.concurrent.TimeUnit.MILLISECONDS));
+    }
+}
+
+class Notification {
+    private final Channel channel;                // composed behaviour 1
+    private final DeliveryPolicy policy;          // composed behaviour 2
+
+    Notification(Channel channel, DeliveryPolicy policy) {
+        this.channel = channel;
+        this.policy = policy;
+    }
+
+    void send(String to, String message) {
+        policy.send(() -&gt; channel.deliver(to, message));
+    }
+}
+
+public class NotificationDemo {
+    public static void main(String[] args) {
+        new Notification(new EmailChannel(), new Immediate()).send("asha@x.com", "Hi");
+        new Notification(new SmsChannel(), new Immediate()).send("98100", "OTP 4521");
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">EMAIL to asha@x.com: Hi
+SMS to 98100: OTP 4521</code></pre>
+  <p>Now there is one <code>Notification</code> class, two small channel classes and two small policy classes: 3 + 3 = 6 classes instead of 9, and adding a push channel is <em>one</em> class, not three. Any combination is possible, and you can change either part at run time. This is the <a href="#m2-strategy">Strategy pattern</a>, and also the shape behind Spring dependency injection.</p>
+
+  <h4>When to choose which</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Use inheritance when</th><th>Use composition when</th></tr></thead>
+    <tbody>
+      <tr><td>There is a true is-a that passes the <a href="#m1-lsp">Liskov test</a></td><td>Behaviour varies along more than one axis</td></tr>
+      <tr><td>The parent is designed for extension (Template Method)</td><td>You want to change behaviour at run time</td></tr>
+      <tr><td>You want to share a stable skeleton of an algorithm</td><td>You want to test with fake parts</td></tr>
+      <tr><td>The hierarchy is shallow (2 levels)</td><td>You want to reuse code from a class that is not a real parent</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule of thumb</p>
+    <p>Use <strong>interfaces</strong> to say what a thing can do, <strong>composition</strong> to get the code that does it, and <strong>inheritance</strong> only for a small, stable skeleton. If you cannot say "a B is always usable as an A", do not write <code>B extends A</code>.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes to avoid</p>
+    <ul>
+      <li>Extending a utility class to get its methods (<code>class OrderService extends BaseService</code> with 40 helper methods). Inject helpers instead.</li>
+      <li>"Base" classes that grow into a god-class every subclass depends on.</li>
+      <li>Composition with no interface: holding a concrete <code>PdfWriter</code> field. You get has-a but not swappability.</li>
+    </ul>
+  </div>
+    <h4>Why inheritance is risky: the fragile base class</h4>
+  <p>Explosion is only one problem. The deeper one is that a subclass depends on how its parent works <em>inside</em>, not just on what it promises. When the parent changes an internal detail, the child breaks even though no public signature changed. This is the <strong>fragile base class</strong> problem. The classic case is a set that counts how many elements were ever added:</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: inherits and depends on internals</p><pre><code class="language-java">import java.util.Collection;
+import java.util.HashSet;
+
+class CountingSet&lt;E&gt; extends HashSet&lt;E&gt; {
+    private int added = 0;
+    @Override public boolean add(E e) { added++; return super.add(e); }
+    @Override public boolean addAll(Collection&lt;? extends E&gt; c) {
+        added += c.size();
+        return super.addAll(c);     // calls add() for each item inside!
+    }
+    int added() { return added; }
+}
+// addAll(List.of("a","b","c")) -&gt; added() == 6, not 3</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: wraps and delegates</p><pre><code class="language-java">import java.util.Collection;
+import java.util.HashSet;
+import java.util.Set;
+
+class CountingSet&lt;E&gt; {
+    private final Set&lt;E&gt; inner = new HashSet&lt;&gt;();
+    private int added = 0;
+    boolean add(E e) { added++; return inner.add(e); }
+    boolean addAll(Collection&lt;? extends E&gt; c) {
+        added += c.size();
+        boolean changed = false;
+        for (E e : c) changed |= inner.add(e);
+        return changed;             // we control exactly what happens
+    }
+    int added() { return added; }
+}</code></pre></div>
+  </div>
+  <p>The inherited <code>addAll</code> calls <code>add</code> for every element, so the count doubles. If the JDK ever changed that internal call, the child would break again in the other direction. With composition you depend only on the public contract of <code>Set</code>. For a version that is also a <code>Set</code>, use a <a href="#m2-decorator">Decorator</a> that implements the interface and forwards calls.</p>
+
+  <h4>The idea in one picture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class Notification {
+    -Channel channel
+    -DeliveryPolicy policy
+    +send(String, String) void
+  }
+  class Channel {
+    &lt;&lt;interface&gt;&gt;
+  }
+  class DeliveryPolicy {
+    &lt;&lt;interface&gt;&gt;
+  }
+  Notification o--> Channel
+  Notification o--> DeliveryPolicy
+  Channel &lt;|.. EmailChannel
+  Channel &lt;|.. SmsChannel
+  DeliveryPolicy &lt;|.. Immediate
+  DeliveryPolicy &lt;|.. Delayed
+</pre>
+    <figcaption>One main class, two small hierarchies; every combination is a constructor call</figcaption>
+  </figure>
+
+  <h4>A second example: order pricing</h4>
+  <p>An e-commerce team writes <code>FestivalOrder extends Order</code> to apply a festival discount, then <code>PrimeFestivalOrder extends FestivalOrder</code> for members, then a <code>GstExemptPrimeFestivalOrder</code>. Each rule multiplies the tree. With composition, an <code>Order</code> holds a <code>PricingRule</code> and a <code>TaxRule</code>, and you assemble the combination per request:</p>
+  <pre data-title="OrderPricing.java"><code class="language-java">interface PricingRule { long apply(long subtotalPaise); }
+interface TaxRule     { long taxOn(long amountPaise); }
+
+class Order {
+    private final long subtotal;
+    private final PricingRule pricing;
+    private final TaxRule tax;
+
+    Order(long subtotal, PricingRule pricing, TaxRule tax) {
+        this.subtotal = subtotal;
+        this.pricing = pricing;
+        this.tax = tax;
+    }
+    long payable() {
+        long net = pricing.apply(subtotal);
+        return net + tax.taxOn(net);
+    }
+}
+
+class Demo {
+    public static void main(String[] args) {
+        PricingRule festival = s -&gt; s - s / 10;          // 10% off
+        PricingRule member   = s -&gt; festival.apply(s) - 5_000;
+        TaxRule gst18        = a -&gt; a * 18 / 100;
+        System.out.println(new Order(100_000, festival, gst18).payable());
+        System.out.println(new Order(100_000, member, gst18).payable());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">106200
+100300</code></pre>
+  <p>Rules are plain lambdas here, which is the lightest form of composition: behaviour passed as a value.</p>
+
+  <h4>Composition, delegation and default methods</h4>
+  <ul>
+    <li><strong>Composition:</strong> the object holds other objects and uses them. The parts' lifetime usually belongs to the whole (see the UML note in <a href="#m1-uml-class">UML class diagrams</a>).</li>
+    <li><strong>Delegation:</strong> the object forwards a call to the held part. This is the mechanism of composition.</li>
+    <li><strong>Interface default methods</strong> give shared code without a parent class, but they cannot hold state. They help for small helpers, not for the main logic.</li>
+    <li><strong>Sealed hierarchies</strong> (Java 17+) keep inheritance safe by listing the allowed subclasses. Use them for closed sets of variants such as payment results.</li>
+  </ul>
+
+  <h4>In the JDK and Spring</h4>
+  <ul>
+    <li><code>Stack extends Vector</code> is a well-known JDK mistake: a stack exposes <code>add(int, E)</code> and <code>get(i)</code>. <code>ArrayDeque</code> is the modern choice and does not inherit them.</li>
+    <li><code>Collections.synchronizedList</code> and the Java I/O wrappers (<code>BufferedReader</code> around a <code>Reader</code>) compose instead of subclassing.</li>
+    <li><code>Thread</code> versus <code>Runnable</code>: pass a <code>Runnable</code> to a thread instead of extending <code>Thread</code>.</li>
+    <li>Spring: <code>JdbcTemplate</code> and <code>RestTemplate</code> take callbacks and converters; constructor injection of collaborators is composition. Spring Data repositories are interfaces, not base classes you extend with logic.</li>
+  </ul>
+
+  <h4>Comparison</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Inheritance</th><th>Composition</th></tr></thead>
+    <tbody>
+      <tr><td>Relationship</td><td>is-a</td><td>has-a / uses</td></tr>
+      <tr><td>Bound at</td><td>Compile time</td><td>Run time (swap the part)</td></tr>
+      <tr><td>Coupling</td><td>To the parent's implementation</td><td>To an interface</td></tr>
+      <tr><td>Testing</td><td>Hard to fake the parent</td><td>Inject a fake part</td></tr>
+      <tr><td>Cost</td><td>Little code</td><td>Some forwarding boilerplate</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Never inherit only to reuse code. Inherit only when the Liskov test passes <em>and</em> the parent was designed for extension.</li>
+      <li>If you do design a class for extension, document which methods call which (self-use), or make the class <code>final</code>.</li>
+      <li>Each composed part should be an interface, so it can be replaced.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Default to <code>final</code> classes; open them to extension on purpose.</li>
+      <li>Pass parts through the constructor and keep them <code>private final</code>.</li>
+      <li>Name the parts by role (<code>Channel</code>, <code>PricingRule</code>), not by kind of class.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to prefer composition</p>
+    <ul>
+      <li>Frameworks that expect you to extend a base class: <code>HttpServlet</code>, <code>OncePerRequestFilter</code>, <code>Exception</code>. Extend them, but keep the subclass thin and move logic into injected collaborators.</li>
+      <li>A real is-a with a stable parent: <code>ArrayList</code> is a <code>List</code>; a <code>Circle</code> is a <code>Shape</code>.</li>
+      <li>Forwarding every method of a wide interface by hand is noise. Use a small IDE-generated delegate, or reconsider (ISP, <a href="#m1-isp">I: Interface Segregation</a>).</li>
+    </ul>
+  </div>
+<div class="co co-interview">
+    <p class="co-t">Interview: composition over inheritance</p>
+    <ul>
+      <li>Give the reason: inheritance couples the child to the parent's implementation and is fixed at compile time; composition couples to an interface and can change at run time.</li>
+      <li>Use the notification example: channel × priority makes N × M subclasses; composition gives N + M classes.</li>
+      <li>Say which pattern it leads to: Strategy (also Decorator and State).</li>
+      <li>Concede that inheritance is still right for real is-a and designed-for-extension classes.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: follow-ups on composition</p>
+    <ul>
+      <li><b>What is the fragile base class problem?</b> A child that relies on the parent's internal calls breaks when the parent changes. Use the <code>HashSet.addAll</code> counting example.</li>
+      <li><b>Composition vs aggregation?</b> Both are has-a. In composition the part cannot live without the whole; in aggregation it can.</li>
+      <li><b>Does "prefer composition" mean never inherit?</b> No. It is a default, not a ban.</li>
+      <li><b>Which patterns follow from it?</b> Strategy, Decorator, State, Adapter, and dependency injection.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-clean-code">
+  <h3>Clean code: naming, small methods, no magic numbers and more</h3>
+  <p class="tldr">Clean code reads like clear prose: names say what things are, each function does one thing, there are no unexplained numbers, errors are handled separately from the main flow, and comments explain why, not what.</p>
+
+  <p>You write code once, and read it many times: when you fix a bug, add a feature, or review a pull request. Clean code (the title of Robert C. Martin's book) optimises for the reader. Each rule below comes with a before and after.</p>
+
+  <h4>1. Meaningful names</h4>
+  <p>A name should answer what it is, why it exists and how it is used, so that no comment is needed. Use nouns for classes and variables, verbs for methods, and the vocabulary of the business (the domain).</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong</p><pre><code class="language-java">int d;                       // elapsed time in days
+List&lt;int[]&gt; list1 = getThem();
+void proc(Order o, boolean f) { }
+class DataManager { }</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right</p><pre><code class="language-java">int elapsedDays;
+List&lt;Cell&gt; flaggedCells = findFlaggedCells();
+void cancel(Order order, boolean refundIssued) { }
+class InvoiceGenerator { }</code></pre></div>
+  </div>
+  <ul>
+    <li>Classes: nouns (<code>OrderValidator</code>); methods: verbs (<code>calculateTotal</code>); booleans: questions (<code>isPaid</code>, <code>hasStock</code>).</li>
+    <li>Avoid noise words (<code>Data</code>, <code>Info</code>, <code>Manager</code>, <code>Util</code>) and encodings (<code>strName</code>, <code>IOrderService</code> is debated; follow your team).</li>
+    <li>Use one word per concept: do not mix <code>fetch</code>, <code>get</code> and <code>retrieve</code> for the same idea.</li>
+    <li>Use searchable names. A name like <code>MAX_RETRIES</code> is easy to find; <code>3</code> is not.</li>
+    <li>Length matches scope: <code>i</code> in a three-line loop is fine; a field used across a class needs a full name.</li>
+  </ul>
+
+  <h4>2. Small functions that do one thing</h4>
+  <p>A function should do one thing, at one level of abstraction, and be short enough to see on one screen (many teams aim for under 20 lines). If you can extract a piece with a name that is not just a restatement of the code, extract it.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: one long method mixing levels</p><pre><code class="language-java">void checkout(Cart cart) {
+    for (Item i : cart.items()) {
+        if (i.qty() &lt;= 0) throw new IllegalArgumentException();
+    }
+    long total = 0;
+    for (Item i : cart.items()) total += i.price() * i.qty();
+    if (total &gt; 100000) total -= total / 10;
+    System.out.println("Charging " + total);
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: reads like an outline</p><pre><code class="language-java">void checkout(Cart cart) {
+    validate(cart);
+    long total = applyBulkDiscount(sum(cart));
+    charge(total);
+}</code></pre></div>
+  </div>
+
+  <h4>3. Few parameters; parameter objects</h4>
+  <p>Zero to two parameters are easy; three is the practical limit; more is a smell. Group related values into an object (<strong>parameter object</strong>), usually a record:</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: long list, order easy to mix up</p><pre><code class="language-java">createUser("Asha", "Rao", "asha@x.com", "98100", "Pune", "411001", true);</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: named, grouped, extendable</p><pre><code class="language-java">record Address(String city, String pincode) { }
+record NewUser(String firstName, String lastName, String email,
+               String phone, Address address, boolean newsletter) { }
+
+createUser(new NewUser("Asha", "Rao", "asha@x.com", "98100",
+                       new Address("Pune", "411001"), true));</code></pre></div>
+  </div>
+  <p>For many optional values, use a <a href="#m2-builder">Builder</a>.</p>
+
+  <h4>4. No boolean flag arguments</h4>
+  <p>A boolean parameter means the method does two things. The call site <code>render(true)</code> says nothing. Split into two methods, or pass an enum.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong</p><pre><code class="language-java">sendMessage(user, text, true);      // true = what?</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right</p><pre><code class="language-java">sendUrgentMessage(user, text);
+sendNormalMessage(user, text);
+// or: sendMessage(user, text, Priority.URGENT);</code></pre></div>
+  </div>
+
+  <h4>5. Guard clauses and early return</h4>
+  <p>Handle the invalid cases first and return or throw. The main path then stays at the left margin without deep nesting (the "arrow anti-pattern").</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: nested</p><pre><code class="language-java">double payment(Employee e) {
+    double result;
+    if (!e.isDead()) {
+        if (!e.isRetired()) {
+            result = e.salary();
+        } else {
+            result = e.pension();
+        }
+    } else {
+        result = 0;
+    }
+    return result;
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: guard clauses</p><pre><code class="language-java">double payment(Employee e) {
+    if (e.isDead()) return 0;
+    if (e.isRetired()) return e.pension();
+    return e.salary();
+}</code></pre></div>
+  </div>
+
+  <h4>6. Constants and enums, not magic numbers or strings</h4>
+  <p>A <strong>magic number</strong> is a literal whose meaning is not obvious. Replace it with a named constant; replace sets of related strings with an enum, so the compiler checks them.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong</p><pre><code class="language-java">if (user.getStatus().equals("A")) { ... }
+if (retries &gt; 3) { ... }
+long fee = amount * 18 / 100 + 25;</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right</p><pre><code class="language-java">enum AccountStatus { ACTIVE, BLOCKED, CLOSED }
+private static final int MAX_RETRIES = 3;
+private static final int GST_PERCENT = 18;
+private static final long FLAT_FEE_PAISE = 25;
+
+if (user.status() == AccountStatus.ACTIVE) { ... }
+if (retries &gt; MAX_RETRIES) { ... }
+long fee = amount * GST_PERCENT / 100 + FLAT_FEE_PAISE;</code></pre></div>
+  </div>
+  <p>Values like 0, 1 and -1 in obvious contexts (<code>i + 1</code>, <code>list.size() == 0</code>) do not need names. Configuration that differs per environment (URLs, timeouts) belongs in <code>application.yml</code>, not in constants.</p>
+
+  <h4>7. Comments explain why, not what</h4>
+  <p>If a comment restates the code, delete it or rename the code. Use comments for intent, warnings, a business rule, or the reason for a surprising choice. Javadoc is for public APIs.</p>
+  <pre data-title="Comments.java"><code class="language-java">// Bad: says what the code already says
+i++;   // increment i
+
+// Better: explains a decision the code cannot
+// Banks settle on working days only, so a weekend due date moves to Monday (RBI rule).
+LocalDate due = nextWorkingDay(requested);</code></pre>
+  <p>Do not leave commented-out code; version control remembers it (see <a href="01-git-github.html#m1">Git basics</a>). A TODO needs an owner or a ticket number.</p>
+
+  <h4>8. Error handling as a separate concern</h4>
+  <p>Main logic should not be buried under <code>try/catch</code> blocks and error-code checks. Use exceptions, not magic return values like <code>-1</code> or <code>null</code>. Keep error mapping in one place (in Spring, <code>@RestControllerAdvice</code>).</p>
+  <pre data-title="ErrorHandling.java"><code class="language-java">// Bad: error codes mixed with the flow
+int code = service.transfer(from, to, amount);
+if (code == -1) { ... } else if (code == -2) { ... }
+
+// Good: the happy path is clean, the failure is an exception
+service.transfer(from, to, amount);      // throws InsufficientFundsException
+
+@RestControllerAdvice
+class ApiExceptionHandler {
+    @ExceptionHandler(InsufficientFundsException.class)
+    ResponseEntity&lt;ErrorBody&gt; onInsufficient(InsufficientFundsException e) {
+        return ResponseEntity.status(409).body(new ErrorBody(e.getMessage()));
+    }
+}</code></pre>
+  <ul>
+    <li>Do not catch <code>Exception</code> and ignore it. At least log it, or let it propagate.</li>
+    <li>Return empty collections, not <code>null</code>; use <code>Optional</code> for "maybe a value" return types.</li>
+    <li>Throw specific exceptions with a message that says what failed and with which ID.</li>
+  </ul>
+
+  <h4>9. Small classes and consistent formatting</h4>
+  <p>Keep classes small and focused (<a href="#m1-srp">SRP</a>). Order members the same way in every file (constants, fields, constructors, public methods, private methods). Use one formatter for the whole team (Google Java Style, Spotless or the IDE formatter in CI) so that diffs show real changes, not whitespace arguments. Keep lines to about 100 to 120 characters.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Checklist before you open a pull request</p>
+    <ul>
+      <li>Could a new teammate understand each method name without reading the body?</li>
+      <li>Is any method longer than a screen, or doing "X and Y"?</li>
+      <li>Any literal number or string that has a meaning? Name it.</li>
+      <li>Any <code>boolean</code> parameter, more than three parameters, or deep nesting?</li>
+      <li>Is there dead code, a commented-out block, or a comment that repeats the code?</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Cautions</p>
+    <ul>
+      <li>Rules are guidelines. A 40-line method that reads as one clear story can beat ten tiny methods that make you jump around.</li>
+      <li>Do not extract a method for every line; extract when the new name adds meaning.</li>
+      <li>Refactor under test. Change structure, not behaviour, and run the tests after each step.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: clean code</p>
+    <ul>
+      <li><b>What is clean code?</b> Code that is easy to read, change and test: good names, small focused functions, no duplication, no magic values.</li>
+      <li><b>How do you handle a 300-line method?</b> Write tests first, then extract methods with intent-revealing names (Extract Method), group data into objects, and replace conditionals with polymorphism.</li>
+      <li><b>Why avoid boolean arguments?</b> Call sites are unreadable and the method does two things.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-code-smells">
+  <h3>Code smells and the refactoring that fixes each</h3>
+  <p class="tldr">A code smell is a surface sign that the design has a problem; learn the common smells (long method, large class, primitive obsession, feature envy, shotgun surgery, switch on type, duplicated code, data clumps) and the standard refactoring for each.</p>
+
+  <p>A <strong>code smell</strong> is a pattern in code that is not a bug but hints at a deeper design weakness. The term comes from Kent Beck and Martin Fowler's book <em>Refactoring</em>. A <strong>refactoring</strong> is a small change that improves structure without changing behaviour. The rule: smell, then test, then refactor in small steps, then test again.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Smell</th><th>How it looks</th><th>Refactoring</th><th>Principle</th></tr></thead>
+    <tbody>
+      <tr><td>Long method</td><td>50+ lines, many levels of nesting, comments marking sections</td><td>Extract Method; guard clauses</td><td>SRP</td></tr>
+      <tr><td>Large class (god class)</td><td>Hundreds of lines, many fields, unrelated methods</td><td>Extract Class</td><td>SRP</td></tr>
+      <tr><td>Primitive obsession</td><td><code>String email</code>, <code>long amount</code> everywhere</td><td>Replace with value objects (<code>Email</code>, <code>Money</code>)</td><td>Encapsulation</td></tr>
+      <tr><td>Feature envy</td><td>A method uses another class's data more than its own</td><td>Move Method</td><td>Tell, Don't Ask</td></tr>
+      <tr><td>Shotgun surgery</td><td>One change forces small edits in many classes</td><td>Move Method / Move Field into one class</td><td>DRY, cohesion</td></tr>
+      <tr><td>Switch on type</td><td><code>switch</code> or <code>if/else</code> on a type code, repeated</td><td>Replace Conditional with Polymorphism (Strategy, State)</td><td>OCP</td></tr>
+      <tr><td>Duplicated code</td><td>Same logic in several places</td><td>Extract Method; Pull Up Method; Template Method</td><td>DRY</td></tr>
+      <tr><td>Data clumps</td><td>The same group of fields or parameters travels together</td><td>Introduce Parameter Object / Extract Class</td><td>Cohesion</td></tr>
+      <tr><td>Long parameter list</td><td>4+ parameters</td><td>Parameter object; Builder</td><td>Clean code</td></tr>
+      <tr><td>Divergent change</td><td>One class changes for many unrelated reasons</td><td>Extract Class</td><td>SRP</td></tr>
+      <tr><td>Message chain</td><td><code>a.getB().getC().getD()</code></td><td>Hide Delegate</td><td>Demeter</td></tr>
+      <tr><td>Speculative generality</td><td>Unused hooks, flags and abstract classes "for later"</td><td>Remove it; inline</td><td>YAGNI</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Example 1: primitive obsession → value object</h4>
+  <p>Primitive obsession means using <code>String</code>, <code>int</code> and <code>long</code> for domain ideas. A <code>String</code> can hold anything, so every method that receives an email must check it again, or forget to.</p>
+  <pre data-title="PrimitiveObsession.java"><code class="language-java">// Smell: any string is accepted; amount might be rupees or paise?
+void register(String email, String phone, long amount) { /* ... */ }
+register("98100", "asha@x.com", 5);        // arguments swapped: compiles fine!
+
+// Refactored: the type carries the rule
+record Email(String value) {
+    Email {                                          // compact constructor validates once
+        if (value == null || !value.matches("[^@\\s]+@[^@\\s]+\\.[^@\\s]+")) {
+            throw new IllegalArgumentException("Invalid email: " + value);
+        }
+    }
+}
+record Money(long paise) {
+    Money {
+        if (paise &lt; 0) throw new IllegalArgumentException("Negative money");
+    }
+    Money plus(Money other) { return new Money(paise + other.paise); }
+}
+void register(Email email, Phone phone, Money deposit) { /* ... */ }</code></pre>
+  <p>Swapping arguments is now a compile error, and validation lives in one place. (<code>Phone</code> would be another record.)</p>
+
+  <h4>Example 2: feature envy → Move Method</h4>
+  <pre data-title="FeatureEnvy.java"><code class="language-java">// Smell: InvoicePrinter is more interested in Order's data than its own
+class InvoicePrinter {
+    long total(Order order) {
+        long sum = 0;
+        for (OrderItem i : order.items()) sum += i.unitPaise() * i.qty();
+        return sum;
+    }
+}
+
+// Fix: the method moves to the class that owns the data
+record Order(String id, List&lt;OrderItem&gt; items) {
+    long total() {
+        return items.stream().mapToLong(i -&gt; i.unitPaise() * i.qty()).sum();
+    }
+}</code></pre>
+
+  <h4>Example 3: switch on type → polymorphism</h4>
+  <p>This one is covered in <a href="#m1-ocp">OCP</a>. A quick cousin: <code>if (employee.type == MANAGER) ... else if (type == ENGINEER) ...</code> repeated in <code>pay()</code>, <code>bonus()</code> and <code>title()</code>. Replace the type code with an interface or an abstract class <code>Employee</code> with one subclass per type, or a <a href="#m2-strategy">Strategy</a>/<a href="#m2-state">State</a> object when the type changes at run time.</p>
+
+  <h4>Example 4: data clumps → Extract Class</h4>
+  <pre data-title="DataClump.java"><code class="language-java">// Smell: street, city, state, pincode travel together in many signatures
+void ship(String street, String city, String state, String pincode) { }
+boolean deliverable(String street, String city, String state, String pincode) { }
+
+// Fix
+record Address(String street, String city, String state, String pincode) {
+    boolean isMetro() { return List.of("Mumbai", "Delhi", "Chennai", "Kolkata").contains(city); }
+}
+void ship(Address to) { }
+boolean deliverable(Address to) { }</code></pre>
+  <p>Once the clump becomes a class, behaviour like <code>isMetro()</code> finds a natural home.</p>
+
+  <h4>Shotgun surgery versus divergent change</h4>
+  <p>They are opposites, and interviewers like to ask. <strong>Divergent change</strong>: one class changes for many reasons (too much in one place; split it). <strong>Shotgun surgery</strong>: one reason for change touches many classes (one concern scattered; gather it). Both come from wrong boundaries.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Safe refactoring workflow</p>
+    <ol class="steps">
+      <li>Make sure tests cover the code. If none, write characterization tests that record current behaviour.</li>
+      <li>Change one small thing (rename, extract, move).</li>
+      <li>Run the tests. If red, undo and try a smaller step.</li>
+      <li>Commit often, so each step can be reverted alone.</li>
+    </ol>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: let the IDE do it</p>
+    <p>IntelliJ IDEA and Eclipse have automated, behaviour-preserving Extract Method, Extract Class, Move, Rename, Introduce Parameter Object and Inline. Static analysis tools such as SonarQube report long methods and duplication. Use them as hints, not as judges.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: code smells</p>
+    <ul>
+      <li><b>What is a code smell?</b> A sign of a design problem, not a bug. Name three and the fix for each: long method (Extract Method), switch on type (polymorphism), data clumps (parameter object).</li>
+      <li><b>What is refactoring?</b> Improving structure without changing behaviour, in small, tested steps.</li>
+      <li><b>Feature envy?</b> A method uses another object's data more than its own; move it there.</li>
+    </ul>
+  </div>
+</article>

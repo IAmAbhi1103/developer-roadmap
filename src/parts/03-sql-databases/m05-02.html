@@ -1,0 +1,363 @@
+<article class="topic" id="m5-explain">
+  <h3>EXPLAIN and EXPLAIN ANALYZE: reading query plans</h3>
+  <p class="tldr"><code>EXPLAIN</code> shows the plan the database chose and its cost estimate;
+  <code>EXPLAIN ANALYZE</code> runs the query and adds real times and row counts, so you can see where time goes
+  and whether an index is used.</p>
+
+  <h4>What the planner does</h4>
+  <p>SQL says <em>what</em> you want, not <em>how</em> to get it. The <strong>query planner</strong> (optimizer)
+  considers several ways (scan with or without an index, join order, join method), estimates the cost of each
+  using table statistics, and executes the cheapest. <code>EXPLAIN</code> prints the chosen plan as a tree of
+  <strong>nodes</strong>. You read it from the innermost, most indented node outward; data flows up.</p>
+<pre data-title="The three forms"><code class="language-sql">EXPLAIN SELECT ...;                      -- plan and estimates only; the query is NOT run
+EXPLAIN ANALYZE SELECT ...;              -- runs the query; adds actual times and rows
+EXPLAIN (ANALYZE, BUFFERS) SELECT ...;   -- also shows pages read from cache and disk</code></pre>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: EXPLAIN ANALYZE on INSERT, UPDATE or DELETE</p>
+    <p><code>EXPLAIN ANALYZE</code> really executes the statement. To look at a write safely, wrap it:
+    <code>BEGIN; EXPLAIN ANALYZE DELETE ...; ROLLBACK;</code></p>
+  </div>
+
+  <h4>The scripted experiment: 1 million rows</h4>
+  <p>The best way to learn indexes is to feel the difference. Run this in <code>psql</code> on a test database.
+  It uses <code>generate_series</code> to create a million rows without any outside file.</p>
+<pre data-title="Step 1: build the table (about 1 million orders)"><code class="language-sql">DROP TABLE IF EXISTS orders_big;
+CREATE TABLE orders_big (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id  INT         NOT NULL,
+    status       TEXT        NOT NULL,
+    amount_paise BIGINT      NOT NULL,
+    placed_at    TIMESTAMPTZ NOT NULL
+);
+
+INSERT INTO orders_big (customer_id, status, amount_paise, placed_at)
+SELECT (random() * 100000)::int + 1,                                -- 100,000 customers
+       (ARRAY['PLACED','DELIVERED','CANCELLED'])[1 + floor(random() * 3)::int],
+       (random() * 500000)::bigint + 1000,
+       now() - random() * INTERVAL '365 days'
+FROM generate_series(1, 1000000);
+
+ANALYZE orders_big;      -- collect statistics so the planner knows the table size
+
+SELECT count(*) FROM orders_big;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">  count
+---------
+ 1000000
+(1 row)</code></pre>
+<pre data-title="Step 2: time a query without an index"><code class="language-sql">\timing on
+SELECT * FROM orders_big WHERE customer_id = 4242;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders_big WHERE customer_id = 4242;</code></pre>
+  <pre class="out" data-title="Output (numbers will differ on your machine)"><code class="language-plaintext">Gather  (cost=1000.00..14282.43 rows=10 width=34) (actual time=2.9..41.7 rows=11 loops=1)
+  Workers Planned: 2
+  Workers Launched: 2
+  Buffers: shared hit=8334
+  -&gt;  Parallel Seq Scan on orders_big  (cost=0.00..13281.43 rows=4 width=34)
+                                       (actual time=6.1..36.4 rows=4 loops=3)
+        Filter: (customer_id = 4242)
+        Rows Removed by Filter: 333330
+        Buffers: shared hit=8334
+Planning Time: 0.12 ms
+Execution Time: 41.9 ms</code></pre>
+  <p>The database read the whole table (8,334 pages) to return 11 rows. It ran the scan with parallel workers
+  and still needed tens of milliseconds. On a slower disk, or with a cold cache, this is seconds.</p>
+<pre data-title="Step 3: add an index and compare"><code class="language-sql">CREATE INDEX idx_orders_big_customer_id ON orders_big (customer_id);
+ANALYZE orders_big;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders_big WHERE customer_id = 4242;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Bitmap Heap Scan on orders_big  (cost=4.46..42.07 rows=10 width=34)
+                                (actual time=0.04..0.07 rows=11 loops=1)
+  Recheck Cond: (customer_id = 4242)
+  Heap Blocks: exact=11
+  Buffers: shared hit=14
+  -&gt;  Bitmap Index Scan on idx_orders_big_customer_id
+        (cost=0.00..4.46 rows=10 width=0) (actual time=0.03..0.03 rows=11 loops=1)
+        Index Cond: (customer_id = 4242)
+        Buffers: shared hit=3
+Planning Time: 0.15 ms
+Execution Time: 0.10 ms</code></pre>
+  <p>From 8,334 pages to 14 pages, and from about 40 ms to 0.1 ms: hundreds of times less work. Plain Index
+  Scan vs Bitmap Scan is a planner choice, explained below. The rest of the experiment shows the limits of an
+  index:</p>
+<pre data-title="Step 4: where the index does not help"><code class="language-sql">-- Low selectivity: one third of all rows
+EXPLAIN SELECT * FROM orders_big WHERE status = 'DELIVERED';
+--  Seq Scan on orders_big  (cost=0.00..21370.00 rows=333500 width=34)
+--    Filter: (status = 'DELIVERED'::text)
+
+-- Function on the column hides the index
+EXPLAIN SELECT * FROM orders_big WHERE customer_id + 0 = 4242;
+--  Seq Scan on orders_big ...
+
+-- Composite index for: one customer's delivered orders, newest first
+CREATE INDEX idx_orders_big_cust_status_placed
+    ON orders_big (customer_id, status, placed_at);
+EXPLAIN ANALYZE
+SELECT id, amount_paise FROM orders_big
+WHERE customer_id = 4242 AND status = 'DELIVERED'
+ORDER BY placed_at DESC;
+--  Index Scan Backward using idx_orders_big_cust_status_placed ... (actual time=0.03..0.04)
+--  (no Sort node: the index already returns rows in order)</code></pre>
+  <p>Finally, compare the write cost: time <code>INSERT INTO orders_big (...) SELECT ... FROM
+  generate_series(1, 100000)</code> before and after adding two or three extra indexes. It will be visibly
+  slower with more indexes.</p>
+
+  <h4>Reading the plan: the numbers</h4>
+  <dl class="terms">
+    <dt><code>cost=0.42..48.90</code></dt><dd>Two numbers: the estimated cost to return the first row, then to
+    return all rows. The unit is arbitrary (relative page-read costs). Only compare costs within the same
+    database.</dd>
+    <dt><code>rows=10</code></dt><dd>The planner's <em>estimate</em> of rows this node returns.</dd>
+    <dt><code>width=34</code></dt><dd>Estimated average row size in bytes.</dd>
+    <dt><code>actual time=0.03..0.05</code></dt><dd>Real milliseconds to the first row and to the last row (only
+    with <code>ANALYZE</code>). It is per loop.</dd>
+    <dt><code>rows=11</code> (in the actual part)</dt><dd>The rows really returned. Compare with the estimate: a
+    big gap (10 vs 100,000) means the statistics are stale or the planner misjudges the data.</dd>
+    <dt><code>loops=N</code></dt><dd>How many times the node ran. For a node on the inner side of a nested loop
+    the total time is <em>actual time × loops</em>.</dd>
+    <dt><code>Buffers: shared hit=14 read=3</code></dt><dd><code>hit</code> pages came from memory,
+    <code>read</code> pages from disk (or the OS cache). Lower is better.</dd>
+    <dt><code>Rows Removed by Filter</code></dt><dd>Rows read and then thrown away. A large number means the
+    database read a lot to keep a little: look for a missing index.</dd>
+  </dl>
+
+  <h4>The common nodes</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Node</th><th>Meaning</th><th>Good or bad?</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Seq Scan</strong></td><td>Reads the whole table</td><td>Fine for small tables or big
+      fractions; bad if it discards most rows</td></tr>
+      <tr><td><strong>Index Scan</strong></td><td>Walks the index, fetches each row from the table</td>
+      <td>Good for few rows</td></tr>
+      <tr><td><strong>Index Only Scan</strong></td><td>Answers from the index alone (covering index)</td>
+      <td>Best</td></tr>
+      <tr><td><strong>Bitmap Index Scan + Bitmap Heap Scan</strong></td><td>Collects matching row locations
+      into a bitmap, then reads table pages in physical order</td><td>Good for medium numbers of rows or
+      combining indexes</td></tr>
+      <tr><td><strong>Nested Loop</strong></td><td>For each row of the outer side, look up the inner side</td>
+      <td>Good when the outer side is small and the inner side is indexed</td></tr>
+      <tr><td><strong>Hash Join</strong></td><td>Builds a hash table of one side, probes it with the other</td>
+      <td>Good for large unsorted inputs; needs memory</td></tr>
+      <tr><td><strong>Merge Join</strong></td><td>Merges two sorted inputs</td><td>Good when both are already
+      sorted (indexes)</td></tr>
+      <tr><td><strong>Sort</strong></td><td>Sorts rows</td><td>Watch for <code>Sort Method: external merge Disk</code>
+      (spilled to disk)</td></tr>
+      <tr><td><strong>Aggregate / HashAggregate</strong></td><td><code>GROUP BY</code>, <code>COUNT</code>, etc.</td>
+      <td>Normal</td></tr>
+      <tr><td><strong>Limit</strong></td><td>Stops after N rows</td><td>Makes an ordered index scan very cheap</td></tr>
+    </tbody>
+  </table></div>
+<pre data-title="A join plan (customers 1,000 rows, orders_big 1,000,000 rows)"><code class="language-sql">EXPLAIN ANALYZE
+SELECT c.name, o.amount_paise
+FROM customers c
+JOIN orders_big o ON o.customer_id = c.id
+WHERE c.id = 4242;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Nested Loop  (cost=4.88..46.60 rows=10 width=22) (actual time=0.06..0.10 rows=11 loops=1)
+  -&gt;  Index Scan using customers_pkey on customers c
+        (cost=0.28..8.29 rows=1 width=18) (actual time=0.01..0.01 rows=1 loops=1)
+        Index Cond: (id = 4242)
+  -&gt;  Bitmap Heap Scan on orders_big o
+        (cost=4.60..38.12 rows=10 width=12) (actual time=0.04..0.07 rows=11 loops=1)
+        Recheck Cond: (customer_id = 4242)
+        -&gt;  Bitmap Index Scan on idx_orders_big_customer_id ...
+Execution Time: 0.14 ms</code></pre>
+
+  <h4>Statistics and ANALYZE</h4>
+  <p>The planner's choices are only as good as its statistics: row counts, distinct values and the most common
+  values per column. <code>ANALYZE table_name</code> refreshes them; the autovacuum process runs it automatically
+  after enough changes. Run it by hand after a bulk load. If estimated and actual rows differ by 10× or more, run
+  <code>ANALYZE</code> first. If they still differ, look for correlated columns or skewed data.</p>
+
+  <h4>MySQL <code>EXPLAIN</code> in brief</h4>
+  <p>MySQL prints a table of rows instead of a tree. <code>EXPLAIN ANALYZE</code> exists too (MySQL 8.0.18+) and
+  prints a tree similar to PostgreSQL's. The columns of the classic table:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Column</th><th>What to look at</th></tr></thead>
+    <tbody>
+      <tr><td><code>type</code></td><td>Access method, best to worst: <code>const</code>, <code>eq_ref</code>,
+      <code>ref</code>, <code>range</code>, <code>index</code>, <code>ALL</code> (full scan, bad)</td></tr>
+      <tr><td><code>possible_keys</code> / <code>key</code></td><td>Indexes that could be used / the one chosen
+      (<code>NULL</code> means none)</td></tr>
+      <tr><td><code>rows</code></td><td>Estimated rows examined</td></tr>
+      <tr><td><code>Extra</code></td><td><code>Using index</code> (covering), <code>Using filesort</code> and
+      <code>Using temporary</code> (extra work to avoid)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A tuning routine</h4>
+  <ol class="steps">
+    <li>Find the slow query (application logs, <code>pg_stat_statements</code>, slow query log).</li>
+    <li>Run <code>EXPLAIN (ANALYZE, BUFFERS)</code> on production-like data.</li>
+    <li>Find the node with the biggest actual time × loops, and big <code>Rows Removed by Filter</code>.</li>
+    <li>Compare estimated and actual rows; run <code>ANALYZE</code> if they are far apart.</li>
+    <li>Change one thing: add or reorder an index, rewrite the condition, select fewer columns.</li>
+    <li>Run <code>EXPLAIN ANALYZE</code> again and compare. Keep the change only if it helps.</li>
+  </ol>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: judge by actual time and buffers, not by cost alone</p>
+    <p>Cost is an estimate in made-up units. The truth is <code>actual time</code> and
+    <code>Buffers</code> from <code>EXPLAIN (ANALYZE, BUFFERS)</code>, run twice (the first run may be cold).</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>With <code>loops=1000</code>, a node showing <code>actual time=0.05</code> costs 50 ms in total.</li>
+      <li>On a small test table the planner picks a Seq Scan even with a perfect index. Test with realistic
+      volumes.</li>
+      <li><code>EXPLAIN</code> on a parameterized query inside a prepared statement can differ from the literal
+      version: PostgreSQL may use a generic plan after several executions.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>EXPLAIN vs EXPLAIN ANALYZE?</b> The first shows the estimated plan; the second runs the query and
+      shows real times and row counts.</li>
+      <li><b>What do you look for?</b> Seq Scan on big tables, big gaps between estimated and actual rows, rows
+      removed by filter, sorts spilling to disk, nested loops with high loop counts.</li>
+      <li><b>Nested loop vs hash join vs merge join?</b> Per-row indexed lookups (small outer); hash table of one
+      side (large unsorted); merge of two sorted sides.</li>
+      <li><b>A query got slow after a bulk import. Why?</b> Stale statistics; run <code>ANALYZE</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-transactions-acid">
+  <h3>Transactions and ACID</h3>
+  <p class="tldr">A transaction groups several statements into one all-or-nothing unit; ACID (Atomicity,
+  Consistency, Isolation, Durability) names the four guarantees the database gives, shown best by a bank
+  transfer.</p>
+
+  <h4>Why transactions exist</h4>
+  <p>Moving ₹500 from Asha's account to Bilal's takes two updates: subtract from one, add to the other. If the
+  server crashes between them, ₹500 vanishes. If two transfers touch the same account at once, one update can
+  overwrite the other. A <strong>transaction</strong> wraps the statements so they succeed together or not at
+  all, and are protected from other users while they run.</p>
+<pre data-title="accounts and a transfer"><code class="language-sql">CREATE TABLE accounts (
+    id            BIGINT PRIMARY KEY,
+    owner         TEXT   NOT NULL,
+    balance_paise BIGINT NOT NULL CHECK (balance_paise &gt;= 0)
+);
+INSERT INTO accounts VALUES (1, 'Asha', 100000), (2, 'Bilal', 50000);
+
+BEGIN;                                                           -- start the transaction
+UPDATE accounts SET balance_paise = balance_paise - 50000 WHERE id = 1;
+UPDATE accounts SET balance_paise = balance_paise + 50000 WHERE id = 2;
+COMMIT;                                                          -- make both changes permanent
+
+SELECT * FROM accounts ORDER BY id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> id | owner | balance_paise
+----+-------+---------------
+  1 | Asha  |         50000
+  2 | Bilal |        100000</code></pre>
+
+  <h4>BEGIN, COMMIT, ROLLBACK, SAVEPOINT</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>BEGIN</code> (or <code>START TRANSACTION</code>)</td><td>Opens a transaction</td></tr>
+      <tr><td><code>COMMIT</code></td><td>Makes all changes permanent and visible to others</td></tr>
+      <tr><td><code>ROLLBACK</code></td><td>Undoes all changes since <code>BEGIN</code></td></tr>
+      <tr><td><code>SAVEPOINT name</code></td><td>Marks a point inside the transaction</td></tr>
+      <tr><td><code>ROLLBACK TO SAVEPOINT name</code></td><td>Undoes only the work after that point</td></tr>
+      <tr><td><code>RELEASE SAVEPOINT name</code></td><td>Forgets the savepoint, keeps the work</td></tr>
+    </tbody>
+  </table></div>
+<pre data-title="Rollback when a rule is broken"><code class="language-sql">BEGIN;
+UPDATE accounts SET balance_paise = balance_paise - 80000 WHERE id = 1;   -- Asha has 50000 only
+-- ERROR:  new row for relation "accounts" violates check constraint "accounts_balance_paise_check"
+ROLLBACK;     -- PostgreSQL: after an error the transaction is "aborted"; only ROLLBACK works
+
+SELECT balance_paise FROM accounts WHERE id = 1;     -- still 50000</code></pre>
+<pre data-title="Savepoints"><code class="language-sql">BEGIN;
+INSERT INTO orders (user_id, restaurant_id, delivery_address, total_paise)
+VALUES (1, 1, 'MG Road', 60000);
+SAVEPOINT before_coupon;
+UPDATE coupons SET used_count = used_count + 1 WHERE code = 'BAD';   -- fails or is not wanted
+ROLLBACK TO SAVEPOINT before_coupon;      -- order insert is kept
+COMMIT;</code></pre>
+
+  <h4>Autocommit</h4>
+  <p>Outside <code>BEGIN</code>, every single statement is its own transaction that commits at once:
+  <strong>autocommit</strong>. That is the default in <code>psql</code> and in the PostgreSQL JDBC driver's
+  server behaviour. JDBC starts with <code>connection.setAutoCommit(true)</code>; to run several statements
+  together you call <code>setAutoCommit(false)</code>, then <code>commit()</code> or <code>rollback()</code>.
+  Spring does this for you: a method annotated with <code>@Transactional</code> gets one connection, turns off
+  autocommit, commits on normal return and rolls back on a runtime exception (see
+  <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>). In MySQL the same: autocommit is on by default;
+  DDL statements such as <code>CREATE TABLE</code> cause an implicit commit, but PostgreSQL can roll DDL back.</p>
+
+  <h4>ACID, letter by letter</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Letter</th><th>Promise</th><th>Bank-transfer example</th><th>How the database does it</th></tr></thead>
+    <tbody>
+      <tr><td><strong>A</strong>tomicity</td><td>All statements apply, or none</td><td>Debit and credit both happen, or neither</td>
+      <td>Undo information / old row versions; rollback discards changes</td></tr>
+      <tr><td><strong>C</strong>onsistency</td><td>Data moves from one valid state to another; rules always hold</td>
+      <td>Balance never negative; foreign keys valid; total money unchanged</td>
+      <td>Constraints (<code>CHECK</code>, <code>FOREIGN KEY</code>, <code>UNIQUE</code>) abort violating
+      transactions; the application defines the business rules</td></tr>
+      <tr><td><strong>I</strong>solation</td><td>Concurrent transactions do not see each other's half-done work</td>
+      <td>A second transfer cannot read Asha's balance between the debit and the credit</td>
+      <td>MVCC (versions) and locks; see <a href="#m5-isolation-levels">isolation levels</a></td></tr>
+      <tr><td><strong>D</strong>urability</td><td>After <code>COMMIT</code>, data survives a crash</td>
+      <td>After "transfer successful" the money stays moved even if the server loses power</td>
+      <td>Write-ahead log (WAL, redo log), flushed to disk at commit</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Durability in more detail:</strong> the database first appends a description of the change to a
+  <strong>write-ahead log</strong> and forces it to disk (<code>fsync</code>) before telling you "committed". Data
+  pages in memory are written to the table files later, in the background. After a crash, the database replays
+  the log to restore every committed change and discards the uncommitted ones. Appending to a log is fast
+  sequential I/O, which is why commits are cheap. (PostgreSQL's setting <code>synchronous_commit = off</code>
+  trades a tiny window of lost commits for speed; do not use it for payments.) InnoDB calls its log the
+  <em>redo log</em> and also keeps an <em>undo log</em> to roll back and to serve old versions.</p>
+  <p><strong>Consistency</strong> has two meanings. In ACID it means "no rule is broken at commit". This is
+  different from "consistency" in the CAP theorem (all nodes agree) in
+  <a href="#m6-cap">Module 6</a>.</p>
+
+  <h4>What a transaction does not do</h4>
+  <ul>
+    <li>It does not make a long operation safe if it contains a call to a payment gateway or an email: those
+    side effects cannot be rolled back. Keep transactions short and do external calls outside them, or use
+    patterns such as an outbox table.</li>
+    <li>It does not stop all concurrency bugs by itself: the isolation level decides what you can see (next
+    article), and read-then-write logic needs locks (see <a href="#m5-locking">Locking</a>).</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: one transaction per business operation, kept short</p>
+    <p>Group the statements that must succeed together (transfer, place an order and its lines). Commit as soon
+    as possible. A transaction left open holds locks and blocks cleanup (<code>VACUUM</code>); an
+    "idle in transaction" connection is a classic production problem.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: catching the exception and carrying on in the same transaction</p>
+    <p>In PostgreSQL, after any error the whole transaction is aborted: every later statement fails with
+    "current transaction is aborted, commands ignored until end of transaction block". Roll back, or use a
+    savepoint around the risky statement. In Spring, swallowing a <code>RuntimeException</code> inside a
+    <code>@Transactional</code> method means the transaction still commits whatever was done before.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>MySQL's MyISAM engine has no transactions; use InnoDB (the default since MySQL 5.5).</li>
+      <li><code>COMMIT</code> can itself fail (deferred constraints, serialization failure at the Serializable
+      level). Handle the error and retry.</li>
+      <li>Sequences and identity values are not rolled back: a rolled-back insert leaves a gap in ids.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Explain ACID with an example.</b> Bank transfer: atomic (both updates or none), consistent
+      (balance never negative, total unchanged), isolated (no one sees the money in flight), durable (survives a
+      crash thanks to the WAL).</li>
+      <li><b>How is durability implemented?</b> Write-ahead log flushed at commit; replayed after a crash.</li>
+      <li><b>Autocommit?</b> Each statement is its own transaction unless you start one explicitly.</li>
+      <li><b>ACID consistency vs CAP consistency?</b> Rules hold after commit, versus all nodes see the same data.</li>
+    </ul>
+  </div>
+</article>

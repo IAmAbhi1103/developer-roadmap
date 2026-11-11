@@ -1,0 +1,559 @@
+<article class="topic" id="m3-classic-islands">
+  <h3>Classic queries: consecutive days, running totals and month-over-month growth</h3>
+  <p class="tldr">Sequence questions are solved with window functions. For "consecutive days" subtract a
+  <code>ROW_NUMBER</code> from the date: rows in an unbroken run get the same result (gaps-and-islands). Running
+  totals use <code>SUM() OVER</code>, and growth compares a row with <code>LAG</code>.</p>
+
+  <h4>Consecutive login days (gaps and islands)</h4>
+  <p>A run of consecutive days is an <strong>island</strong>; a missing day is a <strong>gap</strong> between
+  islands. Create a login table to practise:</p>
+  <pre data-title="Practice data"><code class="language-sql">CREATE TEMP TABLE logins (user_id INT NOT NULL, login_date DATE NOT NULL);
+INSERT INTO logins VALUES
+    (1,'2026-04-01'),(1,'2026-04-02'),(1,'2026-04-03'),(1,'2026-04-05'),(1,'2026-04-06'),(1,'2026-04-09'),
+    (2,'2026-04-01'),(2,'2026-04-03'),(2,'2026-04-04'),(2,'2026-04-05'),(2,'2026-04-06'),(2,'2026-04-07'),
+    (3,'2026-04-02'),(3,'2026-04-04'),(3,'2026-04-06');</code></pre>
+  <p><strong>The trick.</strong> Number each user's dates 1, 2, 3… in order. In an unbroken run the date goes up by
+  one and the row number goes up by one, so <code>date - row_number</code> stays constant. When a day is
+  skipped, the date jumps but the number does not, so the difference changes and a new island starts.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>user 1 date</th><th>row number</th><th>date − row number</th><th>island</th></tr></thead>
+    <tbody>
+      <tr><td>04-01</td><td>1</td><td>03-31</td><td rowspan="3">A</td></tr>
+      <tr><td>04-02</td><td>2</td><td>03-31</td></tr>
+      <tr><td>04-03</td><td>3</td><td>03-31</td></tr>
+      <tr><td>04-05</td><td>4</td><td>04-01</td><td rowspan="2">B</td></tr>
+      <tr><td>04-06</td><td>5</td><td>04-01</td></tr>
+      <tr><td>04-09</td><td>6</td><td>04-03</td><td>C</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="All streaks per user"><code class="language-sql">WITH numbered AS (
+    SELECT DISTINCT user_id, login_date FROM logins          -- DISTINCT: one login per day
+),
+grouped AS (
+    SELECT user_id, login_date,
+           login_date - CAST(ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY login_date) AS INT)
+               AS island
+    FROM numbered
+)
+SELECT user_id,
+       MIN(login_date) AS streak_start,
+       MAX(login_date) AS streak_end,
+       COUNT(*)        AS days
+FROM grouped
+GROUP BY user_id, island
+ORDER BY user_id, streak_start;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> user_id | streak_start | streak_end | days
+---------+--------------+------------+------
+       1 | 2026-04-01   | 2026-04-03 |    3
+       1 | 2026-04-05   | 2026-04-06 |    2
+       1 | 2026-04-09   | 2026-04-09 |    1
+       2 | 2026-04-01   | 2026-04-01 |    1
+       2 | 2026-04-03   | 2026-04-07 |    5
+       3 | 2026-04-02   | 2026-04-02 |    1
+       3 | 2026-04-04   | 2026-04-04 |    1
+       3 | 2026-04-06   | 2026-04-06 |    1
+(8 rows)</code></pre>
+  <p>Wrap it to answer common versions of the question: <em>longest streak per user</em> (<code>MAX(days)</code>
+  grouped by user: 3, 5, 1) or <em>users with a streak of at least 3 days</em> (<code>WHERE days &gt;= 3</code>:
+  users 1 and 2). In MySQL, use <code>DATE_SUB(login_date, INTERVAL rn DAY)</code> for the subtraction.</p>
+  <p><strong>Alternative with LEAD</strong> for the narrow question "which users logged in on 3 consecutive
+  days?":</p>
+  <pre data-title="LEAD looks two rows ahead"><code class="language-sql">SELECT DISTINCT user_id
+FROM (SELECT user_id, login_date,
+             LEAD(login_date, 2) OVER (PARTITION BY user_id ORDER BY login_date) AS two_ahead
+      FROM (SELECT DISTINCT user_id, login_date FROM logins) AS d) AS t
+WHERE two_ahead = login_date + 2
+ORDER BY user_id;     -- 1 and 2</code></pre>
+  <p>If the date two rows ahead is exactly two days later, the three dates must be consecutive. This is short
+  but fixed at 3; the island method works for any length. A third way is a triple self join
+  (<code>l2.login_date = l1.login_date + 1</code> and <code>l3.login_date = l1.login_date + 2</code>), simple to
+  read and fine for small data.</p>
+
+  <p><strong>Reading the result.</strong> User 2 logged in on 04-01, skipped 04-02, then logged in five days in a
+  row (04-03 to 04-07). User 3 never has two days in a row, so every streak has length 1. The two follow-up
+  questions need only one more layer around the same query. Put the streak query into a CTE named
+  <code>streaks</code> and then:</p>
+  <pre data-title="Longest streak per user"><code class="language-sql">SELECT user_id, MAX(days) AS longest_streak
+FROM streaks
+GROUP BY user_id
+ORDER BY user_id;     -- 1 -> 3, 2 -> 5, 3 -> 1</code></pre>
+  <p>For the <em>current</em> streak (the one that includes the latest login) take the island whose
+  <code>streak_end</code> equals the user's <code>MAX(login_date)</code>.</p>
+
+  <h4>The opposite question: find the gaps</h4>
+  <p>"On which days was a user missing?" is the mirror image. Look at the next login with <code>LEAD</code>; if
+  it is more than one day away, everything in between is a gap:</p>
+  <pre data-title="Missing days between logins"><code class="language-sql">SELECT user_id,
+       login_date + 1 AS gap_start,
+       next_date  - 1 AS gap_end
+FROM (SELECT user_id, login_date,
+             LEAD(login_date) OVER (PARTITION BY user_id ORDER BY login_date) AS next_date
+      FROM (SELECT DISTINCT user_id, login_date FROM logins) AS d) AS t
+WHERE next_date - login_date &gt; 1
+ORDER BY user_id, gap_start;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> user_id | gap_start  |  gap_end
+---------+------------+------------
+       1 | 2026-04-04 | 2026-04-04
+       1 | 2026-04-07 | 2026-04-08
+       2 | 2026-04-02 | 2026-04-02
+       3 | 2026-04-03 | 2026-04-03
+       3 | 2026-04-05 | 2026-04-05
+(5 rows)</code></pre>
+  <p>In PostgreSQL, <code>date + 1</code> and <code>date - date</code> work directly (the second gives a number
+  of days). In MySQL use <code>DATE_ADD</code>, <code>DATE_SUB</code> and <code>DATEDIFF(next_date,
+  login_date) &gt; 1</code>. The last login of each user has a NULL <code>next_date</code>, the comparison is
+  unknown, and the row is dropped, which is right: there is no gap after the final login.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method for "N days in a row"</th><th>Any N</th><th>Gives the streak itself</th><th>Needs</th></tr></thead>
+    <tbody>
+      <tr><td>Island trick (date − row number)</td><td>yes</td><td>start, end, length</td><td>window functions</td></tr>
+      <tr><td><code>LEAD(date, N-1)</code></td><td>one query per N</td><td>only that it exists</td><td>window functions</td></tr>
+      <tr><td>Self join, one join per day</td><td>no (grows with N)</td><td>no</td><td>any database</td></tr>
+      <tr><td>Recursive CTE walking day by day</td><td>yes</td><td>yes, but slow</td><td>CTE support</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Running total per customer</h4>
+  <p>Cumulative spending of each customer over their orders (cancelled orders excluded):</p>
+  <pre data-title="SUM OVER with PARTITION BY"><code class="language-sql">WITH order_totals AS (
+    SELECT o.order_id, o.customer_id, o.order_date,
+           SUM(oi.quantity * oi.unit_price) AS total
+    FROM orders o
+    JOIN order_items oi ON oi.order_id = o.order_id
+    WHERE o.status &lt;&gt; 'CANCELLED'
+    GROUP BY o.order_id, o.customer_id, o.order_date
+)
+SELECT customer_id, order_id, order_date, total,
+       SUM(total) OVER (PARTITION BY customer_id
+                        ORDER BY order_date, order_id
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total
+FROM order_totals
+ORDER BY customer_id, order_date, order_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> customer_id | order_id | order_date |  total  | running_total
+-------------+----------+------------+---------+---------------
+           1 |        1 | 2026-01-05 | 1159.00 |       1159.00
+           1 |        3 | 2026-02-02 |  749.00 |       1908.00
+           1 |        7 | 2026-03-21 | 4298.00 |       6206.00
+           2 |        2 | 2026-01-18 | 4097.00 |       4097.00
+           2 |        9 | 2026-04-03 | 1500.00 |       5597.00
+           3 |        6 | 2026-03-08 | 2100.00 |       2100.00
+           4 |        5 | 2026-02-27 | 2048.00 |       2048.00
+           5 |        8 | 2026-03-30 | 1196.00 |       1196.00
+           5 |       10 | 2026-04-10 | 1278.00 |       2474.00
+(9 rows)</code></pre>
+  <p>The frame and the tie-breaker (<code>order_id</code>) are explained in
+  <a href="#m3-window-frames">frames</a>. The non-window version is a correlated subquery summing all orders of
+  the same customer up to the current one; it gives the same numbers but is far slower.</p>
+
+  <p>Two details of this query matter. The <code>PARTITION BY</code> restarts the sum for each customer. And
+  the frame <code>ROWS … CURRENT ROW</code> with a tie-breaker in <code>ORDER BY</code> keeps the total correct if
+  a customer places two orders on the same day. With the default frame (<code>RANGE</code>), rows with an equal
+  <code>order_date</code> would all get the same running total, which surprises people.</p>
+
+  <h4>Month-over-month growth with LAG</h4>
+  <pre data-title="Revenue and percentage change"><code class="language-sql">WITH monthly AS (
+    SELECT DATE_TRUNC('month', o.order_date)::DATE AS month,
+           SUM(oi.quantity * oi.unit_price)         AS revenue
+    FROM orders o
+    JOIN order_items oi ON oi.order_id = o.order_id
+    WHERE o.status &lt;&gt; 'CANCELLED'
+    GROUP BY DATE_TRUNC('month', o.order_date)
+)
+SELECT month, revenue,
+       LAG(revenue) OVER (ORDER BY month) AS previous,
+       ROUND(100.0 * (revenue - LAG(revenue) OVER (ORDER BY month))
+             / LAG(revenue) OVER (ORDER BY month), 1) AS growth_pct
+FROM monthly
+ORDER BY month;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">   month    | revenue | previous | growth_pct
+------------+---------+----------+------------
+ 2026-01-01 | 5256.00 |   (null) |     (null)
+ 2026-02-01 | 2797.00 |  5256.00 |      -46.8
+ 2026-03-01 | 7594.00 |  2797.00 |      171.5
+ 2026-04-01 | 2778.00 |  7594.00 |      -63.4
+(4 rows)</code></pre>
+  <p>The first month has no previous value, so the result is NULL, which is honest. Divide by zero is a risk if a
+  previous month had zero revenue: use <code>NULLIF(LAG(revenue) OVER (…), 0)</code> in the denominator. A month
+  with no orders at all is simply missing from <code>monthly</code>, which makes <code>LAG</code> compare with an
+  older month. Fill the gaps with <code>generate_series</code> and a <code>LEFT JOIN</code>
+  (<a href="#m3-recursive-cte">Recursive CTEs and generating series</a>). Year-over-year growth is
+  <code>LAG(revenue, 12)</code> over monthly rows.</p>
+
+  <p><strong>Reading the numbers.</strong> February fell by (2797 − 5256) / 5256 = −46.8%. March grew by
+  (7594 − 2797) / 2797 = 171.5%. The formula is always (current − previous) / previous. Repeating
+  <code>LAG(revenue) OVER (ORDER BY month)</code> three times is fine for the database (it computes the same
+  window once), but you can make it readable by calculating <code>previous</code> in the CTE and doing the
+  arithmetic in the outer query.</p>
+  <p><strong>Moving average.</strong> A 3-month rolling average smooths the zig-zag. The frame says "this month
+  and the two before it":</p>
+  <pre data-title="Rolling 3-month average"><code class="language-sql">SELECT month, revenue,
+       ROUND(AVG(revenue) OVER (ORDER BY month
+                                ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 2) AS avg_3m
+FROM monthly
+ORDER BY month;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">   month    | revenue | avg_3m
+------------+---------+---------
+ 2026-01-01 | 5256.00 | 5256.00
+ 2026-02-01 | 2797.00 | 4026.50
+ 2026-03-01 | 7594.00 | 5215.67
+ 2026-04-01 | 2778.00 | 4389.67
+(4 rows)</code></pre>
+  <p>The first two rows average fewer than three months because there is not enough history; decide whether
+  to hide them. In MySQL the monthly CTE uses <code>DATE_FORMAT(o.order_date, '%Y-%m-01')</code> or
+  <code>DATE_SUB(order_date, INTERVAL DAYOFMONTH(order_date) - 1 DAY)</code> instead of
+  <code>DATE_TRUNC</code>; the window parts are identical in MySQL 8.</p>
+
+
+  <p>A company-wide running total drops the partition. Using the monthly CTE from the next query, the cumulative
+  revenue after each month is:</p>
+  <pre data-title="Cumulative revenue by month"><code class="language-sql">-- monthly(month, revenue) is the CTE from the query above
+SELECT month, revenue,
+       SUM(revenue) OVER (ORDER BY month) AS cumulative
+FROM monthly
+ORDER BY month;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">   month    | revenue | cumulative
+------------+---------+------------
+ 2026-01-01 | 5256.00 |    5256.00
+ 2026-02-01 | 2797.00 |    8053.00
+ 2026-03-01 | 7594.00 |   15647.00
+ 2026-04-01 | 2778.00 |   18425.00
+(4 rows)</code></pre>
+  <div class="co co-rule">
+    <p class="co-t">Rule: de-duplicate before you number</p>
+    <p>If a user can log in twice on one day, the row-number trick breaks, since the number goes up while the
+    date does not. Always take <code>DISTINCT user_id, login_date</code> first, as the example does.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Timestamps.</strong> If the column is a timestamp, cast it first
+      (<code>login_at::date</code>, or <code>CAST(login_at AS DATE)</code>): two logins at 09:00 and 18:00 are one
+      day. Mind the time zone that defines "a day" (see
+      <a href="#m2-date-ranges-time-zones">dates and time zones</a>).</li>
+      <li><strong>User with a single login.</strong> One island of length 1; fine. A user with no logins is not in
+      the table, so they never appear; join to a users table if they must.</li>
+      <li><strong>Cancelled and empty periods.</strong> The month-over-month query leaves out months without
+      orders; the growth for the month after a gap compares with the last month that has data.</li>
+      <li><strong>Negative or zero base.</strong> Growth from a previous value of 0 is undefined (NULL with
+      <code>NULLIF</code>); growth from a negative base flips the sign meaning, so show the absolute change too.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: integer division in the growth formula</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: integer columns, divide first</p><pre><code class="language-sql">-- revenue and prev are INT (paise)
+SELECT (revenue - prev) / prev * 100 FROM monthly_int;   -- 0 for any change under 100%</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: multiply by 100.0 first</p><pre><code class="language-sql">SELECT ROUND(100.0 * (revenue - prev) / NULLIF(prev, 0), 1) FROM monthly_int;</code></pre></div>
+    </div>
+    <p>With <code>NUMERIC</code> revenue (as in the sample database) the division keeps decimals, but get into the
+    habit of writing <code>100.0</code> first.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: build these queries in layers</p>
+    <p>One CTE per step: deduplicate, number, group, then answer. Test each layer with its own
+    <code>SELECT</code> before adding the next. Long single-statement versions are hard to debug and to explain
+    in an interview.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: comparing the first and last date only</p>
+    <p>"Max date minus min date + 1 equals the number of rows" proves consecutiveness only for a single island
+    in the whole table. Per user, you need the grouping trick or <code>LAG</code>/<code>LEAD</code>.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Consecutive days is a favourite hard question: explain the island idea in one sentence (date minus row
+    number is constant inside a run), then write it. Month-over-month is the standard <code>LAG</code> question;
+    mention the first-row NULL and zero handling.</p>
+    <p>Common variants: "users who logged in on 3 or more consecutive days", "longest streak", "days a user was inactive" (the gaps query), "cumulative sales per day" and "percentage change versus the same month last year" (<code>LAG(revenue, 12)</code>).</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-classic-pivot-median">
+  <h3>Classic queries: pivot rows to columns and the median</h3>
+  <p class="tldr">A pivot turns row values into columns with one conditional aggregate per column. The median is
+  the middle value: PostgreSQL has <code>PERCENTILE_CONT(0.5)</code>, and in other databases you number the rows
+  with a window function and average the one or two in the middle.</p>
+
+  <h4>Pivoting with conditional aggregation</h4>
+  <p>Orders each customer placed per month, one column per month:</p>
+  <pre data-title="Rows to columns"><code class="language-sql">SELECT customer_id,
+       COUNT(*) FILTER (WHERE EXTRACT(MONTH FROM order_date) = 1) AS jan,
+       COUNT(*) FILTER (WHERE EXTRACT(MONTH FROM order_date) = 2) AS feb,
+       COUNT(*) FILTER (WHERE EXTRACT(MONTH FROM order_date) = 3) AS mar,
+       COUNT(*) FILTER (WHERE EXTRACT(MONTH FROM order_date) = 4) AS apr
+FROM orders
+GROUP BY customer_id
+ORDER BY customer_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> customer_id | jan | feb | mar | apr
+-------------+-----+-----+-----+-----
+           1 |   1 |   1 |   1 |   0
+           2 |   1 |   0 |   0 |   1
+           3 |   0 |   1 |   1 |   0
+           4 |   0 |   1 |   0 |   0
+           5 |   0 |   0 |   1 |   1
+(5 rows)</code></pre>
+  <p>The portable version (MySQL, older databases) replaces each <code>COUNT(*) FILTER (WHERE c)</code> with
+  <code>SUM(CASE WHEN c THEN 1 ELSE 0 END)</code>. The column list is fixed in the query: if a new month appears,
+  you edit the SQL. A fully dynamic pivot needs generated SQL from the application, or PostgreSQL's
+  <code>crosstab</code> function from the <code>tablefunc</code> extension. For data that changes shape, pivot in
+  Java or in the reporting tool.</p>
+  <p>The reverse, <strong>unpivot</strong> (columns to rows), uses <code>UNION ALL</code> of one select per
+  column, or in PostgreSQL <code>CROSS JOIN LATERAL (VALUES ('jan', jan), ('feb', feb)) AS v(month, n)</code>.
+  More pivot examples are in <a href="#m2-conditional-aggregation">conditional aggregation</a>.</p>
+
+  <p><strong>How the pivot works.</strong> <code>GROUP BY customer_id</code> makes one output row per customer.
+  Each <code>FILTER</code> then counts, inside that group, only the rows whose month matches. So the headings
+  <code>jan</code>, <code>feb</code> … are not data; they are names you chose, one aggregate per name.
+  Adding a total column is one more aggregate, <code>COUNT(*)</code>.</p>
+  <p>The portable form with a second, more useful pivot: orders per customer by status, with a total.</p>
+  <pre data-title="Portable pivot (PostgreSQL and MySQL)"><code class="language-sql">SELECT customer_id,
+       SUM(CASE WHEN status = 'PLACED'    THEN 1 ELSE 0 END) AS placed,
+       SUM(CASE WHEN status = 'SHIPPED'   THEN 1 ELSE 0 END) AS shipped,
+       SUM(CASE WHEN status = 'DELIVERED' THEN 1 ELSE 0 END) AS delivered,
+       SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END) AS cancelled,
+       COUNT(*)                                              AS total
+FROM orders
+GROUP BY customer_id
+ORDER BY customer_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> customer_id | placed | shipped | delivered | cancelled | total
+-------------+--------+---------+-----------+-----------+-------
+           1 |      0 |       1 |         2 |         0 |     3
+           2 |      1 |       0 |         1 |         0 |     2
+           3 |      0 |       0 |         1 |         1 |     2
+           4 |      0 |       0 |         1 |         0 |     1
+           5 |      1 |       1 |         0 |         0 |     2
+(5 rows)</code></pre>
+  <p>The five rows add up to the 10 orders. Customers 6 and 7 never ordered, so they have no group and no
+  row; start from <code>customers</code> with a <code>LEFT JOIN</code> if they must be listed with zeros.</p>
+  <p>PostgreSQL's <code>crosstab</code> (from the <code>tablefunc</code> extension) takes a source query that
+  returns row name, category and value, plus a query that lists the categories. You must also declare the
+  output columns, so it is still not dynamic:</p>
+  <pre data-title="crosstab (PostgreSQL, needs CREATE EXTENSION tablefunc)"><code class="language-sql">CREATE EXTENSION IF NOT EXISTS tablefunc;
+
+SELECT *
+FROM crosstab(
+    $$SELECT customer_id, status, COUNT(*)
+      FROM orders GROUP BY 1, 2 ORDER BY 1, 2$$,
+    $$VALUES ('CANCELLED'), ('DELIVERED'), ('PLACED'), ('SHIPPED')$$
+) AS ct(customer_id INT, cancelled BIGINT, delivered BIGINT, placed BIGINT, shipped BIGINT);</code></pre>
+  <p>Missing combinations come back as NULL (not 0) and the output columns must follow the category list
+  order, which is why the conditional-aggregation pivot is the safer habit.</p>
+
+  <h4>Unpivot: columns back to rows</h4>
+  <p>Some tables store one column per period (<code>q1</code>, <code>q2</code>, <code>q3</code>). Reports and
+  charts want rows. <code>UNION ALL</code> stacks one select per column:</p>
+  <pre data-title="Unpivot with UNION ALL"><code class="language-sql">CREATE TEMP TABLE quarterly (product VARCHAR(20), q1 INT, q2 INT, q3 INT);
+INSERT INTO quarterly VALUES ('Mouse', 10, 20, 15), ('Keyboard', 5, 0, 8);
+
+SELECT product, 'Q1' AS quarter, q1 AS units FROM quarterly
+UNION ALL
+SELECT product, 'Q2', q2 FROM quarterly
+UNION ALL
+SELECT product, 'Q3', q3 FROM quarterly
+ORDER BY product, quarter;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> product  | quarter | units
+----------+---------+-------
+ Keyboard | Q1      |     5
+ Keyboard | Q2      |     0
+ Keyboard | Q3      |     8
+ Mouse    | Q1      |    10
+ Mouse    | Q2      |    20
+ Mouse    | Q3      |    15
+(6 rows)</code></pre>
+  <p>Use <code>UNION ALL</code>, not <code>UNION</code>: plain <code>UNION</code> removes duplicate rows and
+  would silently merge two equal values. The table is read three times; the <code>LATERAL (VALUES …)</code> form
+  reads it once. The need to unpivot is usually a sign of a design problem; see
+  <a href="#m4-normalization">Normalization</a> (repeating columns break first normal form).</p>
+
+  <h4>The median</h4>
+  <p>The <strong>median</strong> is the middle value of the sorted list (the average of the two middle values
+  when the count is even). It is better than the average for salaries because a few huge values do not distort
+  it. Sorted ascending, the 12 salaries are 55, 65, 75, 90, 110, 120, 150, 150, 150, 160, 220, 300 (thousands);
+  the 6th and 7th values are 120 and 150, so the median is 135,000, while the mean is 137,083.</p>
+  <p><strong>Mean, median and mode compared</strong> on the 12 salaries:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Measure</th><th>Meaning</th><th>Value</th><th>PostgreSQL</th></tr></thead>
+    <tbody>
+      <tr><td>Mean</td><td>sum divided by count</td><td>137,083.33</td><td><code>AVG(salary)</code></td></tr>
+      <tr><td>Median</td><td>middle value</td><td>135,000</td><td><code>PERCENTILE_CONT(0.5)</code></td></tr>
+      <tr><td>Mode</td><td>most frequent value</td><td>150,000</td><td><code>MODE() WITHIN GROUP (ORDER BY salary)</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Meera's 300,000 pulls the mean up. If she were paid 3,000,000, the mean would jump, and the median would
+  stay at 135,000. That robustness is why reports quote the median for salaries and order values.</p>
+
+  <pre data-title="Approach 1: PERCENTILE_CONT (PostgreSQL)"><code class="language-sql">SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY salary) AS median_salary,
+       PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY salary) AS lower_middle
+FROM employees;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> median_salary | lower_middle
+---------------+--------------
+        135000 |    120000.00
+(1 row)</code></pre>
+  <p><code>PERCENTILE_CONT</code> interpolates between the two middle values (continuous);
+  <code>PERCENTILE_DISC</code> returns an actual value from the data (the first one at or above the fraction).
+  Per department, add <code>GROUP BY dept_id</code>: the medians are 150000 for Engineering, 150000 for Sales and
+  65000 for HR.</p>
+  <pre data-title="Approach 2: row numbers (PostgreSQL; MySQL needs DIV)"><code class="language-sql">WITH ordered AS (
+    SELECT salary,
+           ROW_NUMBER() OVER (ORDER BY salary) AS rn,
+           COUNT(*)     OVER ()                AS cnt
+    FROM employees
+)
+SELECT ROUND(AVG(salary), 2) AS median_salary
+FROM ordered
+WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> median_salary
+---------------
+     135000.00
+(1 row)</code></pre>
+  <p>With an odd count (say 11), <code>(cnt+1)/2</code> and <code>(cnt+2)/2</code> are both 6, so one row
+  qualifies; with an even count (12) they are 6 and 7 and the two values are averaged. The division is integer division in PostgreSQL, which is what makes it work (MySQL differs, see the note below). Approach 3, for databases without windows, is the self-balancing
+  correlated count: a row is a median candidate when the number of rows below it and the number above it are each
+  at most half of the total.</p>
+
+  <p><strong>The median per department</strong> with the row-number method: partition both window functions by
+  department, then average the middle one or two rows of each group.</p>
+  <pre data-title="Median per department"><code class="language-sql">WITH ordered AS (
+    SELECT dept_id, salary,
+           ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY salary) AS rn,
+           COUNT(*)     OVER (PARTITION BY dept_id)                AS cnt
+    FROM employees
+)
+SELECT dept_id, ROUND(AVG(salary), 2) AS median_salary
+FROM ordered
+WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2)
+GROUP BY dept_id
+ORDER BY dept_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id | median_salary
+---------+---------------
+       1 |     150000.00
+       2 |     150000.00
+       3 |      65000.00
+  (null) |     300000.00
+(4 rows)</code></pre>
+  <p>Engineering has 5 salaries (90, 110, 150, 150, 220 thousand), so the middle is the 3rd: 150000. Sales and
+  HR have 3 each, so the middle is the 2nd. Meera is a group of one. With
+  <code>PERCENTILE_CONT</code> the same result needs only <code>GROUP BY dept_id</code>.</p>
+  <div class="co co-exc">
+    <p class="co-t">MySQL: the / operator is not integer division</p>
+    <p>In PostgreSQL, dividing two integers cuts off the decimals, so <code>(cnt + 1) / 2</code> is a whole
+    number. In MySQL, <code>/</code> returns a decimal (<code>13 / 2</code> is <code>6.5000</code>), so
+    <code>rn IN (6.5, 7)</code> would match only the 7th row and give the wrong median. Write
+    <code>(cnt + 1) DIV 2</code> and <code>(cnt + 2) DIV 2</code> in MySQL.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>NULLs are ignored by <code>PERCENTILE_CONT</code>, but counted by <code>COUNT(*) OVER ()</code> in
+      approach 2. Use <code>COUNT(salary)</code> or filter NULLs first.</li>
+      <li>MySQL has no <code>PERCENTILE_CONT</code>. Oracle and SQL Server have <code>PERCENTILE_CONT</code> with
+      different syntax (<code>OVER</code> in SQL Server).</li>
+      <li>A pivot column for a category that never occurs shows 0 (with <code>COUNT</code>) or NULL (with
+      <code>SUM</code>); wrap with <code>COALESCE</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-rule">
+    <p class="co-t">Rule: a pivot needs the list of columns up front</p>
+    <p>SQL returns a fixed set of columns that is known when the query is parsed. A new month or a new status
+    means editing the query. If the categories change often, return rows (<code>GROUP BY customer_id,
+    status</code>) and pivot in the application or the reporting tool.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: LIMIT/OFFSET median that ignores the even case</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: takes the 7th of 12 values</p><pre><code class="language-sql">SELECT salary FROM employees
+ORDER BY salary
+LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM employees);   -- 150000.00</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: average the two middle values</p><pre><code class="language-sql">SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY salary)
+FROM employees;                                        -- 135000</code></pre></div>
+    </div>
+    <p>The shortcut is right only when the count is odd. Also do not call <code>AVG</code> "the median".</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: name the pivot columns, show zeros, keep the total</p>
+    <p>Give each pivot column a meaningful alias, use <code>COALESCE(…, 0)</code> (or <code>ELSE 0</code>) so a
+    report shows 0 instead of an empty cell, and add a <code>COUNT(*)</code> column as a check: the buckets
+    should add up to it. If they do not, a status you forgot exists in the data.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Convert rows to columns" is answered with <code>SUM(CASE …)</code> plus <code>GROUP BY</code>. "Find the
+    median salary" is a favourite hard one: give <code>PERCENTILE_CONT</code> if allowed, otherwise the
+    row-number solution, and explain the even/odd count trick.</p>
+    <p>Say why you use the median (outliers do not distort it), what happens with NULLs (ignored by <code>PERCENTILE_CONT</code>) and what you do when the interviewer says "no window functions" (the correlated count of smaller and larger values). For pivots, mention that columns are fixed at write time.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-leetcode-plan">
+  <h3>How to practise: LeetCode SQL 50 and a study routine</h3>
+  <p class="tldr">Reading is not enough for SQL. Solve problems on a real database every day, write more than one
+  solution, and review your mistakes. LeetCode's "SQL 50" study plan is a good ordered list for interviews.</p>
+
+  <h4>What the plan is</h4>
+  <p>LeetCode offers a free study plan called <strong>Top SQL 50</strong>: about fifty database problems
+  ordered from simple selects to joins, aggregation, subqueries and window functions. Each problem shows table
+  definitions and example data, you write one query, and the site checks it against hidden test cases. Its
+  default dialect is MySQL, and PostgreSQL is also offered for many problems; check the language selector, since
+  syntax such as <code>LIMIT</code> expressions, <code>FILTER</code> and <code>DATE_TRUNC</code> differs. Other good
+  sources are HackerRank's SQL track, StrataScratch and DataLemur (interview-style questions from product
+  companies).</p>
+
+  <h4>A weekly routine</h4>
+  <ol class="steps">
+    <li><strong>Week 1, basics:</strong> select, filter, sort, <code>LIKE</code>, <code>NULL</code>,
+    <code>CASE</code>. Aim for ten easy problems with no hints.</li>
+    <li><strong>Week 2, joins and aggregation:</strong> all join types, self join, anti-join,
+    <code>GROUP BY</code>/<code>HAVING</code>, conditional counts. Redo the "customers who never ordered" family
+    until it is automatic.</li>
+    <li><strong>Week 3, subqueries and CTEs:</strong> correlated subqueries, <code>EXISTS</code>, Nth highest,
+    duplicates, employees vs manager.</li>
+    <li><strong>Week 4, windows:</strong> ranking, top N per group, running totals, <code>LAG</code>/<code>LEAD</code>,
+    consecutive days. Rewrite earlier solutions with windows.</li>
+    <li><strong>Revise in month 11:</strong> redo the problems you struggled with, timed, before interview
+    season.</li>
+  </ol>
+
+  <h4>How to work on a problem</h4>
+  <ul>
+    <li><strong>Understand the output first:</strong> which columns, which order, how many rows, what about ties
+    and NULLs? Write the expected result for the sample input by hand.</li>
+    <li><strong>Build in stages:</strong> start with <code>FROM</code> and joins, check the rows, add
+    <code>WHERE</code>, then grouping, then the select list. Run after every step.</li>
+    <li><strong>Test your own edge cases:</strong> an empty group, duplicates, NULLs, a tie at the boundary.
+    Hidden test cases are exactly these.</li>
+    <li><strong>Write a second solution</strong> in a different style (join vs subquery, window vs correlated)
+    and compare readability and, with <code>EXPLAIN</code>, the plan.</li>
+    <li><strong>Read the best solutions</strong> after you pass, and keep a notebook of patterns: top N per
+    group, anti-join, gaps and islands, conditional aggregation, self join.</li>
+    <li><strong>Time-box:</strong> 20 to 30 minutes, then look at a hint. In interviews you also have to explain
+    your thinking, so practise saying it aloud.</li>
+  </ul>
+
+  <h4>Patterns that cover most interview questions</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pattern</th><th>Tool</th><th>Notes in this module</th></tr></thead>
+    <tbody>
+      <tr><td>Rows with no match</td><td><code>NOT EXISTS</code>, <code>LEFT JOIN … IS NULL</code></td><td><a href="#m2-join-traps">Join traps</a></td></tr>
+      <tr><td>Nth value, top N per group</td><td><code>DENSE_RANK</code>, <code>ROW_NUMBER</code></td><td><a href="#m3-window-ranking">Ranking</a></td></tr>
+      <tr><td>Compare with previous or next row</td><td><code>LAG</code>, <code>LEAD</code></td><td><a href="#m3-window-frames">Frames</a></td></tr>
+      <tr><td>Compare a row with its group</td><td>window <code>AVG</code>, correlated subquery</td><td><a href="#m3-window-intro">Window functions</a></td></tr>
+      <tr><td>Hierarchies</td><td>self join, recursive CTE</td><td><a href="#m3-recursive-cte">Recursive CTEs</a></td></tr>
+      <tr><td>Streaks and gaps</td><td>date minus <code>ROW_NUMBER</code></td><td><a href="#m3-classic-islands">Consecutive days</a></td></tr>
+      <tr><td>Several measures in one pass</td><td><code>SUM(CASE …)</code></td><td><a href="#m2-conditional-aggregation">Conditional aggregation</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: practise in your own PostgreSQL</p>
+    <p>Build the college database from the practice list below and write queries in <code>psql</code> or DBeaver
+    first. Use <code>EXPLAIN ANALYZE</code> on larger generated data (<code>generate_series</code>) to see how the
+    same answer behaves with 100,000 rows. Online judges only test correctness; real jobs also test speed.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>In a live SQL round: repeat the question, ask about ties and NULLs, state the tables you will use, write
+    the simple version first, then optimise or generalise. If you get stuck, say what you would try next. A
+    working, well-explained simple query beats a clever one you cannot explain.</p>
+  </div>
+</article>

@@ -1,0 +1,820 @@
+<article class="topic" id="m6-loading-error-states">
+  <h3>Loading and error states: network vs 4xx vs 5xx, spinners, toasts</h3>
+  <p class="tldr">Every API call can be loading, succeeded, empty or failed; a good UI shows a clear face
+  for each, tells a network failure apart from a 4xx (your request was wrong) and a 5xx (the server
+  broke), and never leaves the user staring at a spinner or a blank page.</p>
+
+  <h4>The states of one request</h4>
+  <p>When a component asks the Spring Boot API for data, the screen is in one of four situations. Beginners
+  code only the happy one. Real apps handle all four:</p>
+  <ul>
+    <li><strong>Loading</strong>: the request is in flight. Show a spinner or a skeleton.</li>
+    <li><strong>Error</strong>: the request failed. Say what happened and offer a way forward (retry, go
+    back, log in again).</li>
+    <li><strong>Empty</strong>: the request worked but the list has zero items. This is not an error. Show
+    "No employees yet" and a button to add one.</li>
+    <li><strong>Data</strong>: the normal screen.</li>
+  </ul>
+
+  <h4>Not all errors are the same</h4>
+  <p>The first question is: did the server answer at all? With Axios, a failed call throws an error. If
+  the server answered with a status such as 404 or 500, <code>error.response</code> exists. If the
+  request never got an answer (server down, no internet, CORS block, timeout), <code>error.response</code>
+  is <code>undefined</code>. That single check splits "network problem" from "server answered with a
+  problem".</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Kind</th><th>What it means</th><th>What the user should see</th><th>Retry?</th></tr></thead>
+    <tbody>
+      <tr><td>Network / timeout (no response)</td><td>Server down, offline, DNS, CORS block, timeout</td><td>"Cannot reach the server. Check your connection." + Retry button</td><td>Yes</td></tr>
+      <tr><td>400 / 422</td><td>Your data failed validation</td><td>Field errors next to inputs (see <a href="#m6-backend-validation-errors">next article</a>)</td><td>Fix input first</td></tr>
+      <tr><td>401</td><td>Not logged in or token expired</td><td>Handled by the interceptor: refresh or go to login (<a href="#m6-jwt-flow">JWT flow</a>)</td><td>After login</td></tr>
+      <tr><td>403</td><td>Logged in but not allowed</td><td>"You do not have access to this."</td><td>No</td></tr>
+      <tr><td>404</td><td>Resource does not exist (deleted, wrong id)</td><td>"Employee not found" page with a link back to the list</td><td>No</td></tr>
+      <tr><td>409</td><td>Conflict, for example duplicate email</td><td>Message on the conflicting field</td><td>Fix input first</td></tr>
+      <tr><td>429</td><td>Too many requests</td><td>"Slow down, try again in a moment."</td><td>Later</td></tr>
+      <tr><td>5xx</td><td>Bug or outage on the server</td><td>"Something went wrong on our side." + Retry; never show a stack trace</td><td>Yes, a few times</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Why the difference matters: retrying a 404 or a 400 is pointless because the same request will fail
+  the same way. Retrying a network blip or a 503 often works. Showing "Server error" when the user simply
+  lost Wi-Fi sends them to the wrong place.</p>
+
+  <h4>One place to classify errors</h4>
+  <p>Do not scatter <code>err.response?.status === 404</code> checks across components. Write one helper
+  that turns any thrown value into a small object the UI understands.</p>
+
+<pre data-title="src/lib/errors.js"><code class="language-javascript">import axios from 'axios';
+
+const fail = (kind, status, message, retryable) =&gt; ({ kind, status, message, retryable });
+
+export function classifyError(err) {
+  if (axios.isCancel(err)) {
+    return { kind: 'canceled', status: null, message: '', retryable: false };
+  }
+  if (!err.response) {                       // the server never answered
+    const timeout = err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT';
+    return {
+      kind: timeout ? 'timeout' : 'network',
+      status: null,
+      message: timeout
+        ? 'The server took too long to respond. Please try again.'
+        : 'Cannot reach the server. Check your internet connection.',
+      retryable: true,
+    };
+  }
+
+  const { status, data } = err.response;
+  // Spring Boot ProblemDetail has "detail"; fall back to "message"
+  const serverText = typeof data?.detail === 'string' ? data.detail : data?.message;
+
+  if (status === 401) return fail('auth', status, 'Please log in again.', false);
+  if (status === 403) return fail('forbidden', status, 'You do not have access to this.', false);
+  if (status === 404) return fail('not-found', status, serverText ?? 'Not found.', false);
+  if (status === 429) return fail('rate-limit', status, 'Too many requests. Try again soon.', true);
+  if (status &gt;= 500) {
+    return fail('server', status, 'Something went wrong on our side. Please try again.', true);
+  }
+  return fail('client', status, serverText ?? 'The request was not accepted.', false);
+}
+
+// Short text for banners and toasts
+export function describeError(err) {
+  return classifyError(err).message;
+}</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: never show raw server internals</p>
+    <p>For 5xx responses show your own friendly sentence, not <code>err.message</code> or the response body.
+    Raw text such as "Request failed with status code 500" is meaningless to users, and a leaked stack trace
+    or SQL message helps attackers. Log the details to the console (or an error-tracking tool) instead.
+    Spring Boot should not send stack traces in production responses either.</p>
+  </div>
+
+  <h4>The loading state, by hand</h4>
+  <p>This is the pattern from the <code>useEffect</code> articles in <a href="#m5">Module 5</a>, now with
+  a real API call. Three pieces of state and a <code>finally</code> that always clears the loading flag.</p>
+
+<pre data-title="src/pages/EmployeeListSimple.jsx (hand-written, for understanding)"><code class="language-jsx">import { useEffect, useState } from 'react';
+import { api } from '../lib/axios.js';
+import { classifyError } from '../lib/errors.js';
+
+function EmployeeListSimple() {
+  const [employees, setEmployees] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [attempt, setAttempt] = useState(0);            // bump to retry
+
+  useEffect(() =&gt; {
+    const controller = new AbortController();
+    setLoading(true);
+    setError(null);
+    api.get('/employees', { signal: controller.signal })
+      .then(({ data }) =&gt; setEmployees(data.content))
+      .catch((err) =&gt; {
+        const info = classifyError(err);
+        if (info.kind !== 'canceled') setError(info);
+      })
+      .finally(() =&gt; {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () =&gt; controller.abort();                   // cleanup: cancel the old request
+  }, [attempt]);
+
+  if (loading) return &lt;p&gt;Loading employees…&lt;/p&gt;;
+  if (error) {
+    return (
+      &lt;div role="alert"&gt;
+        &lt;p&gt;{error.message}&lt;/p&gt;
+        {error.retryable &amp;&amp; &lt;button onClick={() =&gt; setAttempt((n) =&gt; n + 1)}&gt;Try again&lt;/button&gt;}
+      &lt;/div&gt;
+    );
+  }
+  if (employees.length === 0) return &lt;p&gt;No employees yet.&lt;/p&gt;;
+  return &lt;ul&gt;{employees.map((e) =&gt; &lt;li key={e.id}&gt;{e.name}&lt;/li&gt;)}&lt;/ul&gt;;
+}
+
+export default EmployeeListSimple;</code></pre>
+
+  <p>This works, but you need the same 25 lines on every page. That is why most teams use TanStack Query
+  (<a href="#m5">Module 5</a>), which keeps these states for you.</p>
+
+  <h4>The same with TanStack Query</h4>
+<pre data-title="src/pages/EmployeeListQuery.jsx"><code class="language-jsx">import { useQuery } from '@tanstack/react-query';
+import { api } from '../lib/axios.js';
+import { QueryState } from '../components/QueryState.jsx';
+
+function EmployeeListQuery() {
+  const query = useQuery({
+    queryKey: ['employees'],
+    queryFn: async () =&gt; (await api.get('/employees')).data,
+  });
+
+  return (
+    &lt;QueryState query={query} isEmpty={query.data?.content.length === 0}&gt;
+      &lt;ul&gt;{query.data?.content.map((e) =&gt; &lt;li key={e.id}&gt;{e.name}&lt;/li&gt;)}&lt;/ul&gt;
+    &lt;/QueryState&gt;
+  );
+}</code></pre>
+
+<pre data-title="src/components/QueryState.jsx"><code class="language-jsx">import { classifyError } from '../lib/errors.js';
+import { Spinner } from './Spinner.jsx';
+
+export function QueryState({ query, isEmpty, emptyMessage = 'Nothing here yet.', skeleton, children }) {
+  if (query.isPending) return skeleton ?? &lt;Spinner /&gt;;
+  if (query.isError) {
+    const info = classifyError(query.error);
+    return (
+      &lt;div role="alert" className="error-box"&gt;
+        &lt;p&gt;{info.message}&lt;/p&gt;
+        {info.retryable &amp;&amp; &lt;button onClick={() =&gt; query.refetch()}&gt;Try again&lt;/button&gt;}
+      &lt;/div&gt;
+    );
+  }
+  if (isEmpty) return &lt;p className="empty"&gt;{emptyMessage}&lt;/p&gt;;
+  return children;
+}</code></pre>
+
+  <p>Two flags to tell apart: <code>isPending</code> is true only when there is no data yet (first load),
+  while <code>isFetching</code> is true whenever a request runs, including a background refresh. Use
+  <code>isPending</code> for the big spinner and <code>isFetching</code> for a small "refreshing…"
+  indicator, otherwise the screen flashes every time the user returns to the tab.</p>
+
+  <div class="co co-version">
+    <p class="co-t">TanStack Query version names</p>
+    <p>In TanStack Query v5 the first-load flag is <code>isPending</code> and mutations use
+    <code>isPending</code> too. Older v4 code and many older tutorials use <code>isLoading</code> for
+    this. If a tutorial's code behaves differently, check which major version it targets.</p>
+  </div>
+
+  <h4>Retries: do not retry what cannot succeed</h4>
+  <p>TanStack Query retries a failed query a few times by default, which is good for network blips and
+  bad for a 404 (the user waits several seconds for a result that will never change). Give it a function
+  that retries only when it makes sense:</p>
+
+<pre data-title="src/main.jsx (QueryClient defaults)"><code class="language-jsx">import { QueryCache, QueryClient } from '@tanstack/react-query';
+import toast from 'react-hot-toast';
+import { classifyError } from './lib/errors.js';
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 30_000,
+      retry: (failureCount, error) =&gt; classifyError(error).retryable &amp;&amp; failureCount &lt; 2,
+    },
+  },
+  queryCache: new QueryCache({
+    // Runs once per failed query. Only toast for background refreshes: when data is on screen
+    // already, the user would otherwise never learn the refresh failed.
+    onError: (error, query) =&gt; {
+      if (query.state.data !== undefined) toast.error(classifyError(error).message);
+    },
+  }),
+});</code></pre>
+
+  <h4>Spinners, skeletons and button states</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pattern</th><th>Use it for</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Spinner</td><td>Short waits of unknown length, small areas, buttons</td><td>Add <code>role="status"</code> and a visually hidden "Loading" text for screen readers</td></tr>
+      <tr><td>Skeleton</td><td>Page or list first load</td><td>Grey placeholder shapes that match the final layout; avoids layout jump</td></tr>
+      <tr><td>Disabled button + label</td><td>Submit, delete, any write action</td><td>Prevents double submission: "Saving…"</td></tr>
+      <tr><td>Keep old data visible</td><td>Pagination, search, refetch</td><td>Dim the table instead of replacing it with a spinner (<code>keepPreviousData</code>)</td></tr>
+    </tbody>
+  </table></div>
+
+<pre data-title="Skeleton row and its CSS"><code class="language-jsx">export function SkeletonRows({ rows = 5 }) {
+  return (
+    &lt;div aria-busy="true" aria-label="Loading employees"&gt;
+      {Array.from({ length: rows }, (_, i) =&gt; (
+        &lt;div key={i} className="skeleton skeleton-row" /&gt;
+      ))}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<pre data-title="skeleton.css"><code class="language-css">.skeleton {
+  background: linear-gradient(90deg, #e5e7eb 25%, #f3f4f6 37%, #e5e7eb 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.4s ease infinite;
+  border-radius: 4px;
+}
+.skeleton-row { height: 2.5rem; margin-bottom: 0.5rem; }
+@keyframes shimmer {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0 50%; }
+}</code></pre>
+
+  <p>For write actions, disable the button while the request runs. Without this, an impatient user
+  double-clicks "Create" and your API creates two employees.</p>
+
+<pre data-title="A submit button that cannot be double-clicked"><code class="language-jsx">const mutation = useMutation({ mutationFn: createEmployee });
+
+&lt;button type="submit" disabled={mutation.isPending}&gt;
+  {mutation.isPending ? 'Saving…' : 'Save employee'}
+&lt;/button&gt;</code></pre>
+
+  <h4>Toasts</h4>
+  <p>A <strong>toast</strong> is a small message that appears for a few seconds in a corner and then goes
+  away. Use toasts for results of actions that do not have a natural place on the page: "Employee
+  deleted", "Saved", "Could not delete: server error". Do not use them for form validation (errors belong
+  next to the field) or for failures the user must act on (use a visible banner).
+  <code>react-hot-toast</code> and <code>sonner</code> are two popular small libraries; the example below
+  uses <code>react-hot-toast</code>.</p>
+
+<pre data-title="Toasts for action results"><code class="language-jsx">// main.jsx: render the container once
+import { Toaster } from 'react-hot-toast';
+// &lt;Toaster position="top-right" /&gt; next to &lt;App /&gt;
+
+// anywhere:
+import toast from 'react-hot-toast';
+
+const remove = useMutation({
+  mutationFn: (id) =&gt; api.delete(`/employees/${id}`),
+  onSuccess: () =&gt; {
+    toast.success('Employee deleted');
+    queryClient.invalidateQueries({ queryKey: ['employees'] });
+  },
+  onError: (err) =&gt; toast.error(describeError(err)),
+});</code></pre>
+
+  <h4>Error boundaries: a different kind of error</h4>
+  <p>A bug in a component, such as reading <code>user.name</code> when <code>user</code> is
+  <code>null</code>, throws during rendering and, left alone, blanks the whole page. An <strong>error
+  boundary</strong> is a component that catches errors thrown while its children render and shows a
+  fallback instead. It does <em>not</em> catch errors in event handlers, async code or
+  <code>fetch</code>/Axios failures; those you handle with <code>try/catch</code> and the patterns above.
+  React supports boundaries only as class components, so most projects use the small
+  <code>react-error-boundary</code> package and wrap the app (or each route) once.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li><strong>Swallowing errors</strong>: <code>.catch(() =&gt; {})</code> or only
+      <code>console.log(err)</code>. The user sees an empty list and thinks there is no data.</li>
+      <li><strong>Forgetting <code>finally</code></strong>: <code>setLoading(false)</code> only in
+      <code>.then</code>, so a failed call leaves the spinner forever.</li>
+      <li><strong>Treating empty as error</strong> (or the reverse): an empty array is a success.</li>
+      <li><strong>Rendering <code>error.message</code> directly</strong> (Axios text like "Network
+      Error").</li>
+      <li><strong>Trusting a 200 status for everything</strong>: some APIs return 200 with an error
+      body. Your own Spring Boot API should use proper status codes, and the frontend should rely on them.</li>
+      <li><strong>Toast spam</strong>: a toast for every failed refetch plus a banner plus a log. Pick one
+      place per error.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A <code>204 No Content</code> response (typical for DELETE) has no body; <code>data</code> is
+      empty. Do not call <code>data.id</code> on it.</li>
+      <li>A CORS block looks like a network error in JavaScript (no <code>response</code>). Open the
+      Network tab and the console to tell them apart: see <a href="#m6-cors-spring">CORS</a>.</li>
+      <li>A request cancelled by <code>AbortController</code> throws too; classify it as
+      <code>canceled</code> and show nothing.</li>
+      <li>If the API gateway or Nginx answers with an HTML error page (502, 504), <code>data</code> is a
+      string, not JSON. Read <code>data?.detail</code> safely, as above.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you handle errors from an API call in React?"</p>
+    <ul>
+      <li>Model the states: loading, error, empty, data. Use <code>try/catch/finally</code> or a query
+      library so loading always ends.</li>
+      <li>Separate network errors (no response), 4xx (client; show message or field errors) and 5xx
+      (server; friendly message, retry). Do not retry 4xx.</li>
+      <li>Centralise: an Axios interceptor for 401, one error classifier, a shared
+      <code>QueryState</code> component, toasts for action results, an error boundary for render
+      crashes.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-backend-validation-errors">
+  <h3>Showing backend validation errors on form fields (ProblemDetail)</h3>
+  <p class="tldr">When Spring Boot rejects a form with 400, send back a ProblemDetail that includes a
+  field-to-message map; the React form reads that map and shows each message under the right input, so
+  the server stays the single source of truth for rules.</p>
+
+  <h4>Why the server's validation must reach the screen</h4>
+  <p>Client-side checks (<code>required</code>, a regex, "password at least 8 characters") give instant
+  feedback, but they are only a convenience: anyone can bypass the browser and call your API with
+  curl. The backend therefore validates again with Bean Validation (<code>@NotBlank</code>,
+  <code>@Email</code>, <code>@Positive</code> and so on; see <a href="04-spring-boot.html#m2">Spring
+  Boot · Module 2</a>). Some rules also exist <em>only</em> on the server, such as "this email is already
+  registered". The frontend must show those messages properly instead of a vague "Request failed".</p>
+
+  <h4>What Spring Boot sends back</h4>
+  <p><strong>ProblemDetail</strong> is Spring's class for the standard error format of RFC 7807 (later
+  RFC 9457), sent with the media type <code>application/problem+json</code>. The standard members are
+  <code>type</code>, <code>title</code>, <code>status</code>, <code>detail</code> and
+  <code>instance</code>. You can add your own members; Spring writes them at the top level of the JSON.
+  The code below returns the field errors in an <code>errors</code> member.</p>
+
+<pre data-title="ApiExceptionHandler.java (backend)"><code class="language-java">import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+@RestControllerAdvice
+public class ApiExceptionHandler {
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ProblemDetail handleValidation(MethodArgumentNotValidException ex) {
+        Map&lt;String, String&gt; errors = new LinkedHashMap&lt;&gt;();
+        ex.getBindingResult().getFieldErrors().forEach(fe -&gt;
+                errors.putIfAbsent(fe.getField(), fe.getDefaultMessage()));
+
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(
+                HttpStatus.BAD_REQUEST, "One or more fields are invalid");
+        pd.setTitle("Validation failed");
+        pd.setProperty("errors", errors);
+        return pd;
+    }
+
+    @ExceptionHandler(DuplicateEmailException.class)
+    public ProblemDetail handleDuplicate(DuplicateEmailException ex) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
+        pd.setTitle("Duplicate email");
+        pd.setProperty("errors", Map.of("email", "This email is already registered"));
+        return pd;
+    }
+}</code></pre>
+
+<pre data-title="Response for POST /api/employees with bad data" class="out"><code class="language-json">{
+  "type": "about:blank",
+  "title": "Validation failed",
+  "status": 400,
+  "detail": "One or more fields are invalid",
+  "instance": "/api/employees",
+  "errors": {
+    "email": "must be a well-formed email address",
+    "salary": "must be greater than 0"
+  }
+}</code></pre>
+
+  <div class="co co-version">
+    <p class="co-t">ProblemDetail in Spring Boot 3.x and 4.x</p>
+    <p><code>ProblemDetail</code> arrived with Spring Framework 6 (Boot 3) and is the same idea in
+    Framework 7 (Boot 4). Extending <code>ResponseEntityExceptionHandler</code> makes Spring's own MVC
+    exceptions (bad JSON, wrong method, missing parameter) come back as problem details; if you extend it,
+    override <code>handleMethodArgumentNotValid</code> instead of adding a second
+    <code>@ExceptionHandler</code> for the same exception (two handlers for the same exception cause an
+    ambiguity error at startup). Boot also has a property to switch problem details on for the default
+    handling; check the reference for your exact version. The <code>errors</code> member is a convention
+    of this project, not part of the standard, so agree on it with the backend developer (probably you).</p>
+  </div>
+
+  <h4>Reading the response in React</h4>
+  <p>Add a helper next to <code>classifyError</code> that returns a plain object from field name to
+  message. It returns an empty object when the error is not a field error, so callers can fall back to a
+  general message.</p>
+
+<pre data-title="src/lib/errors.js (addition)"><code class="language-javascript">// { email: 'must be a well-formed email address', salary: '...' }
+export function getFieldErrors(err) {
+  const errors = err?.response?.data?.errors;
+  if (errors &amp;&amp; typeof errors === 'object' &amp;&amp; !Array.isArray(errors)) return errors;
+  return {};
+}
+
+export function hasFieldErrors(err) {
+  return Object.keys(getFieldErrors(err)).length &gt; 0;
+}</code></pre>
+
+  <h4>A reusable field component</h4>
+  <p>Put the label, the input and the error message in one component so every form shows errors the
+  same, accessible way. <code>aria-invalid</code> and <code>aria-describedby</code> let screen readers
+  announce the message with the field.</p>
+
+<pre data-title="src/components/TextField.jsx"><code class="language-jsx">import { useId } from 'react';
+
+export function TextField({ label, name, error, ...inputProps }) {
+  const id = useId();
+  const errorId = `${id}-error`;
+  return (
+    &lt;div className="field"&gt;
+      &lt;label htmlFor={id}&gt;{label}&lt;/label&gt;
+      &lt;input
+        id={id}
+        name={name}
+        aria-invalid={error ? 'true' : undefined}
+        aria-describedby={error ? errorId : undefined}
+        {...inputProps}
+      /&gt;
+      {error &amp;&amp; &lt;p id={errorId} className="field-error"&gt;{error}&lt;/p&gt;}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <h4>The form: client rules, then server rules</h4>
+<pre data-title="src/components/EmployeeForm.jsx (validation parts)"><code class="language-jsx">import { useState } from 'react';
+import { TextField } from './TextField.jsx';
+import { describeError, getFieldErrors, hasFieldErrors } from '../lib/errors.js';
+
+const EMPTY = { name: '', email: '', department: '', salary: '' };
+
+function validateClient(values) {
+  const errors = {};
+  if (!values.name.trim()) errors.name = 'Name is required';
+  if (!/^\S+@\S+\.\S+$/.test(values.email)) errors.email = 'Enter a valid email';
+  if (!(Number(values.salary) &gt; 0)) errors.salary = 'Salary must be greater than 0';
+  return errors;
+}
+
+export function EmployeeForm({ initial = EMPTY, onSubmit, submitLabel = 'Save' }) {
+  const [values, setValues] = useState(initial);
+  const [errors, setErrors] = useState({});          // field name -&gt; message
+  const [formError, setFormError] = useState(null);  // message not tied to a field
+  const [submitting, setSubmitting] = useState(false);
+
+  function handleChange(e) {
+    const { name, value } = e.target;
+    setValues((v) =&gt; ({ ...v, [name]: value }));
+    setErrors((prev) =&gt; ({ ...prev, [name]: undefined }));  // clear this field's error on typing
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    const clientErrors = validateClient(values);
+    setErrors(clientErrors);
+    setFormError(null);
+    if (Object.keys(clientErrors).length &gt; 0) return;     // do not call the API
+
+    setSubmitting(true);
+    try {
+      await onSubmit({ ...values, salary: Number(values.salary) });
+    } catch (err) {
+      if (hasFieldErrors(err)) setErrors(getFieldErrors(err));  // server said which fields
+      else setFormError(describeError(err));                    // network, 5xx, ...
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    &lt;form onSubmit={handleSubmit} noValidate&gt;
+      {formError &amp;&amp; &lt;p role="alert" className="form-error"&gt;{formError}&lt;/p&gt;}
+      &lt;TextField label="Name" name="name" value={values.name}
+                 onChange={handleChange} error={errors.name} /&gt;
+      &lt;TextField label="Email" name="email" type="email" value={values.email}
+                 onChange={handleChange} error={errors.email} /&gt;
+      &lt;TextField label="Department" name="department" value={values.department}
+                 onChange={handleChange} error={errors.department} /&gt;
+      &lt;TextField label="Salary" name="salary" type="number" value={values.salary}
+                 onChange={handleChange} error={errors.salary} /&gt;
+      &lt;button type="submit" disabled={submitting}&gt;
+        {submitting ? 'Saving…' : submitLabel}
+      &lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+  <p>Notes on the choices: <code>noValidate</code> switches off the browser's own bubbles so that your
+  messages are the only ones; the field <code>name</code> must be <strong>exactly</strong> the Java record
+  component name (<code>email</code>, not <code>emailAddress</code>), because the server's keys come from
+  <code>fe.getField()</code>; and the submit handler throws errors up to <code>onSubmit</code>'s caller
+  so the form decides how to show them.</p>
+
+  <h4>The same with React Hook Form</h4>
+  <p>If you use React Hook Form (<a href="#m5">Module 5</a>), server errors are pushed into the form with
+  <code>setError</code>. The field then behaves exactly like one that failed client validation.</p>
+
+<pre data-title="Server errors into React Hook Form"><code class="language-jsx">const { register, handleSubmit, setError, formState: { errors, isSubmitting } } = useForm();
+
+const onSubmit = async (values) =&gt; {
+  try {
+    await createEmployee(values);
+  } catch (err) {
+    const fieldErrors = getFieldErrors(err);
+    Object.entries(fieldErrors).forEach(([field, message]) =&gt; {
+      setError(field, { type: 'server', message });
+    });
+    if (Object.keys(fieldErrors).length === 0) {
+      setError('root.server', { message: describeError(err) });
+    }
+  }
+};</code></pre>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Show client-side errors on submit (and on blur), then clear each field's error as soon as the
+      user edits it.</li>
+      <li>Keep the user's input. Never reset the form after a failed submit.</li>
+      <li>Move focus to the first invalid field or to the error summary so keyboard and screen-reader
+      users find it.</li>
+      <li>Duplicate rules (client and server) only for fast feedback. The server is the authority.</li>
+      <li>Use the status code to decide the kind of error: 400 or 409 with <code>errors</code> means
+      "show on fields"; anything else means "show a general message".</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Nested and list fields</strong>: Spring reports <code>address.city</code> or
+      <code>items[0].quantity</code> as the field path. Your form must use the same keys, or map them.</li>
+      <li><strong>Class-level rules</strong> (for example "end date after start date") produce object
+      errors, not field errors. Put them under a key such as <code>global</code> or return them in
+      <code>detail</code> and show them as the form error.</li>
+      <li><strong>Several rules fail on one field</strong> (blank and too short): the handler above keeps
+      the first with <code>putIfAbsent</code>. Return a list per field if you want to show all.</li>
+      <li><strong>Malformed JSON or wrong types</strong> (a string in a number field) make Spring throw
+      <code>HttpMessageNotReadableException</code>, a 400 without field errors. Your form falls back to the
+      general message.</li>
+      <li><strong>Messages are English by default</strong>. For other languages use message bundles on the
+      server or map error codes to text on the client.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Showing only <code>err.message</code> ("Request failed with status code 400") and losing the
+      server's field errors.</li>
+      <li>Form field names that differ from the DTO property names, so messages never match an input.</li>
+      <li>Not clearing old server errors when the user retypes, so a stale red message stays.</li>
+      <li>Returning 200 with <code>{ success: false }</code> instead of 400. Use real status codes.</li>
+      <li>Validating only in the browser and assuming it is safe.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you display backend validation errors?"</p>
+    <ul>
+      <li>Backend: <code>@Valid</code> on the request body, a <code>@RestControllerAdvice</code> turns
+      <code>MethodArgumentNotValidException</code> into a 400 <code>ProblemDetail</code> with a
+      field-to-message map.</li>
+      <li>Frontend: in the catch block, read <code>error.response.data.errors</code>, store it in state
+      keyed by field name and render each message beside its input; fall back to a general message for
+      other failures.</li>
+      <li>Both sides validate: the client for speed, the server for safety.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-pagination-optimistic">
+  <h3>Pagination UI and optimistic updates</h3>
+  <p class="tldr">Ask Spring Data for one page at a time with <code>page</code> and <code>size</code>
+  parameters, keep the current page in the URL, render controls from the response's totals, and use
+  optimistic updates only for quick, low-risk actions you can roll back.</p>
+
+  <h4>Why paginate</h4>
+  <p>A table with 50,000 rows must not be sent to the browser in one response. It is slow to download,
+  heavy to render and wasteful in the database. <strong>Pagination</strong> returns a small slice (a
+  <em>page</em>) per request. Spring Data supports this directly with <code>Pageable</code> (see <a
+  href="04-spring-boot.html#m3">Spring Boot · Module 3</a>).</p>
+
+  <h4>The backend contract</h4>
+  <p>Spring MVC turns the query string <code>?page=0&amp;size=10&amp;sort=name,asc</code> into a
+  <code>Pageable</code>. <strong>Page numbers start at 0.</strong> The repository returns a
+  <code>Page&lt;T&gt;</code>, which knows the content and the totals.</p>
+
+<pre data-title="EmployeeController.java (backend)"><code class="language-java">public record PageResponse&lt;T&gt;(List&lt;T&gt; content, int page, int size,
+                              long totalElements, int totalPages) {
+    public static &lt;T&gt; PageResponse&lt;T&gt; from(Page&lt;T&gt; p) {
+        return new PageResponse&lt;&gt;(p.getContent(), p.getNumber(), p.getSize(),
+                p.getTotalElements(), p.getTotalPages());
+    }
+}
+
+@GetMapping("/api/employees")
+public PageResponse&lt;EmployeeDto&gt; list(@RequestParam(defaultValue = "") String q,
+                                      @PageableDefault(size = 10, sort = "name") Pageable pageable) {
+    return PageResponse.from(employeeService.search(q, pageable).map(EmployeeDto::from));
+}</code></pre>
+
+<pre data-title="GET /api/employees?page=1&amp;size=2" class="out"><code class="language-json">{
+  "content": [
+    { "id": 3, "name": "Meera Iyer", "email": "meera@acme.in", "department": "HR", "salary": 62000 },
+    { "id": 4, "name": "Rohan Das", "email": "rohan@acme.in", "department": "IT", "salary": 71000 }
+  ],
+  "page": 1,
+  "size": 2,
+  "totalElements": 9,
+  "totalPages": 5
+}</code></pre>
+
+  <div class="co co-version">
+    <p class="co-t">Serialising Page directly</p>
+    <p>If a controller returns a Spring Data <code>Page</code> object itself, the JSON contains many fields
+    (<code>pageable</code>, <code>sort</code>, <code>first</code>, <code>last</code>,
+    <code>numberOfElements</code>…). Newer Spring Data versions warn about serialising the default
+    implementation directly and offer a DTO-style output with the totals nested under a
+    <code>page</code> object. Because the shape can differ between versions and settings, a small
+    <code>PageResponse</code> record of your own, as above, gives the frontend a stable contract. Always
+    look at the real JSON in the Network tab before writing the TypeScript or JavaScript that reads it.</p>
+  </div>
+
+  <h4>Page state belongs in the URL</h4>
+  <p>If the current page lives only in <code>useState</code>, a refresh sends the user back to page 1, the
+  Back button leaves the list, and nobody can share "page 3 of the IT department". Store page, size and
+  search text in the query string with <code>useSearchParams</code> from React Router. The URL becomes
+  the single source of truth, and the query key follows from it.</p>
+
+<pre data-title="src/hooks/useEmployees.js"><code class="language-javascript">import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { useSearchParams } from 'react-router';
+import { api } from '../lib/axios.js';
+
+export function useEmployeeParams() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = Math.max(0, Number(searchParams.get('page') ?? 0) || 0);
+  const q = searchParams.get('q') ?? '';
+
+  function update(changes) {
+    const next = new URLSearchParams(searchParams);
+    Object.entries(changes).forEach(([key, value]) =&gt; {
+      if (value === '' || value === null || value === undefined) next.delete(key);
+      else next.set(key, String(value));
+    });
+    setSearchParams(next);
+  }
+  return { page, q, update };
+}
+
+export function useEmployees({ page, q, size = 10 }) {
+  return useQuery({
+    queryKey: ['employees', { page, q, size }],        // a new key per page = cached per page
+    queryFn: async ({ signal }) =&gt; {
+      const { data } = await api.get('/employees', { params: { page, size, q }, signal });
+      return data;
+    },
+    placeholderData: keepPreviousData,                  // keep showing the old page while loading
+  });
+}</code></pre>
+
+  <p>Because the page is part of the query key, going to page 2 and back to page 1 shows page 1 instantly
+  from the cache. <code>keepPreviousData</code> keeps the old rows on screen while the next page loads,
+  so the table does not flash empty. While that happens <code>query.isPlaceholderData</code> is true; use
+  it to dim the table and disable the "Next" button.</p>
+
+  <h4>The pagination component</h4>
+  <p>Build it from <code>page</code> (0-based) and <code>totalPages</code> only. Show the user a 1-based
+  number, because people do not read "page 0".</p>
+
+<pre data-title="src/components/Pagination.jsx"><code class="language-jsx">export function Pagination({ page, totalPages, onChange, disabled = false }) {
+  if (totalPages &lt;= 1) return null;                      // nothing to page through
+  const isFirst = page === 0;
+  const isLast = page &gt;= totalPages - 1;
+
+  return (
+    &lt;nav aria-label="Pagination" className="pagination"&gt;
+      &lt;button onClick={() =&gt; onChange(page - 1)} disabled={disabled || isFirst}&gt;
+        Previous
+      &lt;/button&gt;
+      &lt;span&gt;Page {page + 1} of {totalPages}&lt;/span&gt;
+      &lt;button onClick={() =&gt; onChange(page + 1)} disabled={disabled || isLast}&gt;
+        Next
+      &lt;/button&gt;
+    &lt;/nav&gt;
+  );
+}
+
+// In the list page:
+// &lt;Pagination page={data.page} totalPages={data.totalPages}
+//             disabled={query.isPlaceholderData} onChange={(p) =&gt; update({ page: p })} /&gt;</code></pre>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases in pagination</p>
+    <ul>
+      <li><strong>Off-by-one</strong>: the API is 0-based, the UI is 1-based. Convert in exactly one
+      place.</li>
+      <li><strong>Search resets the page</strong>: when the search text changes, set
+      <code>page</code> back to 0, or you may ask for page 7 of a result that has only 2 pages.</li>
+      <li><strong>Last item deleted</strong>: after deleting the only row on the last page, the page you
+      are on no longer exists (an empty <code>content</code> with <code>totalPages</code> smaller than
+      <code>page + 1</code>). Move to <code>totalPages - 1</code>.</li>
+      <li><strong>Sorting</strong>: send <code>sort=field,direction</code>. Whitelist sortable fields on
+      the server; Spring Data throws <code>PropertyReferenceException</code> for an unknown property,
+      which becomes a 500 unless you handle it.</li>
+      <li><strong>Zero results</strong>: <code>totalPages</code> is 0. Show the empty state, not
+      "Page 1 of 0".</li>
+      <li><strong>Data changes between pages</strong>: with offset paging, if someone adds a row while
+      you read, an item can appear twice or be skipped. Large, fast-changing feeds use cursor
+      (keyset) paging instead.</li>
+    </ul>
+  </div>
+
+  <h4>Pages, "load more" and infinite scroll</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Style</th><th>Good for</th><th>Trade-off</th></tr></thead>
+    <tbody>
+      <tr><td>Numbered pages</td><td>Admin tables, search results, anything the user wants to return to</td><td>Needs total count (an extra <code>COUNT</code> query on big tables)</td></tr>
+      <tr><td>"Load more" button</td><td>Feeds, comment lists</td><td>Page grows in the DOM; position is lost on refresh unless you store it</td></tr>
+      <tr><td>Infinite scroll</td><td>Social-style feeds</td><td>Hard to reach the footer, harder accessibility; TanStack Query offers <code>useInfiniteQuery</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Optimistic updates (briefly)</h4>
+  <p>Normally a UI action waits for the server: click "Done", wait 300 ms, the checkbox changes. An
+  <strong>optimistic update</strong> changes the screen immediately, as if the request already succeeded,
+  sends the request in the background, and <strong>rolls back</strong> if it fails. It makes quick
+  actions feel instant. With TanStack Query the recipe is: stop in-flight refetches, save the old data,
+  write the new data into the cache, undo on error, and always refetch at the end so the cache matches the
+  server.</p>
+
+<pre data-title="Optimistic delete from a list"><code class="language-javascript">const queryClient = useQueryClient();
+
+const remove = useMutation({
+  mutationFn: (id) =&gt; api.delete(`/employees/${id}`),
+
+  onMutate: async (id) =&gt; {
+    await queryClient.cancelQueries({ queryKey: ['employees'] });   // avoid overwrite by a refetch
+    const snapshots = queryClient.getQueriesData({ queryKey: ['employees'] });
+    queryClient.setQueriesData({ queryKey: ['employees'] }, (old) =&gt;
+      old ? { ...old, content: old.content.filter((e) =&gt; e.id !== id) } : old);
+    return { snapshots };                                          // passed to onError as context
+  },
+
+  onError: (err, id, context) =&gt; {
+    context?.snapshots.forEach(([key, data]) =&gt; queryClient.setQueryData(key, data));
+    toast.error('Could not delete. The employee is back in the list.');
+  },
+
+  onSettled: () =&gt; queryClient.invalidateQueries({ queryKey: ['employees'] }),
+});</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">When optimistic updates are a bad idea</p>
+    <ul>
+      <li>When the server decides the result: new rows need a server-generated id, prices are
+      recalculated, stock may be insufficient.</li>
+      <li>For money, bookings and anything irreversible. A UPI payment must show "processing", then the
+      real outcome; never "success" first.</li>
+      <li>When failures are common. Constant rollbacks feel worse than a short wait.</li>
+    </ul>
+    <p>Good candidates: toggling a favourite, marking a task done, reordering, deleting a draft.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Keeping the page number in state only, so refresh and Back break.</li>
+      <li>Putting the page outside the query key, so every page shows the cached first page.</li>
+      <li>Optimistic updates without rollback, leaving the UI lying after a failure.</li>
+      <li>Forgetting <code>invalidateQueries</code> in <code>onSettled</code>, so the cache drifts from
+      the server.</li>
+      <li>Fetching all rows and paging in JavaScript. That defeats the purpose.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How would you build a paginated table against a Spring Boot API?"</p>
+    <ul>
+      <li>Backend takes <code>Pageable</code> (0-based <code>page</code>, <code>size</code>,
+      <code>sort</code>) and returns content plus <code>totalElements</code> and
+      <code>totalPages</code>.</li>
+      <li>Frontend keeps page and search in the URL, uses them in the query key, keeps the previous page
+      visible while the next loads, and builds controls from the totals.</li>
+      <li>Mention the edge cases: reset page on search, page beyond the end after deletes, sort
+      whitelist, and offset vs cursor paging for huge or live data.</li>
+    </ul>
+  </div>
+</article>

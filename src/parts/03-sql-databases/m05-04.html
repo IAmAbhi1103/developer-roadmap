@@ -1,0 +1,459 @@
+<article class="topic" id="m5-connection-pooling">
+  <h3>Connection pooling and HikariCP</h3>
+  <p class="tldr">Opening a database connection is slow and each one costs memory on the server, so applications
+  keep a small pool of open connections and lend them out; Spring Boot uses HikariCP, and a small pool is
+  usually faster than a large one.</p>
+
+  <h4>Why connections are expensive</h4>
+  <p>Opening a connection to PostgreSQL involves a TCP handshake, usually TLS, authentication, and the server
+  starting a process (PostgreSQL) or thread (MySQL) with its own memory. That can take several milliseconds to
+  tens of milliseconds, more than a typical indexed query. If every web request opened and closed a connection,
+  the database would spend more time connecting than working. And the server can only hold so many: PostgreSQL's
+  <code>max_connections</code> is 100 by default, and each connection uses memory.</p>
+
+  <h4>How a pool works</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant T as Request thread
+  participant P as Connection pool
+  participant D as Database
+  Note over P,D: Pool opens connections once and keeps them
+  T-&gt;&gt;P: getConnection()
+  P--&gt;&gt;T: idle connection (no handshake)
+  T-&gt;&gt;D: SQL query
+  D--&gt;&gt;T: result
+  T-&gt;&gt;P: close() returns it to the pool
+</pre>
+  <figcaption>A pool lends already-open connections; close() returns the connection, it does not close it</figcaption>
+  </figure>
+  <ol class="steps">
+    <li>At start-up the pool opens a few connections.</li>
+    <li>A request calls <code>dataSource.getConnection()</code>. If an idle connection exists, it is handed out at
+    once.</li>
+    <li>If none is idle and the pool is below its maximum, a new connection is opened.</li>
+    <li>If the pool is at its maximum, the caller <strong>waits</strong>, up to <code>connectionTimeout</code>,
+    then fails with an exception.</li>
+    <li>When the code calls <code>connection.close()</code>, the pooled wrapper returns the connection to the pool
+    for reuse; the real connection stays open.</li>
+  </ol>
+  <p>The connection is only busy while a transaction or statement uses it. In Spring a
+  <code>@Transactional</code> method holds one connection for its whole duration, so long transactions mean long
+  borrow times.</p>
+
+  <h4>HikariCP in Spring Boot</h4>
+  <p><strong>HikariCP</strong> is the default pool in Spring Boot (since 2.0): fast, small and well tested. If
+  <code>spring-boot-starter-data-jpa</code> or <code>-jdbc</code> is on the classpath, you already have it.
+  Configure it in <code>application.yml</code> under <code>spring.datasource.hikari</code>:</p>
+<pre data-title="application.yml"><code class="language-yaml">spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/fooddb
+    username: app
+    password: ${DB_PASSWORD}
+    hikari:
+      pool-name: food-pool
+      maximum-pool-size: 10        # max connections (default 10)
+      minimum-idle: 10             # idle connections kept ready (default = maximum)
+      connection-timeout: 30000    # ms to wait for a free connection (default 30 s)
+      idle-timeout: 600000         # ms before an extra idle connection is closed (default 10 min)
+      max-lifetime: 1800000        # ms before any connection is retired (default 30 min)
+      leak-detection-threshold: 20000   # log a warning if borrowed longer than 20 s (default off)</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Property</th><th>Meaning</th><th>Sensible value</th></tr></thead>
+    <tbody>
+      <tr><td><code>maximumPoolSize</code></td><td>Most connections the pool will hold, in use plus idle</td>
+      <td>Start at 10; see sizing below</td></tr>
+      <tr><td><code>minimumIdle</code></td><td>Idle connections to keep ready. HikariCP advises leaving it unset so the pool
+      has a fixed size</td><td>Same as maximum for steady traffic</td></tr>
+      <tr><td><code>connectionTimeout</code></td><td>How long a caller waits for a connection before an exception</td>
+      <td>2–5 s in an API, so requests fail fast instead of piling up</td></tr>
+      <tr><td><code>idleTimeout</code></td><td>Idle time after which extra connections (above minimumIdle) are closed;
+      only matters if minimumIdle is lower than maximum</td><td>Default 10 min</td></tr>
+      <tr><td><code>maxLifetime</code></td><td>A connection is retired after this age (replaced when idle)</td>
+      <td>A few minutes less than any database or firewall timeout; default 30 min</td></tr>
+      <tr><td><code>leakDetectionThreshold</code></td><td>Logs a stack trace if a connection stays out too long</td>
+      <td>Enable in dev and staging to catch unclosed connections</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>maxLifetime</code> exists because a firewall, a load balancer or the database may silently drop
+  connections that live too long. HikariCP retires its own connections just before that, so your code never
+  receives a dead one. Set it shorter than the database's or network's own limit.</p>
+
+  <h4>Pool sizing: smaller than you think</h4>
+  <p>It is tempting to think "more connections, more speed." The opposite is often true. A database has a limited
+  number of CPU cores and disk operations; beyond that, extra concurrent queries just compete, causing context
+  switching and lock contention. HikariCP's own guidance gives a starting formula for a pool:
+  <code>connections = (core_count × 2) + effective_spindle_count</code>, and notes that a pool around 10 can serve
+  thousands of front-end users. A good rule: start with 10, measure, and raise it only if requests wait for
+  connections while the database is not yet busy.</p>
+  <ul>
+    <li><strong>Across instances:</strong> total connections = pool size × number of app instances. Ten
+    instances with a pool of 20 need 200 connections: more than the default PostgreSQL <code>max_connections</code>
+    of 100. Keep the sum well under the database limit, leaving room for admin tools, migrations and monitoring.</li>
+    <li><strong>Many instances or serverless:</strong> put an external pooler such as PgBouncer in front of
+    PostgreSQL.</li>
+    <li><strong>Keep transactions short.</strong> A pool of 10 serves far more users if each borrows a
+    connection for 5 ms than for 500 ms.</li>
+    <li><strong>Do not hold a connection while calling a slow API.</strong> A <code>@Transactional</code> method
+    that makes an HTTP call keeps its connection idle but locked.</li>
+  </ul>
+
+  <h4>Pool exhaustion: the symptoms</h4>
+  <p>All connections are in use and new requests wait. After <code>connectionTimeout</code> they fail:</p>
+  <pre class="out" data-title="Typical exception"><code class="language-plaintext">java.sql.SQLTransientConnectionException: food-pool - Connection is not available,
+request timed out after 30000ms (total=10, active=10, idle=0, waiting=17)</code></pre>
+  <p>What you see: requests suddenly slow and then fail with timeouts, CPU low on the app server, many threads
+  parked in <code>HikariPool.getConnection</code> in a thread dump, and <code>waiting</code> greater than 0. Typical
+  causes:</p>
+  <ul>
+    <li>A slow query or lock wait that keeps connections busy (the pool is a victim, not the cause).</li>
+    <li>Long transactions, or external calls inside a transaction.</li>
+    <li>A <strong>connection leak</strong>: code that borrows a connection and never closes it (plain JDBC
+    without try-with-resources).</li>
+    <li>A pool too small for the traffic, or too many instances for the database limit.</li>
+    <li>Open-session-in-view (<code>spring.jpa.open-in-view</code>, on by default in Spring Boot) holding the
+    connection until the HTTP response is written. Many teams turn it off.</li>
+  </ul>
+<pre data-title="Always return connections (plain JDBC)"><code class="language-java">try (Connection con = dataSource.getConnection();
+     PreparedStatement ps = con.prepareStatement("SELECT name FROM users WHERE id = ?")) {
+    ps.setLong(1, 42L);
+    try (ResultSet rs = ps.executeQuery()) {
+        if (rs.next()) System.out.println(rs.getString("name"));
+    }
+}   // close() is called automatically: the connection goes back to the pool</code></pre>
+  <p>Monitor the pool with Actuator and Micrometer metrics (<code>hikaricp.connections.active</code>,
+  <code>hikaricp.connections.pending</code>, <code>hikaricp.connections.timeout</code>) and alert when pending is
+  above zero for a while. See <a href="04-spring-boot.html#m6">Spring Boot · Module 6</a>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: total pool size across all instances must stay below the database's max_connections</p>
+    <p>Do the multiplication before deploying: instances × maximum-pool-size, plus scheduled jobs, plus admin
+    connections.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: fixing timeouts by raising the pool size</p>
+    <p>If connections are exhausted because queries are slow or locked, a bigger pool adds more load to an already
+    struggling database. Find the slow query first (<code>EXPLAIN ANALYZE</code>, slow query log).</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A pool can hold a connection that the database already closed (restart, failover). HikariCP validates
+      connections on borrow and retires old ones, so you normally only see a few failed requests, then recovery.</li>
+      <li>With Java 21 virtual threads you can have thousands of threads, but the pool is still the limit: a
+      thousand virtual threads still share the same 10 connections.</li>
+      <li>Session state (<code>SET ...</code>, temporary tables, advisory locks) lives on the connection and leaks
+      to the next borrower. Reset it or avoid it.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Why use a connection pool?</b> Connections are expensive to open; a pool reuses them and caps load on
+      the database.</li>
+      <li><b>What is the default pool in Spring Boot and its default size?</b> HikariCP, 10 connections.</li>
+      <li><b>How big should the pool be?</b> Smaller than you think; start around 10, measure, and keep instances ×
+      pool size under <code>max_connections</code>.</li>
+      <li><b>"Connection is not available, request timed out" - what do you check?</b> Slow queries, long
+      transactions, leaks, pool size versus load, and the thread dump.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-n-plus-one">
+  <h3>The N+1 query problem</h3>
+  <p class="tldr">N+1 means running one query for N parent rows and then one more query for each parent to load
+  its children (N+1 queries in total); detect it in the SQL log and fix it with a JOIN, an IN-list batch, or
+  JPA fetch joins and entity graphs.</p>
+
+  <h4>What it is, in SQL terms</h4>
+  <p>You want each restaurant with its menu items. The slow way:</p>
+<pre data-title="N+1 in plain SQL"><code class="language-sql">SELECT id, name FROM restaurants WHERE city = 'Pune';           -- 1 query, returns 50 rows
+
+SELECT * FROM menu_items WHERE restaurant_id = 1;               -- then 1 query per restaurant
+SELECT * FROM menu_items WHERE restaurant_id = 2;
+SELECT * FROM menu_items WHERE restaurant_id = 3;
+-- ... 50 times: 51 queries in total</code></pre>
+  <p>Each query is fast, but 51 round trips to the database add up (network latency plus parsing plus
+  scheduling, per query). With 1,000 restaurants it becomes 1,001 queries for one page. The cost grows with the
+  data, which is why the bug stays hidden in development with 5 rows and appears in production.</p>
+
+  <h4>How ORMs cause it</h4>
+  <p>With JPA, relationships are loaded <strong>lazily</strong> by default: <code>restaurant.getMenuItems()</code>
+  looks like a simple getter but runs a query the first time it is called. A loop hides this:</p>
+<pre data-title="The classic N+1 in Spring Data JPA"><code class="language-java">@Entity
+public class Restaurant {
+    @Id private Long id;
+    private String name;
+    @OneToMany(mappedBy = "restaurant")           // LAZY by default
+    private List&lt;MenuItem&gt; menuItems = new ArrayList&lt;&gt;();
+    // getters
+}
+
+// Service
+List&lt;Restaurant&gt; list = restaurantRepository.findByCity("Pune");     // query 1
+for (Restaurant r : list) {
+    System.out.println(r.getName() + ": " + r.getMenuItems().size());  // query 2..N+1
+}</code></pre>
+  <pre class="out" data-title="SQL log (spring.jpa.show-sql=true)"><code class="language-plaintext">select r.id, r.name, r.city from restaurants r where r.city=?
+select m.id, m.name, m.restaurant_id from menu_items m where m.restaurant_id=?
+select m.id, m.name, m.restaurant_id from menu_items m where m.restaurant_id=?
+select m.id, m.name, m.restaurant_id from menu_items m where m.restaurant_id=?
+... (one more for each restaurant)</code></pre>
+  <p>It also happens with <code>@ManyToOne</code> set to <code>EAGER</code> (the JPA default for that mapping):
+  loading 100 orders then loads each order's user separately, and when a serializer (Jackson) walks an entity
+  graph and triggers lazy loads. The fix is never "make everything EAGER": that loads too much everywhere.</p>
+
+  <h4>How to detect it</h4>
+  <ul>
+    <li><strong>Read the SQL log</strong> for the request. Many near-identical queries differing only in an id
+    mean N+1. Enable <code>spring.jpa.show-sql=true</code> or, better,
+    <code>logging.level.org.hibernate.SQL=DEBUG</code> (and bind parameters with
+    <code>org.hibernate.orm.jdbc.bind=TRACE</code> in Hibernate 6).</li>
+    <li><strong>Count queries per request.</strong> Hibernate statistics
+    (<code>spring.jpa.properties.hibernate.generate_statistics=true</code>) report the statement count; libraries
+    like datasource-proxy can assert it in tests.</li>
+    <li><strong>Database side:</strong> in PostgreSQL <code>pg_stat_statements</code> shows one statement called
+    thousands of times; a slow endpoint with fast individual queries is the typical sign.</li>
+    <li><strong>Tests:</strong> write an integration test that asserts "this endpoint runs at most 3 queries".</li>
+  </ul>
+
+  <h4>The fixes</h4>
+  <h5>1. A JOIN (one query)</h5>
+  <p>Let the database join the two tables and return everything at once:</p>
+<pre data-title="One query instead of N+1"><code class="language-sql">SELECT r.id, r.name, m.id AS item_id, m.name AS item_name, m.price_paise
+FROM restaurants r
+LEFT JOIN menu_items m ON m.restaurant_id = r.id
+WHERE r.city = 'Pune'
+ORDER BY r.id, m.id;</code></pre>
+  <p>The result repeats each restaurant's columns on every item row; the app groups them. For a parent with
+  many children and wide columns, this duplication costs bandwidth, which leads to the next option.</p>
+  <h5>2. IN-list batching (two queries)</h5>
+<pre data-title="Two queries total"><code class="language-sql">SELECT id, name FROM restaurants WHERE city = 'Pune';                    -- 50 rows
+SELECT * FROM menu_items WHERE restaurant_id IN (1, 2, 3, /* ... */ 50);  -- all children at once</code></pre>
+  <p>No duplicated parent columns, and the number of queries is constant (2) instead of N+1. Hibernate does this
+  when you set a batch size.</p>
+  <h5>3. JPA: fetch join, entity graph, batch size</h5>
+<pre data-title="RestaurantRepository.java"><code class="language-java">public interface RestaurantRepository extends JpaRepository&lt;Restaurant, Long&gt; {
+
+    // (a) JPQL fetch join: one query with a JOIN
+    @Query("select distinct r from Restaurant r left join fetch r.menuItems where r.city = :city")
+    List&lt;Restaurant&gt; findWithMenuByCity(@Param("city") String city);
+
+    // (b) Entity graph: same idea without writing JPQL
+    @EntityGraph(attributePaths = "menuItems")
+    List&lt;Restaurant&gt; findByCity(String city);
+}</code></pre>
+<pre data-title="application.yml: batch fetching as a safety net"><code class="language-yaml">spring:
+  jpa:
+    properties:
+      hibernate:
+        default_batch_fetch_size: 50     # lazy collections load 50 parents per IN query</code></pre>
+  <p>With <code>default_batch_fetch_size</code> the loop above issues <code>... where restaurant_id in (?, ?, ...)</code>
+  once per 50 restaurants instead of once per restaurant. It is a cheap global safety net that makes N+1 into
+  N/50 + 1. Per association, <code>@BatchSize(size = 50)</code> does the same.</p>
+  <h5>4. Select only what you need (DTO projection)</h5>
+<pre data-title="Projection: no entities, no lazy loading"><code class="language-java">public record RestaurantItemCount(Long id, String name, long items) {}
+
+@Query("""
+    select new com.example.food.RestaurantItemCount(r.id, r.name, count(m))
+    from Restaurant r left join r.menuItems m
+    where r.city = :city
+    group by r.id, r.name
+    """)
+List&lt;RestaurantItemCount&gt; countItemsByCity(@Param("city") String city);</code></pre>
+  <p>If a screen needs only counts or a few columns, a projection with <code>GROUP BY</code> is one cheap query and
+  avoids loading entities at all. JPA details are in <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>.</p>
+
+  <h4>Choosing a fix</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Situation</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>Need parents with their children on one screen</td><td>Fetch join or <code>@EntityGraph</code></td></tr>
+      <tr><td>Several collections on one entity</td><td>Batch size or separate queries (fetching two lists in one query gives
+      <code>MultipleBagFetchException</code> or a huge row product)</td></tr>
+      <tr><td>Pagination of parents with children</td><td>Page the parent ids first, then load children with an IN query
+      (a fetch join with <code>Pageable</code> pages in memory and Hibernate warns)</td></tr>
+      <tr><td>Only counts or a few columns</td><td>DTO projection with <code>GROUP BY</code></td></tr>
+      <tr><td>Many places, no time to audit</td><td><code>default_batch_fetch_size</code> as a safety net</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: know how many queries a request runs</p>
+    <p>A page that depends on a list should run a small, fixed number of queries, not a number that grows with
+    the data. Check the SQL log for every new list endpoint.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: switching everything to EAGER</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: eager everywhere</p><pre><code class="language-java">@OneToMany(mappedBy = "restaurant", fetch = FetchType.EAGER)
+private List&lt;MenuItem&gt; menuItems;
+// every query for a Restaurant now loads items, even when not needed;
+// N+1 can still happen through derived queries</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: lazy by default, fetch on demand</p><pre><code class="language-java">@OneToMany(mappedBy = "restaurant")           // lazy
+private List&lt;MenuItem&gt; menuItems;
+// use @EntityGraph or JOIN FETCH in the specific query that needs them</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>LazyInitializationException</code> is the cousin: touching a lazy collection after the transaction
+      or session has closed. Fix by fetching in the query, not by opening the session longer.</li>
+      <li>A fetch join with <code>distinct</code> may still return duplicate parents with older Hibernate versions
+      unless <code>distinct</code> is set; Hibernate 6 de-duplicates entity results automatically.</li>
+      <li>N+1 is not only an ORM problem: a hand-written JDBC loop that queries inside a <code>for</code> loop has the
+      same issue.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>What is the N+1 problem?</b> One query for N parents plus one per parent for children: N+1 round trips.</li>
+      <li><b>How do you find it?</b> SQL logging, Hibernate statistics, query-count assertions in tests,
+      <code>pg_stat_statements</code>.</li>
+      <li><b>How do you fix it?</b> <code>JOIN FETCH</code> or <code>@EntityGraph</code>, batch fetching with an IN list, or
+      a DTO projection; not blanket EAGER.</li>
+      <li><b>Why does it not show in development?</b> Small data; the number of queries grows with the data size.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m5-interview">
+  <h3>Interview questions — How databases work inside</h3>
+  <details class="qa"><summary>What is an index and how does a B-tree index speed up a query?</summary><div class="qa-a">
+    <p>An index is a separate sorted structure (usually a B+ tree) of column values with pointers to rows. The tree
+    is wide and shallow, so finding a key reads only 3 or 4 pages: O(log n) instead of reading the whole table.
+    Leaf pages are linked in order, so range scans and sorted output are cheap too.</p></div></details>
+  <details class="qa"><summary>When does an index hurt?</summary><div class="qa-a">
+    <p>Every insert, update of an indexed column and delete must also update each index, so writes get slower and
+    storage and cache use grow. On low-selectivity columns or small tables, the planner ignores the index anyway.
+    Keep indexes for queries you have measured, and drop unused ones.</p></div></details>
+  <details class="qa"><summary>Explain the leftmost-prefix rule.</summary><div class="qa-a">
+    <p>An index on (a, b, c) is sorted by a, then b, then c. It can serve queries filtering on a; a and b; or a, b
+    and c. It cannot efficiently serve b or c alone, because the entries for one b value are scattered through the
+    index. Put equality columns first and the range or sort column last.</p></div></details>
+  <details class="qa"><summary>Name reasons why an index may not be used.</summary><div class="qa-a">
+    <p>A function or arithmetic on the column (<code>lower(email)</code>), a leading wildcard
+    (<code>LIKE '%x'</code>), an implicit cast, low selectivity, a tiny table, <code>OR</code> across columns, wrong
+    column order, and stale statistics. Check with <code>EXPLAIN</code>; fix with an expression index, a trigram
+    index, correct types, a reordered index, or <code>ANALYZE</code>.</p></div></details>
+  <details class="qa"><summary>What is a covering index?</summary><div class="qa-a">
+    <p>An index that contains every column the query needs, so the database answers from the index alone without
+    reading the table (an Index Only Scan). In PostgreSQL you add extra columns with <code>INCLUDE</code>.</p></div></details>
+  <details class="qa"><summary>What is the difference between EXPLAIN and EXPLAIN ANALYZE?</summary><div class="qa-a">
+    <p><code>EXPLAIN</code> shows the planned steps and estimated costs without running the query.
+    <code>EXPLAIN ANALYZE</code> runs it and adds actual time, actual rows and loops per node; with
+    <code>BUFFERS</code> it adds page counts. Compare estimated and actual rows to spot stale statistics, and look
+    for Seq Scans that discard many rows.</p></div></details>
+  <details class="qa"><summary>Explain ACID with an example.</summary><div class="qa-a">
+    <p>Bank transfer of ₹500: Atomicity - the debit and credit both happen or neither. Consistency - the rules
+    (balance not negative, total unchanged) hold after the transaction. Isolation - other transactions do not see
+    the half-finished state. Durability - once committed, the change survives a crash because the write-ahead log
+    was flushed to disk.</p></div></details>
+  <details class="qa"><summary>What are dirty, non-repeatable and phantom reads?</summary><div class="qa-a">
+    <p>Dirty read: reading another transaction's uncommitted change. Non-repeatable read: the same row gives a
+    different value on the second read because another transaction committed a change. Phantom read: the same
+    query returns a different set of rows because another transaction committed an insert or delete.</p></div></details>
+  <details class="qa"><summary>List the isolation levels and the defaults of PostgreSQL and MySQL.</summary><div class="qa-a">
+    <p>Read Uncommitted, Read Committed, Repeatable Read, Serializable. PostgreSQL defaults to Read Committed (and
+    treats Read Uncommitted as Read Committed); MySQL InnoDB defaults to Repeatable Read. Higher levels prevent more
+    anomalies but cause more blocking or more serialization failures that must be retried.</p></div></details>
+  <details class="qa"><summary>What is MVCC?</summary><div class="qa-a">
+    <p>Multi-version concurrency control: updates create new row versions and keep the old ones, so each
+    transaction reads from a snapshot. Readers do not block writers and writers do not block readers; old versions
+    are removed later (VACUUM in PostgreSQL).</p></div></details>
+  <details class="qa"><summary>What is a deadlock and how do you prevent it?</summary><div class="qa-a">
+    <p>Two transactions each hold a lock the other needs. The database detects the cycle and aborts one with an
+    error. Prevent it by taking locks in a consistent order (lowest id first), keeping transactions short, locking
+    all needed rows up front, and retrying the aborted transaction.</p></div></details>
+  <details class="qa"><summary>Optimistic vs pessimistic locking: which and when?</summary><div class="qa-a">
+    <p>Pessimistic locks the row first (<code>SELECT ... FOR UPDATE</code>) and makes others wait; use it when
+    conflicts are likely and transactions are short (seat booking, wallet). Optimistic reads freely and checks a
+    <code>version</code> column at update time (<code>@Version</code> in JPA), failing on conflict; use it when
+    conflicts are rare or the user holds the data for a while (editing forms).</p></div></details>
+  <details class="qa"><summary>Two users buy the last item at the same time. How do you stop overselling?</summary><div class="qa-a">
+    <p>Make the check and update atomic: <code>UPDATE items SET stock = stock - 1 WHERE id = ? AND stock &gt;= 1</code>
+    and check that one row was updated. Alternatives: <code>SELECT ... FOR UPDATE</code> first, or a version
+    check with retry. Don't read the stock, subtract in Java and write it back at Read Committed: that is a lost
+    update.</p></div></details>
+  <details class="qa"><summary>Why use a connection pool, and how do you size it?</summary><div class="qa-a">
+    <p>Opening connections is slow and the server can hold only a limited number. A pool (HikariCP, default 10)
+    reuses open connections. Keep it small (around 10 to start), because more concurrent queries than the database
+    can run just compete; make sure instances × pool size stays below <code>max_connections</code>. Pool
+    exhaustion shows up as "Connection is not available, request timed out".</p></div></details>
+  <details class="qa"><summary>What is the N+1 problem and how do you fix it?</summary><div class="qa-a">
+    <p>One query loads N parent rows and then N more queries load each parent's children, usually from lazy
+    loading inside a loop. Detect it in the SQL log. Fix it with a JOIN FETCH or <code>@EntityGraph</code>,
+    batch loading (<code>default_batch_fetch_size</code>), or a DTO projection, not by making everything
+    EAGER.</p></div></details>
+</article>
+
+<article class="topic recap" id="m5-cheatsheet">
+  <h3>Cheat sheet — How databases work inside</h3>
+  <ul class="cheat">
+    <li><b>Page</b> 8 KB (PostgreSQL) / 16 KB (InnoDB) unit of I/O; PostgreSQL heap vs InnoDB clustered table</li>
+    <li><b>Seq Scan</b> reads all pages, O(n); fine for tiny tables or large fractions</li>
+    <li><b>B-tree</b> balanced, wide, shallow; lookup O(log n); equality, range, <code>ORDER BY</code>, prefix <code>LIKE</code></li>
+    <li><b>Other index types</b> hash (equality), GIN (JSONB, arrays, full-text), GiST, BRIN (huge ordered tables)</li>
+    <li><b>Index cost</b> slower writes, more disk and cache; drop unused ones (<code>pg_stat_user_indexes</code>)</li>
+    <li><b>FK indexes</b> PostgreSQL does not create them; InnoDB does</li>
+    <li><b>Variants</b> unique, partial (<code>WHERE</code>), expression (<code>lower(col)</code>), covering (<code>INCLUDE</code>)</li>
+    <li><b>Composite (a,b,c)</b> serves a; a,b; a,b,c. Equality first, range last, match <code>ORDER BY</code></li>
+    <li><b>Index ignored</b> function or cast on column, <code>LIKE '%x'</code>, low selectivity, tiny table, <code>OR</code>, wrong order, stale stats</li>
+    <li><b>EXPLAIN</b> estimate only; <b>EXPLAIN (ANALYZE, BUFFERS)</b> runs it, shows actual time, rows, loops, pages</li>
+    <li><b>Plan nodes</b> Seq Scan, Index (Only) Scan, Bitmap Scan, Nested Loop, Hash Join, Merge Join, Sort</li>
+    <li><b>Estimated vs actual rows</b> far apart means run <code>ANALYZE</code></li>
+    <li><b>Transaction</b> <code>BEGIN</code> / <code>COMMIT</code> / <code>ROLLBACK</code> / <code>SAVEPOINT</code>; autocommit = one statement per transaction</li>
+    <li><b>ACID</b> atomic (all or none), consistent (rules hold), isolated (no half-done reads), durable (WAL flushed at commit)</li>
+    <li><b>Anomalies</b> dirty read, non-repeatable read, phantom read, lost update, write skew</li>
+    <li><b>Levels</b> RU, RC (PostgreSQL default), RR (MySQL default), Serializable; RR/Serializable may need retry on SQLSTATE <code>40001</code></li>
+    <li><b>MVCC</b> row versions + snapshots; readers do not block writers</li>
+    <li><b>Row locks</b> <code>FOR UPDATE</code>, <code>FOR SHARE</code>, <code>NOWAIT</code>, <code>SKIP LOCKED</code> (job queues)</li>
+    <li><b>Deadlock</b> cycle of waits; lock in consistent order, keep short, retry (<code>40P01</code>)</li>
+    <li><b>Atomic update</b> <code>SET stock = stock - n WHERE stock &gt;= n</code> beats read-modify-write</li>
+    <li><b>Optimistic</b> <code>version</code> column / <code>@Version</code>; <b>pessimistic</b> <code>FOR UPDATE</code> / <code>PESSIMISTIC_WRITE</code></li>
+    <li><b>HikariCP</b> <code>maximum-pool-size</code> 10, <code>connection-timeout</code> 30 s, <code>max-lifetime</code> 30 min; small pools win</li>
+    <li><b>Pool math</b> instances × pool size &lt; <code>max_connections</code> (100 default in PostgreSQL)</li>
+    <li><b>N+1</b> 1 query for parents + N for children; fix with fetch join, <code>@EntityGraph</code>, batch size, projection</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m5-practice">
+  <h3>Practice — How databases work inside</h3>
+  <ol class="steps">
+    <li><strong>Roadmap exercise: the index experiment.</strong> Build the 1-million-row <code>orders_big</code> table
+    with <code>generate_series</code> from <a href="#m5-explain">the EXPLAIN article</a>. Time
+    <code>WHERE customer_id = 4242</code>, save the <code>EXPLAIN (ANALYZE, BUFFERS)</code> output, add the index,
+    run <code>ANALYZE</code>, and compare execution time and buffers. Done when you can explain every line of both
+    plans.</li>
+    <li><strong>Break the index.</strong> On the same table try a function on the column, a leading wildcard, and a
+    low-selectivity filter (<code>status</code>). For each, show the plan and apply the fix (expression index,
+    trigram index, partial index) and show the new plan.</li>
+    <li><strong>Composite index lab.</strong> Create an index on <code>(customer_id, status, placed_at)</code>. Write
+    six queries that filter on different combinations (a; a,b; b; a,c; ...) and record which ones use the index and
+    how. Reorder the columns and repeat.</li>
+    <li><strong>Covering index.</strong> Make a query return <code>customer_id, placed_at, amount_paise</code> for one
+    customer as an Index Only Scan with <code>INCLUDE</code>. Run <code>VACUUM</code> and check that heap fetches
+    go to zero.</li>
+    <li><strong>Roadmap exercise: bank transfer.</strong> Create <code>accounts</code>, then simulate a transfer with
+    <code>BEGIN</code>, two updates and <code>COMMIT</code>. Repeat with a <code>ROLLBACK</code> and with a failing
+    <code>CHECK</code>. Add a <code>SAVEPOINT</code> to retry one step. Done when balances are always correct.</li>
+    <li><strong>Roadmap exercise: isolation in action.</strong> Open two <code>psql</code> sessions. Reproduce a
+    non-repeatable read at Read Committed, then show it disappears at Repeatable Read. Reproduce the lost update
+    on <code>items.stock</code>, then fix it three ways (atomic update, <code>FOR UPDATE</code>, version column).
+    Try the write-skew rider example at Repeatable Read and at Serializable.</li>
+    <li><strong>Deadlock.</strong> Cause the opposite-order transfer deadlock between two sessions, read the error,
+    then fix it with ordered locking.</li>
+    <li><strong>Job queue.</strong> Create a <code>jobs</code> table with 20 rows. In two sessions run the
+    <code>FOR UPDATE SKIP LOCKED</code> claim query and show each session gets a different job.</li>
+    <li><strong>Optimistic locking in Spring.</strong> Add <code>@Version</code> to an entity, update the same row from
+    two threads or two requests, and show <code>ObjectOptimisticLockingFailureException</code>. Return HTTP 409.</li>
+    <li><strong>N+1 hunt.</strong> In a Spring Boot app with <code>Restaurant</code> and <code>MenuItem</code>, load
+    50 restaurants and print item counts. Count the queries in the log, then fix it with
+    <code>@EntityGraph</code> and again with <code>default_batch_fetch_size</code>. Write a test that asserts the
+    query count. Also set <code>maximum-pool-size</code> to 2 and run a load of 20 parallel requests to watch the
+    pool time out.</li>
+  </ol>
+</article>

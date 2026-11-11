@@ -1,0 +1,356 @@
+<div class="mintro">
+  <p>Basic and intermediate SQL answer "what is in the table" and "how do I combine tables". Advanced SQL
+  answers the harder questions: "rank employees inside each department", "what was the change from last month",
+  "walk the whole management chain", "who logged in five days in a row". The tools are <strong>common table
+  expressions</strong> (<code>WITH</code>), <strong>window functions</strong> (<code>OVER</code>),
+  <strong>views</strong>, and the ability to put logic into the database with functions, procedures and
+  triggers. These are also the topics that separate a strong SQL interview answer from an average one.</p>
+  <p>The module ends with the classic interview queries (second highest salary, duplicates, top N per group,
+  consecutive days, median), each solved in two or three ways on the sample database from
+  <a href="#m1-sample-schema">Module 1</a>. If your skills feel rusty, revisit
+  <a href="#m2-group-by">GROUP BY</a> and <a href="#m2-joins">joins</a> from Module 2 first. How the database
+  executes these queries, and how indexes speed them up, is in <a href="#m5">Module 5</a>.</p>
+  <ul>
+    <li>Write readable multi-step queries with CTEs, and walk trees and hierarchies with recursive CTEs.</li>
+    <li>Use <code>ROW_NUMBER</code>, <code>RANK</code>, <code>DENSE_RANK</code>, <code>LAG</code>,
+    <code>LEAD</code>, running totals and moving averages, and explain window frames.</li>
+    <li>Create views and materialized views, and write a simple function, procedure and trigger, and judge when
+    they are a good idea.</li>
+    <li>Solve the standard interview problems in more than one way and explain the trade-offs.</li>
+    <li>Know how to keep practising with a college database and a LeetCode-style plan.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m3-cte">
+  <h3>Common table expressions (WITH)</h3>
+  <p class="tldr">A <strong>CTE</strong> is a named, temporary result defined with <code>WITH name AS (…)</code>
+  at the top of a statement. It lets you write a complex query as a sequence of small, readable steps instead of
+  nested subqueries.</p>
+
+  <h4>What and why</h4>
+  <p>Nested subqueries read inside-out, and when the same subquery is needed twice you have to copy it. A CTE
+  gives the step a name, defined once, read top to bottom. It exists only for the statement that follows; nothing
+  is saved in the database. Both PostgreSQL and MySQL (8.0 and later) support it.</p>
+  <pre data-title="Syntax"><code class="language-sql">WITH step_one AS (
+    SELECT ...
+),
+step_two AS (                 -- a later CTE can use an earlier one
+    SELECT ... FROM step_one ...
+)
+SELECT ...
+FROM step_two
+JOIN step_one ON ...;         -- the main query can use all of them</code></pre>
+
+  <h4>Example: a multi-step report</h4>
+  <p>Goal: for each customer, the number of orders and the total spent, ignoring cancelled orders. Step one
+  computes the total of each order, step two summarises per customer, and the main query adds the name.</p>
+  <pre data-title="Two CTEs"><code class="language-sql">WITH order_totals AS (
+    SELECT o.order_id, o.customer_id,
+           SUM(oi.quantity * oi.unit_price) AS total
+    FROM orders AS o
+    JOIN order_items AS oi ON oi.order_id = o.order_id
+    WHERE o.status &lt;&gt; 'CANCELLED'
+    GROUP BY o.order_id, o.customer_id
+),
+customer_totals AS (
+    SELECT customer_id, COUNT(*) AS orders, SUM(total) AS spent
+    FROM order_totals
+    GROUP BY customer_id
+)
+SELECT c.name, ct.orders, ct.spent
+FROM customer_totals AS ct
+JOIN customers AS c ON c.customer_id = ct.customer_id
+ORDER BY ct.spent DESC;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">     name     | orders |  spent
+--------------+--------+---------
+ Aarav Shah   |      3 | 6206.00
+ Diya Kapoor  |      2 | 5597.00
+ Rohan Das    |      2 | 2474.00
+ Kabir Singh  |      1 | 2100.00
+ Ishita Joshi |      1 | 2048.00
+(5 rows)</code></pre>
+  <p>Sara and Tanvi are absent because they have no orders and the report starts from
+  <code>customer_totals</code>. Kabir has one order because his other order (4) was cancelled.</p>
+
+  <h4>Using a CTE twice</h4>
+  <p>The big win over a subquery: a CTE can be referenced several times. "Customers who spent more than the
+  average customer":</p>
+  <pre data-title="Reusing a CTE"><code class="language-sql">WITH spend AS (
+    SELECT o.customer_id, SUM(oi.quantity * oi.unit_price) AS spent
+    FROM orders o
+    JOIN order_items oi ON oi.order_id = o.order_id
+    WHERE o.status &lt;&gt; 'CANCELLED'
+    GROUP BY o.customer_id
+)
+SELECT c.name, s.spent
+FROM spend AS s
+JOIN customers AS c ON c.customer_id = s.customer_id
+WHERE s.spent &gt; (SELECT AVG(spent) FROM spend)      -- second use of the same CTE
+ORDER BY s.spent DESC;</code></pre>
+  <pre class="out" data-title="Output (average is 3685)"><code class="language-plaintext">    name     |  spent
+-------------+---------
+ Aarav Shah  | 6206.00
+ Diya Kapoor | 5597.00
+(2 rows)</code></pre>
+  <p>(6206 + 5597 + 2474 + 2100 + 2048 = 18425, divided by 5 customers = 3685.)</p>
+
+  <h4>CTE vs subquery vs view vs temporary table</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Subquery / derived table</th><th>CTE</th><th>View</th><th>Temp table</th></tr></thead>
+    <tbody>
+      <tr><td>Lives for</td><td>one place in a statement</td><td>one statement</td><td>stored in the database</td><td>your session</td></tr>
+      <tr><td>Reusable in the statement</td><td>no (copy it)</td><td>yes</td><td>yes (and in any query)</td><td>yes, many statements</td></tr>
+      <tr><td>Data stored</td><td>no</td><td>no (see below)</td><td>no</td><td>yes</td></tr>
+      <tr><td>Can have an index</td><td>no</td><td>no</td><td>no</td><td>yes</td></tr>
+      <tr><td>Best for</td><td>small inline step</td><td>readable multi-step logic, recursion</td><td>shared definition, security</td><td>very large intermediate results used many times</td></tr>
+    </tbody>
+  </table></div>
+  <p>Performance: in PostgreSQL 12 and later, a non-recursive CTE that is referenced once and has no side
+  effects is <strong>inlined</strong> like a subquery, so the optimizer treats it the same. A CTE referenced more
+  than once is computed once and reused (materialized). You can force the behaviour:
+  <code>WITH x AS MATERIALIZED (…)</code> or <code>AS NOT MATERIALIZED (…)</code>. Before PostgreSQL 12 every CTE
+  was an "optimization fence", always computed first, which made some old advice ("CTEs are slow") true then.
+  Today a CTE is mostly a readability tool, not a performance trick. MySQL 8 behaves similarly (it merges simple
+  CTEs, or materializes them).</p>
+
+  <h4>Data-modifying CTEs (PostgreSQL)</h4>
+  <p>A CTE can contain <code>INSERT</code>, <code>UPDATE</code> or <code>DELETE</code> with
+  <code>RETURNING</code>, and the main statement can use what came back. This moves rows between tables in one
+  atomic statement:</p>
+  <pre data-title="Archive and delete in one statement (hypothetical archive table)"><code class="language-sql">WITH removed AS (
+    DELETE FROM orders
+    WHERE status = 'CANCELLED' AND order_date &lt; DATE '2026-03-01'
+    RETURNING *
+)
+INSERT INTO orders_archive
+SELECT * FROM removed;</code></pre>
+  <p>(Run it only on a copy: order 4 is cancelled and older than March, but it has order lines that this delete
+  would also cascade. A real archive job would copy the lines first.) MySQL does not allow data-modifying
+  CTEs.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: name steps for what they hold</p>
+    <p>Use names like <code>order_totals</code> and <code>active_customers</code>, not <code>t1</code> and
+    <code>x</code>. One logical step per CTE, ordered from raw data to final shape, and let the last
+    <code>SELECT</code> stay short. Teams often format the <code>WITH</code> block at the left edge so reviews
+    read like a recipe.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: expecting a CTE to behave like a table or a temp table</p>
+    <p>A CTE is visible only inside its statement, has no index, and (unless materialized) is not computed once
+    and cached for the next statement. If you run five queries on the same expensive intermediate result,
+    create a temporary table or a materialized view instead (<a href="#m3-views">Views</a>).</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Rules and edge cases</p>
+    <ul>
+      <li>CTE names must be unique in the <code>WITH</code> list. A later CTE can read an earlier one, but not
+      the other way round: <code>ERROR:  relation "customer_totals" does not exist</code>.</li>
+      <li>A CTE shadows a real table with the same name for that statement.</li>
+      <li>Column names can be listed after the name: <code>WITH t(day, total) AS (…)</code>.</li>
+      <li>A CTE can be used in <code>INSERT … WITH …</code>, <code>UPDATE</code> and <code>DELETE</code> in
+      PostgreSQL and MySQL 8 (<code>WITH</code> before the statement).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is a CTE and when would you use one?" Readability, reuse inside one statement, recursion. Know the
+    difference from a view (stored vs temporary) and a temp table (data stored, indexable). Many "top N per group"
+    and "Nth highest" answers use a CTE with a window function.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-recursive-cte">
+  <h3>Recursive CTEs and generating series</h3>
+  <p class="tldr">A <strong>recursive CTE</strong> starts with an anchor query and repeatedly joins its own
+  previous result until nothing new appears. It is how SQL walks trees and graphs (org charts, category trees)
+  and generates sequences of numbers or dates.</p>
+
+  <h4>The structure</h4>
+  <p>A recursive CTE has two parts joined by <code>UNION ALL</code>:</p>
+  <ol class="steps">
+    <li><strong>Anchor member</strong>: a normal query that returns the starting rows (the root of the tree).</li>
+    <li><strong>Recursive member</strong>: a query that refers to the CTE's own name. It runs on the rows
+    produced by the previous round and returns the next level.</li>
+    <li><strong>Termination</strong>: the loop stops when a round returns zero rows. All rounds are then
+    combined into the final result.</li>
+  </ol>
+  <pre data-title="Syntax"><code class="language-sql">WITH RECURSIVE name (columns) AS (
+    SELECT ...                       -- anchor: runs once
+    UNION ALL
+    SELECT ... FROM name ... WHERE ...   -- recursive: runs again and again
+)
+SELECT * FROM name;</code></pre>
+  <p>MySQL 8 also needs the word <code>RECURSIVE</code>. (SQL Server and Oracle do not use the keyword.)</p>
+
+  <h4>Counting from 1 to 5</h4>
+  <pre data-title="The smallest recursive CTE"><code class="language-sql">WITH RECURSIVE counter (n) AS (
+    SELECT 1                         -- anchor
+    UNION ALL
+    SELECT n + 1 FROM counter WHERE n &lt; 5   -- recursive; stops when n reaches 5
+)
+SELECT n FROM counter;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> n
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+(5 rows)</code></pre>
+  <p>Round 0 returns 1. Round 1 reads the 1 and returns 2. This repeats until <code>n &lt; 5</code> fails, the
+  round returns nothing, and the loop ends.</p>
+
+  <h4>The org chart</h4>
+  <p>The classic use. Start with the employee that has no manager, then repeatedly add the people whose
+  <code>manager_id</code> equals an <code>emp_id</code> found in the previous round. Track the level and the path
+  as you go:</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  M[Meera] --> V[Vikram]
+  M --> A[Ananya]
+  M --> S[Sunita]
+  V --> P[Priya]
+  P --> R[Rahul]
+  P --> J[Arjun]
+  P --> D[Divya]
+  A --> K[Karan]
+  A --> N[Neha]
+  S --> F[Farhan]
+  S --> I[Isha]
+</pre>
+  <figcaption>The management tree in the sample data; a recursive query walks it level by level</figcaption>
+  </figure>
+  <pre data-title="Whole hierarchy with level and path"><code class="language-sql">WITH RECURSIVE org AS (
+    SELECT emp_id, first_name, 1 AS level, first_name::TEXT AS path
+    FROM employees
+    WHERE manager_id IS NULL                      -- anchor: the CEO
+    UNION ALL
+    SELECT e.emp_id, e.first_name, o.level + 1, o.path || ' &gt; ' || e.first_name
+    FROM employees AS e
+    JOIN org AS o ON e.manager_id = o.emp_id      -- recursive: direct reports of the previous level
+)
+SELECT level, path
+FROM org
+ORDER BY path;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> level |              path
+-------+--------------------------------
+     1 | Meera
+     2 | Meera &gt; Ananya
+     3 | Meera &gt; Ananya &gt; Karan
+     3 | Meera &gt; Ananya &gt; Neha
+     2 | Meera &gt; Sunita
+     3 | Meera &gt; Sunita &gt; Farhan
+     3 | Meera &gt; Sunita &gt; Isha
+     2 | Meera &gt; Vikram
+     3 | Meera &gt; Vikram &gt; Priya
+     4 | Meera &gt; Vikram &gt; Priya &gt; Arjun
+     4 | Meera &gt; Vikram &gt; Priya &gt; Divya
+     4 | Meera &gt; Vikram &gt; Priya &gt; Rahul
+(12 rows)</code></pre>
+  <p>The path column gives you a handy sort
+  that keeps each branch together. In MySQL, cast the path to a long enough type
+  (<code>CAST(first_name AS CHAR(200))</code>), because the column width is fixed by the anchor row.</p>
+
+  <h4>All subordinates of one manager</h4>
+  <p>Change only the anchor to start from any node. Everyone under Vikram, directly or not:</p>
+  <pre data-title="A subtree"><code class="language-sql">WITH RECURSIVE team AS (
+    SELECT emp_id, first_name FROM employees WHERE emp_id = 2      -- Vikram
+    UNION ALL
+    SELECT e.emp_id, e.first_name
+    FROM employees e
+    JOIN team t ON e.manager_id = t.emp_id
+)
+SELECT first_name FROM team WHERE emp_id &lt;&gt; 2 ORDER BY emp_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name
+------------
+ Priya
+ Rahul
+ Arjun
+ Divya
+(4 rows)</code></pre>
+  <p>Going <em>up</em> works the same way with the join reversed. The chain of command above Divya (id 8)
+  joins <code>e.emp_id = c.manager_id</code>. A category tree (<code>categories(id, name, parent_id)</code>) is
+  the same pattern: breadcrumbs "Electronics &gt; Computers &gt; Laptops", or all sub-categories of a category
+  for a product filter. Comment threads and bill-of-materials tables are further examples.</p>
+
+  <h4>Generating series</h4>
+  <p>Reports often need a row for every day, even days with no data. A recursive CTE can create the days, and in
+  PostgreSQL the built-in <strong><code>generate_series</code></strong> is shorter:</p>
+  <pre data-title="One row per day, with zero for quiet days"><code class="language-sql">SELECT d::DATE AS day, COUNT(o.order_id) AS orders
+FROM generate_series(DATE '2026-04-01', DATE '2026-04-10', INTERVAL '1 day') AS d
+LEFT JOIN orders AS o ON o.order_date = d::DATE
+GROUP BY d
+ORDER BY d;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">    day     | orders
+------------+--------
+ 2026-04-01 |      0
+ 2026-04-02 |      0
+ 2026-04-03 |      1
+ 2026-04-04 |      0
+ 2026-04-05 |      0
+ 2026-04-06 |      0
+ 2026-04-07 |      0
+ 2026-04-08 |      0
+ 2026-04-09 |      0
+ 2026-04-10 |      1
+(10 rows)</code></pre>
+  <p>Without the generated calendar, the days with no orders would simply be missing. MySQL has no
+  <code>generate_series</code>; use a recursive CTE that adds one day (<code>d + INTERVAL 1 DAY</code>). Also
+  handy: <code>generate_series(1, 100000)</code> to create a large test table for practising indexes and
+  <code>EXPLAIN</code>:</p>
+  <pre data-title="100,000 test rows"><code class="language-sql">CREATE TABLE big_numbers AS
+SELECT n, md5(n::TEXT) AS hash FROM generate_series(1, 100000) AS n;</code></pre>
+
+  <h4>Protecting against endless loops</h4>
+  <p>If the data contains a cycle (A manages B, B manages A), the recursion never finishes. Defences:</p>
+  <ul>
+    <li>Carry a depth counter and stop: <code>… WHERE o.level &lt; 20</code>.</li>
+    <li>Track visited ids in an array and refuse repeats:
+    <code>WHERE e.emp_id &lt;&gt; ALL (o.visited)</code>.</li>
+    <li>PostgreSQL 14 and later has a <code>CYCLE</code> clause that detects and marks cycles for you.</li>
+    <li>MySQL stops with an error after <code>cte_max_recursion_depth</code> rounds (default 1000).</li>
+    <li>Prevent bad data: a <code>CHECK (manager_id &lt;&gt; emp_id)</code> stops the simplest cycle.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: anchor, UNION ALL, and a way out</p>
+    <p>The recursive member must reference the CTE exactly once and must eventually return no rows. Use
+    <code>UNION ALL</code> (plain <code>UNION</code> removes duplicates each round and is slower, but also
+    prevents some cycles). The column types come from the anchor, so cast the anchor to a type wide enough for
+    later rounds (<code>first_name::TEXT</code>).</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: no termination condition</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: never stops</p><pre><code class="language-sql">WITH RECURSIVE c(n) AS (
+    SELECT 1 UNION ALL SELECT n + 1 FROM c
+)
+SELECT * FROM c;</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: bounded</p><pre><code class="language-sql">WITH RECURSIVE c(n) AS (
+    SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n &lt; 100
+)
+SELECT * FROM c;</code></pre></div>
+    </div>
+    <p>The wrong query runs until memory or time runs out (add <code>LIMIT</code> while testing, which stops a
+    PostgreSQL recursive CTE early).</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A tree with several roots (or none) works: the anchor returns all roots; if no row has a NULL parent,
+      you get nothing.</li>
+      <li>Rows are not guaranteed to come out level by level unless you order them. Always add
+      <code>ORDER BY</code>.</li>
+      <li>For huge or very deep graphs, a dedicated graph database, or a materialized path column, may be a
+      better design (<a href="#m4">Module 4</a>).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you query a hierarchy in SQL?" Describe the anchor and recursive member and the stop condition,
+    then write the org-chart query. Follow-ups: "how do you detect cycles", "print the level/indentation" and
+    "generate dates between two days". A self join only goes one level; a recursive CTE goes all the way down.</p>
+  </div>
+</article>

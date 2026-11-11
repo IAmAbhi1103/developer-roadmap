@@ -1,0 +1,533 @@
+<article class="topic" id="m2-nested-classes">
+  <h3>Nested classes: static nested, inner, local and anonymous</h3>
+  <p class="tldr">A nested class is a class declared inside another class; there are four kinds (static nested, inner, local, anonymous), and the main difference is whether the nested object carries a hidden reference to an outer object.</p>
+
+  <p>Normally each class sits in its own file. When a small class exists only to serve one other class, you can declare it <em>inside</em> that class. This keeps related code together, hides helpers from the rest of the program (<a href="#m2-encapsulation">encapsulation</a>) and gives the helper access to the outer class's private members. The class that holds the others is the <strong>outer</strong> (enclosing) class.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Kind</th><th>Declared</th><th>Has outer instance?</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td>Static nested</td><td>Member of the class, with <code>static</code></td><td>No</td><td>Builders, helper types, <code>Map.Entry</code></td></tr>
+      <tr><td>Inner (member)</td><td>Member of the class, no <code>static</code></td><td>Yes</td><td>Iterators, event handlers tied to one object</td></tr>
+      <tr><td>Local</td><td>Inside a method or block</td><td>Yes, if the method is an instance method</td><td>A helper used in one method only</td></tr>
+      <tr><td>Anonymous</td><td>An expression: <code>new Type() { … }</code></td><td>Yes, if in an instance context</td><td>One-off implementations; mostly replaced by lambdas</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Static nested class</h4>
+  <p>A <code>static</code> nested class behaves like a top-level class that happens to live inside another one, just for grouping. It has no link to an outer object. It can reach the outer class's <em>static</em> members, including private ones. You create it with <code>new Outer.Nested()</code>. It may have any access modifier, so a <code>private static</code> nested class is invisible outside.</p>
+  <pre data-title="Pizza.java"><code class="language-java">public class Pizza {
+    private final String size;
+    private final boolean cheese;
+
+    private Pizza(Builder b) {                         // can read the builder's private fields
+        this.size = b.size;
+        this.cheese = b.cheese;
+    }
+
+    public static class Builder {                     // static nested class
+        private String size = "medium";
+        private boolean cheese;
+
+        public Builder size(String s) { this.size = s; return this; }
+        public Builder cheese(boolean c) { this.cheese = c; return this; }
+        public Pizza build() { return new Pizza(this); }
+    }
+
+    @Override public String toString() { return size + " pizza, cheese=" + cheese; }
+
+    public static void main(String[] args) {
+        Pizza p = new Pizza.Builder().size("large").cheese(true).build();
+        System.out.println(p);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">large pizza, cheese=true</code></pre>
+  <p>The JDK uses this style often: <code>Map.Entry</code>, <code>AbstractMap.SimpleEntry</code>, <code>HttpRequest.Builder</code>.</p>
+
+  <h4>Inner (member) class</h4>
+  <p>An <strong>inner class</strong> is a non-static member. Each inner object is tied to <em>one</em> outer object and can use all its fields and methods, even private ones, directly. The compiler stores a hidden reference to the outer instance. Inside the inner class, <code>this</code> is the inner object and <code>Outer.this</code> is the outer one.</p>
+  <pre data-title="Playlist.java"><code class="language-java">import java.util.Iterator;
+import java.util.NoSuchElementException;
+
+public class Playlist implements Iterable&lt;String&gt; {
+    private final String[] songs = {"Kun Faya Kun", "Tum Hi Ho", "Kesariya"};
+    private final String owner = "Asha";
+
+    @Override
+    public Iterator&lt;String&gt; iterator() {
+        return new SongIterator();                    // created inside an instance method
+    }
+
+    private class SongIterator implements Iterator&lt;String&gt; {   // inner class
+        private int index = 0;
+
+        @Override public boolean hasNext() { return index &lt; songs.length; }   // outer field
+
+        @Override public String next() {
+            if (!hasNext()) throw new NoSuchElementException();
+            return songs[index++] + " (" + Playlist.this.owner + ")";       // Outer.this
+        }
+    }
+
+    public static void main(String[] args) {
+        for (String s : new Playlist()) {
+            System.out.println(s);
+        }
+        Playlist p = new Playlist();
+        Playlist.SongIterator it = p.new SongIterator();   // outer.new Inner() from outside
+        System.out.println(it.next());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Kun Faya Kun (Asha)
+Tum Hi Ho (Asha)
+Kesariya (Asha)
+Kun Faya Kun (Asha)</code></pre>
+  <p>From outside you need an outer object first: <code>outer.new Inner()</code>. Plain <code>new Inner()</code> works only inside an instance method of the outer class. This is how <code>ArrayList</code> implements its iterator.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Inner classes hold on to the outer object</p>
+    <p>Because an inner object keeps a reference to its outer object, it keeps that outer object alive for the garbage collector. If a long-living inner or anonymous object (a listener, a cache entry) is registered somewhere, it can leak a large outer object. If the inner class does not need the outer instance, make it <code>static</code>. IDEs warn about this, and it is the main reason to prefer <code>static</code> nested classes by default. Also, an inner class cannot declare static members in older Java; since Java 16 it can.</p>
+  </div>
+
+  <h4>Local classes</h4>
+  <p>A <strong>local class</strong> is declared in a method body, like a local variable. It is visible only in that block, and it can use the method's parameters and local variables if they are final or effectively final (<a href="#m2-final">final</a>). Since Java 16, local <em>records</em>, <em>enums</em> and <em>interfaces</em> are allowed too; they are useful for small data holders inside a stream pipeline.</p>
+  <pre data-title="LocalDemo.java"><code class="language-java">static void printTotals(double[] prices) {
+    final double gst = 0.18;
+    class Line {                                       // local class
+        final double price;
+        Line(double price) { this.price = price; }
+        double withTax() { return price * (1 + gst); } // captures the effectively final gst
+    }
+    for (double p : prices) {
+        System.out.printf("%.2f%n", new Line(p).withTax());
+    }
+}
+// printTotals(new double[]{100, 250}) prints 118.00 and 295.00</code></pre>
+
+  <h4>Anonymous classes and lambdas</h4>
+  <p>An <strong>anonymous class</strong> declares and instantiates a class in one expression: it extends a class or implements an interface, has no name and exists only here. It is useful for a one-off implementation, with state or several methods.</p>
+  <pre data-title="AnonDemo.java"><code class="language-java">import java.util.*;
+
+public class AnonDemo {
+    public static void main(String[] args) {
+        List&lt;String&gt; names = new ArrayList&lt;&gt;(List.of("Ravi", "Asha", "Meera"));
+
+        names.sort(new Comparator&lt;String&gt;() {           // anonymous class
+            @Override public int compare(String a, String b) {
+                return a.length() - b.length();
+            }
+        });
+        System.out.println(names);
+
+        names.sort((a, b) -&gt; a.compareTo(b));              // same idea as a lambda
+        System.out.println(names);
+
+        Runnable r = new Runnable() {
+            private int runs = 0;                         // own state: a lambda cannot do this
+            @Override public void run() { System.out.println("run " + (++runs)); }
+        };
+        r.run();
+        r.run();
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[Ravi, Asha, Meera]
+[Asha, Meera, Ravi]
+run 1
+run 2</code></pre>
+  <p>Since Java 8, a lambda replaces an anonymous class when the type is a <a href="#m2-interfaces">functional interface</a> (one abstract method). Prefer the lambda; it is shorter (<a href="#m5">Module 5</a>). The two are not identical:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Question</th><th>Anonymous class</th><th>Lambda</th></tr></thead>
+    <tbody>
+      <tr><td>Can implement</td><td>Any interface, or extend a class</td><td>Only a functional interface</td></tr>
+      <tr><td>Meaning of <code>this</code></td><td>The anonymous object itself</td><td>The enclosing object</td></tr>
+      <tr><td>Own fields and extra methods</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Compiled to</td><td>A separate class file (<code>Outer$1.class</code>)</td><td>An <code>invokedynamic</code> call, no class file for it</td></tr>
+      <tr><td>Shadowing local names</td><td>Can declare a variable with the same name as an outer local</td><td>Cannot; same scope as the enclosing method</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Access rules in short</p>
+    <ul>
+      <li>A nested class can access all members of its outer class, including private ones, and the outer class can access the nested class's private members.</li>
+      <li>A static nested class sees only the outer class's static members directly; for instance members it needs an outer object.</li>
+      <li>Local and anonymous classes can capture only final or effectively final local variables.</li>
+      <li>An anonymous class has no constructor of its own; arguments go to the superclass constructor: <code>new Shape("x") { … }</code>. It cannot be <code>static</code> or <code>abstract</code>.</li>
+      <li>The compiled names are <code>Outer$Nested.class</code>, <code>Outer$1.class</code> and <code>Outer$1Local.class</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions: which kind to choose</p>
+    <ul>
+      <li>Start with a <strong>static nested</strong> class. Use <strong>inner</strong> only when each instance really needs the outer object.</li>
+      <li>If the nested class is big or used by other classes, move it to its own file.</li>
+      <li>Use a <strong>lambda</strong> for functional interfaces, an <strong>anonymous class</strong> only when you need state or a non-functional type, and a <strong>local class</strong> or local record for a tiny helper inside one method.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: instantiating an inner class from a static method</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong</p><pre><code class="language-java">public static void main(String[] a) {
+    Inner i = new Inner();     // error: non-static variable this cannot be referenced
+                               // from a static context
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: make it static, or create an outer object</p><pre><code class="language-java">static class Inner { }                    // option 1
+// option 2: Outer o = new Outer(); Outer.Inner i = o.new Inner();</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: nested class questions</p>
+    <ul>
+      <li><b>Static nested vs inner?</b> Inner holds a reference to an outer instance and can use its instance members; static nested does not.</li>
+      <li><b>Why can a local or anonymous class use only final variables?</b> It captures a copy of the value; see <a href="#m2-final">effectively final</a>.</li>
+      <li><b>Anonymous class vs lambda?</b> Show the table: <code>this</code>, state, class file, functional-interface limit.</li>
+      <li><b>Can an inner class be private?</b> Yes; a top-level class cannot (<a href="#m2-access-modifiers">access modifiers</a>).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-packages">
+  <h3>Packages and imports</h3>
+  <p class="tldr">A package is a named folder of related classes that prevents name clashes and controls package-private access; you declare it with <code>package</code>, name it with your reversed domain in lowercase, and bring other packages' classes into view with <code>import</code>.</p>
+
+  <p>Imagine a project with two classes called <code>Date</code>, one for the database and one for the UI. Without a way to separate them they would clash. A <strong>package</strong> is a namespace: <code>java.util.Date</code> and <code>java.sql.Date</code> are different classes because their packages differ. Packages also group classes by purpose, and they are the unit for the package-private access level (<a href="#m2-access-modifiers">access modifiers</a>).</p>
+
+  <h4>Declaring a package and the folder rule</h4>
+  <p>The first statement of a file (before imports and the class) is the <code>package</code> declaration. The folder structure must match it. For a Maven or Gradle project, source files live under <code>src/main/java</code>.</p>
+  <pre class="diagram">
+ src/main/java
+ └── com
+     └── acme
+         └── shop
+             ├── model
+             │   └── Order.java          package com.acme.shop.model;
+             ├── service
+             │   └── OrderService.java   package com.acme.shop.service;
+             └── ShopApp.java            package com.acme.shop;
+</pre>
+  <pre data-title="OrderService.java"><code class="language-java">package com.acme.shop.service;               // must be the first statement
+
+import com.acme.shop.model.Order;            // single-type import
+import java.util.List;
+import java.util.ArrayList;
+
+public class OrderService {
+    private final List&lt;Order&gt; orders = new ArrayList&lt;&gt;();
+
+    public void place(Order order) {
+        orders.add(order);
+        System.out.println("Placed " + order.id());
+    }
+}</code></pre>
+  <p>The <strong>fully qualified name</strong> of this class is <code>com.acme.shop.service.OrderService</code>. You can always use it without an import: <code>java.util.List&lt;String&gt; names = new java.util.ArrayList&lt;&gt;();</code>. An import is only a shortcut so that you can write the short name. It does not copy or load anything, and unused imports cost nothing at run time.</p>
+  <p>To compile and run by hand from the project root:</p>
+  <pre data-title="Terminal"><code class="language-shell">$ javac -d out src/main/java/com/acme/shop/model/*.java src/main/java/com/acme/shop/service/*.java src/main/java/com/acme/shop/ShopApp.java
+$ java -cp out com.acme.shop.ShopApp</code></pre>
+  <p>The class is run by its fully qualified name; the <code>-d out</code> option creates the matching folders for you. Build tools do this automatically.</p>
+
+  <h4>Naming conventions</h4>
+  <ul>
+    <li>All lowercase, no underscores or spaces: <code>com.acme.shop.service</code>.</li>
+    <li>Start with your organisation's <strong>domain name reversed</strong>: the company <code>acme.com</code> becomes <code>com.acme</code>. Add the project and then layers or features. Open source: <code>org.springframework</code>, <code>com.fasterxml.jackson</code>.</li>
+    <li>If you have no domain, use something unique such as <code>io.github.yourname</code>.</li>
+    <li>Do not start with <code>java.</code> or <code>javax.</code>; those belong to the JDK.</li>
+    <li>Layer-based (<code>controller</code>, <code>service</code>, <code>repository</code>) or feature-based (<code>order</code>, <code>payment</code>) layouts both work. Larger apps tend to prefer feature packages, because a feature's classes can stay package-private and change together.</li>
+  </ul>
+
+  <h4>Imports</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Form</th><th>Example</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Single-type</td><td><code>import java.util.List;</code></td><td>Preferred; the reader sees where each name comes from</td></tr>
+      <tr><td>On-demand (wildcard)</td><td><code>import java.util.*;</code></td><td>All classes of that package, <em>not</em> its subpackages</td></tr>
+      <tr><td>Static single</td><td><code>import static java.lang.Math.max;</code></td><td>Use <code>max(a, b)</code> without <code>Math.</code></td></tr>
+      <tr><td>Static wildcard</td><td><code>import static org.junit.jupiter.api.Assertions.*;</code></td><td>Common in tests; avoid in main code</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="ImportDemo.java"><code class="language-java">import static java.lang.Math.max;
+import static java.lang.Math.sqrt;
+import java.util.*;                       // List, Map, Set, ... but not java.util.function
+
+public class ImportDemo {
+    public static void main(String[] args) {
+        System.out.println(max(3, 8));              // Math.max, via static import
+        System.out.println(sqrt(81));
+        List&lt;String&gt; names = new ArrayList&lt;&gt;();     // no import needed for String: java.lang
+        names.add("Asha");
+        System.out.println(names);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">8
+9.0
+[Asha]</code></pre>
+  <p>Things you do not need to import: everything in <code>java.lang</code> (<code>String</code>, <code>Math</code>, <code>Integer</code>, <code>System</code>, <code>Object</code>, <code>Exception</code>, <code>Thread</code>…), and classes in the <em>same</em> package. Classes in other packages always need an import or the full name, even if the folders are next to each other.</p>
+
+  <h4>Name clashes</h4>
+  <p>If two imported packages contain the same simple name, the compiler cannot decide. With two single-type imports of the same name it is an error, with two wildcard imports it is an error only when you use the name ("reference to Date is ambiguous"). Import one and write the other fully qualified:</p>
+  <pre data-title="Clash.java"><code class="language-java">import java.util.Date;
+
+public class Clash {
+    java.util.Date utilDate = new Date();           // from the import
+    java.sql.Date sqlDate = new java.sql.Date(0L);  // full name for the other one
+}</code></pre>
+  <p>A single-type import beats a wildcard import, and a class declared in the same package beats a wildcard import. A class in your own file shadows a same-named import (the compiler rejects a conflicting single-type import).</p>
+
+  <h4>The default package</h4>
+  <p>A file with no <code>package</code> line belongs to the unnamed <strong>default package</strong>. It is fine for a 20-line experiment. Do not use it in real projects: classes in named packages cannot import classes from the default package, and Spring Boot's component scan will not work properly. Always declare a package.</p>
+
+  <h4>Packages, access and modules</h4>
+  <ul>
+    <li>Package-private (no modifier) members are visible to every class in the same package, and nowhere else. Sub-packages are <em>not</em> "inside": <code>com.acme.shop</code> and <code>com.acme.shop.model</code> are separate packages.</li>
+    <li>Package names are a naming scheme; there is no "parent can see child" rule.</li>
+    <li>Java 9 added <strong>modules</strong> (<code>module-info.java</code>) that group packages and decide which are exported. Most application projects, including typical Spring Boot ones, do not use them; libraries and the JDK itself do.</li>
+  </ul>
+
+  <div class="co co-version">
+    <p class="co-t">Version note: module imports in Java 25</p>
+    <p>Java 25 finalises <em>module import declarations</em>: <code>import module java.base;</code> imports every public class of the packages that module exports. It is meant for scripts and teaching; in team code, explicit single-type imports are still the style.</p>
+  </div>
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>The <code>package</code> statement comes first; imports come next; then the type declarations. One public top-level class per file, named like the file.</li>
+      <li>A wildcard import does not include subpackages: <code>import java.util.*;</code> does not give you <code>java.util.function.Function</code>.</li>
+      <li>Static imports import members, not classes; a regular import does not make static members available by simple name.</li>
+      <li>Folder structure must match the package for the usual tools; otherwise: <code>class not found</code> errors at run time.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes to avoid</p>
+    <ul>
+      <li>Running <code>java OrderService</code> for a packaged class. You need the full name and a class path: <code>java -cp out com.acme.shop.service.OrderService</code> (the error is <code>Could not find or load main class</code>).</li>
+      <li>Naming a package after a class or using capitals (<code>com.acme.Shop</code>); it confuses readers and file systems.</li>
+      <li>Wildcard imports of two big packages, then an ambiguous <code>List</code> (<code>java.util.List</code> vs <code>java.awt.List</code>).</li>
+      <li>Circular dependencies between packages (<code>model</code> imports <code>service</code> and the reverse). Keep the dependency direction one way.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In a Spring Boot project</p>
+    <p>The main class sits in the root package (<code>com.acme.shop.ShopApplication</code>), and <code>@SpringBootApplication</code> scans that package and everything below it. A controller placed in a sibling package outside it is silently not found. Your IDE organises imports for you (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>O</kbd> in IntelliJ) and Maven/Gradle compile the folders as packages.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: package questions</p>
+    <ul>
+      <li><b>Why packages?</b> Avoid name clashes, organise code, control access with package-private.</li>
+      <li><b>Does <code>import java.util.*</code> import subpackages?</b> No.</li>
+      <li><b>Which package is imported automatically?</b> <code>java.lang</code>.</li>
+      <li><b>Is importing a lot of classes slower?</b> No; imports are resolved at compile time and leave no run-time cost.</li>
+      <li><b>What is a static import?</b> It lets you use static members without the class name; use it sparingly.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-enums">
+  <h3>Enums: type-safe constants with behaviour</h3>
+  <p class="tldr">An enum is a class with a fixed set of named instances; it replaces int and String constants with a type the compiler checks, and each constant can carry fields, methods and its own behaviour.</p>
+
+  <p>Without enums, people wrote <code>static final int PENDING = 0, SHIPPED = 1;</code>. Nothing stops <code>setStatus(42)</code> or mixing an order status with a payment status. An <strong>enum</strong> (short for enumeration) fixes this: <code>OrderStatus</code> is its own type with exactly the values you list, and the compiler rejects anything else. Use an enum whenever a value comes from a small, known, fixed set: days, order states, roles, payment modes, HTTP methods.</p>
+
+  <h4>The basics</h4>
+  <pre data-title="EnumBasics.java"><code class="language-java">enum OrderStatus { PLACED, PACKED, SHIPPED, DELIVERED, CANCELLED }
+
+public class EnumBasics {
+    public static void main(String[] args) {
+        OrderStatus s = OrderStatus.SHIPPED;
+        System.out.println(s);                         // SHIPPED (name())
+        System.out.println(s.ordinal());               // 2: position in the declaration
+        System.out.println(s == OrderStatus.SHIPPED);  // true: == is the right comparison
+        System.out.println(s.compareTo(OrderStatus.PLACED));  // 2: ordinal difference
+
+        for (OrderStatus x : OrderStatus.values()) {   // all constants, in order
+            System.out.print(x + " ");
+        }
+        System.out.println();
+
+        OrderStatus y = OrderStatus.valueOf("PACKED"); // from a String; exact, case-sensitive
+        System.out.println(y);
+
+        String msg = switch (s) {                      // switch expression, no default needed
+            case PLACED, PACKED -&gt; "We are preparing it";
+            case SHIPPED        -&gt; "On the way";
+            case DELIVERED      -&gt; "Done";
+            case CANCELLED      -&gt; "Cancelled";
+        };
+        System.out.println(msg);
+        OrderStatus.valueOf("shipped");                // throws IllegalArgumentException
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">SHIPPED
+2
+true
+2
+PLACED PACKED SHIPPED DELIVERED CANCELLED
+PACKED
+On the way
+Exception in thread "main" java.lang.IllegalArgumentException: No enum constant OrderStatus.shipped
+	at java.base/java.lang.Enum.valueOf(Enum.java:...)</code></pre>
+  <p>The compiler turns the enum into a class that extends <code>java.lang.Enum</code>. Each constant is a <code>public static final</code> instance, created once when the enum class loads. Because there is exactly one instance of each constant, <code>==</code> is correct and fast (and <code>equals</code> is the same thing). When a <code>switch</code> <em>expression</em> covers every constant, the compiler checks that none is missing, so adding a new constant later makes the build fail where you forgot to handle it. That is a good reason to avoid a <code>default</code> branch there.</p>
+
+  <h4>Enums with fields, constructors and methods</h4>
+  <p>An enum is a full class. Put data after the constants (note the semicolon), write a constructor and add methods. The constructor is always <code>private</code> (implicitly), because only the enum itself creates its constants.</p>
+  <pre data-title="PaymentMode.java"><code class="language-java">import java.util.*;
+
+enum PaymentMode {
+    UPI("UPI", 0.0),                       // calls the constructor
+    CREDIT_CARD("Credit card", 2.0),
+    NET_BANKING("Net banking", 1.5),
+    COD("Cash on delivery", 0.0);
+
+    private final String label;
+    private final double feePercent;
+
+    PaymentMode(String label, double feePercent) {   // implicitly private
+        this.label = label;
+        this.feePercent = feePercent;
+    }
+
+    public String label() { return label; }
+
+    public double fee(double amount) { return amount * feePercent / 100; }
+
+    private static final Map&lt;String, PaymentMode&gt; BY_LABEL = new HashMap&lt;&gt;();
+    static {
+        for (PaymentMode m : values()) BY_LABEL.put(m.label, m);
+    }
+    public static Optional&lt;PaymentMode&gt; fromLabel(String label) {   // safe lookup
+        return Optional.ofNullable(BY_LABEL.get(label));
+    }
+
+    public static void main(String[] args) {
+        for (PaymentMode m : values()) {
+            System.out.printf("%-12s fee on 1000 = %.1f%n", m.label(), m.fee(1000));
+        }
+        System.out.println(fromLabel("Net banking").orElseThrow());
+        System.out.println(fromLabel("Bitcoin").isPresent());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">UPI          fee on 1000 = 0.0
+Credit card  fee on 1000 = 20.0
+Net banking  fee on 1000 = 15.0
+Cash on delivery fee on 1000 = 0.0
+NET_BANKING
+false</code></pre>
+  <p>Fields of an enum should be <code>final</code>. A mutable enum is shared global state and a bug waiting to happen. The static lookup map is the standard answer to "convert a code or label from the database or a request to an enum without an exception".</p>
+
+  <h4>Per-constant behaviour</h4>
+  <p>Each constant can have its own body that overrides a method, or supply a missing abstract method. This replaces long <code>if</code>/<code>switch</code> chains (a form of the Strategy pattern, <a href="#m2-polymorphism">polymorphism</a>).</p>
+  <pre data-title="Operation.java"><code class="language-java">enum Operation {
+    ADD("+") { @Override double apply(double a, double b) { return a + b; } },
+    SUBTRACT("-") { @Override double apply(double a, double b) { return a - b; } },
+    MULTIPLY("*") { @Override double apply(double a, double b) { return a * b; } };
+
+    private final String symbol;
+    Operation(String symbol) { this.symbol = symbol; }
+
+    abstract double apply(double a, double b);        // every constant must implement it
+
+    @Override public String toString() { return symbol; }
+
+    public static void main(String[] args) {
+        for (Operation op : values()) {
+            System.out.println("6 " + op + " 3 = " + op.apply(6, 3));
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">6 + 3 = 9.0
+6 - 3 = 3.0
+6 * 3 = 18.0</code></pre>
+  <p>Enums can also implement interfaces (<code>enum Plan implements Billable</code>), which lets them plug into a type hierarchy. They cannot extend a class, because they already extend <code>Enum</code>, and they cannot be extended.</p>
+
+  <h4>Useful members</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Member</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>values()</code></td><td>New array with all constants in declaration order (a copy each call)</td></tr>
+      <tr><td><code>valueOf(String)</code></td><td>Constant with exactly that name; throws <code>IllegalArgumentException</code> if none, <code>NullPointerException</code> for null</td></tr>
+      <tr><td><code>name()</code></td><td>The identifier as declared; <code>final</code>, stable</td></tr>
+      <tr><td><code>toString()</code></td><td>Same as <code>name()</code> by default; override for a friendly text</td></tr>
+      <tr><td><code>ordinal()</code></td><td>Zero-based position; changes if you reorder</td></tr>
+      <tr><td><code>compareTo(E)</code></td><td>Compares ordinals, so enums sort in declaration order</td></tr>
+      <tr><td><code>getDeclaringClass()</code></td><td>The enum type (useful when constants have bodies)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>EnumMap and EnumSet</h4>
+  <p>For enum keys, use <code>EnumMap</code> and <code>EnumSet</code>. They store data in a compact array or bit vector indexed by ordinal. They are faster and smaller than <code>HashMap</code> and <code>HashSet</code>, and they iterate in declaration order (more in <a href="#m4">Module 4</a>).</p>
+  <pre data-title="EnumCollections.java"><code class="language-java">import java.util.*;
+
+enum Day { MON, TUE, WED, THU, FRI, SAT, SUN }
+
+public class EnumCollections {
+    public static void main(String[] args) {
+        Map&lt;Day, Integer&gt; orders = new EnumMap&lt;&gt;(Day.class);
+        orders.put(Day.WED, 40);
+        orders.put(Day.MON, 25);
+        System.out.println(orders);                       // ordered by declaration, not insertion
+
+        Set&lt;Day&gt; weekend = EnumSet.of(Day.SAT, Day.SUN);
+        Set&lt;Day&gt; weekdays = EnumSet.complementOf(weekend);
+        System.out.println(weekdays);
+        System.out.println(EnumSet.range(Day.TUE, Day.THU));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{MON=25, WED=40}
+[MON, TUE, WED, THU, FRI]
+[TUE, WED, THU]</code></pre>
+
+  <h4>Enum singleton</h4>
+  <p>A one-constant enum is the simplest safe singleton: the JVM guarantees one instance, it is thread-safe and it survives serialization and reflection attacks. See the Singleton pattern in <a href="08-system-design.html#m2">Design patterns</a>.</p>
+  <pre data-title="AppConfig.java"><code class="language-java">enum AppConfig {
+    INSTANCE;
+    private final String env = System.getenv().getOrDefault("APP_ENV", "dev");
+    public String env() { return env; }
+}
+// usage: AppConfig.INSTANCE.env()</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>An enum constructor is private; calling <code>new</code> on an enum is a compile error ("enum classes may not be instantiated").</li>
+      <li>Constants come first in the body, separated by commas; a semicolon is needed only if members follow.</li>
+      <li>Enums cannot extend a class or be extended, but can implement interfaces. They are implicitly <code>final</code> unless a constant has a body (then implicitly sealed).</li>
+      <li>In a <code>switch</code> over an enum, case labels use the bare constant name (<code>case SHIPPED</code>), not <code>OrderStatus.SHIPPED</code> in old-style switches.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and runtime exceptions</p>
+    <ul>
+      <li><code>valueOf("shipped")</code> throws <code>IllegalArgumentException: No enum constant …</code> (case matters). Catch it or use a lookup map when the input comes from outside.</li>
+      <li><code>switch</code> on a <code>null</code> enum throws <code>NullPointerException</code>.</li>
+      <li>A static field of the enum cannot be used from its constructor (the constants are built first); use a static block after the constants, as the lookup map above does.</li>
+      <li>Enum constants are serialized by name, so renaming a constant breaks old data.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: persisting ordinal()</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: stores the position</p><pre><code class="language-java">@Enumerated(EnumType.ORDINAL)      // JPA default! stores 0, 1, 2...
+private OrderStatus status;
+// Later someone inserts a constant in the middle: every old row now means something else.</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: store the name</p><pre><code class="language-java">@Enumerated(EnumType.STRING)       // stores "SHIPPED"
+private OrderStatus status;</code></pre></div>
+    </div>
+    <p>Never use <code>ordinal()</code> in your own logic either (no "status + 1"). If you need a number in a database or an API, give the enum a field such as <code>code</code> and a lookup method.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Enum type names are singular nouns in <code>PascalCase</code> (<code>OrderStatus</code>); constants in <code>UPPER_SNAKE_CASE</code>.</li>
+      <li>Use <code>==</code> for comparison. Put behaviour in the enum rather than scattering <code>switch</code> statements across the code base.</li>
+      <li>For a fixed set that has data rather than behaviour and is read from a database, weigh an enum (compile-time safe, needs a deploy to change) against a lookup table (changes at run time).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: enum questions</p>
+    <ul>
+      <li><b>Why enums over constants?</b> Type safety, names in output, can hold data and behaviour, works in <code>switch</code>, <code>EnumMap</code>.</li>
+      <li><b>Can an enum have a constructor? Be public?</b> Yes; always private, implicitly.</li>
+      <li><b>Can an enum extend a class or implement an interface?</b> Not extend; implement, yes.</li>
+      <li><b>How do you get an enum from a String?</b> <code>valueOf</code>, with <code>IllegalArgumentException</code> on failure.</li>
+      <li><b>How is an enum singleton safe?</b> JVM-guaranteed single instance, serialization-safe, reflection cannot create more.</li>
+    </ul>
+  </div>
+</article>

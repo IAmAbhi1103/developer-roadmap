@@ -1,0 +1,308 @@
+<article class="topic" id="m2-tree-views-lca">
+  <h3>Binary trees: LCA, views, construction and serialization</h3>
+  <p class="tldr">Lowest common ancestor is a bottom-up recursion that returns a node when it finds a target; side views use level-order BFS; top and bottom views add a horizontal-distance map; construction and serialization rebuild a tree from preorder data.</p>
+
+  <p>These problems use the ideas from <a href="#m2-binary-tree-basics">traversals</a> and <a href="#m2-tree-recursion">tree recursion</a>. Each one is a small change to BFS or DFS.</p>
+
+  <h4>Lowest Common Ancestor of a Binary Tree (LeetCode 236)</h4>
+  <p>The <strong>lowest common ancestor (LCA)</strong> of nodes <code>p</code> and <code>q</code> is the deepest node that has both as descendants (a node counts as its own descendant). Think of two employees and the nearest manager above both.</p>
+  <p>Contract: <code>lca(node, p, q)</code> returns <code>p</code> or <code>q</code> if it finds one of them in this subtree, the LCA if it finds both, otherwise <code>null</code>. If both the left and right calls return non-null, the current node is where the two paths meet, so it is the LCA. If only one side returns non-null, pass that up.</p>
+<pre data-title="LowestCommonAncestor.java"><code class="language-java">public TreeNode lowestCommonAncestor(TreeNode root, TreeNode p, TreeNode q) {
+    if (root == null || root == p || root == q) return root;   // found one, or fell off
+    TreeNode left = lowestCommonAncestor(root.left, p, q);
+    TreeNode right = lowestCommonAncestor(root.right, p, q);
+    if (left != null &amp;&amp; right != null) return root;           // p and q are on both sides
+    return left != null ? left : right;                        // both on one side
+}</code></pre>
+  <p>Dry run on the tree <code>3 / (5, 1)</code> with <code>p = 5</code>, <code>q = 1</code>: the left call returns 5 at once, the right call returns 1 at once, both are non-null, so the answer is 3. If <code>p = 5</code> and <code>q</code> is inside 5's subtree, the left call returns 5 (it stops at 5 without searching deeper) and the right call returns null, so the answer is 5, which is correct. <b>Complexity:</b> O(n) time, O(h) space. This code assumes both nodes exist in the tree.</p>
+
+  <h4>Views of a binary tree</h4>
+  <p><b>Right side view</b> (LeetCode 199): the nodes you see standing on the right of the tree. That is the <em>last</em> node of every level. Use the level-order template and keep the node at index <code>size - 1</code>. For the left view, keep the first node (<code>i == 0</code>).</p>
+<pre data-title="RightSideView.java"><code class="language-java">public List&lt;Integer&gt; rightSideView(TreeNode root) {
+    List&lt;Integer&gt; view = new ArrayList&lt;&gt;();
+    if (root == null) return view;
+    Queue&lt;TreeNode&gt; q = new ArrayDeque&lt;&gt;();
+    q.offer(root);
+    while (!q.isEmpty()) {
+        int size = q.size();
+        for (int i = 0; i &lt; size; i++) {
+            TreeNode node = q.poll();
+            if (i == size - 1) view.add(node.val);     // last in the level
+            if (node.left != null)  q.offer(node.left);
+            if (node.right != null) q.offer(node.right);
+        }
+    }
+    return view;
+}</code></pre>
+  <p>A DFS version visits the right child first and records a value the first time it reaches a new depth: <code>if (depth == view.size()) view.add(node.val)</code>. <b>Complexity:</b> O(n) time, O(w) space for BFS.</p>
+
+  <h4>Top view and bottom view with horizontal distance</h4>
+  <p>Draw vertical lines through the tree. Give the root <strong>horizontal distance</strong> (HD) 0, a left child HD − 1 and a right child HD + 1. Nodes with the same HD sit on the same vertical line. The <strong>top view</strong> shows the first node you meet on each line going downward (use BFS so higher nodes come first, and store a value only if the HD is new). The <strong>bottom view</strong> shows the last node on each line (BFS, overwrite the value every time). A <code>TreeMap</code> keeps columns sorted from left to right.</p>
+<pre data-title="TopAndBottomView.java"><code class="language-java">public List&lt;Integer&gt; topView(TreeNode root) {
+    TreeMap&lt;Integer, Integer&gt; firstAtHd = new TreeMap&lt;&gt;();   // hd -&gt; value
+    if (root == null) return new ArrayList&lt;&gt;();
+    Queue&lt;TreeNode&gt; nodes = new ArrayDeque&lt;&gt;();
+    Queue&lt;Integer&gt; hds = new ArrayDeque&lt;&gt;();
+    nodes.offer(root);  hds.offer(0);
+    while (!nodes.isEmpty()) {
+        TreeNode node = nodes.poll();
+        int hd = hds.poll();
+        firstAtHd.putIfAbsent(hd, node.val);       // top view: keep the first
+        // bottom view: use firstAtHd.put(hd, node.val) to keep the last
+        if (node.left != null)  { nodes.offer(node.left);  hds.offer(hd - 1); }
+        if (node.right != null) { nodes.offer(node.right); hds.offer(hd + 1); }
+    }
+    return new ArrayList&lt;&gt;(firstAtHd.values());       // ordered left to right
+}</code></pre>
+  <p>Do not use DFS for the top view: a deeper node could be seen before a shallower node of the same column. <b>Complexity:</b> O(n log n) time because of the <code>TreeMap</code> (O(n + c) if you track min/max HD and use an array or HashMap), O(n) space. <b>Vertical Order Traversal</b> (LeetCode 987) is the same idea keeping every node per column, sorted by row and then value.</p>
+
+  <h4>Construct Binary Tree from Preorder and Inorder (LeetCode 105)</h4>
+  <p>Preorder starts with the root. Find that root in the inorder array: everything to its left is the left subtree, everything to its right is the right subtree. The size of the left part tells you how many preorder elements belong to the left subtree. Recurse. A HashMap from value to inorder index replaces the linear search (values are unique).</p>
+<pre data-title="BuildTree.java"><code class="language-java">private int preIdx = 0;
+private Map&lt;Integer, Integer&gt; inIndex = new HashMap&lt;&gt;();
+
+public TreeNode buildTree(int[] preorder, int[] inorder) {
+    for (int i = 0; i &lt; inorder.length; i++) inIndex.put(inorder[i], i);
+    return build(preorder, 0, inorder.length - 1);
+}
+
+private TreeNode build(int[] preorder, int lo, int hi) {   // range in inorder
+    if (lo &gt; hi) return null;
+    TreeNode root = new TreeNode(preorder[preIdx++]);      // next preorder = root
+    int mid = inIndex.get(root.val);
+    root.left = build(preorder, lo, mid - 1);              // left FIRST (preorder)
+    root.right = build(preorder, mid + 1, hi);
+    return root;
+}</code></pre>
+  <p>With <code>preorder = [3,9,20,15,7]</code> and <code>inorder = [9,3,15,20,7]</code>: root 3, inorder index 1, so 9 is the left subtree and <code>[15,20,7]</code> the right one. <b>Complexity:</b> O(n) time and space. You cannot rebuild a tree from preorder and postorder alone in general, and preorder alone is not enough either; but preorder with <code>null</code> markers is (next section).</p>
+
+  <h4>Serialize and Deserialize Binary Tree (LeetCode 297)</h4>
+  <p>Turn a tree into a string and back. Preorder with an explicit marker for <code>null</code> children is unambiguous, because the markers show where each subtree ends.</p>
+<pre data-title="Codec.java"><code class="language-java">public class Codec {
+    public String serialize(TreeNode root) {
+        StringBuilder sb = new StringBuilder();
+        write(root, sb);
+        return sb.toString();                     // e.g. "1,2,#,#,3,#,#,"
+    }
+    private void write(TreeNode node, StringBuilder sb) {
+        if (node == null) { sb.append("#,"); return; }
+        sb.append(node.val).append(',');
+        write(node.left, sb);
+        write(node.right, sb);
+    }
+
+    public TreeNode deserialize(String data) {
+        Deque&lt;String&gt; tokens = new ArrayDeque&lt;&gt;(Arrays.asList(data.split(",")));
+        return read(tokens);
+    }
+    private TreeNode read(Deque&lt;String&gt; tokens) {
+        String t = tokens.poll();
+        if (t.equals("#")) return null;
+        TreeNode node = new TreeNode(Integer.parseInt(t));
+        node.left = read(tokens);
+        node.right = read(tokens);
+        return node;
+    }
+}</code></pre>
+  <p><b>Complexity:</b> O(n) time and space. A level-order version using a queue gives the format LeetCode shows in its examples.</p>
+
+  <h4>Brief: Lowest Common Ancestor shortcuts and Subtree of Another Tree</h4>
+  <ul>
+    <li>If every node has a <code>parent</code> pointer, the LCA is the intersection of two lists (see <b>Intersection of Two Linked Lists</b> in <a href="#m2-fast-slow-pointers">the linked list article</a>).</li>
+    <li><b>Subtree of Another Tree</b> (LeetCode 572): for each node of the big tree call <code>isSameTree</code> against the small tree. O(m·n) simple version.</li>
+    <li><b>Count Good Nodes</b>, <b>Sum Root to Leaf Numbers</b>: top-down recursion passing the max-so-far or the number built so far.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>LCA when one node is an ancestor of the other: the ancestor itself is the answer (the code above handles it).</li>
+      <li>LCA when a target is not in the tree: this simple code returns the other node wrongly; count matches explicitly if the problem says nodes may be missing.</li>
+      <li>Deserializing negative numbers or multi-digit values: that is why the format uses a separator like a comma.</li>
+      <li>Views of a skewed tree: the view has one node per level, so the view length is n.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>LCA is asked at nearly every company. Explain the contract in one sentence, then the "both sides non-null means this is the LCA" rule. Be ready with the BST version (<a href="#m2-bst-basics">next article</a>) that is O(h) with no recursion on both sides. For views, say why BFS (not DFS) is natural for top view and what the horizontal distance map stores.</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-bst-basics">
+  <h3>Binary search trees: search, insert, delete, validate</h3>
+  <p class="tldr">A BST keeps every left descendant smaller and every right descendant larger than a node, so search, insert and delete follow one path in O(h), and an inorder walk yields sorted values.</p>
+
+  <p>A <strong>binary search tree (BST)</strong> is a binary tree with one rule at every node: all values in the left subtree are <em>smaller</em>, all values in the right subtree are <em>larger</em> (we assume no duplicates unless a problem says otherwise). This is binary search turned into a data structure (see binary search in <a href="#m1">Module 1</a>): at each node you discard one half of what remains.</p>
+  <figure class="fig">
+<pre class="diagram">
+          8
+        /   \
+       3     10
+      / \      \
+     1   6      14
+        / \     /
+       4   7   13
+
+ inorder = 1 3 4 6 7 8 10 13 14   (sorted)
+</pre>
+  <figcaption>A BST: left is smaller, right is larger, at every node</figcaption>
+  </figure>
+  <p>If the tree is balanced, its height is about log₂ n, so search, insert and delete are O(log n). If you insert already sorted data into a plain BST, it degenerates into a linked list of height n and everything becomes O(n). Self-balancing trees (AVL, red-black) fix this; Java's <code>TreeMap</code> and <code>TreeSet</code> are red-black trees (see below).</p>
+
+  <h4>Search and insert</h4>
+<pre data-title="BST search and insert"><code class="language-java">// Search in a BST (LeetCode 700)
+public TreeNode searchBST(TreeNode root, int val) {
+    while (root != null &amp;&amp; root.val != val) {
+        root = (val &lt; root.val) ? root.left : root.right;
+    }
+    return root;                                     // null if absent
+}
+
+// Insert into a BST (LeetCode 701)
+public TreeNode insertIntoBST(TreeNode root, int val) {
+    if (root == null) return new TreeNode(val);      // found the empty slot
+    if (val &lt; root.val) root.left = insertIntoBST(root.left, val);
+    else                root.right = insertIntoBST(root.right, val);
+    return root;
+}</code></pre>
+  <p>The recursive insert re-assigns <code>root.left</code> or <code>root.right</code> on the way back, which is harmless for unchanged children and attaches the new leaf at the bottom. <b>Complexity:</b> O(h) time; O(1) space for the loop, O(h) for the recursion.</p>
+
+  <h4>Delete a node (LeetCode 450): three cases</h4>
+  <p>First find the node. Then:</p>
+  <ol class="steps">
+    <li><b>Leaf:</b> return <code>null</code> to the parent.</li>
+    <li><b>One child:</b> return that child, which takes the node's place.</li>
+    <li><b>Two children:</b> replace the node's value with its <strong>inorder successor</strong> (the smallest value in the right subtree, found by going right once and then left as far as possible), then delete that successor from the right subtree. The inorder predecessor (largest in the left subtree) works equally well.</li>
+  </ol>
+<pre data-title="DeleteNode.java"><code class="language-java">public TreeNode deleteNode(TreeNode root, int key) {
+    if (root == null) return null;
+    if (key &lt; root.val)      root.left = deleteNode(root.left, key);
+    else if (key &gt; root.val) root.right = deleteNode(root.right, key);
+    else {
+        if (root.left == null)  return root.right;     // leaf or only right child
+        if (root.right == null) return root.left;      // only left child
+        TreeNode succ = root.right;                    // two children
+        while (succ.left != null) succ = succ.left;    // smallest in right subtree
+        root.val = succ.val;                           // copy its value up
+        root.right = deleteNode(root.right, succ.val); // remove the successor
+    }
+    return root;
+}</code></pre>
+  <p>Deleting 3 from the tree above: it has two children; the successor is 4 (right child 6, then left to 4). Copy 4 into the node, then delete the old 4 (a leaf). <b>Complexity:</b> O(h) time and space.</p>
+
+  <h4>Validate Binary Search Tree (LeetCode 98)</h4>
+  <p>The tempting solution checks only <code>node.left.val &lt; node.val &lt; node.right.val</code>. That is <strong>wrong</strong>, because the rule applies to the whole subtree, not just the direct children.</p>
+  <figure class="fig">
+<pre class="diagram">
+        5
+       / \
+      1   6
+         / \
+        3   7      3 is less than 6 (parent check passes) but 3 is in the
+                   right subtree of 5, so it must be greater than 5.
+</pre>
+  <figcaption>A tree that passes the parent-child check but is not a BST</figcaption>
+  </figure>
+  <p>The correct approach passes an allowed range down. Each node must lie strictly between <code>lo</code> and <code>hi</code>. Going left tightens <code>hi</code> to the node's value; going right raises <code>lo</code>.</p>
+<pre data-title="IsValidBST.java"><code class="language-java">public boolean isValidBST(TreeNode root) {
+    return valid(root, null, null);
+}
+
+private boolean valid(TreeNode node, Integer lo, Integer hi) {
+    if (node == null) return true;
+    if (lo != null &amp;&amp; node.val &lt;= lo) return false;
+    if (hi != null &amp;&amp; node.val &gt;= hi) return false;
+    return valid(node.left, lo, node.val) &amp;&amp; valid(node.right, node.val, hi);
+}</code></pre>
+  <div class="co co-mistake">
+    <p class="co-t">Common mistake: bounds with Integer.MIN_VALUE</p>
+    <p>If you start with <code>long lo = Integer.MIN_VALUE</code> as the bound, a tree containing the value <code>Integer.MIN_VALUE</code> is wrongly rejected. Use <code>Integer</code> objects with <code>null</code> for "no bound" as above, or use <code>Long.MIN_VALUE</code> and <code>Long.MAX_VALUE</code>.</p>
+  </div>
+  <p>The alternative: an <strong>inorder traversal</strong> of a valid BST is strictly increasing, so keep the previously visited value and check that each value is greater than it. Both ways are O(n) time and O(h) space.</p>
+
+  <h4>Kth Smallest Element in a BST (LeetCode 230)</h4>
+  <p>Inorder visits values in sorted order, so the k-th node visited is the answer. Use the iterative inorder from <a href="#m2-binary-tree-basics">traversals</a> and stop early.</p>
+<pre data-title="KthSmallest.java"><code class="language-java">public int kthSmallest(TreeNode root, int k) {
+    Deque&lt;TreeNode&gt; stack = new ArrayDeque&lt;&gt;();
+    TreeNode cur = root;
+    while (cur != null || !stack.isEmpty()) {
+        while (cur != null) { stack.push(cur); cur = cur.left; }
+        cur = stack.pop();
+        if (--k == 0) return cur.val;       // the k-th smallest
+        cur = cur.right;
+    }
+    throw new IllegalArgumentException("k is larger than the tree size");
+}</code></pre>
+  <p><b>Complexity:</b> O(h + k) time, O(h) space. If the tree is modified often and k-th queries are frequent, store the subtree size in each node to get O(h) per query (a follow-up asked in interviews).</p>
+
+  <h4>LCA in a BST (LeetCode 235)</h4>
+  <p>The BST order lets you decide the direction without exploring both sides. If both targets are smaller than the current node, go left; if both are larger, go right; otherwise the current node is where they split, so it is the LCA.</p>
+<pre data-title="LcaBst.java"><code class="language-java">public TreeNode lowestCommonAncestor(TreeNode root, TreeNode p, TreeNode q) {
+    while (root != null) {
+        if (p.val &lt; root.val &amp;&amp; q.val &lt; root.val)      root = root.left;
+        else if (p.val &gt; root.val &amp;&amp; q.val &gt; root.val) root = root.right;
+        else return root;                                    // split point
+    }
+    return null;
+}</code></pre>
+  <p><b>Complexity:</b> O(h) time, O(1) space.</p>
+
+  <h4>Floor and ceiling</h4>
+  <p>The <strong>floor</strong> of x is the largest value ≤ x in the tree; the <strong>ceiling</strong> is the smallest value ≥ x. Walk down as in search; whenever a node qualifies, remember it and keep going to find a better one.</p>
+<pre data-title="FloorCeil.java"><code class="language-java">// floor: largest value &lt;= x, or null if none
+public Integer floor(TreeNode root, int x) {
+    Integer best = null;
+    while (root != null) {
+        if (root.val == x) return x;
+        if (root.val &lt; x) { best = root.val; root = root.right; }  // candidate, go bigger
+        else               root = root.left;
+    }
+    return best;
+}
+// ceiling: mirror image -&gt; if (root.val &gt; x) { best = root.val; root = root.left; }</code></pre>
+  <p><b>Complexity:</b> O(h).</p>
+
+  <h4>Convert Sorted Array to Binary Search Tree (LeetCode 108)</h4>
+  <p>Choose the middle element as the root so both halves have nearly equal size, then recurse on each half. The result is height-balanced.</p>
+<pre data-title="SortedArrayToBST.java"><code class="language-java">public TreeNode sortedArrayToBST(int[] nums) {
+    return build(nums, 0, nums.length - 1);
+}
+
+private TreeNode build(int[] nums, int lo, int hi) {
+    if (lo &gt; hi) return null;
+    int mid = lo + (hi - lo) / 2;
+    TreeNode node = new TreeNode(nums[mid]);
+    node.left = build(nums, lo, mid - 1);
+    node.right = build(nums, mid + 1, hi);
+    return node;
+}</code></pre>
+  <p><b>Complexity:</b> O(n) time, O(log n) recursion depth.</p>
+
+  <h4>Brief: BST Iterator (LeetCode 173)</h4>
+  <p>Implement <code>next()</code> and <code>hasNext()</code> over inorder. Keep a stack holding the left spine. <code>next()</code> pops a node, then pushes the left spine of its right child. Each node is pushed and popped once, so <code>next()</code> is amortized O(1) and space is O(h). It is the iterative inorder loop frozen between steps.</p>
+
+  <h4>TreeMap and TreeSet: balanced BSTs in Java</h4>
+  <p>In real projects you do not write BST code; you use <code>TreeMap</code> or <code>TreeSet</code>, which are red-black trees (self-balancing BSTs), so all operations are O(log n) guaranteed and keys stay sorted.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Need</th><th>Method</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>Insert / search / delete</td><td><code>put</code>, <code>get</code>, <code>remove</code></td><td>O(log n)</td></tr>
+      <tr><td>Smallest / largest key</td><td><code>firstKey()</code>, <code>lastKey()</code></td><td>O(log n)</td></tr>
+      <tr><td>Floor / ceiling key</td><td><code>floorKey(x)</code>, <code>ceilingKey(x)</code></td><td>O(log n)</td></tr>
+      <tr><td>Strictly lower / higher</td><td><code>lowerKey(x)</code>, <code>higherKey(x)</code></td><td>O(log n)</td></tr>
+      <tr><td>Range view</td><td><code>subMap(a, b)</code>, <code>headMap</code>, <code>tailMap</code></td><td>O(log n) to create</td></tr>
+    </tbody>
+  </table></div>
+  <p>Use a <code>TreeMap</code> when you need sorted keys or nearest-value lookups (for example "the closest earlier booking time"). Use a <code>HashMap</code> when you only need exact lookups at O(1) average. <code>TreeSet</code> has the same methods: <code>floor</code>, <code>ceiling</code>, <code>lower</code>, <code>higher</code>, <code>first</code>, <code>last</code>. See <a href="02-core-java.html#m4">Core Java · Module 4</a> for the collections view.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: TreeMap keys need an ordering</p>
+    <p>Keys must be <code>Comparable</code> or you must pass a <code>Comparator</code>. Two keys that compare as equal are treated as the same key, even if <code>equals()</code> says they differ. A <code>null</code> key throws <code>NullPointerException</code> with natural ordering.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>The classic trap is the wrong "check only children" validation; draw the counter-example above. Know the three delete cases and say "inorder successor". Mention that a plain BST can degrade to O(n) and that <code>TreeMap</code> is the balanced answer. "Kth smallest" = inorder; "closest value" = walk down while tracking the best.</p>
+  </div>
+</article>

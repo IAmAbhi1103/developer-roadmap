@@ -1,0 +1,583 @@
+<article class="topic" id="m1-processes">
+  <h3>Processes: ps, top, signals, kill and background jobs</h3>
+  <p class="tldr">A process is a running program with a PID; list them with <code>ps aux</code> or
+  <code>top</code>, stop them politely with <code>kill</code> (signal 15) and only use <code>kill -9</code> as
+  a last resort.</p>
+
+  <h4>What a process is</h4>
+  <p>When you run <code>java -jar app.jar</code>, Linux starts a <strong>process</strong>: your program
+  loaded in memory, with its own <strong>PID</strong> (process id), an owner, and a parent process. Your
+  shell is a process too, and it is the parent of every command you run from it. The very first process
+  is <code>systemd</code> (PID 1), which starts the services of the machine. For the theory (scheduling,
+  memory, threads) see <a href="09-cs-fundamentals.html#m1">CS Fundamentals · Module 1</a>.</p>
+
+  <h4>Listing processes: ps</h4>
+  <pre data-title="ps aux and filtering"><code class="language-shell">$ ps aux | head -3
+USER   PID %CPU %MEM    VSZ   RSS TTY   STAT START  TIME COMMAND
+root     1  0.0  0.4 167680 11520 ?     Ss   09:00  0:03 /sbin/init
+root     2  0.0  0.0      0     0 ?     S    09:00  0:00 [kthreadd]
+$ ps aux | grep billing
+billing 4120  3.1 12.5 3456788 502340 ?  Sl   10:00  1:12 /usr/bin/java -jar billing.jar
+ubuntu  4388  0.0  0.0   9032   720 pts/0 S+  10:20  0:00 grep --color=auto billing
+$ pgrep -f billing.jar
+4120
+$ ps -p 4120 -o pid,ppid,etime,cmd
+    PID    PPID     ELAPSED CMD
+   4120       1       20:11 /usr/bin/java -jar billing.jar</code></pre>
+  <p>Columns: <code>USER</code> owner; <code>PID</code>; <code>%CPU</code> and <code>%MEM</code>;
+  <code>RSS</code> real memory in KB (here about 490 MB); <code>STAT</code> state (<code>S</code>
+  sleeping, <code>R</code> running, <code>Z</code> zombie, <code>l</code> multi-threaded);
+  <code>COMMAND</code>. Note that the <code>grep</code> itself shows up in its own result. Use
+  <code>pgrep -f</code> to avoid this, or <code>ps aux | grep [b]illing</code>.
+  <code>ps aux</code> uses BSD-style options (no dash) and shows all users' processes.</p>
+
+  <h4>Live view: top and htop</h4>
+  <pre data-title="top (first lines)"><code class="language-shell">$ top
+top - 10:21:05 up 1:21,  1 user,  load average: 0.35, 0.28, 0.20
+Tasks: 112 total,   1 running, 111 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  4.0 us,  1.0 sy,  0.0 ni, 94.5 id,  0.3 wa
+MiB Mem :   1948.4 total,    210.2 free,   1120.5 used,    617.7 buff/cache
+MiB Swap:      0.0 total,      0.0 free,      0.0 used.    650.1 avail Mem
+
+    PID USER   PR  NI    VIRT    RES    SHR S  %CPU  %MEM  COMMAND
+   4120 billing 20   0 3456788 502340  24160 S   3.1  25.2  java</code></pre>
+  <p>The <em>load average</em> is the average number of runnable processes over 1, 5 and 15 minutes;
+  compare it to your CPU count. Inside <code>top</code>: <kbd>P</kbd> sorts by CPU, <kbd>M</kbd> by
+  memory, <kbd>k</kbd> asks for a PID to kill, <kbd>q</kbd> quits. <code>htop</code> is a friendlier
+  version (<code>sudo apt install htop</code>) with colours, mouse and a tree view.</p>
+
+  <h4>Signals: asking a process to stop</h4>
+  <p>A <strong>signal</strong> is a small message the kernel delivers to a process.
+  <code>kill</code> does not necessarily "kill": it <em>sends</em> a signal, and by default it sends
+  <code>SIGTERM</code>.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Signal</th><th>Number</th><th>Meaning</th><th>Can the app handle it?</th></tr></thead>
+    <tbody>
+      <tr><td><code>SIGTERM</code></td><td>15</td><td>"Please shut down" (default)</td><td>Yes: cleanup, close connections</td></tr>
+      <tr><td><code>SIGINT</code></td><td>2</td><td>Interrupt; what <kbd>Ctrl</kbd>+<kbd>C</kbd> sends</td><td>Yes</td></tr>
+      <tr><td><code>SIGKILL</code></td><td>9</td><td>"Die now"; the kernel ends it</td><td>No: cannot be caught</td></tr>
+      <tr><td><code>SIGHUP</code></td><td>1</td><td>Terminal closed; some daemons reload config</td><td>Yes</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Stopping a process"><code class="language-shell">$ kill 4120
+$ ps -p 4120
+    PID TTY          TIME CMD
+$ kill -9 4120
+$ pkill -f billing.jar
+$ killall nginx</code></pre>
+  <p>Always try <code>kill -15</code> (same as plain <code>kill</code>) first. A Spring Boot app handles
+  SIGTERM by running its shutdown hooks: it stops accepting requests, finishes work in progress and closes
+  its database pool. <code>kill -9</code> skips all of that and can leave half-written files or open
+  transactions. Use it only when the process ignores SIGTERM for a long time. A process that exited
+  after SIGTERM reports <strong>exit code 143</strong> (128 + 15); after SIGKILL, 137 (128 + 9). Both
+  numbers show up in Docker and Kubernetes too.</p>
+  <p><code>pkill -f pattern</code> matches the full command line; <code>killall name</code> matches the
+  program name. Check with <code>pgrep -af pattern</code> first so you do not kill the wrong thing.</p>
+
+  <h4>Background jobs</h4>
+  <p>A command normally owns the terminal until it ends. You can move work to the background:</p>
+  <pre data-title="Jobs"><code class="language-shell">$ java -jar billing.jar &amp;
+[1] 4120
+$ jobs
+[1]+  Running                 java -jar billing.jar &amp;
+$ fg %1
+java -jar billing.jar
+^Z
+[1]+  Stopped                 java -jar billing.jar
+$ bg %1
+[1]+ java -jar billing.jar &amp;
+$ nohup java -jar billing.jar &gt; app.log 2&gt;&amp;1 &amp;
+[1] 4150</code></pre>
+  <ul>
+    <li><code>cmd &amp;</code> starts in the background. <code>jobs</code> lists this shell's jobs.</li>
+    <li><kbd>Ctrl</kbd>+<kbd>Z</kbd> pauses the foreground job; <code>bg</code> resumes it in the
+    background, <code>fg</code> brings it back.</li>
+    <li>When you close the terminal or the SSH session, the shell sends SIGHUP to its jobs and they die.
+    <code>nohup</code> ("no hang up") makes the command ignore SIGHUP so it survives logout. Output goes
+    to <code>nohup.out</code> unless you redirect it as shown.</li>
+  </ul>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: nohup is for quick tests, systemd is for real services</p>
+    <p>A <code>nohup</code> process does not restart after a crash or a reboot, has no standard log
+    handling and is hard to manage. For anything that must stay up, write a service unit
+    (<a href="#m1-systemd">next article</a>). <code>tmux</code> is another useful tool: a session that keeps
+    running after you disconnect.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: kill -9 as the first move</p>
+    <p>Reaching for <code>kill -9</code> every time means your app never runs its shutdown hooks. You may
+    see lost messages, locked rows or corrupted files. Try <code>kill</code>, wait 10-30 seconds, check
+    with <code>ps</code>, and only then escalate.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>kill: (4120) - Operation not permitted</code> — the process belongs to another user. Use
+      <code>sudo kill</code>.</li>
+      <li>A <strong>zombie</strong> (<code>Z</code>) process has already exited but its parent has not
+      collected its status. You cannot kill it; fix or restart the parent.</li>
+      <li>A process in state <code>D</code> (uninterruptible sleep, usually stuck on disk or NFS) ignores
+      even <code>kill -9</code> until the I/O returns.</li>
+      <li>The JVM may be killed by the kernel's <strong>OOM killer</strong> when the machine runs out of
+      memory. The process just disappears; look for "Out of memory: Killed process" with
+      <code>dmesg</code> or <code>journalctl -k</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Difference between kill -15 and kill -9?"</p>
+    <ul>
+      <li>15 (SIGTERM) asks the process to stop and lets it clean up; 9 (SIGKILL) cannot be caught or
+      ignored, the kernel removes the process immediately.</li>
+      <li>Use 15 first; 9 only for a hung process. Exit codes 143 and 137.</li>
+      <li>Bonus: how <code>nohup</code> and systemd keep a process alive after logout.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-systemd">
+  <h3>systemd: running a Spring Boot JAR as a service</h3>
+  <p class="tldr">systemd starts services at boot, restarts them when they crash and collects their logs;
+  you describe your app in a small unit file and control it with <code>systemctl</code> and
+  <code>journalctl</code>.</p>
+
+  <h4>What systemd does</h4>
+  <p><strong>systemd</strong> is the service manager on Ubuntu, Debian, Amazon Linux and RHEL. It is PID 1.
+  A <strong>unit</strong> is something it manages; the most common is a <strong>service</strong> (a
+  long-running program). For your Spring Boot JAR, systemd gives you what <code>nohup</code> cannot:</p>
+  <ul>
+    <li>Start at boot, and start after the network is up.</li>
+    <li>Restart automatically after a crash.</li>
+    <li>Run as a limited user, with environment variables and a working directory.</li>
+    <li>Capture everything the app prints (stdout and stderr) in the <strong>journal</strong>.</li>
+    <li>A single, standard interface: <code>start</code>, <code>stop</code>, <code>status</code>.</li>
+  </ul>
+
+  <h4>systemctl commands</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>sudo systemctl start billing</code></td><td>Start now</td></tr>
+      <tr><td><code>sudo systemctl stop billing</code></td><td>Stop now (sends SIGTERM)</td></tr>
+      <tr><td><code>sudo systemctl restart billing</code></td><td>Stop then start</td></tr>
+      <tr><td><code>systemctl status billing</code></td><td>State, PID, last log lines</td></tr>
+      <tr><td><code>sudo systemctl enable billing</code></td><td>Start automatically at boot</td></tr>
+      <tr><td><code>sudo systemctl enable --now billing</code></td><td>Enable and start in one step</td></tr>
+      <tr><td><code>sudo systemctl disable billing</code></td><td>Do not start at boot</td></tr>
+      <tr><td><code>sudo systemctl daemon-reload</code></td><td>Re-read unit files after you edit them</td></tr>
+      <tr><td><code>systemctl is-active billing</code></td><td>Prints <code>active</code> or <code>inactive</code></td></tr>
+    </tbody>
+  </table></div>
+  <p><code>start</code> and <code>enable</code> are different: <code>start</code> affects the current
+  boot, <code>enable</code> affects future boots. You usually want both.</p>
+
+  <h4>A complete unit file for a Spring Boot JAR</h4>
+  <p>First prepare a user, a folder and the files:</p>
+  <pre data-title="One-time setup"><code class="language-shell">$ sudo adduser --system --group --no-create-home billing
+$ sudo mkdir -p /opt/billing /etc/billing
+$ sudo cp target/billing-1.0.0.jar /opt/billing/billing.jar
+$ sudo chown -R billing:billing /opt/billing
+$ sudo nano /etc/billing/billing.env
+$ sudo chown root:billing /etc/billing/billing.env
+$ sudo chmod 640 /etc/billing/billing.env</code></pre>
+  <p>The environment file holds secrets, one <code>KEY=value</code> per line, no <code>export</code>:</p>
+  <pre data-title="/etc/billing/billing.env"><code class="language-properties">SPRING_PROFILES_ACTIVE=prod
+SERVER_PORT=8080
+SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/billing
+SPRING_DATASOURCE_USERNAME=billing
+SPRING_DATASOURCE_PASSWORD=change-me</code></pre>
+  <p>Now the unit file, created with <code>sudo nano /etc/systemd/system/billing.service</code>:</p>
+  <pre data-title="/etc/systemd/system/billing.service"><code class="language-ini">[Unit]
+Description=Billing service (Spring Boot)
+After=network.target
+
+[Service]
+Type=simple
+User=billing
+Group=billing
+WorkingDirectory=/opt/billing
+EnvironmentFile=/etc/billing/billing.env
+ExecStart=/usr/bin/java -Xms256m -Xmx512m -jar /opt/billing/billing.jar
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+SyslogIdentifier=billing
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+  <dl class="terms">
+    <dt>After=network.target</dt><dd>Start this service after basic networking is up.</dd>
+    <dt>User / Group</dt><dd>Run as the unprivileged <code>billing</code> account, not root.</dd>
+    <dt>WorkingDirectory</dt><dd>The folder the process starts in; relative paths like
+    <code>./config</code> are resolved here.</dd>
+    <dt>EnvironmentFile</dt><dd>Loads variables from a file, so passwords stay out of the unit file and
+    out of Git.</dd>
+    <dt>ExecStart</dt><dd>The command. Use full paths: systemd does not use your shell's
+    <code>PATH</code>. Check with <code>which java</code>. Heap options go before
+    <code>-jar</code>.</dd>
+    <dt>SuccessExitStatus=143</dt><dd>A JVM stopped by SIGTERM exits with 143. This tells systemd that
+    is a normal stop, not a failure.</dd>
+    <dt>Restart=on-failure, RestartSec=5</dt><dd>Restart after a crash or non-success exit, waiting five
+    seconds. <code>Restart=always</code> also restarts after a clean exit.</dd>
+    <dt>WantedBy=multi-user.target</dt><dd>What <code>enable</code> hooks into: start in normal
+    multi-user boot.</dd>
+  </dl>
+  <pre data-title="Load, start and check"><code class="language-shell">$ sudo systemctl daemon-reload
+$ sudo systemctl enable --now billing
+Created symlink /etc/systemd/system/multi-user.target.wants/billing.service
+$ systemctl status billing
+● billing.service - Billing service (Spring Boot)
+     Loaded: loaded (/etc/systemd/system/billing.service; enabled; preset: enabled)
+     Active: active (running) since Tue 2026-11-11 10:30:12 IST; 8s ago
+   Main PID: 5201 (java)
+      Tasks: 38 (limit: 2300)
+     Memory: 310.2M
+     CGroup: /system.slice/billing.service
+             └─5201 /usr/bin/java -Xms256m -Xmx512m -jar /opt/billing/billing.jar</code></pre>
+
+  <h4>Reading logs with journalctl</h4>
+  <p>Anything your app writes to the console goes to the <strong>journal</strong>. Read it with
+  <code>journalctl</code>:</p>
+  <pre data-title="journalctl"><code class="language-shell">$ journalctl -u billing -f
+$ journalctl -u billing -n 100 --no-pager
+$ journalctl -u billing --since "1 hour ago"
+$ journalctl -u billing --since "2026-11-11 10:00" --until "2026-11-11 10:30"
+$ journalctl -u billing -p err
+$ journalctl -u billing -b</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>-u NAME</code></td><td>Only this unit</td></tr>
+      <tr><td><code>-f</code></td><td>Follow: show new lines live (<kbd>Ctrl</kbd>+<kbd>C</kbd> to stop)</td></tr>
+      <tr><td><code>-n 100</code></td><td>The last 100 lines</td></tr>
+      <tr><td><code>--since</code> / <code>--until</code></td><td>Time window</td></tr>
+      <tr><td><code>-p err</code></td><td>Only priority <code>err</code> and worse</td></tr>
+      <tr><td><code>-b</code></td><td>Only the current boot</td></tr>
+    </tbody>
+  </table></div>
+  <p>Pipe it for analysis: <code>journalctl -u billing --since today --no-pager | grep ERROR</code>.</p>
+
+  <h4>Deploying a new version</h4>
+  <pre data-title="Replace the JAR and restart"><code class="language-shell">$ sudo cp billing-1.0.1.jar /opt/billing/billing.jar
+$ sudo chown billing:billing /opt/billing/billing.jar
+$ sudo systemctl restart billing
+$ systemctl is-active billing
+active</code></pre>
+  <p>If you edit the <em>unit file</em> itself, run <code>sudo systemctl daemon-reload</code> first;
+  changing only the JAR or the env file needs just a restart.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: forgetting daemon-reload, or using relative paths</p>
+    <p>After editing <code>billing.service</code>, systemd warns: <em>The unit file changed on disk.
+    Run 'systemctl daemon-reload'</em>. And <code>ExecStart=java -jar billing.jar</code> fails with
+    <code>Executable path is not absolute</code>. Use <code>/usr/bin/java</code> and a full JAR path.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Why a service fails: status codes you will see</p>
+    <ul>
+      <li><code>status=203/EXEC</code> — systemd could not run <code>ExecStart</code>: wrong path to
+      <code>java</code> or the JAR, or the file is not readable by the service user.</li>
+      <li><code>status=217/USER</code> — the <code>User=</code> account does not exist.</li>
+      <li><code>status=1/FAILURE</code> — the app started and exited; read
+      <code>journalctl -u billing -n 100</code> (often a database connection or "port already in
+      use").</li>
+      <li>Restart loop: <code>Active: activating (auto-restart)</code>. After too many quick restarts
+      systemd gives up with <code>start-limit-hit</code>; fix the cause, then
+      <code>systemctl reset-failed billing</code>.</li>
+      <li>Spring Boot also supports building an "executable" JAR; the explicit
+      <code>java -jar</code> in <code>ExecStart</code> is clearer and works with all versions.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>On a single VM, many teams run the app exactly like this behind Nginx (<a href="#m2-nginx-config">Nginx
+    config</a>). With containers, Docker or Kubernetes replaces systemd (Module 3), but the ideas are the
+    same: a restart policy, a non-root user, config from environment variables, logs to stdout.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you keep your Spring Boot app running after you close SSH?"</p>
+    <ul>
+      <li>Create a systemd unit, <code>enable --now</code> it; it survives logout and reboots and
+      restarts on crash with <code>Restart=on-failure</code>.</li>
+      <li>Mention a dedicated user, <code>EnvironmentFile</code> for secrets and
+      <code>journalctl -u</code> for logs. <code>nohup</code> or <code>&amp;</code> are only quick
+      tricks.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-ports">
+  <h3>Ports on a server: ss, lsof and "address already in use"</h3>
+  <p class="tldr">A program <em>listens</em> on a port to accept connections; <code>ss -tulpn</code> shows who
+  listens where, and "address already in use" means another process already owns that port.</p>
+
+  <h4>What listening means</h4>
+  <p>An IP address finds a machine; a <strong>port</strong> (0-65535) finds a program on it. A server
+  program <strong>listens</strong> on one address and port, such as <code>0.0.0.0:8080</code>. When a
+  client connects, the kernel hands the connection to that program. Only one process can listen on a given
+  address and port at a time. Ports below 1024 are "privileged": only root (or a process given special
+  rights) may bind to them, which is why apps listen on 8080 and Nginx on 80 and 443. Full networking
+  ideas are in <a href="#m2-ip-ports">Module 2</a>.</p>
+
+  <h4>ss -tulpn</h4>
+  <pre data-title="Who is listening?"><code class="language-shell">$ sudo ss -tulpn
+Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+tcp   LISTEN 0      4096   0.0.0.0:22          0.0.0.0:*         users:(("sshd",pid=801,fd=3))
+tcp   LISTEN 0      511    0.0.0.0:80          0.0.0.0:*         users:(("nginx",pid=1100,fd=6))
+tcp   LISTEN 0      200    127.0.0.1:5432      0.0.0.0:*         users:(("postgres",pid=950,fd=5))
+tcp   LISTEN 0      100    *:8080              *:*               users:(("java",pid=5201,fd=9))
+udp   UNCONN 0      0      127.0.0.53%lo:53    0.0.0.0:*         users:(("systemd-resolve",pid=620,fd=13))</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>-t</code> / <code>-u</code></td><td>TCP / UDP sockets</td></tr>
+      <tr><td><code>-l</code></td><td>Only listening sockets</td></tr>
+      <tr><td><code>-p</code></td><td>Show the process (needs <code>sudo</code> to see other users' processes)</td></tr>
+      <tr><td><code>-n</code></td><td>Numbers, do not translate names (faster, clearer)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Read the <strong>Local Address</strong> column carefully:</p>
+  <ul>
+    <li><code>0.0.0.0:80</code> or <code>*:8080</code> — listens on <em>all</em> network interfaces. Reachable
+    from other machines (if the firewall allows).</li>
+    <li><code>127.0.0.1:5432</code> — listens on <em>localhost only</em>. Only programs on the same machine
+    can connect. This is the right setting for a database that only your app uses.</li>
+  </ul>
+  <p>Many "my app is not reachable" problems are exactly this: the app listens on
+  <code>127.0.0.1</code> only (see <a href="#m2-debug-tools">the checklist</a>).</p>
+
+  <h4>lsof and other ways to check a port</h4>
+  <pre data-title="One port, several tools"><code class="language-shell">$ sudo lsof -i :8080
+COMMAND  PID    USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+java    5201 billing    9u  IPv6  45678      0t0  TCP *:8080 (LISTEN)
+$ sudo ss -tulpn | grep :8080
+tcp LISTEN 0 100 *:8080 *:* users:(("java",pid=5201,fd=9))
+$ curl -I http://localhost:8080/actuator/health
+HTTP/1.1 200
+$ nc -zv localhost 8080
+Connection to localhost (127.0.0.1) 8080 port [tcp/http-alt] succeeded!</code></pre>
+  <p><code>lsof</code> ("list open files") works because in Linux a network socket is a file.
+  <code>lsof -i :PORT</code> is the shortest way to answer "who is using this port?". <code>netstat</code>
+  is the older tool; <code>ss</code> replaces it and is installed by default.</p>
+
+  <h4>Fixing "address already in use"</h4>
+  <p>When you start a second copy of your app, or an old one is still running, Spring Boot fails at
+  startup:</p>
+  <pre class="out" data-title="Startup failure"><code class="language-plaintext">***************************
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+Web server failed to start. Port 8080 was already in use.
+
+Action:
+
+Identify and stop the process that's listening on port 8080 or configure this
+application to listen on another port.</code></pre>
+  <ol class="steps">
+    <li>Find the owner: <code>sudo lsof -i :8080</code> or <code>sudo ss -tulpn | grep :8080</code>.</li>
+    <li>Decide: is it your old app, a leftover from a crash, or something else important?</li>
+    <li>Stop it politely: <code>kill PID</code>, or <code>sudo systemctl stop billing</code> if it is a
+    service. Escalate to <code>kill -9 PID</code> only if needed.</li>
+    <li>Start your app again. Or choose another port: <code>java -jar app.jar --server.port=8081</code>
+    (or the environment variable <code>SERVER_PORT=8081</code>).</li>
+  </ol>
+  <p>On Windows the same job is <code>netstat -ano | findstr :8080</code> then
+  <code>taskkill /PID 1234 /F</code>.</p>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: a quick one-liner</p>
+    <p>Free a port you know is a stuck dev process: <code>kill $(lsof -t -i :8080)</code>.
+    <code>lsof -t</code> prints only the PIDs. Make sure the port really is yours before you run it.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>Permission denied</code> when binding port 80 or 443 as a normal user — ports below 1024
+      need root. Run the app on 8080 and let Nginx (running as a service) listen on 80/443.</li>
+      <li>After a crash, a port can stay in <code>TIME_WAIT</code> for about a minute; most servers set
+      the socket option so a restart still works.</li>
+      <li>The same port may be used for TCP and UDP by two different programs: they are separate.</li>
+      <li>Inside Docker, <code>ss</code> shows the container's own network, not the host's.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Your app says port 8080 is in use. What do you do?"</p>
+    <ul>
+      <li>Find the PID with <code>lsof -i :8080</code> or <code>ss -tulpn</code>; check it is safe; stop
+      it with <code>kill</code>; restart. Or change <code>server.port</code>.</li>
+      <li>Explain what "listening" means and why <code>127.0.0.1</code> versus <code>0.0.0.0</code>
+      matters.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-text-tools">
+  <h3>Text tools: pipes, redirection, grep and tail -f</h3>
+  <p class="tldr">Linux tools each do one small job on text; pipes (<code>|</code>) connect them and
+  redirection (<code>&gt;</code>, <code>&gt;&gt;</code>, <code>2&gt;&amp;1</code>) sends output to files, so a
+  one-line pipeline can answer questions about gigabytes of logs.</p>
+
+  <h4>Standard streams</h4>
+  <p>Every process has three channels: <strong>stdin</strong> (0, input), <strong>stdout</strong> (1,
+  normal output) and <strong>stderr</strong> (2, error messages). By default stdin is your keyboard and
+  both outputs go to your screen. Redirection and pipes change where they go.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A["cat app.log"] -->|stdout| B["grep ERROR"]
+  B -->|stdout| C["sort"]
+  C -->|stdout| D["uniq -c"]
+  D --> E[Screen]
+</pre>
+    <figcaption>A pipeline: the output of each command is the input of the next</figcaption>
+  </figure>
+
+  <h4>Redirection and pipes</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Syntax</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>cmd &gt; file</code></td><td>Write stdout to the file, <strong>replacing</strong> it</td></tr>
+      <tr><td><code>cmd &gt;&gt; file</code></td><td>Append stdout to the file</td></tr>
+      <tr><td><code>cmd &lt; file</code></td><td>Read stdin from the file</td></tr>
+      <tr><td><code>cmd 2&gt; err.txt</code></td><td>Write only stderr to a file</td></tr>
+      <tr><td><code>cmd &gt; out.txt 2&gt;&amp;1</code></td><td>Send stderr to the same place as stdout (both into <code>out.txt</code>)</td></tr>
+      <tr><td><code>cmd &gt; /dev/null 2&gt;&amp;1</code></td><td>Throw away all output</td></tr>
+      <tr><td><code>cmd1 | cmd2</code></td><td>Pipe: stdout of cmd1 becomes stdin of cmd2</td></tr>
+      <tr><td><code>cmd | tee file</code></td><td>Show on screen <em>and</em> save to a file</td></tr>
+      <tr><td><code>cmd1 &amp;&amp; cmd2</code> / <code>cmd1 || cmd2</code></td><td>Run cmd2 only if cmd1 succeeded / failed</td></tr>
+    </tbody>
+  </table></div>
+  <p>Order matters: <code>2&gt;&amp;1</code> means "make 2 point where 1 points <em>now</em>", so it must
+  come <em>after</em> <code>&gt; file</code>.</p>
+  <pre data-title="Redirection"><code class="language-shell">$ echo "build started" &gt; build.log
+$ echo "step 2 done" &gt;&gt; build.log
+$ cat build.log
+build started
+step 2 done
+$ ls /nonexistent 2&gt; errors.txt
+$ cat errors.txt
+ls: cannot access '/nonexistent': No such file or directory
+$ mvn package &gt; build.log 2&gt;&amp;1
+$ sort &lt; names.txt | head -3
+$ mkdir release &amp;&amp; cp app.jar release/ || echo "failed"</code></pre>
+
+  <h4>grep: search text</h4>
+  <p><code>grep</code> prints the lines that match a pattern. It is the tool you will use most on
+  servers.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>-i</code></td><td>Ignore case</td></tr>
+      <tr><td><code>-n</code></td><td>Show line numbers</td></tr>
+      <tr><td><code>-r</code></td><td>Search a directory recursively</td></tr>
+      <tr><td><code>-v</code></td><td>Invert: lines that do <em>not</em> match</td></tr>
+      <tr><td><code>-c</code></td><td>Only count matching lines</td></tr>
+      <tr><td><code>-E</code></td><td>Extended regular expressions: <code>a|b</code>, <code>+</code>, <code>?</code>, <code>()</code></td></tr>
+      <tr><td><code>-A 3</code> / <code>-B 3</code> / <code>-C 3</code></td><td>Show 3 lines After / Before / around each match</td></tr>
+      <tr><td><code>-l</code></td><td>Only list names of files that match</td></tr>
+      <tr><td><code>-w</code></td><td>Match whole words only</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="grep on an application log"><code class="language-shell">$ grep ERROR app.log
+2026-11-11T10:09:44.870+05:30 ERROR 4120 --- [io-8080-exec-3] c.e.PaymentClient : Timeout
+2026-11-11T10:11:02.115+05:30 ERROR 4120 --- [io-8080-exec-5] c.e.OrderService : Order 991 failed
+$ grep -c ERROR app.log
+2
+$ grep -n -i "timeout" app.log
+5:2026-11-11T10:09:44.870+05:30 ERROR 4120 --- [io-8080-exec-3] c.e.PaymentClient : Timeout
+$ grep -B1 -A2 "Order 991" app.log
+$ grep -E "ERROR|WARN" app.log | grep -v "Slow query"
+$ grep -rn "DataSource" /opt/billing/config/
+$ grep -rl "password" /etc/nginx/ 2&gt;/dev/null</code></pre>
+  <p><code>-A</code>/<code>-B</code> are very useful for Java logs: the line with <code>ERROR</code> is
+  followed by a stack trace, so <code>grep -A 15 "ERROR"</code> prints the exception under each error.
+  Quote patterns so the shell does not interpret <code>*</code>, <code>|</code> or <code>$</code>.</p>
+
+  <h4>Watching logs live</h4>
+  <pre data-title="tail -f and less +F"><code class="language-shell">$ tail -f /opt/billing/logs/app.log
+$ tail -n 200 -f app.log
+$ tail -f app.log | grep --line-buffered ERROR
+$ tail -F app.log
+$ less +F app.log</code></pre>
+  <ul>
+    <li><code>tail -f</code> follows the file. <code>-F</code> also follows through <em>log rotation</em>,
+    when the file is renamed and recreated; prefer it on production logs.</li>
+    <li>When you pipe <code>tail -f</code> into <code>grep</code>, add <code>--line-buffered</code> or the
+    output may appear late.</li>
+    <li><code>less +F</code> starts in follow mode; press <kbd>Ctrl</kbd>+<kbd>C</kbd> to stop following
+    and scroll or search (<kbd>/</kbd>), then <kbd>F</kbd> to follow again. It is better than
+    <code>tail -f</code> when you need to go back and look.</li>
+    <li>For a systemd service use <code>journalctl -u NAME -f</code>.</li>
+  </ul>
+
+  <h4>Small helpers: wc, sort, uniq, cut, tr</h4>
+  <pre data-title="Building blocks"><code class="language-shell">$ wc -l app.log
+1240 app.log
+$ grep -c ERROR app.log
+18
+$ cut -d: -f1,3 /etc/passwd | head -2
+root:0
+daemon:1
+$ echo "Hello" | tr 'a-z' 'A-Z'
+HELLO
+$ sort names.txt | uniq
+$ sort names.txt | uniq -c | sort -rn | head</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Tool</th><th>Job</th></tr></thead>
+    <tbody>
+      <tr><td><code>wc -l</code></td><td>Count lines (<code>-w</code> words, <code>-c</code> bytes)</td></tr>
+      <tr><td><code>sort</code></td><td>Sort lines; <code>-n</code> numeric, <code>-r</code> reverse, <code>-k2</code> by column 2, <code>-u</code> unique</td></tr>
+      <tr><td><code>uniq -c</code></td><td>Collapse <em>adjacent</em> equal lines and count them — so always <code>sort</code> first</td></tr>
+      <tr><td><code>cut -d, -f2</code></td><td>Take field 2 with delimiter <code>,</code></td></tr>
+      <tr><td><code>tr a-z A-Z</code></td><td>Translate or delete characters (<code>tr -d '\r'</code> strips Windows line endings)</td></tr>
+      <tr><td><code>head</code> / <code>tail</code></td><td>First / last lines</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: truncating a file by redirecting onto itself</p>
+    <p><code>sort data.txt &gt; data.txt</code> empties the file before <code>sort</code> reads it. Write to
+    a new file, then <code>mv</code> it back, or use <code>sort -o data.txt data.txt</code>. A single
+    <code>&gt;</code> overwrites; when in doubt use <code>&gt;&gt;</code>.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: uniq without sort</p>
+    <p><code>uniq</code> only merges neighbours. <code>uniq -c</code> on unsorted input gives many partial
+    counts. The standard idiom is <code>sort | uniq -c | sort -rn</code>.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>grep</code> exit code: 0 if something matched, 1 if nothing matched, 2 on error. In a
+      script with <code>set -e</code>, a "no match" stops the script.</li>
+      <li>Binary file: <em>Binary file x matches</em>. Use <code>grep -a</code> to treat it as text.</li>
+      <li>Compressed rotated logs: <code>zgrep ERROR app.log.2.gz</code> searches without
+      unzipping.</li>
+      <li>Basic <code>grep</code> treats <code>+</code>, <code>|</code> and <code>()</code> literally;
+      add <code>-E</code> for regex features.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you debug a production issue from logs?"</p>
+    <ul>
+      <li><code>tail -f</code> or <code>journalctl -f</code> to watch live; <code>grep -n ERROR</code>
+      with <code>-A</code> context to see stack traces; narrow to the time window.</li>
+      <li>Summarise with <code>sort | uniq -c | sort -rn</code> (<a href="#m1-log-analysis">next
+      article</a>).</li>
+      <li>Explain stdout, stderr and what <code>2&gt;&amp;1</code> does.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,409 @@
+<article class="topic" id="m7-pastebin">
+  <h3>Design Pastebin (text sharing with expiry)</h3>
+  <p class="tldr">Pastebin stores blocks of text under a short link; because pastes can be large and are rarely
+  changed, keep small metadata in a database and the text itself in object storage behind a CDN, generate keys
+  like a URL shortener, and expire pastes with a TTL plus a background cleaner.</p>
+
+  <h4>1. Requirements</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>A user (logged in or anonymous) pastes text and gets a unique link.</li>
+    <li>Anyone with the link can read the paste. Options: public, unlisted or private.</li>
+    <li>Optional expiry (10 minutes, 1 day, 1 month, never), optional syntax highlighting language, optional
+    custom alias.</li>
+    <li>Pastes are immutable once created (editing creates a new paste); users can delete their own.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> high availability for reads, low read latency (a few hundred
+  milliseconds), durability (a paste must not be lost before it expires), a size limit (say 10 MB), unguessable
+  links for unlisted pastes, and abuse control (spam, malware, illegal content). Strong consistency for the
+  "create then open" flow is nice: the creator opens the link immediately, so reads right after writes must
+  work. <strong>Out of scope:</strong> collaborative editing, full-text search across all pastes.</p>
+
+  <h4>2. Capacity estimates (assumptions)</h4>
+  <ul>
+    <li>Writes: 1 million new pastes per day → 1,000,000 ÷ 86,400 ≈ <strong>12 per second</strong>; peak
+    about 3× = 36 per second.</li>
+    <li>Reads: 5 reads per paste → 5 million reads per day → 5,000,000 ÷ 86,400 ≈ <strong>58 per second</strong>;
+    peak ~175 per second. Many pastes are read once or twice, a few go viral.</li>
+    <li>Average paste size 10 KB. Daily text = 1,000,000 × 10 KB = 10 GB. Per year = 10 GB × 365 ≈
+    <strong>3.65 TB</strong>. Over 5 years ≈ 18 TB, before compression (text often compresses 3–5×) and before
+    expiry removes many pastes.</li>
+    <li>Metadata: about 200 B per paste (key, owner, size, times, storage path) → 1M × 200 B = 200 MB per day,
+    about 73 GB per year. Small enough for one database with replicas.</li>
+    <li>Read bandwidth: 58/s × 10 KB ≈ 580 KB/s average. Trivial. Even the 10 MB worst case at a few requests per
+    second is manageable via a CDN.</li>
+    <li>Keys: 1M per day × 365 × 5 ≈ 1.8 billion keys. Base62 with 8 characters (62<sup>8</sup> ≈ 2.18 × 10<sup>14</sup>)
+    leaves a huge margin and makes random guessing impractical.</li>
+  </ul>
+  <p>Conclusion: request rates are low; the interesting problems are <strong>storing large blobs
+  cheaply</strong>, <strong>expiry</strong>, and <strong>unguessable keys</strong>.</p>
+
+  <h4>3. API design</h4>
+  <pre data-title="API" class="out"><code class="language-http">POST /api/v1/pastes
+{"content": "public class Hello { ... }",
+ "language": "java",
+ "visibility": "UNLISTED",
+ "expiresInSeconds": 86400}
+
+201 Created
+{"key": "k3Fq9XaB", "url": "https://paste.example/k3Fq9XaB",
+ "expiresAt": "2026-11-12T09:30:00Z"}
+
+GET /api/v1/pastes/k3Fq9XaB
+200 OK
+{"key": "k3Fq9XaB", "language": "java", "createdAt": "...",
+ "content": "public class Hello { ... }"}
+
+DELETE /api/v1/pastes/k3Fq9XaB   (owner only)   -> 204 No Content</code></pre>
+  <p>For large pastes, a good variant is to return metadata only and let the client fetch the raw text from a
+  CDN URL (<code>/raw/k3Fq9XaB</code>), so big payloads never pass through the app servers.</p>
+
+  <h4>4. Data model</h4>
+  <p>Split <strong>metadata</strong> from <strong>content</strong>. Metadata is small, structured and queried by
+  key or by user; content is a large blob read as a whole.</p>
+  <pre data-title="schema.sql"><code class="language-sql">CREATE TABLE paste (
+    paste_key    VARCHAR(12)  PRIMARY KEY,
+    owner_id     BIGINT,                          -- null for anonymous
+    visibility   VARCHAR(10)  NOT NULL,           -- PUBLIC, UNLISTED, PRIVATE
+    language     VARCHAR(20),
+    size_bytes   INT          NOT NULL,
+    blob_path    VARCHAR(200) NOT NULL,           -- e.g. pastes/2026/11/11/k3Fq9XaB
+    created_at   TIMESTAMP    NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMP
+);
+CREATE INDEX idx_paste_owner   ON paste (owner_id, created_at DESC);
+CREATE INDEX idx_paste_expires ON paste (expires_at);</code></pre>
+  <p>The content lives in <strong>object storage</strong> (S3, GCS, Azure Blob, MinIO; see
+  <a href="#m5">Module 5</a>). Why not keep 10 KB–10 MB text in the database? Large rows bloat the buffer cache
+  and backups, slow replication, and cost far more per GB than object storage, which is cheap, durable (designed
+  for many nines of durability) and scales to petabytes. Tiny pastes (under a few KB) could be stored inline in
+  the row as an optimisation; do not start there.</p>
+  <p>Database choice: a relational database is fine for this volume (73 GB per year of metadata). A key-value
+  store also works since the main lookup is by key. Choose what the team knows; mention the alternative.</p>
+
+  <h4>5. High-level architecture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  U[Client] --> CDN[CDN]
+  CDN --> LB[Load balancer]
+  LB --> API[Paste API service]
+  API --> KG[Key generator]
+  API --> DB[(Metadata database)]
+  API --> OS[(Object storage)]
+  API --> C[(Redis cache)]
+  J[Expiry cleaner job] --> DB
+  J --> OS
+  CDN -.->|raw content| OS
+</pre>
+    <figcaption>Metadata in a database, text in object storage, hot pastes in the cache and CDN, a job cleans up expired ones</figcaption>
+  </figure>
+  <p><strong>Write path:</strong> validate size and rate → get a unique key → upload the text to object storage
+  at <code>blob_path</code> → insert the metadata row → return the link. Do the blob upload first; if the
+  insert fails you have an orphan blob (cleaned up by a periodic scan), which is better than a metadata row
+  pointing to a missing blob. <strong>Read path:</strong> check cache → on a miss read the metadata row, check
+  <code>expires_at</code> and visibility → fetch the blob → fill the cache → return.</p>
+
+  <h4>6. Deep dive A: key generation</h4>
+  <p>The same options as the <a href="#m7-url-shortener">URL shortener</a> apply: counter + base62, random
+  pre-generated keys, or hashing. For Pastebin, <strong>unguessable</strong> keys matter more because "unlisted"
+  means "anyone with the link", so a sequential key would let people walk through all pastes. Use a random
+  8-character base62 key from a key service, or encode a random 48-bit number (8 base62 characters). On insert,
+  rely on the primary key: if a random key already exists (very unlikely), generate another and retry. For
+  private pastes, also check ownership on read; the key alone is not authorisation.</p>
+
+  <h4>7. Deep dive B: object storage and the read path</h4>
+  <ul>
+    <li><strong>Immutability helps.</strong> A paste never changes, so it can be cached for a long time. The CDN
+    and the browser can cache <code>/raw/&lt;key&gt;</code> with a long <code>Cache-Control</code> max-age,
+    which removes most read load. When a paste is deleted or expires, purge it from the CDN (or accept bounded
+    staleness for public pastes).</li>
+    <li><strong>Signed URLs.</strong> For private pastes the app can hand out a short-lived signed URL to the
+    object store, so the bytes flow storage → client directly. This keeps big traffic off the app servers
+    and still enforces authorisation.</li>
+    <li><strong>Compression.</strong> Compress text (gzip) before storing, typically cutting size 3–5×; the 18 TB
+    five-year figure becomes roughly 4–6 TB.</li>
+    <li><strong>Hot pastes.</strong> A viral paste is served by the CDN; the origin sees only misses. Cache
+    metadata for hot keys in Redis with a TTL, using the patterns in
+    <a href="#m5">Module 5</a>.</li>
+    <li><strong>Large uploads.</strong> For the 10 MB limit, either accept through the API with a body size cap
+    or issue a pre-signed upload URL so the client uploads straight to storage, then calls the API to commit.</li>
+  </ul>
+
+  <h4>8. Deep dive C: expiry</h4>
+  <p>Expired pastes must stop being served immediately, and their storage must eventually be reclaimed.
+  Separate these two goals.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Approach</th><th>How</th><th>Trade-off</th></tr></thead>
+    <tbody>
+      <tr><td>Lazy expiry</td><td>On every read, compare <code>expires_at</code> with now; if past, return 404 (and optionally delete)</td><td>Always correct for reads; storage is not freed for pastes nobody reads</td></tr>
+      <tr><td>Background cleaner</td><td>A scheduled job selects rows with <code>expires_at &lt; now()</code> in batches, deletes the blob and then the row</td><td>Frees storage; needs the index on expires_at and batching to avoid load spikes</td></tr>
+      <tr><td>Native TTL</td><td>Use a store with TTL (Redis, DynamoDB TTL, object-store lifecycle rules)</td><td>No custom code; deletion time is approximate (often within hours or days)</td></tr>
+      <tr><td>Time-bucketed partitions</td><td>Partition metadata (and blob prefixes) by expiry date and drop whole partitions</td><td>Very cheap deletion; more design effort</td></tr>
+    </tbody>
+  </table></div>
+  <p>A solid answer combines <strong>lazy expiry for correctness</strong> with a <strong>background cleaner (or
+  lifecycle rule) for storage</strong>. Delete the row first and the blob second, or mark first and sweep later,
+  so a failure leaves an orphan blob rather than a dangling pointer. Cache entries get a TTL no longer than the
+  paste's remaining life.</p>
+  <pre data-title="ExpiryCleaner.java"><code class="language-java">@Scheduled(fixedDelay = 60_000)
+public void cleanExpired() {
+    List&lt;PasteMeta&gt; batch = repo.findExpired(Instant.now(), 500);   // uses idx_paste_expires
+    for (PasteMeta p : batch) {
+        blobStore.delete(p.blobPath());      // idempotent: deleting a missing blob is fine
+        repo.deleteByKey(p.key());
+        cache.evict(p.key());
+    }
+}</code></pre>
+
+  <h4>9. Bottlenecks, scaling and abuse</h4>
+  <ul>
+    <li><strong>Scaling is easy here.</strong> Stateless API servers behind a load balancer; metadata DB with
+    read replicas; blobs in object storage that scales by itself. If metadata outgrows one DB, shard by
+    <code>paste_key</code>.</li>
+    <li><strong>Availability:</strong> cached and CDN content survive a database blip; run across zones.</li>
+    <li><strong>Abuse:</strong> rate limit anonymous creation per IP; reject over-size content; scan for
+    malware, credentials leaks and illegal material; provide a report button and takedown flow; add
+    <code>X-Content-Type-Options</code> and serve raw text as <code>text/plain</code> so a paste cannot run as a
+    web page (stored XSS).</li>
+    <li><strong>Privacy:</strong> never put private paste content in logs; encrypt blobs at rest.</li>
+    <li><strong>Monitoring:</strong> cache hit ratio, p99 latency, storage growth, orphan count, cleaner lag.</li>
+  </ul>
+
+  <h4>Follow-up questions</h4>
+  <ul>
+    <li>How would you add search over paste content? (A search index, fed by CDC or a queue; public pastes
+    only.)</li>
+    <li>How do you stop the same spam paste being posted millions of times? (Content hash dedupe and rate
+    limits.)</li>
+    <li>What if the object store is down? (Serve from cache/CDN; fail creates with a clear error or queue them.)</li>
+    <li>How would you support editing or versions? (New immutable version with a parent id.)</li>
+    <li>How do you make "burn after reading" pastes work? (Atomic delete on first read, with a conditional
+    update to avoid two readers.)</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>The key insight to say early: "metadata in a database, content in object storage".</li>
+      <li>Treat expiry as two problems: correctness on read, reclamation in the background.</li>
+      <li>Mention immutability, CDN caching and unguessable keys.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m7-rate-limiter">
+  <h3>Design a distributed rate limiter (with Redis)</h3>
+  <p class="tldr">A distributed rate limiter decides, in about a millisecond, whether a client may make a request
+  now; the usual design keeps per-client counters or token buckets in Redis, updates them atomically with a Lua
+  script, and decides what to do when Redis itself is slow or down.</p>
+
+  <h4>1. Requirements</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>Limit requests per client (user id, API key or IP) per rule, such as 100 requests per minute, or 10 per
+    second on login.</li>
+    <li>Different limits per endpoint and per plan (free vs paid).</li>
+    <li>Reject excess requests with <code>429 Too Many Requests</code> and tell the client when to retry.</li>
+    <li>Rules can be changed without redeploying.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> very low added latency (a few milliseconds at most, since it sits on every
+  request), accurate enough across many servers (not 10× over the limit), highly available (it must not become the
+  outage), and scalable to the whole API's traffic. Decide the failure policy: when the limiter is down, do we
+  <strong>fail open</strong> (allow traffic) or <strong>fail closed</strong> (block)? For most APIs fail open;
+  for expensive or security-critical endpoints (login, SMS) fail closed or fall back to local limits.
+  <strong>Out of scope:</strong> DDoS protection at network level (a CDN/WAF job).</p>
+
+  <h4>2. Capacity estimates (assumptions)</h4>
+  <ul>
+    <li>Total API traffic: 50,000 requests per second at peak. Every request needs one limiter check →
+    <strong>50,000 checks per second</strong>.</li>
+    <li>One Redis node handles very roughly on the order of 100,000 simple operations per second (an
+    approximation that depends on hardware and commands). A Lua script costs more than one GET, so budget a
+    node for perhaps 30,000–50,000 checks per second. We need a <strong>cluster of 3–5 shards</strong> with
+    headroom, sharded by client key.</li>
+    <li>Memory: 10 million active clients, each with a token bucket of about 100 bytes (key + two fields +
+    overhead) → 10,000,000 × 100 B = <strong>1 GB</strong>. Memory is not the problem; operations per second
+    are.</li>
+    <li>Latency: a Redis round trip inside a data centre is roughly 0.5–1 ms. With a budget of 5 ms this is
+    fine; with 100 rules per request it would not be (so check only the few rules that apply).</li>
+  </ul>
+
+  <h4>3. Choosing the algorithm</h4>
+  <p>The algorithms are explained in <a href="#m5">Module 5</a> and as a single-machine class in
+  <a href="#m3">Module 3</a>. Here is the comparison that matters for the distributed design.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Algorithm</th><th>State per client</th><th>Accuracy</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Fixed window counter</td><td>1 counter + window start</td><td>Allows up to 2× the limit around a window boundary</td><td>Simplest, cheapest (<code>INCR</code> + <code>EXPIRE</code>)</td></tr>
+      <tr><td>Sliding window log</td><td>Timestamp of every request</td><td>Exact</td><td>Memory heavy (limit × clients)</td></tr>
+      <tr><td>Sliding window counter</td><td>Two counters (current and previous window)</td><td>Close approximation</td><td>Good balance; small state</td></tr>
+      <tr><td>Token bucket</td><td>Token count + last refill time</td><td>Allows controlled bursts</td><td>Most popular; two fields per client</td></tr>
+      <tr><td>Leaky bucket</td><td>Queue or level + time</td><td>Smooth constant output rate</td><td>Good when the backend needs a steady rate</td></tr>
+    </tbody>
+  </table></div>
+  <p>The boundary problem: with a limit of 100 per minute and a fixed window, a client can send 100 requests
+  at 12:00:59 and 100 more at 12:01:00, which is 200 in two seconds. The sliding window counter estimates the
+  current rate as <code>current + previous × overlap</code>. For example, 30 seconds into a window, with 40
+  requests in the previous window and 30 in the current one, the estimate is 30 + 40 × 0.5 = 50.</p>
+  <p>This design uses the <strong>token bucket</strong>: a bucket of capacity C refills at R tokens per second;
+  each request takes one token; an empty bucket means reject. It allows short bursts up to C and a long-run rate
+  of R.</p>
+
+  <h4>4. API design</h4>
+  <p>The limiter is usually a library or sidecar inside the API gateway, with an optional internal service for
+  rule lookup. Internal API:</p>
+  <pre data-title="API" class="out"><code class="language-http">POST /internal/v1/ratelimit/check
+{"clientId": "key_8a1f", "rule": "orders-create", "cost": 1}
+
+200 OK
+{"allowed": true, "remaining": 87, "limit": 100, "resetMs": 8200}
+
+200 OK
+{"allowed": false, "remaining": 0, "retryAfterMs": 1300}</code></pre>
+  <p>The public API then answers rejected calls like this:</p>
+  <pre data-title="Response" class="out"><code class="language-http">HTTP/1.1 429 Too Many Requests
+Retry-After: 2
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1762853400</code></pre>
+  <p>The <code>X-RateLimit-*</code> headers are a widely used convention (not one single official standard);
+  <code>Retry-After</code> is a standard HTTP header.</p>
+
+  <h4>5. Data model</h4>
+  <p>Two kinds of data. <strong>Rules</strong> (config): <code>(rule, plan, limit, window or refill)</code>,
+  stored in a small database or config service and cached in each limiter instance, refreshed every few seconds.
+  <strong>Counters</strong> (hot state): a Redis hash per client and rule.</p>
+  <pre data-title="redis keys" class="out"><code class="language-plaintext">ratelimit:{key_8a1f}:orders-create   (hash)
+    tokens = 87.0
+    ts     = 1762853392100        (last refill time, ms)
+  expire after about 2 x the time to refill a full bucket</code></pre>
+
+  <h4>6. High-level architecture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  C[Client] --> GW[API gateway with limiter]
+  GW -->|allowed| S[Backend services]
+  GW -->|check token bucket| R[(Redis cluster)]
+  GW -->|rejected| X[429 response]
+  CFG[(Rules config)] -.->|refresh| GW
+  GW -.-> M[Metrics]
+</pre>
+    <figcaption>Each gateway instance asks Redis, sharded by client key, before passing a request on</figcaption>
+  </figure>
+
+  <h4>7. Deep dive A: atomic checks in Redis</h4>
+  <p>The naive approach is <code>GET</code> then <code>SET</code> from the app. Two gateways do it at the same
+  time, both see 1 token left, and both allow: a <strong>race condition</strong>. The state change must be
+  atomic. For a fixed window, <code>INCR</code> is atomic by itself. For a token bucket you need several
+  steps (read, refill, subtract, write), so run them as one <strong>Lua script</strong>; Redis executes a script
+  without interleaving other commands.</p>
+  <pre data-title="token_bucket.lua"><code class="language-plaintext">local key      = KEYS[1]
+local capacity = tonumber(ARGV[1])   -- max tokens
+local refill   = tonumber(ARGV[2])   -- tokens added per second
+local now      = tonumber(ARGV[3])   -- current time in ms
+local cost     = tonumber(ARGV[4])   -- tokens needed for this request
+
+local data   = redis.call('HMGET', key, 'tokens', 'ts')
+local tokens = tonumber(data[1])
+local ts     = tonumber(data[2])
+if tokens == nil then
+  tokens = capacity
+  ts = now
+end
+
+tokens = math.min(capacity, tokens + math.max(0, now - ts) * refill / 1000)
+local allowed = 0
+if tokens &gt;= cost then
+  tokens = tokens - cost
+  allowed = 1
+end
+
+redis.call('HSET', key, 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', key, math.ceil(capacity / refill * 2000))
+return {allowed, math.floor(tokens)}</code></pre>
+  <pre data-title="RateLimiter.java"><code class="language-java">import java.util.List;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+
+public class RedisRateLimiter {
+    private final StringRedisTemplate redis;
+    private final DefaultRedisScript&lt;List&gt; script;
+
+    public RedisRateLimiter(StringRedisTemplate redis, String luaSource) {
+        this.redis = redis;
+        this.script = new DefaultRedisScript&lt;&gt;(luaSource, List.class);
+    }
+
+    public boolean allow(String clientId, String rule, int capacity, double refillPerSec) {
+        String key = "ratelimit:{" + clientId + "}:" + rule;     // {..} = hash tag
+        List&lt;?&gt; r = redis.execute(script, List.of(key),
+            String.valueOf(capacity), String.valueOf(refillPerSec),
+            String.valueOf(System.currentTimeMillis()), "1");
+        return r != null &amp;&amp; ((Long) r.get(0)) == 1L;
+    }
+}</code></pre>
+  <p>Notes: in Redis Cluster all keys touched by one script must live in the same slot; the
+  <code>{clientId}</code> hash tag guarantees that. Passing time from the gateway means clock differences
+  between gateways add small errors; if that matters, read the time inside the script with
+  <code>redis.call('TIME')</code>. Keep scripts short, since they block the Redis thread while running.</p>
+
+  <h4>8. Deep dive B: accuracy, latency and failure</h4>
+  <ul>
+    <li><strong>Centralised vs local limits.</strong> Calling Redis on every request adds about a millisecond and
+    makes Redis a dependency. A hybrid cuts both: each gateway keeps a local counter and syncs with Redis every
+    100 ms or after N requests (<strong>batching</strong>), or gets a <strong>slice of the quota</strong>
+    ("you may admit 20 of this client's 100 per minute locally"). It is slightly less exact (a client might
+    exceed by a small percentage) but much cheaper. Say which error you accept.</li>
+    <li><strong>Sharding.</strong> Shard Redis by client key with consistent hashing
+    (<a href="#m5">Module 5</a>); one hot client stays on one shard, so for extreme keys use a local limiter or
+    split the key into sub-buckets.</li>
+    <li><strong>Failure policy.</strong> If a Redis call times out (use a very short timeout, 5–20 ms), fail open
+    with a local in-memory limiter as a safety net, and raise an alert. For login or SMS, fail closed. A circuit
+    breaker (<a href="#m6-resilience">Resilience</a>) stops the gateway from waiting on a dead Redis.</li>
+    <li><strong>Replication.</strong> Redis replication is asynchronous, so after a failover the counters can
+    roll back a little and clients get a brief extra allowance. For a limiter that is acceptable.</li>
+    <li><strong>Multi-region.</strong> Strict global limits need cross-region calls (slow). Usually each region
+    enforces its own share of the limit (for example 50% each) or syncs asynchronously.</li>
+  </ul>
+
+  <h4>9. Deep dive C: where to put it and how to identify clients</h4>
+  <ul>
+    <li><strong>Placement:</strong> at the edge or API gateway (best: reject before doing any work), as a
+    middleware in each service, or both (coarse at the edge, fine-grained per service). Client-side limiting
+    alone is not enough since clients can be hostile.</li>
+    <li><strong>Identity:</strong> API key or user id once authenticated; IP address for anonymous traffic
+    (but many users share one IP behind NAT, so be generous), and a combination for login attempts
+    (per username plus per IP).</li>
+    <li><strong>Cost-based limits:</strong> let an expensive call take 5 tokens instead of 1.</li>
+    <li><strong>Response:</strong> return 429 with <code>Retry-After</code>; well-behaved clients back off with
+    jitter (<a href="#m6-retries">Retries</a>). Log rejections to spot abusive clients and tune rules.</li>
+  </ul>
+
+  <h4>Bottlenecks and scaling</h4>
+  <p>Add Redis shards as checks per second grow; reduce checks with local batching; keep rules in memory;
+  monitor Redis CPU, command latency and the rejection rate. At 10× traffic (500,000 checks per second) the
+  central-Redis-per-request design needs 10–15 shards, so moving to local batching or quota slices becomes
+  worthwhile.</p>
+
+  <h4>Follow-up questions</h4>
+  <ul>
+    <li>How do you stop one tenant using the whole shared quota? (Per-tenant limits plus a global limit.)</li>
+    <li>How would you rate limit by "requests in flight" instead of rate? (A semaphore-style counter that is
+    decremented on completion; needs expiry for crashed requests.)</li>
+    <li>Fixed window vs sliding window: which and why? (Sliding window counter for accuracy at low cost; token
+    bucket for bursts.)</li>
+    <li>How do you test the limiter? (Load test with many parallel clients; assert total allowed ≤ limit plus
+    tolerance.)</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Say "atomic, so a Lua script" and explain the race in GET-then-SET.</li>
+      <li>State your failure policy (fail open or closed) and justify it per endpoint.</li>
+      <li>Mention the boundary problem of fixed windows and why token bucket or sliding window is better.</li>
+    </ul>
+  </div>
+</article>

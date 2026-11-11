@@ -1,0 +1,539 @@
+<article class="topic" id="m5-method-references">
+  <h3>Method references: the four kinds</h3>
+  <p class="tldr">A method reference such as String::toUpperCase is a shorter way to write a lambda that does nothing except call one existing method; there are four kinds — static, bound instance, unbound instance and constructor.</p>
+
+  <p>Many lambdas only forward their arguments to a method that already exists: <code>s -&gt; s.toUpperCase()</code>, <code>x -&gt; System.out.println(x)</code>, <code>() -&gt; new ArrayList&lt;&gt;()</code>. A <strong>method reference</strong> names that method directly with the <code>::</code> operator. It compiles to the same thing as the lambda, but it is shorter and says <em>what</em> is being called instead of <em>how</em> the arguments are passed.</p>
+
+  <h4>The four kinds</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Kind</th><th>Syntax</th><th>Example</th><th>Same as the lambda</th></tr></thead>
+    <tbody>
+      <tr><td>1. Static method</td><td><code>ClassName::staticMethod</code></td><td><code>Integer::parseInt</code></td><td><code>s -&gt; Integer.parseInt(s)</code></td></tr>
+      <tr><td>2. Bound instance method (a specific object)</td><td><code>object::method</code></td><td><code>System.out::println</code></td><td><code>x -&gt; System.out.println(x)</code></td></tr>
+      <tr><td>3. Unbound instance method (any object of a type)</td><td><code>ClassName::method</code></td><td><code>String::toUpperCase</code></td><td><code>s -&gt; s.toUpperCase()</code></td></tr>
+      <tr><td>4. Constructor</td><td><code>ClassName::new</code></td><td><code>ArrayList::new</code></td><td><code>() -&gt; new ArrayList&lt;&gt;()</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Bound vs unbound — the one that confuses people</h4>
+  <p>In a <strong>bound</strong> reference, the object is fixed when you write the reference: <code>System.out::println</code> always prints to that one <code>PrintStream</code>. All lambda parameters become method arguments.</p>
+  <p>In an <strong>unbound</strong> reference, you name a type, not an object. The <em>first</em> lambda parameter becomes the object the method is called on, and the remaining parameters become arguments:</p>
+  <ul>
+    <li><code>String::toUpperCase</code> as a <code>Function&lt;String, String&gt;</code> → <code>s -&gt; s.toUpperCase()</code></li>
+    <li><code>String::compareToIgnoreCase</code> as a <code>Comparator&lt;String&gt;</code> → <code>(a, b) -&gt; a.compareToIgnoreCase(b)</code></li>
+    <li><code>String::startsWith</code> as a <code>BiFunction&lt;String, String, Boolean&gt;</code> → <code>(s, p) -&gt; s.startsWith(p)</code></li>
+  </ul>
+
+  <h4>All four in one program</h4>
+  <pre data-title="MethodRefs.java"><code class="language-java">import java.util.*;
+import java.util.function.*;
+import java.util.stream.*;
+
+public class MethodRefs {
+    record Employee(String name, String dept) {
+        Employee(String name) {            // second constructor
+            this(name, "UNASSIGNED");
+        }
+    }
+
+    public static void main(String[] args) {
+        // 1. Static method
+        Function&lt;String, Integer&gt; parse = Integer::parseInt;
+        System.out.println(parse.apply("42") + 1);
+
+        // 2. Bound instance method: the receiver (System.out) is fixed
+        Consumer&lt;String&gt; printer = System.out::println;
+        printer.accept("bound to System.out");
+
+        // 3. Unbound instance method: the first argument is the receiver
+        Function&lt;String, String&gt; upper = String::toUpperCase;
+        System.out.println(upper.apply("upi"));
+
+        List&lt;String&gt; cities = new ArrayList&lt;&gt;(List.of("pune", "Agra", "delhi", "Bhopal"));
+        // same as (a, b) -&gt; a.compareToIgnoreCase(b)
+        cities.sort(String::compareToIgnoreCase);
+        System.out.println(cities);
+
+        // 4. Constructor: the target type picks the constructor
+        Supplier&lt;List&lt;String&gt;&gt; listMaker = ArrayList::new;             // no-arg
+        Function&lt;String, Employee&gt; newEmp = Employee::new;             // (String)
+        BiFunction&lt;String, String, Employee&gt; newEmp2 = Employee::new;  // (String, String)
+        IntFunction&lt;int[]&gt; newArray = int[]::new;                      // new int[n]
+        System.out.println(listMaker.get().size() + " " + newEmp.apply("Ravi") + " "
+                + newEmp2.apply("Asha", "HR") + " " + newArray.apply(3).length);
+
+        // Typical stream usage
+        String[] arr = Stream.of("a", "b").toArray(String[]::new);
+        List&lt;Employee&gt; emps = Stream.of("Kiran", "Meera").map(Employee::new).toList();
+        TreeSet&lt;String&gt; set = Stream.of("b", "a", "b")
+                .collect(Collectors.toCollection(TreeSet::new));
+        List&lt;String&gt; noNulls = Stream.of("x", null, "y")
+                .filter(Objects::nonNull)
+                .toList();
+
+        System.out.println(arr.length + " " + emps + " " + set + " " + noNulls);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">43
+bound to System.out
+UPI
+[Agra, Bhopal, delhi, pune]
+0 Employee[name=Ravi, dept=UNASSIGNED] Employee[name=Asha, dept=HR] 3
+2 [Employee[name=Kiran, dept=UNASSIGNED], Employee[name=Meera, dept=UNASSIGNED]] [a, b] [x, y]</code></pre>
+
+  <h4>How the compiler matches a method reference</h4>
+  <ol class="steps">
+    <li>It looks at the target functional interface and its one method — for <code>Function&lt;String, Integer&gt;</code> that is <code>Integer apply(String)</code>.</li>
+    <li>For <code>ClassName::name</code> it searches for a <em>static</em> method <code>name(String)</code> and for an <em>instance</em> method <code>name()</code> called on the first parameter.</li>
+    <li>Overloads are resolved by the parameter types, exactly like a normal call. <code>System.out::println</code> works for <code>Consumer&lt;String&gt;</code> and <code>Consumer&lt;Integer&gt;</code> because the right <code>println</code> overload is picked each time.</li>
+    <li>If both a static and an instance method fit, the reference is ambiguous and does not compile.</li>
+  </ol>
+  <pre data-title="Ambiguous reference"><code class="language-java">Function&lt;Integer, String&gt; f = Integer::toString;   // toString(int) or toString()?</code></pre>
+  <pre class="out" data-title="javac"><code class="language-plaintext">error: incompatible types: invalid method reference
+    reference to toString is ambiguous
+      both method toString(int) in Integer and method toString() in Integer match</code></pre>
+  <p>Fix it with a lambda that says what you mean: <code>i -&gt; Integer.toString(i)</code>, or use <code>String::valueOf</code>.</p>
+
+  <h4><code>this::</code> and <code>super::</code></h4>
+  <p>Inside an instance method you can reference your own methods with <code>this::validate</code> and the parent's version with <code>super::describe</code>. <code>orders.forEach(this::process)</code> is a common pattern in Spring services: the loop body lives in a named, testable method.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge case: a bound receiver is evaluated immediately</p>
+    <p>For <code>object::method</code>, Java evaluates <code>object</code> when the reference is <em>created</em>, not when it runs. Two visible effects:</p>
+    <ul>
+      <li>If <code>object</code> is <code>null</code>, you get a <code>NullPointerException</code> at creation time. The equivalent lambda <code>() -&gt; object.method()</code> fails only when it is called.</li>
+      <li>The variable does not need to be effectively final, because only its current value is captured. After <code>String s = "abc"; Supplier&lt;Integer&gt; len = s::length; s = "abcdef";</code>, <code>len.get()</code> returns 3.</li>
+    </ul>
+  </div>
+  <pre data-title="Null receiver: reference vs lambda"><code class="language-java">Order order = null;
+Runnable lambda = () -&gt; order.confirm();   // created fine
+Runnable ref = order::confirm;             // NullPointerException right here
+lambda.run();                              // the lambda throws only now</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the referenced method must fit the functional method</p>
+    <p>The number and types of parameters must match (for an unbound reference, counting the receiver as the first parameter), and the return type must be compatible. A method returning a value may be used where <code>void</code> is expected (the value is discarded), but not the other way round.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions: when to use a method reference</p>
+    <ul>
+      <li>Use one when the lambda only forwards its parameters: prefer <code>map(Employee::name)</code> over <code>map(e -&gt; e.name())</code>.</li>
+      <li>Keep the lambda when it does more than one call or passes extra values: <code>map(e -&gt; e.salary() * 12)</code> has no method-reference form.</li>
+      <li>For chains of getters, split them: <code>.map(User::address).map(Address::city)</code> reads better than one long lambda.</li>
+      <li>Do not force it. If <code>Foo::bar</code> hides which argument goes where, the lambda is clearer.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: calling a default method directly on a method reference</p>
+    <p><code>String::trim.andThen(...)</code> does not compile ("method reference not expected here"), and <code>var f = String::trim;</code> fails with "method reference needs an explicit target-type". A method reference has no type until it is assigned or passed. Assign it to a typed variable first: <code>Function&lt;String, String&gt; trim = String::trim;</code>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What are the types of method references?"</p>
+    <ul>
+      <li>Four kinds: static (<code>Integer::parseInt</code>), bound instance (<code>System.out::println</code>), unbound instance (<code>String::length</code>), constructor (<code>ArrayList::new</code>, <code>int[]::new</code>).</li>
+      <li>Give the lambda equivalent of each — interviewers often ask for it.</li>
+      <li>Unbound: the first parameter becomes the receiver, which is why <code>String::compareToIgnoreCase</code> works as a <code>Comparator&lt;String&gt;</code>.</li>
+      <li>The target type decides which overload or constructor is used.</li>
+      <li>Bonus point: a bound receiver is evaluated when the reference is created (null check happens then).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-streams-basics">
+  <h3>What a stream is: pipeline, laziness and sources</h3>
+  <p class="tldr">A stream is a one-time pipeline over a source of elements: a chain of lazy intermediate operations followed by one terminal operation, which triggers all the work and produces the result.</p>
+
+  <p>A <strong>stream</strong> (<code>java.util.stream.Stream&lt;T&gt;</code>) is a sequence of elements that you process with a chain of operations. It is <strong>not a data structure</strong>: it stores nothing. It pulls elements from a <strong>source</strong> — a collection, an array, a file, a generator — and pushes them through the operations one by one. It never modifies the source; a <code>filter</code> on a stream of a list leaves the list untouched.</p>
+
+  <h4>Stream vs collection</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Collection (List, Set)</th><th>Stream</th></tr></thead>
+    <tbody>
+      <tr><td>Purpose</td><td>Stores and manages elements</td><td>Describes a computation over elements</td></tr>
+      <tr><td>Storage</td><td>Holds all elements in memory</td><td>Holds nothing; elements flow through</td></tr>
+      <tr><td>When work happens</td><td>Immediately (eager)</td><td>Only when a terminal operation runs (lazy)</td></tr>
+      <tr><td>Reuse</td><td>Iterate as often as you like</td><td>Single use — consumed by the terminal operation</td></tr>
+      <tr><td>Size</td><td>Finite</td><td>Can be infinite (<code>Stream.iterate</code>, <code>generate</code>)</td></tr>
+      <tr><td>Iteration</td><td>External (you write the loop)</td><td>Internal (the stream runs the loop for you)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The pipeline: source → intermediate → terminal</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  S["Source: list, array, file"] --> F["filter: lazy"]
+  F --> M["map: lazy"]
+  M --> O["sorted: lazy, stateful"]
+  O --> T["collect: terminal"]
+  T --> R["Result: List, Map, number"]
+</pre>
+  <figcaption>A stream pipeline: nothing moves until the terminal operation asks for elements</figcaption>
+  </figure>
+  <dl class="terms">
+    <dt>Source</dt>
+    <dd>Where elements come from: <code>list.stream()</code>, <code>Arrays.stream(arr)</code>, <code>Files.lines(path)</code>.</dd>
+    <dt>Intermediate operation</dt>
+    <dd>Returns a new <code>Stream</code> and does no work yet: <code>filter</code>, <code>map</code>, <code>sorted</code>, <code>distinct</code>, <code>limit</code>. You can chain any number of them.</dd>
+    <dt>Terminal operation</dt>
+    <dd>Produces a result or a side effect and ends the stream: <code>collect</code>, <code>toList</code>, <code>forEach</code>, <code>count</code>, <code>reduce</code>, <code>findFirst</code>. A pipeline has exactly one, at the end.</dd>
+  </dl>
+
+  <h4>Laziness and short-circuiting — see it with <code>peek</code></h4>
+  <p><strong>Lazy</strong> means intermediate operations only record what to do. The work starts when the terminal operation asks for elements. The stream then processes elements <em>one at a time, through the whole chain</em> ("vertically"), not one operation at a time over the whole list. Some operations are <strong>short-circuiting</strong>: they can finish without looking at every element (<code>findFirst</code>, <code>anyMatch</code>, <code>limit</code>). <code>peek(action)</code> lets you watch elements pass by.</p>
+  <pre data-title="Lazy.java"><code class="language-java">List&lt;String&gt; names = List.of("Asha", "Bharat", "Chirag", "Deepa", "Esha");
+
+Stream&lt;String&gt; pipeline = names.stream()
+        .peek(n -&gt; System.out.println("source: " + n))
+        .filter(n -&gt; n.length() &gt; 4)
+        .peek(n -&gt; System.out.println("  passed filter: " + n))
+        .map(String::toUpperCase);
+
+System.out.println("Pipeline built, nothing processed yet");
+Optional&lt;String&gt; first = pipeline.findFirst();       // terminal: work starts here
+System.out.println("Result: " + first.get());</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Pipeline built, nothing processed yet
+source: Asha
+source: Bharat
+  passed filter: Bharat
+Result: BHARAT</code></pre>
+  <p>Three things to notice. Nothing printed before <code>findFirst()</code>. "Asha" failed the filter and went no further. And after "Bharat" produced a result, the stream stopped — "Chirag", "Deepa" and "Esha" were never read. With a million names, that saves a million checks.</p>
+
+  <h4>Stateful operations break the one-at-a-time flow</h4>
+  <p>Most intermediate operations are <strong>stateless</strong>: each element is handled on its own (<code>filter</code>, <code>map</code>). <strong>Stateful</strong> operations need to remember other elements. <code>sorted()</code> cannot emit the smallest element until it has seen all of them; <code>distinct()</code> must remember what it has already seen.</p>
+  <pre data-title="sorted is a barrier"><code class="language-java">Stream.of("c", "a", "b")
+        .peek(s -&gt; System.out.println("before sorted: " + s))
+        .sorted()
+        .forEach(s -&gt; System.out.println("after sorted:  " + s));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">before sorted: c
+before sorted: a
+before sorted: b
+after sorted:  a
+after sorted:  b
+after sorted:  c</code></pre>
+  <p>This is why <code>sorted()</code> on an infinite stream never finishes, and why it uses memory proportional to the number of elements.</p>
+
+  <h4>A stream can be used only once</h4>
+  <pre data-title="Reusing a stream"><code class="language-java">Stream&lt;String&gt; once = names.stream();
+System.out.println(once.count());   // 5
+once.count();                       // throws</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">5
+Exception in thread "main" java.lang.IllegalStateException: stream has already been operated upon or closed</code></pre>
+  <p>A terminal operation consumes the stream. If you need the data twice, keep the <em>source</em> (the list) and call <code>stream()</code> again, or use a <code>Supplier&lt;Stream&lt;T&gt;&gt;</code>. Calling two intermediate operations on the same stream object (branching) fails the same way.</p>
+
+  <h4>Where streams come from</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Source</th><th>Code</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Any collection</td><td><code>list.stream()</code>, <code>set.stream()</code></td><td>The most common source</td></tr>
+      <tr><td>A map</td><td><code>map.entrySet().stream()</code></td><td><code>Map</code> itself has no <code>stream()</code>; use <code>keySet()</code>, <code>values()</code> or <code>entrySet()</code></td></tr>
+      <tr><td>Fixed values</td><td><code>Stream.of("a", "b")</code></td><td><code>Stream.ofNullable(x)</code> (Java 9): empty if <code>x</code> is null</td></tr>
+      <tr><td>Arrays</td><td><code>Arrays.stream(arr)</code>, <code>Arrays.stream(arr, from, to)</code></td><td>An <code>int[]</code> gives an <code>IntStream</code></td></tr>
+      <tr><td>Number ranges</td><td><code>IntStream.range(0, 5)</code>, <code>IntStream.rangeClosed(1, 5)</code></td><td><code>range</code> excludes the end (0–4); <code>rangeClosed</code> includes it (1–5)</td></tr>
+      <tr><td>Iteration</td><td><code>Stream.iterate(1, n -&gt; n * 2)</code></td><td>Infinite — add <code>limit</code>. Java 9 form with a condition: <code>Stream.iterate(1, n -&gt; n &lt;= 100, n -&gt; n * 3)</code></td></tr>
+      <tr><td>Generator</td><td><code>Stream.generate(UUID::randomUUID)</code></td><td>Infinite; each element from a <code>Supplier</code></td></tr>
+      <tr><td>File lines</td><td><code>Files.lines(path)</code></td><td>Reads lazily; must be closed (try-with-resources)</td></tr>
+      <tr><td>Text</td><td><code>text.lines()</code> (Java 11), <code>text.chars()</code></td><td><code>chars()</code> gives an <code>IntStream</code> of char codes</td></tr>
+      <tr><td>Others</td><td><code>Stream.empty()</code>, <code>Stream.concat(a, b)</code>, <code>Pattern.splitAsStream</code></td><td><code>concat</code> joins two streams</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Sources in action"><code class="language-java">System.out.println(IntStream.range(0, 5).boxed().toList());
+System.out.println(IntStream.rangeClosed(1, 5).sum());
+System.out.println(Stream.iterate(1, n -&gt; n * 2).limit(6).toList());
+System.out.println(Stream.iterate(1, n -&gt; n &lt;= 100, n -&gt; n * 3).toList());
+System.out.println(Stream.generate(() -&gt; "hi").limit(3).toList());
+
+int[] marks = {72, 85, 64};
+System.out.println(Arrays.stream(marks).max().getAsInt());
+System.out.println("hello".chars().filter(ch -&gt; ch == 'l').count());
+
+Map&lt;String, Integer&gt; stock = new TreeMap&lt;&gt;(Map.of("pen", 12, "book", 4, "bag", 0));
+System.out.println(stock.entrySet().stream()
+        .filter(e -&gt; e.getValue() == 0)
+        .map(Map.Entry::getKey)
+        .toList());
+
+// I/O-backed streams hold an open file: always close them
+try (Stream&lt;String&gt; lines = Files.lines(Path.of("orders.csv"))) {
+    long failed = lines.filter(l -&gt; l.endsWith(",FAILED")).count();
+    System.out.println("Failed orders: " + failed);
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[0, 1, 2, 3, 4]
+15
+[1, 2, 4, 8, 16, 32]
+[1, 3, 9, 27, 81]
+[hi, hi, hi]
+85
+2
+[bag]
+Failed orders: 2</code></pre>
+
+  <h4>Kinds of streams and encounter order</h4>
+  <p>There are four stream types: <code>Stream&lt;T&gt;</code> for objects, and <code>IntStream</code>, <code>LongStream</code>, <code>DoubleStream</code> for primitives (with extras like <code>sum()</code> and <code>average()</code>). A stream from a <code>List</code>, an array or a range has an <strong>encounter order</strong>, and operations keep it. A stream from a <code>HashSet</code> has no defined order, so <code>findFirst()</code> on it can return any element.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Exactly one terminal operation per stream; after it, the stream is closed.</li>
+      <li>Without a terminal operation, nothing runs — not even <code>peek</code> or <code>map</code>.</li>
+      <li>Do not modify the source while the stream runs (no <code>list.add</code> inside the pipeline).</li>
+      <li>Close streams backed by I/O (<code>Files.lines</code>, <code>Files.list</code>, <code>Files.walk</code>) with try-with-resources. Streams over collections do not need closing.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Put each operation on its own line, aligned under <code>.stream()</code>. Diffs and stack traces become readable.</li>
+      <li>Return collections from methods, not streams, unless the caller clearly needs lazy processing. A returned stream can be consumed only once.</li>
+      <li>Use <code>peek</code> only for debugging; never for logic.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>Stream.of(intArray)</code> gives a stream with <em>one</em> element — the array itself (<code>Stream&lt;int[]&gt;</code>). <code>Stream.of(new int[]{1, 2, 3}).count()</code> is 1. Use <code>Arrays.stream(intArray)</code> or <code>IntStream.of(1, 2, 3)</code>.</li>
+      <li>An infinite stream without <code>limit</code>, <code>takeWhile</code> or a short-circuiting terminal never ends; with <code>sorted()</code> or <code>collect</code> it eventually throws <code>OutOfMemoryError</code>.</li>
+      <li><code>Files.lines</code> throws <code>UncheckedIOException</code> during processing if a line cannot be decoded (for example, wrong charset); the file-not-found <code>IOException</code> is thrown when you open it.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: keeping a stream to use it twice</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: IllegalStateException on the second use</p><pre><code class="language-java">Stream&lt;Order&gt; paid = orders.stream()
+        .filter(Order::isPaid);
+long count = paid.count();
+List&lt;Order&gt; list = paid.toList();   // throws</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: collect once, then reuse the list</p><pre><code class="language-java">List&lt;Order&gt; paid = orders.stream()
+        .filter(Order::isPaid)
+        .toList();
+long count = paid.size();</code></pre></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a stream? Intermediate vs terminal? What is lazy evaluation?"</p>
+    <ul>
+      <li>A stream is a pipeline over a source; it stores nothing and does not change the source.</li>
+      <li>Intermediate operations return a stream and are lazy; terminal operations produce a result and trigger processing.</li>
+      <li>Elements flow one at a time through the whole chain; short-circuiting operations stop early. Show the <code>peek</code> demo if you can.</li>
+      <li>Stateful operations (<code>sorted</code>, <code>distinct</code>) must see many or all elements.</li>
+      <li>Streams are single-use: reuse throws <code>IllegalStateException</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-stream-intermediate-ops">
+  <h3>Intermediate operations: filter, map, flatMap, sorted and friends</h3>
+  <p class="tldr">Intermediate operations turn one stream into another, lazily: filter keeps elements, map transforms them, flatMap flattens nested data, sorted and distinct reorder or deduplicate, and limit, skip, takeWhile and dropWhile cut the stream.</p>
+
+  <h4>The intermediate operations table</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operation</th><th>What it does</th><th>Kind</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>filter(Predicate)</code></td><td>Keeps elements that match</td><td>Stateless</td><td><code>filter(o -&gt; o.amount() &gt; 800)</code></td></tr>
+      <tr><td><code>map(Function)</code></td><td>Transforms each element (one in, one out)</td><td>Stateless</td><td><code>map(Order::id)</code></td></tr>
+      <tr><td><code>flatMap(Function)</code></td><td>Each element → a stream; all streams joined into one</td><td>Stateless</td><td><code>flatMap(o -&gt; o.items().stream())</code></td></tr>
+      <tr><td><code>mapToInt</code> / <code>mapToLong</code> / <code>mapToDouble</code></td><td>Converts to a primitive stream</td><td>Stateless</td><td><code>mapToInt(Employee::salary)</code></td></tr>
+      <tr><td><code>boxed()</code>, <code>mapToObj(...)</code></td><td>Primitive stream → object stream</td><td>Stateless</td><td><code>IntStream.range(0, 3).boxed()</code></td></tr>
+      <tr><td><code>distinct()</code></td><td>Removes duplicates using <code>equals</code>/<code>hashCode</code></td><td>Stateful</td><td><code>map(Order::customer).distinct()</code></td></tr>
+      <tr><td><code>sorted()</code>, <code>sorted(Comparator)</code></td><td>Natural order, or the given order</td><td>Stateful</td><td><code>sorted(Comparator.comparing(Employee::name))</code></td></tr>
+      <tr><td><code>peek(Consumer)</code></td><td>Looks at each element as it passes (debugging)</td><td>Stateless</td><td><code>peek(e -&gt; log.debug("{}", e))</code></td></tr>
+      <tr><td><code>limit(n)</code></td><td>Keeps the first <code>n</code> elements</td><td>Short-circuiting</td><td><code>limit(3)</code></td></tr>
+      <tr><td><code>skip(n)</code></td><td>Drops the first <code>n</code> elements</td><td>Stateful</td><td><code>skip(10)</code></td></tr>
+      <tr><td><code>takeWhile(Predicate)</code> (9)</td><td>Takes elements while the test is true; stops at the first false</td><td>Short-circuiting</td><td><code>takeWhile(n -&gt; n &lt; 5)</code></td></tr>
+      <tr><td><code>dropWhile(Predicate)</code> (9)</td><td>Drops elements while true; keeps everything after</td><td>Stateless after the first false</td><td><code>dropWhile(n -&gt; n &lt; 5)</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>filter and map — the workhorses</h4>
+  <pre data-title="Sample data used below"><code class="language-java">record Order(String id, String customer, int amount, List&lt;String&gt; items) {}
+
+List&lt;Order&gt; orders = List.of(
+        new Order("O1", "Ravi", 1200, List.of("Phone case", "Charger")),
+        new Order("O2", "Asha", 350, List.of("Notebook")),
+        new Order("O3", "Ravi", 899, List.of("Earphones", "Charger")),
+        new Order("O4", "Meera", 2500, List.of("Shoes")));
+
+List&lt;String&gt; bigOrderIds = orders.stream()
+        .filter(o -&gt; o.amount() &gt; 800)     // keep orders above ₹800
+        .map(Order::id)                    // Order → String
+        .toList();
+System.out.println(bigOrderIds);           // [O1, O3, O4]
+
+System.out.println(orders.stream().map(Order::customer).distinct().toList());
+// [Ravi, Asha, Meera]</code></pre>
+
+  <h4>map vs flatMap</h4>
+  <p><code>map</code> is one-to-one: each element becomes exactly one new element. When each element holds a <em>collection</em>, <code>map</code> gives you a stream of collections. <code>flatMap</code> is one-to-many: the function returns a <em>stream</em> for each element, and <code>flatMap</code> joins ("flattens") all of them into a single stream.</p>
+  <pre data-title="map vs flatMap"><code class="language-java">List&lt;List&lt;String&gt;&gt; nested = orders.stream()
+        .map(Order::items)                         // Stream&lt;List&lt;String&gt;&gt;
+        .toList();
+System.out.println(nested);
+
+List&lt;String&gt; allItems = orders.stream()
+        .flatMap(o -&gt; o.items().stream())          // Stream&lt;String&gt;
+        .toList();
+System.out.println(allItems);
+
+List&lt;String&gt; uniqueItems = orders.stream()
+        .flatMap(o -&gt; o.items().stream())
+        .distinct()
+        .sorted()
+        .toList();
+System.out.println(uniqueItems);
+
+List&lt;String&gt; lines = List.of("upi is fast", "cards are common");
+System.out.println(lines.stream()
+        .flatMap(line -&gt; Arrays.stream(line.split(" ")))   // sentences → words
+        .toList());</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[[Phone case, Charger], [Notebook], [Earphones, Charger], [Shoes]]
+[Phone case, Charger, Notebook, Earphones, Charger, Shoes]
+[Charger, Earphones, Notebook, Phone case, Shoes]
+[upi, is, fast, cards, are, common]</code></pre>
+  <figure class="fig">
+<pre class="diagram">
+ map(Order::items)               flatMap(o -&gt; o.items().stream())
+
+ O1 ─▶ [Phone case, Charger]     O1 ─▶ Phone case, Charger
+ O2 ─▶ [Notebook]                O2 ─▶ Notebook
+ O3 ─▶ [Earphones, Charger]      O3 ─▶ Earphones, Charger
+ O4 ─▶ [Shoes]                   O4 ─▶ Shoes
+
+ Result: Stream&lt;List&lt;String&gt;&gt;    Result: Stream&lt;String&gt;
+         4 elements (lists)              6 elements (strings)
+</pre>
+  <figcaption>map keeps the nesting; flatMap removes one level of it</figcaption>
+  </figure>
+
+  <h4>sorted with Comparator</h4>
+  <p><code>sorted()</code> uses the natural order (elements must implement <code>Comparable</code>, like <code>String</code> and <code>Integer</code>). For anything else, pass a <code>Comparator</code>, usually built with the helper methods from <a href="#m4">Module 4</a>:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Helper</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>Comparator.comparing(Employee::name)</code></td><td>Order by a key that is <code>Comparable</code></td></tr>
+      <tr><td><code>Comparator.comparingInt(Employee::salary)</code></td><td>Order by an <code>int</code> key without boxing</td></tr>
+      <tr><td><code>.thenComparing(Employee::name)</code></td><td>Tie-breaker when the first key is equal</td></tr>
+      <tr><td><code>.reversed()</code></td><td>Reverse the <em>whole</em> comparator built so far</td></tr>
+      <tr><td><code>Comparator.comparing(Employee::salary, Comparator.reverseOrder())</code></td><td>Reverse only this key</td></tr>
+      <tr><td><code>Comparator.nullsFirst(...)</code>, <code>nullsLast(...)</code></td><td>Decide where <code>null</code> values go instead of throwing</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Sorting employees"><code class="language-java">record Employee(String name, String dept, int salary, int age) {}
+
+List&lt;Employee&gt; emps = List.of(
+        new Employee("Ravi", "IT", 90000, 31),
+        new Employee("Asha", "HR", 60000, 28),
+        new Employee("Kiran", "IT", 90000, 26),
+        new Employee("Meera", "IT", 120000, 35),
+        new Employee("John", "HR", 75000, 40));
+
+// Salary high → low, then name A → Z for equal salaries
+System.out.println(emps.stream()
+        .sorted(Comparator.comparingInt(Employee::salary).reversed()
+                .thenComparing(Employee::name))
+        .map(e -&gt; e.name() + ":" + e.salary())
+        .toList());
+
+// Department A → Z, and inside each department salary high → low
+System.out.println(emps.stream()
+        .sorted(Comparator.comparing(Employee::dept)
+                .thenComparing(Employee::salary, Comparator.reverseOrder()))
+        .map(e -&gt; e.dept() + "/" + e.name())
+        .toList());</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[Meera:120000, Kiran:90000, Ravi:90000, John:75000, Asha:60000]
+[HR/John, HR/Asha, IT/Meera, IT/Ravi, IT/Kiran]</code></pre>
+  <p>In the second result, Ravi and Kiran both earn 90,000, and they stay in their original order. For ordered streams, <code>sorted</code> is <strong>stable</strong>: equal elements keep their encounter order.</p>
+
+  <h4>limit and skip — pagination</h4>
+  <pre data-title="Page 2 with page size 2"><code class="language-java">int page = 1, size = 2;                   // page index starts at 0
+System.out.println(emps.stream()
+        .sorted(Comparator.comparing(Employee::name))   // Asha, John, Kiran, Meera, Ravi
+        .skip((long) page * size)
+        .limit(size)
+        .map(Employee::name)
+        .toList());                       // [Kiran, Meera]</code></pre>
+  <p>Good for in-memory lists. For database data, paginate in SQL (<code>LIMIT</code>/<code>OFFSET</code> or Spring Data's <code>Pageable</code>) instead of loading everything and skipping in Java.</p>
+
+  <h4>takeWhile and dropWhile vs filter</h4>
+  <pre data-title="They are not the same as filter"><code class="language-java">List&lt;Integer&gt; nums = List.of(1, 2, 3, 10, 4, 5);
+System.out.println(nums.stream().takeWhile(n -&gt; n &lt; 5).toList());   // [1, 2, 3]
+System.out.println(nums.stream().filter(n -&gt; n &lt; 5).toList());      // [1, 2, 3, 4]
+System.out.println(nums.stream().dropWhile(n -&gt; n &lt; 5).toList());   // [10, 4, 5]</code></pre>
+  <p><code>takeWhile</code> stops at the <em>first</em> element that fails — 4 is never reached. <code>filter</code> checks every element. Use <code>takeWhile</code> on data that is already sorted or ordered by the condition (log lines by time, prices ascending), where stopping early is both correct and faster.</p>
+
+  <h4>Primitive streams: mapToInt, boxed, mapToObj</h4>
+  <pre data-title="Switching between object and primitive streams"><code class="language-java">int total = emps.stream().mapToInt(Employee::salary).sum();                 // 435000
+double avg = emps.stream()
+        .mapToDouble(Employee::salary)
+        .average()
+        .getAsDouble();                                                      // 87000.0
+
+List&lt;Integer&gt; squares = IntStream.rangeClosed(1, 5)
+        .map(n -&gt; n * n)       // IntStream → IntStream
+        .boxed()               // IntStream → Stream&lt;Integer&gt;
+        .toList();             // [1, 4, 9, 16, 25]
+
+List&lt;String&gt; seats = IntStream.range(0, 3)
+        .mapToObj(i -&gt; "Seat-" + i)
+        .toList();             // [Seat-0, Seat-1, Seat-2]</code></pre>
+  <p>Object streams have no <code>sum()</code>; convert with <code>mapToInt</code> first. Primitive streams cannot be collected with <code>Collectors</code> directly; convert back with <code>boxed()</code> or <code>mapToObj</code>.</p>
+
+  <div class="co co-version">
+    <p class="co-t">Version note: mapMulti (Java 16)</p>
+    <p><code>mapMulti((element, sink) -&gt; ...)</code> is an alternative to <code>flatMap</code>: instead of returning a stream, you push zero or more results into <code>sink</code>. It avoids creating many small streams. <code>orders.stream().&lt;String&gt;mapMulti((o, sink) -&gt; o.items().forEach(sink))</code> gives the same 6 items as the <code>flatMap</code> example. <code>flatMap</code> remains the common, readable choice.</p>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>The function given to <code>map</code> must return a value. <code>map(s -&gt; System.out.println(s))</code> does not compile, because <code>println</code> returns <code>void</code>.</li>
+      <li>The function given to <code>flatMap</code> must return a <code>Stream</code>, not a <code>List</code> — write <code>o.items().stream()</code>.</li>
+      <li><code>sorted()</code> without a comparator requires <code>Comparable</code> elements.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and runtime exceptions</p>
+    <ul>
+      <li><code>sorted()</code> on elements that are not <code>Comparable</code> compiles, but throws <code>ClassCastException</code> (… cannot be cast to class java.lang.Comparable) when the terminal operation runs.</li>
+      <li><code>distinct()</code> relies on <code>equals</code> and <code>hashCode</code>. Records have them; a plain class without them is compared by identity, so "duplicates" stay.</li>
+      <li>If the function in <code>flatMap</code> returns <code>null</code>, that element contributes nothing (it is treated as an empty stream).</li>
+      <li><code>takeWhile</code>/<code>dropWhile</code> on an unordered source (a <code>HashSet</code>) give unpredictable results.</li>
+      <li>Sorting with <code>null</code> keys throws <code>NullPointerException</code>; wrap the key comparator with <code>Comparator.nullsLast(...)</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a lambda key extractor before reversed()</p>
+    <p><code>Comparator.comparing(e -&gt; e.name()).reversed()</code> fails with "cannot find symbol: method name(), location: variable e of type Object". With <code>.reversed()</code> chained on, the compiler cannot use the target type to infer <code>e</code>, so it falls back to <code>Object</code>. Use a method reference (<code>Employee::name</code>) or type the parameter: <code>(Employee e) -&gt; e.name()</code>.</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: does not compile</p><pre><code class="language-java">emps.stream()
+    .sorted(Comparator.comparing(e -&gt; e.name()).reversed())
+    .toList();</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: method reference gives the type</p><pre><code class="language-java">emps.stream()
+    .sorted(Comparator.comparing(Employee::name).reversed())
+    .toList();</code></pre></div>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: filter early, map late</p>
+    <p>Put <code>filter</code> before expensive <code>map</code> calls and before <code>sorted</code>. Sorting 100 filtered elements is far cheaper than sorting 100,000 and filtering afterwards. The result is the same; the work is not.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Difference between map and flatMap?" and "What is a stateful operation?"</p>
+    <ul>
+      <li><code>map</code>: one input → one output. <code>flatMap</code>: one input → a stream of outputs, all joined into one stream. Example: orders → items.</li>
+      <li>Stateful operations (<code>sorted</code>, <code>distinct</code>, <code>skip</code>, <code>limit</code>) need information about other elements; stateless ones (<code>filter</code>, <code>map</code>) handle each element alone.</li>
+      <li><code>takeWhile</code> stops at the first failure; <code>filter</code> checks every element.</li>
+      <li><code>reversed()</code> reverses the whole comparator chain; use <code>Comparator.reverseOrder()</code> as a second argument to reverse one key.</li>
+    </ul>
+  </div>
+</article>

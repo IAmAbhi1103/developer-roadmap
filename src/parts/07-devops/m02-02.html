@@ -1,0 +1,444 @@
+<article class="topic" id="m2-http-tls">
+  <h3>HTTP versus HTTPS, TLS certificates and Let's Encrypt</h3>
+  <p class="tldr">HTTPS is HTTP inside a TLS tunnel: TLS encrypts the traffic, detects tampering and proves the
+  server's identity with a certificate signed by a trusted authority; Let's Encrypt and <code>certbot</code>
+  give you that certificate for free and renew it automatically.</p>
+
+  <h4>HTTP is plain text</h4>
+  <p><strong>HTTP</strong> is the request/response protocol of the web. Over plain HTTP (port 80) every
+  router between the browser and the server can read and change the data: passwords, cookies, JWTs, card
+  details. Public Wi-Fi makes this easy. <strong>HTTPS</strong> (port 443) wraps HTTP in
+  <strong>TLS</strong> (Transport Layer Security; the old name was SSL, and people still say "SSL
+  certificate"). Today every real site should use HTTPS only, and browsers mark plain HTTP as "Not
+  secure".</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>HTTP</th><th>HTTPS</th></tr></thead>
+    <tbody>
+      <tr><td>Port</td><td>80</td><td>443</td></tr>
+      <tr><td>Encrypted</td><td>No</td><td>Yes (TLS)</td></tr>
+      <tr><td>Server identity checked</td><td>No</td><td>Yes (certificate)</td></tr>
+      <tr><td>Tamper detection</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Needed for</td><td>Local development, redirects to HTTPS</td><td>Everything else; also required for HTTP/2 in browsers, service workers and Secure cookies</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>What TLS gives you</h4>
+  <dl class="terms">
+    <dt>Encryption (confidentiality)</dt><dd>Only the two ends can read the data. A listener on the path
+    sees random bytes.</dd>
+    <dt>Integrity</dt><dd>Any change in transit is detected, so nobody can silently alter a response or
+    inject a script.</dd>
+    <dt>Authentication</dt><dd>The browser verifies that the server really owns the domain, using a
+    certificate. This stops someone from impersonating <code>yourbank.com</code>.</dd>
+  </dl>
+
+  <h4>Certificates and certificate authorities</h4>
+  <p>A <strong>certificate</strong> is a signed document that says "this public key belongs to
+  <code>shop.example.com</code>, valid from date A to date B". It is signed by a
+  <strong>Certificate Authority (CA)</strong>. Your operating system and browser ship with a list of CAs they
+  trust (<em>root certificates</em>). Servers usually send a <strong>chain</strong>: the server
+  certificate, signed by an intermediate CA, signed by a root the browser already trusts. The browser
+  checks that the chain leads to a trusted root, that the name matches, that the dates are valid and that
+  the certificate was not revoked.</p>
+
+  <h4>The TLS handshake, simplified</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant B as Browser
+  participant S as Server
+  B->>S: ClientHello (TLS versions, ciphers, SNI = shop.example.com)
+  S->>B: ServerHello + certificate chain
+  B->>B: Verify chain, name and dates
+  B->>S: Key exchange (both sides derive the same session key)
+  S->>B: Finished
+  Note over B,S: All HTTP data is now encrypted with the session key
+</pre>
+    <figcaption>TLS handshake in simplified form (TLS 1.3 needs one round trip)</figcaption>
+  </figure>
+  <ol class="steps">
+    <li>The client says which TLS versions and ciphers it supports and, through <strong>SNI</strong>
+    (Server Name Indication), the host name it wants. SNI lets one IP serve many HTTPS sites.</li>
+    <li>The server chooses the settings and sends its certificate chain.</li>
+    <li>The client verifies the chain and the name.</li>
+    <li>Both sides use a key-exchange algorithm to agree on a fresh <strong>session key</strong> without
+    ever sending it. The slow public-key maths is used only here.</li>
+    <li>The rest of the connection uses fast symmetric encryption with the session key.</li>
+  </ol>
+  <p>Where the TLS ends matters. Most setups use <strong>TLS termination</strong> at Nginx or a load
+  balancer: the proxy handles HTTPS, and passes plain HTTP to your Spring Boot app on
+  <code>localhost</code> or a private network (<a href="#m2-nginx-config">Nginx config</a>).</p>
+
+  <h4>Let's Encrypt and certbot</h4>
+  <p><strong>Let's Encrypt</strong> is a free, automated CA. It proves you control a domain by asking for
+  a file at <code>http://yourdomain/.well-known/acme-challenge/...</code> (the HTTP-01 challenge), so the
+  domain must already point to your server and port 80 must be open. Its certificates last 90 days by
+  design, so renewal must be automatic. <code>certbot</code> is the usual client.</p>
+  <pre data-title="Get a certificate for Nginx on Ubuntu"><code class="language-shell">$ sudo apt update
+$ sudo apt install -y certbot python3-certbot-nginx
+$ sudo certbot --nginx -d shop.example.com -d www.shop.example.com
+Enter email address (used for urgent renewal and security notices): you@example.com
+...
+Successfully received certificate.
+Certificate is saved at: /etc/letsencrypt/live/shop.example.com/fullchain.pem
+Key is saved at:         /etc/letsencrypt/live/shop.example.com/privkey.pem
+This certificate expires on 2027-02-09.
+Deploying certificate
+Successfully deployed certificate for shop.example.com to /etc/nginx/sites-enabled/shop
+$ sudo certbot renew --dry-run
+Congratulations, all simulated renewals succeeded
+$ systemctl list-timers | grep certbot</code></pre>
+  <p>The <code>--nginx</code> plugin edits your Nginx config to add the certificate and (if you choose) an
+  HTTP-to-HTTPS redirect. Certbot installs a systemd timer (or cron job) that renews certificates before
+  they expire; <code>--dry-run</code> proves the renewal path works. The two files you care about:
+  <code>fullchain.pem</code> (your certificate plus the intermediates) and <code>privkey.pem</code> (the
+  private key: keep it secret, readable by root only). Certbot's exact prompts and the way it is
+  installed (apt or snap) vary by version; check certbot.eff.org for current instructions. An email
+  address, a domain pointing at the server and open ports 80 and 443 are what you need.</p>
+  <p>Besides HTTP-01, there is a DNS-01 challenge (a TXT record) which allows wildcard certificates such
+  as <code>*.example.com</code> and works for servers that are not reachable from the internet. AWS
+  offers a different route: AWS Certificate Manager (ACM) gives free certificates for use with load
+  balancers and CloudFront, so you may not need certbot at all (Module 5).</p>
+
+  <h4>Inspecting TLS from the command line</h4>
+  <pre data-title="Check what the server presents"><code class="language-shell">$ curl -vI https://shop.example.com 2&gt;&amp;1 | grep -E "subject|issuer|expire|SSL|HTTP/"
+*  subject: CN=shop.example.com
+*  start date: Nov 11 05:00:00 2026 GMT
+*  expire date: Feb  9 05:00:00 2027 GMT
+*  issuer: C=US; O=Let's Encrypt; CN=R11
+&lt; HTTP/2 200
+$ echo | openssl s_client -connect shop.example.com:443 -servername shop.example.com 2&gt;/dev/null \
+    | openssl x509 -noout -dates -issuer
+notBefore=Nov 11 05:00:00 2026 GMT
+notAfter=Feb  9 05:00:00 2027 GMT
+issuer=C = US, O = Let's Encrypt, CN = R11</code></pre>
+  <p>The issuer name above is a sample; Let's Encrypt changes its intermediate certificates over time.
+  Browsers also show the certificate under the padlock icon.</p>
+
+  <h4>HSTS, HTTP/2 and HTTP/3</h4>
+  <ul>
+    <li><strong>HSTS</strong> (HTTP Strict Transport Security): the header
+    <code>Strict-Transport-Security: max-age=31536000</code> tells browsers to use only HTTPS for that
+    domain for the given seconds. It prevents downgrade attacks. Enable it only when HTTPS works
+    everywhere, because a mistake is cached by browsers for a long time.</li>
+    <li><strong>HTTP/2</strong> keeps one connection and sends many requests in parallel
+    (multiplexing), compresses headers, and is used over TLS by browsers. <strong>HTTP/3</strong> runs
+    the same ideas over QUIC (UDP), which avoids head-of-line blocking at the TCP level and connects
+    faster. You rarely change code for this: enable it in Nginx or your CDN, and Spring Boot behind the
+    proxy still sees HTTP/1.1.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: HTTPS everywhere, redirect HTTP, keep the private key private</p>
+    <p>Serve production only over HTTPS, redirect port 80 to 443, mark session cookies <code>Secure</code>,
+    and never commit <code>privkey.pem</code> or put it in a Docker image. Use a normal (non-root)
+    process to run the app, and let Nginx read the key.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: turning off certificate checks to "fix" an error</p>
+    <p><code>curl -k</code>, <code>verify=False</code> in Python or a trust-all <code>TrustManager</code>
+    in Java makes the error go away by removing the security. Fix the cause: wrong name, expired
+    certificate, missing intermediate in <code>fullchain.pem</code>, or an unknown (self-signed) CA that
+    must be added to the truststore.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and errors</p>
+    <ul>
+      <li><code>NET::ERR_CERT_DATE_INVALID</code> / "certificate has expired" — renewal failed. Check
+      <code>certbot renew</code> and that port 80 is reachable.</li>
+      <li><code>NET::ERR_CERT_COMMON_NAME_INVALID</code> — the certificate does not cover the name you
+      typed (for example you got a certificate for <code>shop.example.com</code> but visit
+      <code>www.shop.example.com</code>).</li>
+      <li>Java: <code>javax.net.ssl.SSLHandshakeException: PKIX path building failed</code> — your JVM
+      does not trust the issuer, typical with internal or self-signed CAs. Import the CA into the
+      truststore (<code>keytool -importcert</code>).</li>
+      <li>Let's Encrypt has rate limits; test with <code>--dry-run</code> or the staging environment
+      before you request many certificates.</li>
+      <li>Mixed content: an HTTPS page that loads <code>http://</code> scripts or APIs is blocked by
+      browsers.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How does HTTPS work? What does a certificate prove?"</p>
+    <ul>
+      <li>TLS handshake: negotiate, server sends certificate, client validates the chain, both derive a
+      session key, then symmetric encryption.</li>
+      <li>You get confidentiality, integrity and authentication. A certificate binds a public key to a
+      domain name and is signed by a trusted CA.</li>
+      <li>Practical: Let's Encrypt, certbot, auto-renewal every 60 days or so, TLS termination at
+      Nginx.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-firewalls">
+  <h3>Firewalls and security groups: open only the ports you need</h3>
+  <p class="tldr">A firewall allows or blocks traffic by port, protocol and source address; on a server you
+  use <code>ufw</code>, in AWS you use security groups, and the rule is to open only what is needed (22 from
+  your IP, 80 and 443 from anywhere, never the database).</p>
+
+  <h4>Why a firewall</h4>
+  <p>A running program that listens on a port is a door. Databases, debug ports and admin tools you forgot
+  about are doors too. A firewall decides which doors are reachable from where. The core idea is
+  <strong>default deny</strong>: block everything, then allow exactly what you need. Bots scan the whole
+  internet for open 22, 3306, 5432, 6379 and 27017 all day, and databases left open with a weak or no
+  password are a leading cause of data leaks.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Internet
+    │   80, 443 allowed from anywhere
+    │   22 allowed from my IP only
+    ▼
+ ┌────────────────────────┐
+ │ Security group / ufw   │   everything else is dropped
+ └──────────┬─────────────┘
+            ▼
+   Nginx :80/:443  ──►  Spring Boot :8080 (localhost only)
+                    ──►  PostgreSQL :5432 (localhost or private subnet only)
+</pre>
+    <figcaption>Only the proxy and SSH are exposed; the app and database stay private</figcaption>
+  </figure>
+
+  <h4>ufw: the simple Ubuntu firewall</h4>
+  <p><code>ufw</code> (Uncomplicated Firewall) is a friendly front end for the Linux packet filter. It is
+  installed on Ubuntu but disabled until you turn it on.</p>
+  <pre data-title="A safe order of commands"><code class="language-shell">$ sudo ufw default deny incoming
+$ sudo ufw default allow outgoing
+$ sudo ufw allow 22/tcp
+$ sudo ufw allow 80,443/tcp
+$ sudo ufw enable
+Command may disrupt existing ssh connections. Proceed with operation (y|n)? y
+Firewall is active and enabled on system startup
+$ sudo ufw status verbose
+Status: active
+Default: deny (incoming), allow (outgoing), disabled (routed)
+
+To                         Action      From
+--                         ------      ----
+22/tcp                     ALLOW IN    Anywhere
+80,443/tcp                 ALLOW IN    Anywhere
+$ sudo ufw allow from 203.0.113.10 to any port 22 proto tcp
+$ sudo ufw delete allow 22/tcp
+$ sudo ufw status numbered</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>ufw allow 8080/tcp</code></td><td>Allow inbound TCP 8080 from anywhere</td></tr>
+      <tr><td><code>ufw allow from IP to any port 22 proto tcp</code></td><td>Allow SSH only from one address (or a CIDR like <code>203.0.113.0/24</code>)</td></tr>
+      <tr><td><code>ufw deny 3306</code></td><td>Explicitly block a port</td></tr>
+      <tr><td><code>ufw status numbered</code> + <code>ufw delete N</code></td><td>List rules with numbers, delete rule N</td></tr>
+      <tr><td><code>ufw reload</code> / <code>ufw disable</code></td><td>Reload rules / switch the firewall off</td></tr>
+    </tbody>
+  </table></div>
+  <p>The order matters: <strong>allow SSH before you enable the firewall</strong>, or you lock yourself
+  out of a remote machine. <code>ufw allow OpenSSH</code> also works, using an application profile.</p>
+
+  <h4>AWS security groups</h4>
+  <p>On EC2 the main firewall is the <strong>security group</strong>, attached to the instance's network
+  interface. It lives outside the machine, so it protects even if the OS firewall is off. Key ideas:</p>
+  <ul>
+    <li><strong>Allow rules only.</strong> You cannot write a deny rule; anything not allowed is dropped.</li>
+    <li><strong>Inbound and outbound rules.</strong> Each rule has a protocol, a port (or range), and a
+    source (inbound) or destination (outbound): a CIDR, or another security group. By default all
+    outbound traffic is allowed and no inbound traffic is.</li>
+    <li><strong>Stateful.</strong> If an inbound request is allowed, the reply is allowed automatically,
+    and the same for outbound requests and their replies. You do not need a rule for the response.</li>
+    <li><strong>Reference groups.</strong> A rule can use another security group as the source: "allow
+    5432 from the web servers' group". It keeps working when instance IPs change.</li>
+  </ul>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Port</th><th>Source</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>SSH</td><td>22</td><td>Your IP, e.g. <code>203.0.113.10/32</code></td><td>Admin access only for you</td></tr>
+      <tr><td>HTTP</td><td>80</td><td><code>0.0.0.0/0</code></td><td>Public web and the Let's Encrypt challenge</td></tr>
+      <tr><td>HTTPS</td><td>443</td><td><code>0.0.0.0/0</code></td><td>Public web</td></tr>
+      <tr><td>PostgreSQL</td><td>5432</td><td>The app's security group (or the app subnet)</td><td>Database reachable only from the app, never from the internet</td></tr>
+    </tbody>
+  </table></div>
+  <p>Security groups are one layer. A <strong>network ACL</strong> is a second, stateless filter at the
+  subnet level (rarely needed at first). Put databases in private subnets without a public IP. Module 5
+  covers VPCs in detail.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: never open a database to 0.0.0.0/0</p>
+    <p>Ports 3306 (MySQL), 5432 (PostgreSQL), 6379 (Redis), 27017 (MongoDB) and 9092 (Kafka) must not
+    be reachable from the whole internet. Allow them only from the app's security group or private subnet;
+    for admin work use an SSH tunnel (<a href="#m1-ssh">Module 1</a>). Allow SSH only from your own IP.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "All traffic from anywhere" while testing</p>
+    <p>Opening everything to find a connection problem usually stays in place for months. Open one port to
+    the smallest source that works. If your home IP changes (most ISPs rotate it), update the rule
+    instead of widening it to <code>0.0.0.0/0</code>; the AWS console offers a "My IP" source for this.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Two firewalls can stack: the security group <em>and</em> <code>ufw</code>. A request must pass
+      both. On Amazon Linux/Ubuntu AMIs the OS firewall is usually off by default, but check.</li>
+      <li>Docker publishes ports by writing its own packet-filter rules and can bypass <code>ufw</code>.
+      A container started with <code>-p 5432:5432</code> may be reachable even if <code>ufw</code> says
+      "deny". Bind to localhost (<code>-p 127.0.0.1:5432:5432</code>) or rely on the security group.</li>
+      <li>Symptom: a blocked port by a firewall that drops packets gives a <em>timeout</em>; a closed port
+      with no listener gives <em>connection refused</em>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you secure an EC2 instance's network access?"</p>
+    <ul>
+      <li>Security group with default deny: 22 only from my IP, 80 and 443 from anywhere, database only
+      from the app group; stateful rules; no public IP for private resources.</li>
+      <li>Add OS-level <code>ufw</code>, key-only SSH, regular updates and least privilege.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-debug-tools">
+  <h3>Network debugging tools and the "my app is not reachable" checklist</h3>
+  <p class="tldr">Test one hop at a time: is the app running, on which address and port, can the machine reach
+  it locally, then check the firewall, the security group, DNS and HTTPS — with <code>ss</code>,
+  <code>curl -v</code>, <code>nc</code>, <code>ping</code> and <code>dig</code>.</p>
+
+  <h4>The tools</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Tool</th><th>Question it answers</th></tr></thead>
+    <tbody>
+      <tr><td><code>ip a</code> (Windows <code>ipconfig</code>)</td><td>What IP addresses does this machine have?</td></tr>
+      <tr><td><code>ping host</code></td><td>Is the host reachable at all, and how fast? (ICMP echo; may be blocked by a firewall, so no reply does not always mean down)</td></tr>
+      <tr><td><code>traceroute host</code> (Windows <code>tracert</code>)</td><td>Which routers does the path pass; where does it stop?</td></tr>
+      <tr><td><code>dig</code> / <code>nslookup</code></td><td>What IP does this name resolve to?</td></tr>
+      <tr><td><code>nc -zv host port</code></td><td>Is this TCP port open from here? (<code>nc</code> = netcat; <code>telnet host port</code> also works)</td></tr>
+      <tr><td><code>curl -v URL</code></td><td>What does the HTTP(S) conversation look like: DNS, connect, TLS, status, headers?</td></tr>
+      <tr><td><code>ss -tulpn</code></td><td>Which process listens on which address and port on this machine?</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Tools in use"><code class="language-shell">$ ping -c 3 shop.example.com
+PING shop.example.com (203.0.113.10) 56(84) bytes of data.
+64 bytes from 203.0.113.10: icmp_seq=1 ttl=52 time=28.4 ms
+64 bytes from 203.0.113.10: icmp_seq=2 ttl=52 time=27.9 ms
+64 bytes from 203.0.113.10: icmp_seq=3 ttl=52 time=28.1 ms
+--- 3 packets transmitted, 3 received, 0% packet loss
+$ nc -zv shop.example.com 443
+Connection to shop.example.com (203.0.113.10) 443 port [tcp/https] succeeded!
+$ nc -zv -w 3 shop.example.com 8080
+nc: connect to shop.example.com (203.0.113.10) port 8080 (tcp) timed out: Operation now in progress
+$ traceroute -n shop.example.com | tail -3
+ 8  198.51.100.1  22.1 ms  22.4 ms  22.0 ms
+ 9  * * *
+10  203.0.113.10  28.3 ms  28.1 ms  28.4 ms
+$ curl -v http://shop.example.com/api/health
+*   Trying 203.0.113.10:80...
+* Connected to shop.example.com (203.0.113.10) port 80
+&gt; GET /api/health HTTP/1.1
+&gt; Host: shop.example.com
+&lt; HTTP/1.1 502 Bad Gateway
+&lt; Server: nginx/1.24.0 (Ubuntu)</code></pre>
+  <p>The last <code>curl -v</code> is informative: DNS worked, TCP connected, and Nginx answered, but it
+  returned <strong>502 Bad Gateway</strong>, which means Nginx could not reach the app behind it. The
+  fault is on the server, not the network. Lines starting with <code>&gt;</code> are what you sent,
+  <code>&lt;</code> what you received, and <code>*</code> are curl's notes.</p>
+
+  <h4>Read the error to find the layer</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>What you see</th><th>Likely meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>Could not resolve host</code></td><td>DNS problem: wrong name, no record yet, resolver issue</td></tr>
+      <tr><td><code>Connection timed out</code></td><td>Packets dropped: firewall, security group, wrong IP, instance stopped</td></tr>
+      <tr><td><code>Connection refused</code></td><td>Host reachable, but nothing listens on that port (app down, wrong port or bind address)</td></tr>
+      <tr><td>Certificate errors</td><td>TLS problem: expired, wrong name, missing chain</td></tr>
+      <tr><td>HTTP 502 / 504</td><td>Proxy is up but the app is down (502) or too slow (504)</td></tr>
+      <tr><td>HTTP 404 / 403 / 500</td><td>The app (or proxy rule) answered: it is an application or routing problem</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The checklist</h4>
+  <p>Work from the server outward. Do not skip steps; each one removes a whole class of causes.</p>
+  <ol class="steps">
+    <li><strong>Is the app running?</strong> <code>systemctl status billing</code> and
+    <code>journalctl -u billing -n 50</code> (crashes, "port in use", database errors). In Docker:
+    <code>docker ps</code> and <code>docker logs</code>.</li>
+    <li><strong>On which address and port is it listening?</strong> <code>sudo ss -tulpn | grep 8080</code>.
+    <code>127.0.0.1:8080</code> is local only; <code>*:8080</code> or <code>0.0.0.0:8080</code> accepts
+    outside connections. Is the port the one you expect (<code>server.port</code>)?</li>
+    <li><strong>Does it answer locally?</strong> <code>curl -i http://localhost:8080/actuator/health</code>
+    on the server. If this fails, the problem is the app, not the network.</li>
+    <li><strong>Is the reverse proxy fine?</strong> <code>sudo nginx -t</code>,
+    <code>systemctl status nginx</code>, <code>tail /var/log/nginx/error.log</code>. Does
+    <code>curl -i http://localhost</code> reach the app through Nginx?</li>
+    <li><strong>OS firewall?</strong> <code>sudo ufw status</code>. Are 80/443 (or the port you use)
+    allowed?</li>
+    <li><strong>Cloud firewall?</strong> The security group's inbound rules: right port, right protocol
+    (TCP), right source (is your IP still the same?). Is the instance in a subnet with an Internet
+    Gateway route, and does it have a public IP?</li>
+    <li><strong>Reachable from outside?</strong> From your laptop: <code>nc -zv IP 443</code> and
+    <code>curl -v http://IP/</code>. Use the IP to skip DNS.</li>
+    <li><strong>DNS?</strong> <code>dig +short shop.example.com</code> returns the right IP? Wait for the
+    TTL after a change, or test with <code>dig @8.8.8.8</code>.</li>
+    <li><strong>HTTPS?</strong> <code>curl -vI https://shop.example.com</code>: valid certificate, right
+    name, not expired? Does port 443 listen in Nginx (<code>ss -tlnp | grep 443</code>)?</li>
+    <li><strong>The application layer.</strong> If a response comes back, read the status code and
+    headers: CORS, wrong context path, authentication, or a 4xx from Spring Security. That is no longer a
+    network problem.</li>
+  </ol>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A[Client request] --> B{DNS resolves?}
+  B -->|no| B1[Fix DNS record]
+  B -->|yes| C{Port reachable?}
+  C -->|timeout| C1[Check firewall and security group]
+  C -->|refused| C2[Check app is running and its bind address]
+  C -->|yes| D{TLS valid?}
+  D -->|no| D1[Fix certificate]
+  D -->|yes| E{HTTP status}
+  E -->|502 or 504| E1[Proxy cannot reach app]
+  E -->|4xx or 5xx| E2[Application problem, read logs]
+  E -->|200| F[Works]
+</pre>
+    <figcaption>Where to look based on how the request fails</figcaption>
+  </figure>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: bisect the path</p>
+    <p>Test from inside out: app on <code>localhost:8080</code>, then Nginx on
+    <code>localhost:80</code>, then the public IP from another machine, then the domain name, then
+    HTTPS. The first step that fails is where the fault is.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: trusting ping</p>
+    <p>Many cloud networks block ICMP, so <code>ping</code> can fail while the website works, and it can
+    succeed while the app is down (the machine is up, the app is not). Test the real thing: the TCP port
+    with <code>nc</code> or the HTTP response with <code>curl</code>.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>It works over the IP but not by name — DNS. It works by name from one network but not another —
+      a stale cache, or an IPv6 (AAAA) record that points nowhere.</li>
+      <li>The app answers on the private IP from inside the VPC but not from the internet — a security
+      group, route table or missing public IP.</li>
+      <li>Everything works from your laptop but a colleague in the office fails — a corporate proxy or
+      firewall blocking unusual ports (use 80/443).</li>
+      <li>Intermittent failures with a load balancer — one of several backends is down; check
+      health checks.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Users say the site is down. How do you troubleshoot?"</p>
+    <ul>
+      <li>Reproduce with <code>curl -v</code>, read the failure (DNS, timeout, refused, TLS, 5xx), then
+      follow the checklist from the server outward: process, listening address, local curl, proxy,
+      firewall, security group, DNS, HTTPS.</li>
+      <li>Say what you read in the logs and that you change one thing at a time.</li>
+    </ul>
+  </div>
+</article>

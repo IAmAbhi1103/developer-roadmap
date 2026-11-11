@@ -1,0 +1,810 @@
+<article class="topic" id="m5-useeffect">
+  <h3>useEffect: side effects and the dependency array</h3>
+  <p class="tldr"><code>useEffect</code> runs code after React has updated the screen, to synchronise
+  your component with something outside React; the dependency array decides when it re-runs and the
+  cleanup function undoes the previous run.</p>
+
+  <h4>What an effect is for</h4>
+  <p>Rendering must be pure, but real apps need to do things that are not pure: call an API, start a
+  timer, subscribe to a WebSocket, change <code>document.title</code>, read the size of a DOM node. These
+  are <strong>side effects</strong>. <code>useEffect</code> is the place for effects that happen
+  <em>because the component appeared or changed</em>. Effects that happen because the user did something
+  (clicked Save) belong in the event handler instead.</p>
+  <p>Think of an effect as: "after rendering, <strong>synchronise</strong> the outside world with the
+  current props and state". It is not a lifecycle method like <code>componentDidMount</code>, even if it
+  can imitate one.</p>
+
+<pre data-title="Syntax"><code class="language-jsx">import { useEffect } from 'react';
+
+useEffect(() =&gt; {
+  // setup: runs after the render is on screen
+  return () =&gt; {
+    // cleanup (optional): runs before the next setup and when the component unmounts
+  };
+}, [dep1, dep2]);   // dependency array</code></pre>
+
+  <h4>When does it run?</h4>
+  <p>React renders your component, commits the changes to the DOM, lets the browser paint, and
+  <em>then</em> runs effects. The dependency array controls re-runs:</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Dependency array</th><th>Runs</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td>Omitted</td><td>After every render</td><td>Rare; almost always a mistake</td></tr>
+      <tr><td><code>[]</code></td><td>Once after the first render (twice in dev StrictMode)</td><td>Connect once, load initial data, add a global listener</td></tr>
+      <tr><td><code>[a, b]</code></td><td>After the first render and whenever <code>a</code> or <code>b</code> changed (compared with <code>Object.is</code>)</td><td>Fetch data for an id, re-subscribe to a room</td></tr>
+    </tbody>
+  </table></div>
+
+<pre data-title="Document title follows state"><code class="language-jsx">function EmployeePage({ employee }) {
+  useEffect(() =&gt; {
+    document.title = `${employee.name} | HR Portal`;
+  }, [employee.name]);                      // re-run only when the name changes
+
+  return &lt;h1&gt;{employee.name}&lt;/h1&gt;;
+}</code></pre>
+
+  <h4>The dependency rule</h4>
+  <p>Every reactive value the effect reads — props, state, and variables or functions declared inside
+  the component — must be listed in the array. Do not lie to React to silence a warning. The
+  <code>react-hooks/exhaustive-deps</code> ESLint rule (already in the Vite template) checks this. A
+  missing dependency gives a <strong>stale closure</strong>: the effect keeps using old values from the
+  render in which it was created (the closure idea from <a href="#m4">Module 4</a>).</p>
+
+<pre data-title="Stale closure bug"><code class="language-jsx">function Ticker() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() =&gt; {
+    const id = setInterval(() =&gt; {
+      console.log(count);            // always logs 0: closure from the first render
+      setCount(count + 1);           // always sets 1
+    }, 1000);
+    return () =&gt; clearInterval(id);
+  }, []);                            // count is missing
+
+  return &lt;p&gt;{count}&lt;/p&gt;;
+}</code></pre>
+
+  <p>Fix it by removing the dependency on <code>count</code> with a functional update
+  (<code>setCount(c =&gt; c + 1)</code>), which makes the empty array correct, or by listing
+  <code>[count]</code> (the interval is then recreated every second, which works but is wasteful).</p>
+
+  <h4>Cleanup</h4>
+  <p>The function you return is the <strong>cleanup</strong>. React calls it before running the effect
+  again (with new values) and when the component unmounts. Use it for everything the effect started:
+  timers, event listeners, subscriptions, WebSocket connections, in-flight requests.</p>
+
+<pre data-title="Window size with cleanup"><code class="language-jsx">function useWindowWidth() {
+  const [width, setWidth] = useState(window.innerWidth);
+
+  useEffect(() =&gt; {
+    function onResize() {
+      setWidth(window.innerWidth);
+    }
+    window.addEventListener('resize', onResize);
+    return () =&gt; window.removeEventListener('resize', onResize);   // no leak
+  }, []);
+
+  return width;
+}</code></pre>
+
+  <p>Order for a change of <code>[roomId]</code>: render with the new value → cleanup of the previous
+  effect (with the <em>old</em> values) → setup with the new values. In StrictMode development, React
+  adds one extra setup → cleanup → setup on mount. If that breaks your component, your cleanup is
+  incomplete; fix the effect.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant R as React
+  participant E as Your effect
+  R->>R: Render 1 and commit
+  R->>E: Setup (deps A)
+  R->>R: Re-render, deps changed to B
+  R->>E: Cleanup (closure of A)
+  R->>E: Setup (deps B)
+  R->>R: Component removed
+  R->>E: Cleanup (closure of B)
+</pre>
+    <figcaption>The life of an effect when its dependencies change and when the component unmounts</figcaption>
+  </figure>
+
+  <h4>Objects and functions as dependencies</h4>
+  <p>React compares dependencies by reference. An object, array or function created inside the component
+  is a <em>new one on every render</em>, so an effect depending on it runs after every render — and if
+  that effect sets state, you get an infinite loop.</p>
+
+<pre data-title="Infinite loop"><code class="language-jsx">function Bad({ userId }) {
+  const [user, setUser] = useState(null);
+  const options = { headers: { 'X-User': userId } };   // new object each render
+
+  useEffect(() =&gt; {
+    fetch('/api/me', options).then((r) =&gt; r.json()).then(setUser);
+  }, [options]);     // changes every render -&gt; fetch -&gt; setUser -&gt; render -&gt; fetch ...
+  return &lt;p&gt;{user?.name}&lt;/p&gt;;
+}</code></pre>
+
+  <p>Fixes: depend on primitives (<code>userId</code>), move the object inside the effect, move constants
+  outside the component, or memoise with <code>useMemo</code> / <code>useCallback</code>. The other
+  classic infinite loop is an effect with <em>no</em> dependency array that sets state.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for useEffect</p>
+    <ul>
+      <li>List every reactive value the effect uses; never suppress the lint rule to "fix" a loop.</li>
+      <li>Return a cleanup for anything that needs one.</li>
+      <li>The effect function itself cannot be <code>async</code> (it would return a Promise instead of
+      a cleanup function). Define an inner <code>async</code> function and call it.</li>
+      <li>Effects must be safe to run twice in development.</li>
+      <li>Do not use effects to respond to user actions; use event handlers.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Effects do not run during server rendering; they run only in the browser.</li>
+      <li><code>useLayoutEffect</code> runs before the browser paints. Use it only to measure the DOM
+      and adjust before the user sees a flicker; it blocks painting.</li>
+      <li>Refs and setters from <code>useState</code>/<code>useReducer</code> are stable and need not be
+      listed (the linter knows), though listing them is harmless.</li>
+      <li>React 19.2 added <code>useEffectEvent</code> for reading the latest value inside an effect
+      without making it a dependency (a chat room that logs the current theme but reconnects only when
+      the room changes). It is new; many codebases do not use it yet.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Empty array <code>[]</code> while the effect uses props or state (stale data, wrong request).</li>
+      <li>No array at all, plus <code>setState</code> in the effect: endless re-render loop.</li>
+      <li>Passing an <code>async</code> function directly to <code>useEffect</code>.</li>
+      <li>No cleanup for <code>setInterval</code> or <code>addEventListener</code>: duplicates pile up,
+      and you see memory leaks and multiple handlers.</li>
+      <li>Putting state-changing logic in an effect that just reacts to another state change (see <a
+      href="#m5-no-effect">you might not need an effect</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain useEffect and its dependency array"</p>
+    <ul>
+      <li>It runs after render to synchronise with external systems; setup returns an optional
+      cleanup.</li>
+      <li>No array: after every render. <code>[]</code>: after mount only. <code>[a]</code>: when
+      <code>a</code> changes.</li>
+      <li>Cleanup runs before the next effect and on unmount; use it for timers, listeners,
+      subscriptions, aborting requests.</li>
+      <li>Missing dependencies cause stale closures; unstable object dependencies cause loops.</li>
+      <li>Runs twice on mount in StrictMode development to verify cleanup.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-fetching-data">
+  <h3>Fetching data with useEffect: loading, error and race conditions</h3>
+  <p class="tldr">A fetch in an effect needs three states (loading, error, data), a cleanup that
+  aborts or ignores outdated responses, and a dependency array containing every input of the request.</p>
+
+  <h4>The basic pattern</h4>
+  <p>Fetching is the most common reason to write an effect. You need three pieces of state, because a
+  request is not a single value: it starts, then ends with data or with an error. This uses the
+  <code>apiClient</code> style from <a href="#m4">Module 4</a>: check <code>response.ok</code>, because
+  <code>fetch</code> only rejects on network failure, not on HTTP 404 or 500.</p>
+
+<pre data-title="EmployeeList.jsx"><code class="language-jsx">import { useEffect, useState } from 'react';
+
+function EmployeeList() {
+  const [employees, setEmployees] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() =&gt; {
+    const controller = new AbortController();
+
+    async function load() {
+      try {
+        setLoading(true);
+        setError(null);
+        const res = await fetch('http://localhost:8080/api/employees', {
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error(`Server returned ${res.status}`);
+        setEmployees(await res.json());
+      } catch (err) {
+        if (err.name === 'AbortError') return;   // cleanup aborted it: not a real error
+        setError(err);
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    }
+    load();
+
+    return () =&gt; controller.abort();   // cancel the request on unmount / re-run
+  }, []);
+
+  if (loading) return &lt;p&gt;Loading employees…&lt;/p&gt;;
+  if (error) return &lt;p role="alert"&gt;Something went wrong: {error.message}&lt;/p&gt;;
+  if (employees.length === 0) return &lt;p&gt;No employees yet.&lt;/p&gt;;
+
+  return (
+    &lt;ul&gt;
+      {employees.map((e) =&gt; &lt;li key={e.id}&gt;{e.name}&lt;/li&gt;)}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+  <h4>The race condition</h4>
+  <p>Suppose a page shows employee details for an <code>id</code> from the URL. The user clicks
+  employee 1, then quickly employee 2. Two requests are in flight. Network responses can arrive in any
+  order. If the response for 1 arrives <em>after</em> the response for 2, the screen shows employee 1's
+  data under employee 2's URL. This is a <strong>race condition</strong>, and it happens in real apps on
+  slow mobile networks.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant U as User
+  participant C as Component
+  participant S as Server
+  U->>C: opens employee 1
+  C->>S: GET /employees/1 (slow)
+  U->>C: opens employee 2
+  C->>S: GET /employees/2 (fast)
+  S-->>C: response for 2
+  C->>C: shows employee 2
+  S-->>C: response for 1 (late)
+  C->>C: shows employee 1 (wrong)
+</pre>
+    <figcaption>A late response overwrites newer data unless you cancel or ignore it</figcaption>
+  </figure>
+
+  <p>The cleanup function solves it. When <code>id</code> changes, React runs the cleanup of the old
+  effect before starting the new one. Two options:</p>
+  <ul>
+    <li><strong>AbortController</strong> cancels the old request, so its promise rejects with an
+    <code>AbortError</code> and never reaches <code>setState</code>. This also saves bandwidth.</li>
+    <li>An <strong>ignore flag</strong> lets the request finish but throws its result away. Use it
+    when the library does not support abort.</li>
+  </ul>
+
+<pre data-title="EmployeeDetails.jsx (ignore flag version)"><code class="language-jsx">function EmployeeDetails({ id }) {
+  const [employee, setEmployee] = useState(null);
+  const [status, setStatus] = useState('loading');   // 'loading' | 'error' | 'success'
+
+  useEffect(() =&gt; {
+    let ignore = false;                 // belongs to THIS run of the effect
+    setStatus('loading');
+
+    fetch(`http://localhost:8080/api/employees/${id}`)
+      .then((res) =&gt; {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((data) =&gt; {
+        if (!ignore) {                  // only the latest effect run may set state
+          setEmployee(data);
+          setStatus('success');
+        }
+      })
+      .catch(() =&gt; {
+        if (!ignore) setStatus('error');
+      });
+
+    return () =&gt; {
+      ignore = true;                    // this run is now outdated
+    };
+  }, [id]);                             // re-fetch when the id changes
+
+  if (status === 'loading') return &lt;p&gt;Loading…&lt;/p&gt;;
+  if (status === 'error') return &lt;p role="alert"&gt;Could not load employee {id}.&lt;/p&gt;;
+  return &lt;h2&gt;{employee.name}&lt;/h2&gt;;
+}</code></pre>
+
+  <p>Why this also fixes StrictMode's double effect in development: the first run's cleanup marks it as
+  ignored (or aborts it), so only the second request updates the state. You may still see two requests
+  in the Network tab; that is expected.</p>
+
+  <h4>A status state instead of three booleans</h4>
+  <p>Several separate booleans (<code>loading</code>, <code>error</code>, <code>success</code>) can
+  contradict each other. One <code>status</code> string, or one state object, makes impossible
+  combinations impossible. The same thinking leads to <code>useReducer</code> (see <a
+  href="#m5-memo-callback">hooks toolbox</a>) and to TanStack Query, which gives you exactly this.</p>
+
+  <h4>Fetching on user action vs on mount</h4>
+  <p>Use an effect to load data a screen <em>needs to show</em>. For data loaded because the user
+  clicked something (search, refresh, submit), call the API directly in the event handler — no effect.
+  And to keep UI responsive while typing in a search box, combine the effect with a <a
+  href="#m5-custom-hooks">debounce hook</a> so you do not call the API on every keystroke.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Situation</th><th>Where to fetch</th></tr></thead>
+    <tbody>
+      <tr><td>Screen opens and needs a list or details</td><td>Effect (or better, TanStack Query)</td></tr>
+      <tr><td>Route param or filter changes</td><td>Effect with that value in the dependency array</td></tr>
+      <tr><td>User clicks Save, Delete, Search</td><td>Event handler</td></tr>
+      <tr><td>Many components need the same data, with caching</td><td><a href="#m5-tanstack-query">TanStack Query</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every fetching effect needs a cleanup</p>
+    <p>Abort the request or set an ignore flag in the cleanup. Without it, fast navigation shows wrong
+    data, and responses arriving after unmount waste work. Always check <code>response.ok</code> and
+    always handle the error branch; an unhandled rejection leaves the user on a spinner forever.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Forgetting to reset <code>loading</code> to <code>true</code> when the id changes, so the old
+      employee shows while the new one loads.</li>
+      <li>Setting <code>loading</code> to false only on success; on an error the spinner stays.</li>
+      <li>Using <code>async</code> directly: <code>useEffect(async () =&gt; {…})</code>.</li>
+      <li>Reading <code>data.name</code> before data arrives: "Cannot read properties of null". Render
+      the loading branch first, or use optional chaining.</li>
+      <li>Treating <code>AbortError</code> as a real error and showing it to the user.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Hand-written fetch effects are fine for learning and for one or two small screens. In real
+    codebases they are repeated in dozens of components, and each copy handles loading, errors, caching
+    and refetching slightly differently. Teams usually switch to <a href="#m5-tanstack-query">TanStack
+    Query</a> or at least a <a href="#m5-custom-hooks">custom <code>useFetch</code> hook</a>. In <a
+    href="#m6">Module 6</a> the same calls go through an Axios instance with the JWT attached.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you fetch data in React and avoid race conditions?"</p>
+    <ul>
+      <li>Fetch in <code>useEffect</code> with the request inputs as dependencies; keep loading, error
+      and data state.</li>
+      <li>Check <code>res.ok</code> since <code>fetch</code> does not reject on HTTP errors.</li>
+      <li>Return a cleanup that calls <code>controller.abort()</code> or sets an <code>ignore</code>
+      flag, so an older response cannot overwrite a newer one.</li>
+      <li>Mention StrictMode's double effect and that libraries like TanStack Query handle caching,
+      deduplication and cancellation for you.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-no-effect">
+  <h3>You might not need an effect</h3>
+  <p class="tldr">Most "state that follows other state" bugs come from effects used where a plain
+  calculation during render or an event handler is the right tool.</p>
+
+  <h4>Why this matters</h4>
+  <p>Effects are an <strong>escape hatch</strong> for talking to things outside React. When you use one
+  only to move data between your own state variables, you add an extra render, risk showing stale
+  values for a frame, and write code that is harder to follow. The React docs have a whole page on this
+  (react.dev, "You Might Not Need an Effect"). Learn these patterns.</p>
+
+  <h4>What an effect really costs</h4>
+  <p>Remember the order of work from <a href="#m5-useeffect">useEffect</a>: React renders your
+  component, commits the result to the DOM, the browser paints, and only then your effect runs. If the
+  effect calls <code>setState</code>, React must render and commit <em>again</em>. So an effect that
+  copies state costs two renders for every change, and for one frame the screen shows the old,
+  inconsistent value (a "flicker"). With a chain of effects, each setting state for the next, you pay
+  one extra render per link and the logic becomes very hard to follow. In development, Strict Mode also
+  runs every effect twice (set up, clean up, set up) to expose missing cleanup, so careless effects
+  show bugs earlier.</p>
+  <p>An easy test: <em>is there an outside system involved?</em> A WebSocket, a timer, the DOM, a
+  browser API, a network request: yes, an effect may be right. Only your own props and state: probably
+  not.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A[State or props change] --> B[Render]
+  B --> C[Commit to DOM]
+  C --> D[Browser paints]
+  D --> E[Effect runs]
+  E -->|setState in effect| B
+</pre>
+    <figcaption>An effect that sets state sends React around the loop a second time</figcaption>
+  </figure>
+
+  <h4>1. Derived state: calculate it during render</h4>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: effect copies data into state</p><pre><code class="language-jsx">const [employees, setEmployees] = useState([]);
+const [search, setSearch] = useState('');
+const [visible, setVisible] = useState([]);
+
+useEffect(() =&gt; {
+  setVisible(
+    employees.filter((e) =&gt; e.name.includes(search)),
+  );
+}, [employees, search]);   // extra render, extra state</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: derive while rendering</p><pre><code class="language-jsx">const [employees, setEmployees] = useState([]);
+const [search, setSearch] = useState('');
+
+const visible = employees.filter((e) =&gt;
+  e.name.includes(search),
+);</code></pre></div>
+  </div>
+  <p>If the calculation is truly expensive, wrap it in <code>useMemo</code>, not an effect.</p>
+
+  <p>The same applies to anything you can compute: a full name from first and last name, a cart total
+  from the items, an "is the form valid" flag from the field values. Store the minimum (the raw
+  fields); compute the rest. Storing both creates two sources of truth that can disagree.</p>
+
+<pre data-title="Cart total: derive, do not store"><code class="language-jsx">function Cart({ items }) {
+  // items: [{ id, name, priceInPaise, qty }] from your API
+  const totalInPaise = items.reduce((sum, i) =&gt; sum + i.priceInPaise * i.qty, 0);
+  const itemCount = items.reduce((n, i) =&gt; n + i.qty, 0);
+
+  return &lt;p&gt;{itemCount} items — ₹{(totalInPaise / 100).toFixed(2)}&lt;/p&gt;;
+}</code></pre>
+
+  <h4>2. Responding to user actions: use the event handler</h4>
+  <p>If something should happen <em>because the user clicked</em>, do it in the click handler. An
+  effect cannot tell why state changed; it only sees that it did.</p>
+
+<pre data-title="Event handler, not effect"><code class="language-jsx">// Wrong: effect watches "submitted" and then posts
+useEffect(() =&gt; {
+  if (submitted) postEmployee(form);
+}, [submitted]);
+
+// Right: do the work where the event happens
+async function handleSubmit(e) {
+  e.preventDefault();
+  await postEmployee(form);
+  showToast('Employee saved');
+}</code></pre>
+
+  <p>The effect version has a nasty extra problem: if <code>form</code> is in the dependency array, a
+  later edit re-posts; if it is left out, the linter complains and you may post stale data. The handler
+  has none of this, because it runs exactly once per click with the current values.</p>
+
+  <h4>3. Resetting state when a prop changes: use a key</h4>
+<pre data-title="Reset with key"><code class="language-jsx">// Wrong: effect resets the form when the employee changes
+useEffect(() =&gt; { setDraft(employee); }, [employee]);
+
+// Right: a new key = a new component instance with fresh state
+&lt;EmployeeForm key={employee.id} employee={employee} /&gt;</code></pre>
+
+  <p>With the effect, the form first renders with the old user's draft for one frame and then jumps to
+  the new one. With the key, React throws the old instance away and mounts a new one, so the first
+  render is already correct. See <a href="#m5-lists-keys">keys</a>.</p>
+
+  <h4>4. Notifying a parent: do it in the handler</h4>
+  <p>Do not call <code>onChange(value)</code> from an effect after setting local state. Call both the
+  local setter and the parent's callback in the same event handler, or lift the state up so there is a
+  single source of truth (see <a href="#m5-lifting-context">Sharing state</a>).</p>
+
+<pre data-title="Toggle that tells its parent"><code class="language-jsx">// Wrong: parent is told one render late, by an effect
+function Toggle({ onChange }) {
+  const [on, setOn] = useState(false);
+  useEffect(() =&gt; { onChange(on); }, [on, onChange]);
+  return &lt;button onClick={() =&gt; setOn(!on)}&gt;{on ? 'ON' : 'OFF'}&lt;/button&gt;;
+}
+
+// Right: update both in the handler (or make the parent own the state)
+function Toggle({ onChange }) {
+  const [on, setOn] = useState(false);
+  function handleClick() {
+    const next = !on;
+    setOn(next);
+    onChange(next);
+  }
+  return &lt;button onClick={handleClick}&gt;{on ? 'ON' : 'OFF'}&lt;/button&gt;;
+}</code></pre>
+
+  <h4>5. Adjusting some state when a prop changes</h4>
+  <p>Sometimes only <em>part</em> of the state should reset when a prop changes (for example, clear the
+  selected row when the list is replaced). The first choice is still to calculate it: store the
+  selected <em>id</em> and derive the selected row with <code>list.find(...)</code>; if the id is no
+  longer in the list, you get <code>undefined</code> and no reset is needed. If you truly must store
+  something from the previous render, React allows calling the component's own <code>setState</code>
+  during render behind a condition (<code>if (prevList !== list) { setPrevList(list); setSelected(null); }</code>).
+  It re-renders immediately without painting the stale value. Use it rarely; derive or use a key first.</p>
+
+  <h4>6. Chains of effects</h4>
+  <p>Avoid effects whose only job is to set state that triggers another effect (country → state →
+  city dropdowns). Compute what you can, and put the real logic in the event handler that started the
+  chain (<code>handleCountryChange</code> sets country and clears state and city together). Each hop
+  in a chain is an extra render and a place for the values to go out of sync.</p>
+
+  <h4>When an effect IS right</h4>
+  <ul>
+    <li>Synchronising with an external system: browser APIs, timers, WebSockets, a non-React widget.</li>
+    <li>Fetching data that a screen needs because it is displayed (ideally through a library).</li>
+    <li>Sending an analytics event because a page was <em>shown</em>.</li>
+    <li>Subscribing to an external store. For this, React provides <code>useSyncExternalStore</code>,
+    which is safer than writing the subscription by hand; libraries such as Redux and Zustand use it.</li>
+  </ul>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>You want to…</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td>Compute a value from props or state</td><td>A variable in render (<code>useMemo</code> if slow)</td></tr>
+      <tr><td>Do something after a click or submit</td><td>Event handler</td></tr>
+      <tr><td>Reset state when an id changes</td><td><code>key</code> on the component</td></tr>
+      <tr><td>Load server data for the screen</td><td>TanStack Query (or an effect)</td></tr>
+      <tr><td>Connect to a WebSocket or add a window listener</td><td><code>useEffect</code> with cleanup</td></tr>
+      <tr><td>Measure a DOM node before paint</td><td><code>useLayoutEffect</code></td></tr>
+      <tr><td>Read a browser or third-party store</td><td><code>useSyncExternalStore</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: an effect that updates its own dependency</p>
+    <p><code>useEffect(() =&gt; { setCount(count + 1); }, [count]);</code> loops forever: the effect
+    changes <code>count</code>, which re-runs the effect. Similar loops happen when the effect sets an
+    object or array that is also in its dependencies, because a new object is never equal to the old
+    one. If you find yourself adding <code>// eslint-disable-line react-hooks/exhaustive-deps</code>
+    to stop a loop, the effect is probably unnecessary.</p>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every effect needs a clear external reason and a cleanup if it subscribes</p>
+    <p>Before writing <code>useEffect</code>, you should be able to name the outside system it
+    synchronises with. If it starts something (listener, timer, connection, request), return a cleanup
+    function that stops it. Dependencies must list every reactive value the effect reads.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: a code-review question</p>
+    <p>Whenever you see <code>useEffect(() =&gt; { setSomething(...) }, [other])</code>, ask: "can
+    <code>something</code> be calculated during render instead?" Usually it can.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Data fetching on mount is a legitimate effect, but it has traps (race conditions, double
+      calls in Strict Mode); see <a href="#m5-fetching-data">fetching data</a>, or avoid the problem
+      with <a href="#m5-tanstack-query">TanStack Query</a>.</li>
+      <li>Do not use an effect to run code "once when the app starts" if the code is not about the
+      component; module-level code (outside the component) or <code>main.jsx</code> is the place.</li>
+      <li>Initialising state from a prop is fine (<code>useState(props.initial)</code>) but later prop
+      changes are ignored; that is why the key pattern exists.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "When should you NOT use useEffect?"</p>
+    <ul>
+      <li>For derived data, for reacting to user events, for resetting state, for chains of effects that
+      set state to trigger other effects.</li>
+      <li>Effects are for syncing with external systems; each unnecessary effect adds a render and a
+      place for bugs.</li>
+      <li>Give one concrete example: filtering a list by search text is a variable in render, not
+      <code>useEffect</code> plus a second state.</li>
+      <li>Mention the alternatives by name: render-time calculation, <code>useMemo</code>, event
+      handlers, <code>key</code>, and a data library for server state.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-memo-callback">
+  <h3>useRef, useMemo, useCallback, useReducer and the rules of hooks</h3>
+  <p class="tldr"><code>useRef</code> holds a value or DOM node without re-rendering,
+  <code>useMemo</code> and <code>useCallback</code> cache a value or function between renders,
+  <code>useReducer</code> organises complex state, and all hooks follow two strict rules.</p>
+
+  <h4>useRef: a box that does not trigger renders</h4>
+  <p><code>useRef(initial)</code> returns an object <code>{ current: initial }</code> that stays the same
+  object for the whole life of the component. Changing <code>ref.current</code> does <strong>not</strong>
+  cause a re-render. It has two uses.</p>
+  <p><strong>1. Reaching a DOM element</strong> (focus an input, scroll to a row, measure size). Pass
+  the ref to the element's <code>ref</code> prop; after the commit, <code>ref.current</code> is the DOM
+  node.</p>
+
+<pre data-title="SearchBox.jsx"><code class="language-jsx">import { useEffect, useRef } from 'react';
+
+function SearchBox() {
+  const inputRef = useRef(null);
+
+  useEffect(() =&gt; {
+    inputRef.current.focus();          // DOM node is available after mount
+  }, []);
+
+  return &lt;input ref={inputRef} placeholder="Search employees" /&gt;;
+}</code></pre>
+
+  <p><strong>2. Keeping a mutable value between renders</strong> that is not part of the UI: a timer
+  id, the previous value of a prop, a "has this run already" flag, the latest callback.</p>
+
+<pre data-title="Stopwatch.jsx"><code class="language-jsx">function Stopwatch() {
+  const [seconds, setSeconds] = useState(0);
+  const timerId = useRef(null);
+
+  function start() {
+    if (timerId.current) return;       // already running
+    timerId.current = setInterval(() =&gt; setSeconds((s) =&gt; s + 1), 1000);
+  }
+  function stop() {
+    clearInterval(timerId.current);
+    timerId.current = null;
+  }
+  useEffect(() =&gt; stop, []);           // cleanup on unmount
+
+  return (
+    &lt;div&gt;
+      &lt;p&gt;{seconds}s&lt;/p&gt;
+      &lt;button onClick={start}&gt;Start&lt;/button&gt;
+      &lt;button onClick={stop}&gt;Stop&lt;/button&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: do not read or write ref.current during render</p>
+    <p>Refs are an escape hatch. Read and write them in event handlers and effects. If a value should
+    appear on screen, it is state, not a ref. In React 19, <code>ref</code> is a normal prop for function
+    components; in 18 you needed <code>forwardRef</code> to pass a ref to a child.</p>
+  </div>
+
+  <h4>useMemo and useCallback: caching between renders</h4>
+  <p><code>useMemo(() =&gt; compute(a, b), [a, b])</code> remembers a calculated <strong>value</strong>
+  and recalculates only when a dependency changes. <code>useCallback(fn, [deps])</code> remembers a
+  <strong>function</strong> (it is shorthand for <code>useMemo(() =&gt; fn, [deps])</code>). Because
+  every render creates new objects and functions, these hooks give you stable references.</p>
+
+<pre data-title="Memoised value and function"><code class="language-jsx">import { memo, useCallback, useMemo, useState } from 'react';
+
+const EmployeeRow = memo(function EmployeeRow({ employee, onSelect }) {
+  console.log('render row', employee.id);
+  return &lt;li onClick={() =&gt; onSelect(employee.id)}&gt;{employee.name}&lt;/li&gt;;
+});
+
+function EmployeeTable({ employees }) {
+  const [query, setQuery] = useState('');
+  const [selectedId, setSelectedId] = useState(null);
+
+  const visible = useMemo(
+    () =&gt; employees.filter((e) =&gt; e.name.toLowerCase().includes(query.toLowerCase())),
+    [employees, query],
+  );
+  const handleSelect = useCallback((id) =&gt; setSelectedId(id), []);
+
+  return (
+    &lt;&gt;
+      &lt;input value={query} onChange={(e) =&gt; setQuery(e.target.value)} /&gt;
+      &lt;p&gt;Selected: {selectedId}&lt;/p&gt;
+      &lt;ul&gt;
+        {visible.map((e) =&gt; (
+          &lt;EmployeeRow key={e.id} employee={e} onSelect={handleSelect} /&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/>
+  );
+}</code></pre>
+
+  <p><code>React.memo(Component)</code> makes a component skip re-rendering when its props are
+  shallow-equal to last time. It only helps if the props are stable: without <code>useCallback</code>,
+  <code>onSelect</code> would be a new function each render and <code>memo</code> would never skip. The
+  three tools work as a team: <code>memo</code> + <code>useCallback</code> + <code>useMemo</code>.</p>
+
+  <h4>When are they worth it?</h4>
+  <ul>
+    <li>A calculation is genuinely expensive (sorting or filtering thousands of rows, heavy maths) —
+    measure first with the React DevTools Profiler.</li>
+    <li>A value is a dependency of an effect or another hook and must stay stable.</li>
+    <li>A function or object is passed to a <code>memo</code>-wrapped child, or into Context value.</li>
+  </ul>
+  <p>Otherwise skip them. They cost memory and make code harder to read, and re-rendering is cheap.
+  Do not wrap everything "just in case". The <strong>React Compiler</strong> (a build plugin that has
+  reached a stable release) can add this memoisation automatically, which is one more reason not to
+  hand-optimise early. Check the React docs before adopting it in a project.</p>
+
+  <h4>useReducer: state with many transitions</h4>
+  <p>When state has several related fields and many ways to change, or the next state depends on
+  complex rules, <code>useReducer</code> puts all transitions in one pure function:
+  <code>(state, action) =&gt; newState</code>. You <strong>dispatch</strong> actions such as
+  <code>{ type: 'added', item }</code>. Java developers: it is a small state machine, and the same idea
+  as Redux (<a href="#m7-state-libraries">Module 7</a>).</p>
+
+<pre data-title="cartReducer.js and Cart.jsx"><code class="language-jsx">function cartReducer(state, action) {
+  switch (action.type) {
+    case 'added': {
+      const found = state.find((i) =&gt; i.id === action.item.id);
+      if (found) {
+        return state.map((i) =&gt; (i.id === found.id ? { ...i, qty: i.qty + 1 } : i));
+      }
+      return [...state, { ...action.item, qty: 1 }];
+    }
+    case 'removed':
+      return state.filter((i) =&gt; i.id !== action.id);
+    case 'cleared':
+      return [];
+    default:
+      throw new Error(`Unknown action: ${action.type}`);
+  }
+}
+
+function Cart() {
+  const [cart, dispatch] = useReducer(cartReducer, []);
+  return (
+    &lt;&gt;
+      &lt;button onClick={() =&gt; dispatch({ type: 'added', item: { id: 1, name: 'Dosa' } })}&gt;
+        Add dosa
+      &lt;/button&gt;
+      &lt;button onClick={() =&gt; dispatch({ type: 'cleared' })}&gt;Clear&lt;/button&gt;
+      &lt;p&gt;{cart.length} different items&lt;/p&gt;
+    &lt;/>
+  );
+}</code></pre>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>useState</code></th><th><code>useReducer</code></th></tr></thead>
+    <tbody>
+      <tr><td>Best for</td><td>Independent, simple values</td><td>Related fields, many update types</td></tr>
+      <tr><td>Update logic lives</td><td>In event handlers</td><td>In one reducer (easy to unit test)</td></tr>
+      <tr><td>Passing updates down</td><td>Several setters</td><td>One stable <code>dispatch</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The rules of hooks</h4>
+  <div class="co co-rule">
+    <p class="co-t">Rule: two rules for every hook (anything named useSomething)</p>
+    <ol>
+      <li><strong>Call hooks only at the top level.</strong> Not inside <code>if</code>, loops, nested
+      functions, event handlers, or after an early <code>return</code>.</li>
+      <li><strong>Call hooks only from React function components or from other (custom) hooks</strong>,
+      never from plain JavaScript functions.</li>
+    </ol>
+  </div>
+  <p>Why? React does not know hook names. It remembers each component's hooks as an ordered list:
+  "first <code>useState</code>, second <code>useEffect</code>…". On every render it expects the same
+  calls in the same order. A conditional hook shifts the order and React hands back the wrong state.
+  The ESLint plugin <code>eslint-plugin-react-hooks</code> catches both rules and is installed in the
+  Vite template.</p>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: hook after an early return</p><pre><code class="language-jsx">function Profile({ user }) {
+  if (!user) return null;
+  const [open, setOpen] = useState(false);   // skipped sometimes
+  return &lt;p&gt;{user.name}&lt;/p&gt;;
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: hooks first, then conditions</p><pre><code class="language-jsx">function Profile({ user }) {
+  const [open, setOpen] = useState(false);
+  if (!user) return null;
+  return &lt;p&gt;{user.name}&lt;/p&gt;;
+}</code></pre></div>
+  </div>
+
+  <p>The error you see: "Rendered more hooks than during the previous render" or "React has detected a
+  change in the order of Hooks".</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Other hooks you will meet</p>
+    <ul>
+      <li><code>useContext</code> (see <a href="#m5-lifting-context">Context</a>), <code>useId</code>
+      (stable unique ids for labels), <code>useTransition</code> and <code>useDeferredValue</code>
+      (keep typing responsive while a heavy list updates), <code>useSyncExternalStore</code> (for
+      library authors), <code>useImperativeHandle</code> (rare).</li>
+      <li>React 19: <code>use</code>, <code>useActionState</code>, <code>useOptimistic</code>,
+      <code>useFormStatus</code>. <code>use</code> is not bound by the "no conditions" rule in the same
+      way as other hooks; read the docs before using it.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Wrapping everything in <code>useMemo</code>/<code>useCallback</code> with no measurement.</li>
+      <li>Using <code>useMemo</code> to <em>guarantee</em> something runs once; it is a performance
+      hint, React may recompute.</li>
+      <li>Putting values that should render in a ref (the UI never updates).</li>
+      <li>Wrong dependency arrays in <code>useCallback</code> giving stale values.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "useMemo vs useCallback? Why the rules of hooks?"</p>
+    <ul>
+      <li><code>useMemo</code> caches a computed value; <code>useCallback</code> caches a function
+      reference. Both depend on a dependency array and only help when stability matters (memo children,
+      effect dependencies) or the work is expensive.</li>
+      <li><code>useRef</code> persists a mutable value without re-rendering and holds DOM nodes.</li>
+      <li>Hooks are stored by call order, so they must run unconditionally at the top level, in
+      components or custom hooks.</li>
+      <li><code>useReducer</code> centralises complex transitions in a pure reducer.</li>
+    </ul>
+  </div>
+</article>

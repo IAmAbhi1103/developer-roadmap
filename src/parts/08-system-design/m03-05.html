@@ -1,0 +1,570 @@
+<article class="topic" id="m3-splitwise">
+  <h3>Design Splitwise (expenses, balances and settling debts)</h3>
+  <p class="tldr">Record each expense as "who paid, how much, split how among whom" using a SplitStrategy (equal, exact, percentage), keep a pairwise balance sheet, and simplify debts by computing each person's net balance and matching the biggest debtor with the biggest creditor.</p>
+
+  <h4>Requirements and assumptions</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>Users add expenses: one person pays; the amount is split among participants.</li>
+    <li>Split types: <strong>equal</strong>, <strong>exact</strong> (each person's amount given), <strong>percentage</strong>.</li>
+    <li>Show who owes whom: per user, and for the whole group.</li>
+    <li>Settle up: record a payment from one user to another.</li>
+    <li>Simplify debts: the fewest transfers that clear everything.</li>
+  </ul>
+  <p><strong>Assumptions:</strong> one currency, amounts in paise as <code>long</code>, one group (extension: many groups), the payer may or may not be in the split, rounding leftovers go to the first participants one paisa at a time so the parts always add up to the total.</p>
+
+  <h4>Entities</h4>
+  <ul>
+    <li><code>Split</code>: a user id and the amount that user owes for one expense.</li>
+    <li><code>SplitStrategy</code>: interface that turns (total, participants, values) into a list of <code>Split</code>s; implementations for equal, exact and percentage. <a href="#m2">Strategy pattern</a>.</li>
+    <li><code>Expense</code>: payer, total, list of splits. Kept for history.</li>
+    <li><code>BalanceSheet</code> (inside the service here): <code>owes[debtor][creditor]</code> in paise.</li>
+    <li><code>Transfer</code>: from, to, amount, the output of simplification.</li>
+  </ul>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class SplitwiseService {
+    -Map~SplitType, SplitStrategy~ strategies
+    -Map owes
+    -List~Expense~ history
+    +addExpense(String payer, long total, SplitType t, List users, List values) void
+    +settle(String from, String to, long amount) void
+    +simplify() List~Transfer~
+  }
+  class SplitStrategy {
+    &lt;&lt;interface&gt;&gt;
+    +split(long total, List users, List values) List~Split~
+  }
+  class EqualSplit
+  class ExactSplit
+  class PercentSplit
+  class Expense {
+    -String payer
+    -long total
+    -List~Split~ splits
+  }
+  class Split {
+    -String userId
+    -long amount
+  }
+  SplitStrategy &lt;|.. EqualSplit
+  SplitStrategy &lt;|.. ExactSplit
+  SplitStrategy &lt;|.. PercentSplit
+  SplitwiseService --> SplitStrategy
+  SplitwiseService "1" o-- "many" Expense
+  Expense "1" *-- "many" Split
+</pre>
+    <figcaption>The split rule is a Strategy; the service just records debts</figcaption>
+  </figure>
+
+  <h4>Key design decisions</h4>
+  <ul>
+    <li><strong>Strategy per split type</strong> so a new type (by shares, by item) is a new class. A small <code>EnumMap</code> from <code>SplitType</code> to strategy plays the role of a factory (<a href="#m2">Module 2</a>).</li>
+    <li><strong>Validate in the strategy:</strong> exact amounts must sum to the total; percentages must sum to 100.</li>
+    <li><strong>Net out opposite debts immediately:</strong> if B owes A 100 and A now owes B 30, store "B owes A 70". The sheet never has both directions for one pair.</li>
+    <li><strong>Simplify on demand</strong> from the sheet, without mutating it. It produces a plan; actually settling is a separate call.</li>
+    <li><strong>Money is <code>long</code> paise.</strong> Splitting Rs 10.00 three ways is 334, 333, 333 paise, not 333.33 each.</li>
+  </ul>
+
+  <h4>Core code: split strategies</h4>
+  <pre data-title="SplitStrategies.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+enum SplitType { EQUAL, EXACT, PERCENT }
+
+record Split(String userId, long amountPaise) { }
+
+interface SplitStrategy {
+    /** values is null for EQUAL; amounts for EXACT; percentages for PERCENT. */
+    List&lt;Split&gt; split(long total, List&lt;String&gt; users, List&lt;Long&gt; values);
+}
+
+class EqualSplit implements SplitStrategy {
+    public List&lt;Split&gt; split(long total, List&lt;String&gt; users, List&lt;Long&gt; values) {
+        int n = users.size();
+        long base = total / n, extra = total % n;
+        List&lt;Split&gt; out = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; n; i++) {
+            out.add(new Split(users.get(i), base + (i &lt; extra ? 1 : 0)));  // spread leftovers
+        }
+        return out;
+    }
+}
+
+class ExactSplit implements SplitStrategy {
+    public List&lt;Split&gt; split(long total, List&lt;String&gt; users, List&lt;Long&gt; values) {
+        long sum = values.stream().mapToLong(Long::longValue).sum();
+        if (sum != total) throw new IllegalArgumentException("Amounts must add up to total");
+        List&lt;Split&gt; out = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; users.size(); i++) out.add(new Split(users.get(i), values.get(i)));
+        return out;
+    }
+}
+
+class PercentSplit implements SplitStrategy {
+    public List&lt;Split&gt; split(long total, List&lt;String&gt; users, List&lt;Long&gt; values) {
+        long pct = values.stream().mapToLong(Long::longValue).sum();
+        if (pct != 100) throw new IllegalArgumentException("Percentages must add up to 100");
+        List&lt;Split&gt; out = new ArrayList&lt;&gt;();
+        long assigned = 0;
+        for (int i = 0; i &lt; users.size(); i++) {
+            long amount = total * values.get(i) / 100;
+            out.add(new Split(users.get(i), amount));
+            assigned += amount;
+        }
+        long left = total - assigned;                       // rounding leftover
+        out.set(0, new Split(out.get(0).userId(), out.get(0).amountPaise() + left));
+        return out;
+    }
+}</code></pre>
+
+  <h4>Core code: the service and debt simplification</h4>
+  <pre data-title="SplitwiseService.java"><code class="language-java">import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
+
+record Transfer(String from, String to, long amountPaise) { }
+
+class SplitwiseService {
+    private final Map&lt;SplitType, SplitStrategy&gt; strategies = new EnumMap&lt;&gt;(SplitType.class);
+    // owes.get(debtor).get(creditor) = amount in paise
+    private final Map&lt;String, Map&lt;String, Long&gt;&gt; owes = new HashMap&lt;&gt;();
+
+    SplitwiseService() {
+        strategies.put(SplitType.EQUAL, new EqualSplit());
+        strategies.put(SplitType.EXACT, new ExactSplit());
+        strategies.put(SplitType.PERCENT, new PercentSplit());
+    }
+
+    synchronized void addExpense(String payer, long total, SplitType type,
+                                 List&lt;String&gt; users, List&lt;Long&gt; values) {
+        if (total &lt;= 0 || users.isEmpty()) throw new IllegalArgumentException("Bad expense");
+        for (Split s : strategies.get(type).split(total, users, values)) {
+            if (!s.userId().equals(payer) &amp;&amp; s.amountPaise() &gt; 0) {
+                addDebt(s.userId(), payer, s.amountPaise());
+            }
+        }
+    }
+
+    synchronized void settle(String from, String to, long amount) {
+        addDebt(to, from, amount);              // paying reduces what 'from' owes 'to'
+    }
+
+    private void addDebt(String debtor, String creditor, long amount) {
+        Map&lt;String, Long&gt; reverse = owes.computeIfAbsent(creditor, k -&gt; new HashMap&lt;&gt;());
+        long back = reverse.getOrDefault(debtor, 0L);       // does creditor owe debtor?
+        if (back &gt;= amount) {
+            if (back == amount) reverse.remove(debtor); else reverse.put(debtor, back - amount);
+        } else {
+            reverse.remove(debtor);
+            owes.computeIfAbsent(debtor, k -&gt; new HashMap&lt;&gt;()).merge(creditor, amount - back, Long::sum);
+        }
+    }
+
+    synchronized long owed(String debtor, String creditor) {
+        return owes.getOrDefault(debtor, Map.of()).getOrDefault(creditor, 0L);
+    }
+
+    private record Bal(String user, long amount) { }
+
+    /** Greedy min cash flow: biggest debtor pays biggest creditor. */
+    synchronized List&lt;Transfer&gt; simplify() {
+        Map&lt;String, Long&gt; net = new HashMap&lt;&gt;();            // + means is owed, - means owes
+        owes.forEach((d, m) -&gt; m.forEach((c, amt) -&gt; {
+            net.merge(d, -amt, Long::sum);
+            net.merge(c, amt, Long::sum);
+        }));
+        PriorityQueue&lt;Bal&gt; creditors = new PriorityQueue&lt;&gt;((a, b) -&gt; Long.compare(b.amount(), a.amount()));
+        PriorityQueue&lt;Bal&gt; debtors = new PriorityQueue&lt;&gt;((a, b) -&gt; Long.compare(b.amount(), a.amount()));
+        net.forEach((u, v) -&gt; {
+            if (v &gt; 0) creditors.add(new Bal(u, v));
+            else if (v &lt; 0) debtors.add(new Bal(u, -v));    // store debt as positive
+        });
+        List&lt;Transfer&gt; plan = new ArrayList&lt;&gt;();
+        while (!creditors.isEmpty() &amp;&amp; !debtors.isEmpty()) {
+            Bal c = creditors.poll(), d = debtors.poll();
+            long pay = Math.min(c.amount(), d.amount());
+            plan.add(new Transfer(d.user(), c.user(), pay));
+            if (c.amount() &gt; pay) creditors.add(new Bal(c.user(), c.amount() - pay));
+            if (d.amount() &gt; pay) debtors.add(new Bal(d.user(), d.amount() - pay));
+        }
+        return plan;
+    }
+}</code></pre>
+  <pre data-title="SplitwiseDemo.java"><code class="language-java">import java.util.List;
+
+public class SplitwiseDemo {
+    public static void main(String[] args) {
+        var sw = new SplitwiseService();
+        sw.addExpense("A", 300_000, SplitType.EQUAL, List.of("A", "B", "C"), null);
+        sw.addExpense("B", 60_000, SplitType.EQUAL, List.of("B", "C"), null);
+        System.out.println("B owes A: " + sw.owed("B", "A"));
+        sw.simplify().forEach(t -&gt;
+            System.out.println(t.from() + " pays " + t.to() + " " + t.amountPaise()));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">B owes A: 100000
+C pays A 120000
+B pays A 80000</code></pre>
+
+  <h4>Why the greedy simplification works</h4>
+  <p>Only each person's <strong>net</strong> balance matters: what they are owed minus what they owe. Net balances always sum to zero. Repeatedly settling the largest debtor against the largest creditor clears at least one person per transfer, so with N people with non-zero balance you need at most N-1 transfers. Finding the true minimum is NP-hard (it is a subset-sum style problem); the greedy result is the standard interview answer and is optimal in most practical cases. Say that sentence aloud; interviewers like it.</p>
+
+  <h4>Concurrency</h4>
+  <p>Group members add expenses at the same time. The service methods are <code>synchronized</code>, so each expense (several balance updates) applies atomically and <code>simplify</code> sees a consistent sheet. For many independent groups, keep one service (or lock) per group so groups never block each other. In a database, an expense and its balance changes go in one transaction; balances are derived or updated with <code>UPDATE ... SET amount = amount + ?</code>.</p>
+
+  <h4>Edge cases</h4>
+  <ul>
+    <li>Payer not in the split: they paid for others; every split row creates a debt to the payer.</li>
+    <li>Payer is the only participant: no debt created.</li>
+    <li>Exact amounts do not add up, or percentages are not 100: reject before changing anything (validation happens before the loop).</li>
+    <li>Rounding: leftover paise are assigned deterministically, so totals always match.</li>
+    <li>Settling more than owed: here it flips the direction (the other person now owes); a stricter version rejects it.</li>
+    <li>Unknown user ids: validate against a user registry.</li>
+  </ul>
+
+  <h4>Extensions interviewers ask</h4>
+  <ul>
+    <li><strong>Groups and friends:</strong> a <code>Group</code> entity with its own balance sheet.</li>
+    <li><strong>Split by shares or by item:</strong> new strategies; no change to the service.</li>
+    <li><strong>Multiple currencies:</strong> a <code>Money</code> type and an exchange-rate service.</li>
+    <li><strong>Edit or delete an expense:</strong> keep expenses as an event log; reverse the old effect, apply the new one.</li>
+    <li><strong>Notifications:</strong> Observer on expense added.</li>
+    <li><strong>Activity feed and history:</strong> read from the <code>history</code> list.</li>
+  </ul>
+  <div class="co co-interview">
+    <p class="co-t">How to present this in 45 minutes</p>
+    <ol>
+      <li>5 min: split types, groups, simplification, currency, rounding.</li>
+      <li>7 min: diagram with SplitStrategy; explain pairwise sheet and netting.</li>
+      <li>20 min: code the three strategies, <code>addExpense</code>, <code>addDebt</code>.</li>
+      <li>8 min: explain and code the greedy simplify; walk the example numbers.</li>
+      <li>5 min: concurrency and the group extension.</li>
+    </ol>
+  </div>
+</article>
+
+<article class="topic" id="m3-bookmyshow">
+  <h3>Design BookMyShow (seat booking without double booking)</h3>
+  <p class="tldr">Model movies, shows and per-show seats; let a user hold seats for a few minutes under a per-show lock (all or nothing), pay, then confirm, so two people can never get the same seat and abandoned checkouts free their seats automatically.</p>
+
+  <h4>Requirements and assumptions</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>Cities have theatres; theatres have screens; screens have seats. A <strong>show</strong> is a movie on a screen at a time.</li>
+    <li>Users browse shows and see seat availability for a show.</li>
+    <li>A user selects seats (up to 6), pays, and receives a booking.</li>
+    <li>Seat prices vary by seat category (for example regular and premium).</li>
+    <li>Unpaid selections expire after 5 minutes.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> no seat is ever sold twice, even with thousands of users on one popular show; booking is all-or-nothing for multiple seats.</p>
+  <p><strong>Assumptions:</strong> payment is an external call that may succeed or fail, no cancellations or refunds in the core code, in-memory model first; the database version is discussed afterwards.</p>
+
+  <h4>Entities</h4>
+  <p>A very common mistake is to put "booked" on the physical <code>Seat</code>. A physical seat exists once; its availability is different for each show. So the booking state lives on <code>ShowSeat</code>, one object per seat per show.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Class</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td><code>Movie</code>, <code>Theatre</code>, <code>Screen</code>, <code>Seat</code></td><td>Mostly static data: titles, locations, layout</td></tr>
+      <tr><td><code>Show</code></td><td>Movie, screen, start time; owns its <code>ShowSeat</code>s and the lock</td></tr>
+      <tr><td><code>ShowSeat</code></td><td>Seat id, price, status AVAILABLE, HELD or BOOKED, hold owner and expiry</td></tr>
+      <tr><td><code>Hold</code></td><td>Temporary claim on seats: id, user, seat ids, expiry, total</td></tr>
+      <tr><td><code>Booking</code></td><td>Confirmed purchase</td></tr>
+      <tr><td><code>BookingService</code></td><td>Orchestrates hold, payment, confirm, release</td></tr>
+      <tr><td><code>PaymentGateway</code></td><td>Interface; the external payment service</td></tr>
+    </tbody>
+  </table></div>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class BookingService {
+    -Map~String, Show~ shows
+    -PaymentGateway payment
+    +checkout(String showId, String userId, List seatIds) Booking
+  }
+  class Show {
+    -String id
+    -Map~String, ShowSeat~ seats
+    -ReentrantLock lock
+    +hold(String user, List ids, Instant now, Duration ttl) Hold
+    +confirm(String holdId, String user, Instant now) Booking
+    +release(String holdId) void
+  }
+  class ShowSeat {
+    -String seatId
+    -long price
+    -SeatStatus status
+    -String heldBy
+    -Instant holdUntil
+  }
+  class Hold
+  class Booking
+  class PaymentGateway {
+    &lt;&lt;interface&gt;&gt;
+    +charge(String user, long amount) boolean
+  }
+  BookingService "1" o-- "many" Show
+  BookingService --> PaymentGateway
+  Show "1" *-- "many" ShowSeat
+  Show ..> Hold : creates
+  Show ..> Booking : creates
+</pre>
+    <figcaption>All seat state for a show lives in the Show object, behind one lock</figcaption>
+  </figure>
+
+  <h4>Key design decisions</h4>
+  <ul>
+    <li><strong>Per-show lock</strong>, not per-seat: a booking touches several seats, and one lock per show makes all-or-nothing trivial and deadlock-free. Different shows never block each other. (The reasoning and alternatives are in <a href="#m3-concurrency-in-lld">Concurrency in LLD</a>.)</li>
+    <li><strong>Hold, pay, confirm:</strong> the lock is held for microseconds (to mark seats HELD), never during payment. Payment takes seconds and must not block other users.</li>
+    <li><strong>Lazy expiry:</strong> a HELD seat whose time passed counts as available. No timer threads are needed for correctness; a cleaner job only tidies memory.</li>
+    <li><strong>Confirm re-checks</strong> the hold owner and the expiry before marking BOOKED.</li>
+    <li>Patterns: a thin Facade (<code>BookingService</code>), a Strategy for seat pricing if rules grow, an Observer to notify users (<a href="#m2">Module 2</a>).</li>
+  </ul>
+
+  <h4>Core code: seats, holds and the show</h4>
+  <pre data-title="ShowModel.java"><code class="language-java">import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.locks.ReentrantLock;
+
+enum SeatStatus { AVAILABLE, HELD, BOOKED }
+
+class SeatUnavailableException extends RuntimeException {
+    SeatUnavailableException(String seatId) { super("Seat " + seatId + " unavailable"); }
+}
+
+record Hold(String id, String userId, List&lt;String&gt; seatIds, Instant expiresAt, long total) { }
+
+record Booking(String id, String userId, String showId, List&lt;String&gt; seatIds, long total) { }
+
+class ShowSeat {
+    final String seatId;
+    final long price;
+    SeatStatus status = SeatStatus.AVAILABLE;
+    String heldBy;                          // hold id
+    Instant holdUntil;
+
+    ShowSeat(String seatId, long price) {
+        this.seatId = seatId;
+        this.price = price;
+    }
+
+    boolean isAvailable(Instant now) {
+        return status == SeatStatus.AVAILABLE
+            || (status == SeatStatus.HELD &amp;&amp; !now.isBefore(holdUntil));   // expired hold
+    }
+}
+
+class Show {
+    static final int MAX_SEATS = 6;
+    private final String id;
+    private final Map&lt;String, ShowSeat&gt; seats = new LinkedHashMap&lt;&gt;();
+    private final Map&lt;String, Hold&gt; holds = new LinkedHashMap&lt;&gt;();
+    private final ReentrantLock lock = new ReentrantLock();
+
+    Show(String id, List&lt;ShowSeat&gt; layout) {
+        this.id = id;
+        layout.forEach(s -&gt; seats.put(s.seatId, s));
+    }
+
+    String id() { return id; }
+
+    Hold hold(String userId, List&lt;String&gt; seatIds, Instant now, Duration ttl) {
+        List&lt;String&gt; ids = new ArrayList&lt;&gt;(new LinkedHashSet&lt;&gt;(seatIds));   // drop duplicates
+        if (ids.isEmpty() || ids.size() &gt; MAX_SEATS) {
+            throw new IllegalArgumentException("Choose 1 to " + MAX_SEATS + " seats");
+        }
+        lock.lock();
+        try {
+            long total = 0;
+            for (String sid : ids) {                              // check ALL first
+                ShowSeat s = seats.get(sid);
+                if (s == null) throw new IllegalArgumentException("No seat " + sid);
+                if (!s.isAvailable(now)) throw new SeatUnavailableException(sid);
+                total += s.price;
+            }
+            Hold h = new Hold(UUID.randomUUID().toString(), userId, ids, now.plus(ttl), total);
+            for (String sid : ids) {                              // then mark ALL
+                ShowSeat s = seats.get(sid);
+                s.status = SeatStatus.HELD;
+                s.heldBy = h.id();
+                s.holdUntil = h.expiresAt();
+            }
+            holds.put(h.id(), h);
+            return h;
+        } finally {
+            lock.unlock();
+        }
+    }
+}</code></pre>
+
+  <h4>Core code: confirm, release and the service</h4>
+  <p>These two methods belong in the same <code>Show</code> class; they are shown separately to keep the blocks short.</p>
+  <pre data-title="ShowConfirm.java"><code class="language-java">// inside class Show
+
+Booking confirm(String holdId, String userId, Instant now) {
+    lock.lock();
+    try {
+        Hold h = holds.get(holdId);
+        if (h == null || !h.userId().equals(userId)) {
+            throw new IllegalStateException("No such hold");
+        }
+        if (!now.isBefore(h.expiresAt())) {
+            releaseLocked(h);
+            throw new IllegalStateException("Hold expired, please select seats again");
+        }
+        for (String sid : h.seatIds()) {
+            ShowSeat s = seats.get(sid);
+            if (!holdId.equals(s.heldBy)) throw new SeatUnavailableException(sid);
+        }
+        for (String sid : h.seatIds()) seats.get(sid).status = SeatStatus.BOOKED;
+        holds.remove(holdId);
+        return new Booking(UUID.randomUUID().toString(), userId, id, h.seatIds(), h.total());
+    } finally {
+        lock.unlock();
+    }
+}
+
+void release(String holdId) {
+    lock.lock();
+    try {
+        Hold h = holds.get(holdId);
+        if (h != null) releaseLocked(h);
+    } finally {
+        lock.unlock();
+    }
+}
+
+private void releaseLocked(Hold h) {
+    for (String sid : h.seatIds()) {
+        ShowSeat s = seats.get(sid);
+        if (h.id().equals(s.heldBy) &amp;&amp; s.status == SeatStatus.HELD) {   // only our own hold
+            s.status = SeatStatus.AVAILABLE;
+            s.heldBy = null;
+            s.holdUntil = null;
+        }
+    }
+    holds.remove(h.id());
+}</code></pre>
+  <pre data-title="BookingService.java"><code class="language-java">import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+
+interface PaymentGateway {
+    boolean charge(String userId, long amountPaise);
+}
+
+class BookingService {
+    private static final Duration HOLD_TTL = Duration.ofMinutes(5);
+    private final Map&lt;String, Show&gt; shows;
+    private final PaymentGateway payment;
+    private final Clock clock;
+
+    BookingService(Map&lt;String, Show&gt; shows, PaymentGateway payment, Clock clock) {
+        this.shows = shows;
+        this.payment = payment;
+        this.clock = clock;
+    }
+
+    Booking checkout(String showId, String userId, List&lt;String&gt; seatIds) {
+        Show show = shows.get(showId);
+        if (show == null) throw new IllegalArgumentException("No show " + showId);
+
+        Hold hold = show.hold(userId, seatIds, Instant.now(clock), HOLD_TTL);  // fast, locked
+        try {
+            if (!payment.charge(userId, hold.total())) {                       // slow, unlocked
+                throw new IllegalStateException("Payment failed");
+            }
+            return show.confirm(hold.id(), userId, Instant.now(clock));
+        } catch (RuntimeException e) {
+            show.release(hold.id());                                           // free the seats
+            throw e;
+        }
+    }
+}</code></pre>
+  <pre data-title="BookMyShowDemo.java"><code class="language-java">import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+
+public class BookMyShowDemo {
+    public static void main(String[] args) {
+        Show show = new Show("S1", List.of(new ShowSeat("A1", 25_000), new ShowSeat("A2", 25_000)));
+        Instant now = Instant.now();
+
+        Hold h = show.hold("u1", List.of("A1", "A2"), now, Duration.ofMinutes(5));
+        try {
+            show.hold("u2", List.of("A2"), now, Duration.ofMinutes(5));
+        } catch (SeatUnavailableException e) {
+            System.out.println("u2: " + e.getMessage());
+        }
+        Booking b = show.confirm(h.id(), "u1", now.plusSeconds(60));
+        System.out.println("Booked " + b.seatIds() + " total " + b.total());
+
+        var service = new BookingService(Map.of("S1", show), (u, amt) -&gt; true, Clock.systemUTC());
+        try {
+            service.checkout("S1", "u3", List.of("A1"));
+        } catch (SeatUnavailableException e) {
+            System.out.println("u3: " + e.getMessage());
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">u2: Seat A2 unavailable
+Booked [A1, A2] total 50000
+u3: Seat A1 unavailable</code></pre>
+
+  <h4>Concurrency: from this code to production</h4>
+  <p>The in-memory <code>ReentrantLock</code> works for one JVM. With several app servers, move the truth into the database (see <a href="#m3-concurrency-in-lld">Concurrency in LLD</a> and <a href="03-sql-databases.html#m5">SQL · Module 5</a>):</p>
+  <pre data-title="seat-hold.sql"><code class="language-sql">-- hold N seats atomically: succeeds only if ALL rows were updated
+UPDATE show_seat
+   SET status = 'HELD', held_by = :holdId, hold_expires_at = now() + interval '5 minutes'
+ WHERE show_id = :show AND seat_id IN (:seats)
+   AND (status = 'AVAILABLE' OR (status = 'HELD' AND hold_expires_at &lt; now()));
+-- if rows updated &lt;&gt; number of seats: ROLLBACK (someone else got one)
+
+-- final guard on the bookings table
+ALTER TABLE booking_seat ADD CONSTRAINT uq_show_seat UNIQUE (show_id, seat_id);</code></pre>
+  <p>Keep that transaction to the one statement above. Never keep it open while the user pays.</p>
+
+  <h4>Edge cases</h4>
+  <ul>
+    <li>Payment succeeds but the hold expired meanwhile: <code>confirm</code> fails; you must refund. Use a longer hold than the payment timeout, and make the refund path explicit.</li>
+    <li>Payment fails or the user closes the tab: release (explicit, or lazily by expiry).</li>
+    <li>Same user clicks twice: duplicate seat ids are removed; the second hold on the same seats fails unless you allow re-hold by the same user.</li>
+    <li>Two users want overlapping seat sets: one wins entirely, the other gets none (no partial holds).</li>
+    <li>Show already started or cancelled: check <code>startTime</code> in <code>hold</code>.</li>
+    <li>Idempotent payment callbacks: confirm by hold id so a repeated callback does not create two bookings (the hold is removed on first confirm).</li>
+  </ul>
+
+  <h4>Extensions interviewers ask</h4>
+  <ul>
+    <li><strong>Cancellation and refund:</strong> a <code>CANCELLED</code> booking state; seats go back to AVAILABLE; refund through the gateway.</li>
+    <li><strong>Dynamic pricing:</strong> a <code>PricingStrategy</code> deciding each <code>ShowSeat</code> price by demand or time.</li>
+    <li><strong>Seat recommendations ("seats together"):</strong> scan a row for a contiguous free block.</li>
+    <li><strong>Search shows by city and movie:</strong> indexes by city and movie id.</li>
+    <li><strong>Waiting list:</strong> Observer: notify when a held seat is released.</li>
+    <li><strong>Coupons and offers:</strong> decorator over the price (<a href="#m2">Module 2</a>).</li>
+  </ul>
+  <div class="co co-interview">
+    <p class="co-t">How to present this in 60 minutes</p>
+    <ol>
+      <li>6 min: requirements; ask about holds, payment, cancellation, scale.</li>
+      <li>8 min: entities; point out Seat vs ShowSeat; diagram.</li>
+      <li>8 min: draw the double-booking timeline and name the fix (lock the check and the mark together).</li>
+      <li>25 min: code <code>Show.hold</code>, <code>confirm</code>, <code>release</code>, <code>checkout</code>.</li>
+      <li>13 min: expiry, payment failure, database version with conditional update and unique constraint.</li>
+    </ol>
+  </div>
+</article>

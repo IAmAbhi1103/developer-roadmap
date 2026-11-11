@@ -1,0 +1,520 @@
+<article class="topic" id="m1-insert-upsert">
+  <h3>INSERT: adding rows, RETURNING and upserts</h3>
+  <p class="tldr"><code>INSERT INTO table (columns) VALUES (…)</code> adds rows; list the columns every time,
+  add many rows in one statement, copy rows with <code>INSERT … SELECT</code>, and use
+  <code>ON CONFLICT</code> (MySQL: <code>ON DUPLICATE KEY UPDATE</code>) to insert-or-update in one atomic
+  step.</p>
+
+  <div class="co co-note">
+    <p class="co-t">Note: examples that change data</p>
+    <p>The statements in this article and the next two change rows. Each example is wrapped in
+    <code>BEGIN; … ROLLBACK;</code>, so the sample database is exactly the same afterwards (the next article
+    explains why this is also the safest habit in real work). The outputs below leave out the
+    <code>BEGIN</code> and <code>ROLLBACK</code> lines that psql prints. In MySQL write
+    <code>START TRANSACTION;</code> instead of <code>BEGIN;</code>.</p>
+  </div>
+
+  <h4>One row, and RETURNING</h4>
+  <pre data-title="Add a department"><code class="language-sql">BEGIN;
+INSERT INTO departments (name, location)
+VALUES ('Finance', 'Delhi')
+RETURNING dept_id, name;
+ROLLBACK;</code></pre>
+  <pre class="out" data-title="Output (first run)"><code class="language-plaintext"> dept_id |  name
+---------+---------
+       5 | Finance
+(1 row)
+
+INSERT 0 1</code></pre>
+  <p>The line <code>INSERT 0 1</code> is the <strong>command tag</strong>: the statement inserted 1 row (the
+  <code>0</code> is a historical object id and is always 0 today). We did not give a <code>dept_id</code>; the
+  identity column generated it. <code>RETURNING</code> (PostgreSQL) sends back any columns of the new row,
+  including generated ones, so you do not need a second <code>SELECT</code>. It also works with
+  <code>UPDATE</code> and <code>DELETE</code>. MySQL has no <code>RETURNING</code>; you call
+  <code>SELECT LAST_INSERT_ID()</code> instead.</p>
+  <p>From Java, ask JDBC for the generated key. The PostgreSQL driver does this with
+  <code>RETURNING</code> behind the scenes:</p>
+  <pre data-title="JDBC (fragment)"><code class="language-java">String sql = "INSERT INTO departments (name, location) VALUES (?, ?)";
+try (PreparedStatement ps = connection.prepareStatement(sql, new String[] {"dept_id"})) {
+    ps.setString(1, "Finance");
+    ps.setString(2, "Delhi");
+    ps.executeUpdate();
+    try (ResultSet keys = ps.getGeneratedKeys()) {
+        if (keys.next()) {
+            System.out.println("New id: " + keys.getInt(1));
+        }
+    }
+}</code></pre>
+
+  <h4>Always list the columns</h4>
+  <p>The column list says which value goes where. Columns you leave out get their <code>DEFAULT</code>, or NULL
+  if there is none. If a left-out column is <code>NOT NULL</code> and has no default, the insert fails.</p>
+  <pre data-title="Defaults fill the gaps"><code class="language-sql">BEGIN;
+INSERT INTO customers (name, email, city)
+VALUES ('Meghna Rao', 'meghna.rao@example.com', 'Chennai')
+RETURNING *;
+ROLLBACK;</code></pre>
+  <pre class="out" data-title="Output (joined_on is the date you run it)"><code class="language-plaintext"> customer_id |    name    |         email          |  city   | phone  |  joined_on
+-------------+------------+------------------------+---------+--------+------------
+           8 | Meghna Rao | meghna.rao@example.com | Chennai | (null) | 2026-10-21
+(1 row)
+
+INSERT 0 1</code></pre>
+  <p>The new customer got the next id, a NULL phone (no default) and today's date (the default expression
+  <code>CURRENT_DATE</code>). You can also write the keyword <code>DEFAULT</code> in the value list
+  (<code>VALUES (DEFAULT, 'Meghna', …)</code>), or insert a row made only of defaults with
+  <code>INSERT INTO t DEFAULT VALUES</code>.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: no column list, values map to table order</p><pre><code class="language-sql">INSERT INTO departments VALUES ('Finance', 'Delhi');
+-- ERROR:  invalid input syntax for type integer: "Finance"</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: name the columns</p><pre><code class="language-sql">INSERT INTO departments (name, location) VALUES ('Finance', 'Delhi');</code></pre></div>
+  </div>
+  <p>Without a column list the values must match <em>all</em> columns in table order. It breaks (or worse,
+  silently stores data in the wrong columns) the day someone adds a column.</p>
+
+  <h4>Many rows in one statement</h4>
+  <p>List several rows after <code>VALUES</code>, separated by commas. The statement is atomic: either every row
+  is inserted or none is. It is also much faster than separate inserts, because there is one round trip and one
+  parse.</p>
+  <pre data-title="Two products at once"><code class="language-sql">BEGIN;
+INSERT INTO products (name, category, price, stock)
+VALUES ('Phone Stand', 'Electronics', 349.00, 80),
+       ('Pencil Box',  'Stationery',   60.00, 200)
+RETURNING product_id, name;
+ROLLBACK;</code></pre>
+  <pre class="out" data-title="Output (first run)"><code class="language-plaintext"> product_id |    name
+------------+-------------
+          8 | Phone Stand
+          9 | Pencil Box
+(2 rows)
+
+INSERT 0 2</code></pre>
+  <p>From Java, use JDBC batching (<code>addBatch()</code> and <code>executeBatch()</code>) for thousands of
+  rows. Note that Hibernate cannot batch inserts for entities whose id is generated by an
+  <code>IDENTITY</code> column, because it needs the id right after every insert (see
+  <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>).</p>
+
+  <h4>INSERT … SELECT: copy rows from a query</h4>
+  <p>Instead of <code>VALUES</code>, feed the insert with a <code>SELECT</code>. This copies, archives or
+  transforms data entirely inside the database. The column types and the column count of the
+  <code>SELECT</code> must match the insert's column list.</p>
+  <pre data-title="Copy the stationery items into a clearance table at 20 percent off"><code class="language-sql">BEGIN;
+CREATE TABLE clearance (
+    product_id INT PRIMARY KEY,
+    name       VARCHAR(100),
+    sale_price NUMERIC(10, 2)
+);
+INSERT INTO clearance (product_id, name, sale_price)
+SELECT product_id, name, ROUND(price * 0.8, 2)
+FROM products
+WHERE category = 'Stationery';
+SELECT * FROM clearance ORDER BY product_id;
+ROLLBACK;</code></pre>
+  <pre class="out" data-title="Output of the INSERT and the final SELECT"><code class="language-plaintext">INSERT 0 2
+
+ product_id |     name     | sale_price
+------------+--------------+------------
+          4 | Notebook A5  |      96.00
+          5 | Gel Pen Pack |      72.00
+(2 rows)</code></pre>
+  <p>To create the table and fill it in one step, use <code>CREATE TABLE clearance AS SELECT …</code>. That
+  form copies the data and column types but no constraints, so add the primary key afterwards.</p>
+
+  <h4>Upsert: insert, or update if it already exists</h4>
+  <p>Sometimes you do not know whether a row exists: importing a customer list, handling a message that may
+  arrive twice, counting page views. Checking with a <code>SELECT</code> first and then inserting is a race
+  condition: two sessions can both see "not found" and both insert. An <strong>upsert</strong> does it in one
+  atomic statement. The email column of <code>customers</code> is unique, so it can decide what "already
+  exists" means:</p>
+  <pre data-title="PostgreSQL: ON CONFLICT"><code class="language-sql">BEGIN;
+INSERT INTO customers (name, email, city)
+VALUES ('Aarav Shah', 'aarav.shah@example.com', 'Navi Mumbai')
+ON CONFLICT (email) DO UPDATE SET city = EXCLUDED.city
+RETURNING customer_id, name, city;
+ROLLBACK;</code></pre>
+  <pre class="out" data-title="Output: the existing row 1 was updated, not duplicated"><code class="language-plaintext"> customer_id |    name    |    city
+-------------+------------+-------------
+           1 | Aarav Shah | Navi Mumbai
+(1 row)
+
+INSERT 0 1</code></pre>
+  <p><code>EXCLUDED</code> is a pseudo-table that holds the row you tried to insert. <code>ON CONFLICT (email)</code>
+  names the unique column (or constraint) that detects the conflict. Use <code>DO NOTHING</code> to skip a
+  duplicate silently (the command tag becomes <code>INSERT 0 0</code>). MySQL spells it differently, and
+  reacts to a conflict on <em>any</em> unique key:</p>
+  <pre data-title="MySQL: ON DUPLICATE KEY UPDATE"><code class="language-sql">INSERT INTO customers (name, email, city)
+VALUES ('Aarav Shah', 'aarav.shah@example.com', 'Navi Mumbai') AS new
+ON DUPLICATE KEY UPDATE city = new.city;</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>PostgreSQL</th><th>MySQL</th><th>Standard SQL</th></tr></thead>
+    <tbody>
+      <tr><td>Insert or update</td><td><code>ON CONFLICT (col) DO UPDATE SET …</code></td>
+      <td><code>ON DUPLICATE KEY UPDATE …</code></td><td><code>MERGE</code> (PostgreSQL 15+; not in MySQL)</td></tr>
+      <tr><td>Skip duplicates</td><td><code>ON CONFLICT DO NOTHING</code></td>
+      <td><code>INSERT IGNORE</code> (also hides other errors; avoid)</td><td><code>MERGE</code> without a matched branch</td></tr>
+      <tr><td>What counts as a conflict</td><td>The unique index or constraint you name</td>
+      <td>Any PRIMARY KEY or UNIQUE index</td><td>The <code>ON</code> condition</td></tr>
+      <tr><td>Use the new values</td><td><code>EXCLUDED.col</code></td>
+      <td>Row alias <code>new.col</code> (older style: <code>VALUES(col)</code>, deprecated)</td><td>Columns of the source</td></tr>
+    </tbody>
+  </table></div>
+  <p>MySQL also has <code>REPLACE INTO</code>, which deletes the old row and inserts a new one. That fires
+  <code>ON DELETE</code> actions and can change ids, so prefer <code>ON DUPLICATE KEY UPDATE</code>.</p>
+
+  <h4>What can go wrong</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Error message (PostgreSQL)</th><th>Cause</th></tr></thead>
+    <tbody>
+      <tr><td><code>null value in column "email" of relation "customers" violates not-null constraint</code></td>
+      <td>A <code>NOT NULL</code> column got no value and has no default</td></tr>
+      <tr><td><code>duplicate key value violates unique constraint "customers_email_key"</code></td>
+      <td>The email already exists (the DETAIL line shows the value)</td></tr>
+      <tr><td><code>insert or update on table "orders" violates foreign key constraint "fk_orders_customer"</code></td>
+      <td>The customer id does not exist in <code>customers</code></td></tr>
+      <tr><td><code>new row for relation "products" violates check constraint "products_price_check"</code></td>
+      <td>For example a negative price</td></tr>
+      <tr><td><code>invalid input syntax for type integer: "abc"</code></td><td>Wrong type for a column</td></tr>
+      <tr><td><code>value too long for type character varying(15)</code></td><td>Text longer than the column allows</td></tr>
+      <tr><td><code>INSERT has more expressions than target columns</code></td><td>Column list and value list differ in length</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: one statement, one outcome</p>
+    <p>A single <code>INSERT</code> is all-or-nothing. If row 99 of 100 violates a constraint, no row is
+    inserted. A multi-row insert inside a transaction is safe to retry.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Ids have gaps.</strong> A sequence never goes back, even when the transaction rolls back or
+      an upsert turns into an update. After running the examples above, the next real department gets id 6 or
+      higher, not 5. Never rely on ids being continuous.</li>
+      <li>With <code>GENERATED ALWAYS AS IDENTITY</code> you cannot supply an id:
+      <code>ERROR:  cannot insert a non-DEFAULT value into column "id"</code>. (Our sample tables use
+      <code>BY DEFAULT</code>, which allows it.)</li>
+      <li>In one upsert statement, two input rows must not hit the same existing row:
+      <code>ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Upserts make jobs and message consumers <strong>idempotent</strong>: processing the same event twice
+    leaves the same result. Counters use
+    <code>ON CONFLICT (page) DO UPDATE SET hits = page_hits.hits + 1</code>. Data imports use
+    <code>INSERT … SELECT</code> from a staging table, usually in a migration script.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>How do you insert if absent, update if present?</b> <code>ON CONFLICT … DO UPDATE</code>
+      (PostgreSQL), <code>ON DUPLICATE KEY UPDATE</code> (MySQL), or <code>MERGE</code>. Explain why
+      "<code>SELECT</code> then <code>INSERT</code>" is a race condition.</li>
+      <li><b>How do you get the generated id?</b> <code>RETURNING</code>, <code>LAST_INSERT_ID()</code>, or
+      JDBC <code>getGeneratedKeys()</code>.</li>
+      <li><b>Why list the column names?</b> The statement keeps working when the table gets new columns.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-update-delete">
+  <h3>UPDATE and DELETE</h3>
+  <p class="tldr"><code>UPDATE … SET … WHERE</code> changes existing rows and <code>DELETE FROM … WHERE</code>
+  removes them. The <code>WHERE</code> clause decides which rows are touched; without it, every row is. Check the
+  row count in the command tag after every change.</p>
+
+  <h4>UPDATE</h4>
+  <p>The syntax is <code>UPDATE table SET column = expression [, column = expression …] WHERE condition</code>.
+  The expression can use the row's current values, so you can calculate the new value from the old one. Here is a
+  10 percent raise for the Sales department (inside a transaction that is rolled back, as in the previous
+  article):</p>
+  <pre data-title="A raise for Sales"><code class="language-sql">BEGIN;
+UPDATE employees
+SET salary = salary * 1.10
+WHERE dept_id = 2
+RETURNING emp_id, first_name, salary;
+ROLLBACK;</code></pre>
+  <pre class="out" data-title="Output (RETURNING rows can come in any order)"><code class="language-plaintext"> emp_id | first_name |  salary
+--------+------------+-----------
+      3 | Ananya     | 165000.00
+      9 | Karan      | 176000.00
+     10 | Neha       |  82500.00
+(3 rows)
+
+UPDATE 3</code></pre>
+  <p><code>UPDATE 3</code> tells you three rows changed. If you expected three, good. If it says 12, you forgot
+  the <code>WHERE</code>. An <code>UPDATE</code> that matches no row is not an error; it prints
+  <code>UPDATE 0</code>.</p>
+  <ul>
+    <li><strong>Several columns:</strong> <code>SET salary = 90000, dept_id = 2</code>.</li>
+    <li><strong>NULL and defaults:</strong> <code>SET phone = NULL</code> and <code>SET stock = DEFAULT</code>.</li>
+    <li><strong>All right-hand sides use the old row.</strong> <code>SET a = b, b = a</code> swaps the two
+    values; the second assignment does not see the first.</li>
+    <li><strong>A subquery can supply a value:</strong>
+    <code>SET salary = (SELECT MAX(salary) FROM employees WHERE dept_id = 2)</code> as long as it returns one
+    row and one column.</li>
+  </ul>
+
+  <h4>UPDATE using another table</h4>
+  <p>Often the rows to change are chosen by looking at another table: "give a 5 percent raise to everyone who
+  works on the Payments Platform project (id 1)". The portable way is a subquery:</p>
+  <pre data-title="Portable: subquery (works in PostgreSQL and MySQL)"><code class="language-sql">UPDATE employees
+SET salary = salary * 1.05
+WHERE emp_id IN (SELECT emp_id FROM employee_projects WHERE project_id = 1);</code></pre>
+  <p>This changes three rows: Priya becomes 157500.00, Rahul 157500.00 and Arjun 115500.00. PostgreSQL also has
+  <code>UPDATE … FROM</code>, MySQL has <code>UPDATE … JOIN</code>:</p>
+  <pre data-title="PostgreSQL: UPDATE ... FROM"><code class="language-sql">UPDATE employees AS e
+SET salary = e.salary * 1.05
+FROM employee_projects AS ep
+WHERE ep.emp_id = e.emp_id
+  AND ep.project_id = 1;</code></pre>
+  <pre data-title="MySQL: UPDATE ... JOIN"><code class="language-sql">UPDATE employees AS e
+JOIN employee_projects AS ep ON ep.emp_id = e.emp_id
+SET e.salary = e.salary * 1.05
+WHERE ep.project_id = 1;</code></pre>
+  <div class="co co-exc">
+    <p class="co-t">Edge case: one target row, many matching rows</p>
+    <p>If the join finds several source rows for one employee (for example an employee on projects 1 and 2 when
+    you remove the <code>project_id</code> filter), PostgreSQL applies <strong>only one</strong> of them,
+    chosen arbitrarily, and the employee is updated once, not twice. A subquery with <code>IN</code> never has
+    this surprise.</p>
+  </div>
+
+  <h4>DELETE</h4>
+  <p><code>DELETE FROM table WHERE condition</code> removes the matching rows. Rows that reference the deleted
+  row through a foreign key are handled by the foreign key's <code>ON DELETE</code> rule (see
+  <a href="#m1-foreign-keys">Foreign key actions</a>). In the sample database, items of an order are deleted
+  together with the order:</p>
+  <pre data-title="Delete the cancelled order"><code class="language-sql">BEGIN;
+DELETE FROM orders WHERE status = 'CANCELLED' RETURNING order_id, customer_id;
+SELECT COUNT(*) AS items_left FROM order_items;
+ROLLBACK;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> order_id | customer_id
+----------+-------------
+        4 |           3
+(1 row)
+
+DELETE 1
+
+ items_left
+------------
+         18
+(1 row)</code></pre>
+  <p>Order 4 had one item, so <code>order_items</code> went from 19 rows to 18 without you deleting anything
+  there: <code>fk_items_order</code> is declared with <code>ON DELETE CASCADE</code>. The opposite case is a
+  customer who has orders, where the default rule refuses the delete:</p>
+  <pre class="out" data-title="DELETE FROM customers WHERE customer_id = 1;"><code class="language-plaintext">ERROR:  update or delete on table "customers" violates foreign key constraint
+        "fk_orders_customer" on table "orders"
+DETAIL:  Key (customer_id)=(1) is still referenced from table "orders".</code></pre>
+  <p>Deleting rows by looking at another table works like <code>UPDATE</code>: use a subquery
+  (<code>WHERE order_id IN (SELECT …)</code>), PostgreSQL's <code>DELETE … USING</code>, or MySQL's
+  <code>DELETE t FROM t JOIN …</code>.</p>
+
+  <h4>Check how many rows changed</h4>
+  <p>Every <code>UPDATE</code> and <code>DELETE</code> reports a count (<code>UPDATE 3</code>,
+  <code>DELETE 1</code>). Compare it with what you expected before you commit. In Java,
+  <code>executeUpdate()</code> returns the same number, and code can use it: an
+  <code>UPDATE … WHERE id = ? AND version = ?</code> that returns 0 means somebody else changed the row first
+  (this is how optimistic locking works).</p>
+
+  <h4>Soft delete: mark instead of remove</h4>
+  <p>Many applications never run <code>DELETE</code> on business data. They add a column such as
+  <code>deleted_at TIMESTAMPTZ</code> and set it, so the row can be restored and the history is kept:</p>
+  <pre data-title="Soft delete (sketch)"><code class="language-sql">ALTER TABLE customers ADD COLUMN deleted_at TIMESTAMPTZ;
+
+UPDATE customers SET deleted_at = NOW() WHERE customer_id = 6;
+
+SELECT * FROM customers WHERE deleted_at IS NULL;   -- every query must remember this</code></pre>
+  <p>The costs: every query must filter <code>deleted_at IS NULL</code> (views or Hibernate's soft-delete
+  support can hide that), unique constraints get awkward (a deleted email blocks a new signup unless you use
+  a partial unique index such as <code>CREATE UNIQUE INDEX … ON customers (email) WHERE deleted_at IS
+  NULL</code>), and personal data must still be erased when privacy rules require it.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every UPDATE and DELETE needs a WHERE you have checked</p>
+    <p>Write the <code>WHERE</code> first, run it as a <code>SELECT</code>, and only then turn it into an
+    <code>UPDATE</code> or <code>DELETE</code> (see <a href="#m1-safe-changes">Changing data safely</a>).</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a forgotten or wrong WHERE</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: everyone gets the raise</p><pre><code class="language-sql">UPDATE employees SET salary = salary * 1.10;      -- UPDATE 12</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: only Sales</p><pre><code class="language-sql">UPDATE employees SET salary = salary * 1.10 WHERE dept_id = 2;   -- UPDATE 3</code></pre></div>
+    </div>
+    <p>The command tag is your alarm bell: 12 instead of 3. A similar bug is
+    <code>WHERE dept_id = 2 OR salary &gt; 100000</code> written when you meant <code>AND</code>; it matches far
+    more rows than you think.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Errors and limits</p>
+    <ul>
+      <li>An update can violate a constraint: <code>SET salary = -5</code> fails with
+      <code>new row for relation "employees" violates check constraint "employees_salary_check"</code>.</li>
+      <li>A subquery in <code>SET</code> that returns two rows fails:
+      <code>ERROR:  more than one row returned by a subquery used as an expression</code>.</li>
+      <li>MySQL allows <code>UPDATE … LIMIT n</code> and <code>DELETE … LIMIT n</code>; PostgreSQL does not.
+      To limit a delete in PostgreSQL use <code>WHERE ctid IN (SELECT ctid … LIMIT n)</code> or a key
+      subquery.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>What happens if you forget <code>WHERE</code> in an <code>UPDATE</code>?</b> Every row changes.
+      Describe the safe workflow: <code>SELECT</code> first, transaction, check the count, then commit.</li>
+      <li><b>Hard delete vs soft delete?</b> Hard delete removes the row for good; soft delete sets a flag or
+      timestamp, keeps history, but every query must filter it.</li>
+      <li><b>How do you update one table using another?</b> A subquery, <code>UPDATE … FROM</code>
+      (PostgreSQL) or <code>UPDATE … JOIN</code> (MySQL).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-safe-changes">
+  <h3>Changing data safely: transactions, TRUNCATE and DROP</h3>
+  <p class="tldr">Databases do not ask "are you sure?". Look first with a <code>SELECT</code>, change inside a
+  transaction, check the row count, then <code>COMMIT</code> or <code>ROLLBACK</code>. Know the difference
+  between <code>DELETE</code> (some rows), <code>TRUNCATE</code> (all rows, fast) and <code>DROP TABLE</code>
+  (the table itself).</p>
+
+  <h4>The risk</h4>
+  <p>Most tools run in <strong>autocommit</strong> mode: every statement is committed the moment it succeeds.
+  An <code>UPDATE employees SET dept_id = 1</code> without <code>WHERE</code> moves all twelve employees to
+  Engineering, and there is no undo button. Your only way back is a backup. People lose real data this way, so
+  experienced developers follow a routine.</p>
+
+  <h4>The safe workflow</h4>
+  <ol class="steps">
+    <li><strong>Look first.</strong> Write the <code>WHERE</code> clause as a <code>SELECT</code> and check the
+    rows and the count.</li>
+    <li><strong>Open a transaction</strong> with <code>BEGIN;</code>.</li>
+    <li><strong>Run the change</strong> with exactly the same <code>WHERE</code>. Read the command tag.</li>
+    <li><strong>Verify</strong> with another <code>SELECT</code>.</li>
+    <li><strong><code>COMMIT;</code></strong> if everything is as expected, <strong><code>ROLLBACK;</code></strong>
+    if not.</li>
+  </ol>
+  <pre data-title="A careful session in psql"><code class="language-shell">learn_sql=&gt; SELECT emp_id, first_name, salary FROM employees WHERE dept_id = 3 ORDER BY emp_id;
+ emp_id | first_name |  salary
+--------+------------+-----------
+      4 | Sunita     | 120000.00
+     11 | Farhan     |  65000.00
+     12 | Isha       |  55000.00
+(3 rows)
+
+learn_sql=&gt; BEGIN;
+BEGIN
+learn_sql=*&gt; UPDATE employees SET salary = salary * 1.10 WHERE dept_id = 3;
+UPDATE 3
+learn_sql=*&gt; SELECT emp_id, first_name, salary FROM employees WHERE dept_id = 3 ORDER BY emp_id;
+ emp_id | first_name |  salary
+--------+------------+-----------
+      4 | Sunita     | 132000.00
+     11 | Farhan     |  71500.00
+     12 | Isha       |  60500.00
+(3 rows)
+
+learn_sql=*&gt; ROLLBACK;
+ROLLBACK</code></pre>
+  <p>The <code>*</code> in the prompt (<code>learn_sql=*&gt;</code>) means "a transaction is open". The count
+  <code>UPDATE 3</code> matched the three rows seen in step 1, so this is a plan you could have committed. After
+  <code>ROLLBACK</code> the salaries are back to the old values. If a statement fails inside a transaction,
+  PostgreSQL marks the whole transaction as failed (prompt <code>learn_sql=!&gt;</code>) and answers every later
+  command with <code>ERROR:  current transaction is aborted, commands ignored until end of transaction
+  block</code>; the only way out is <code>ROLLBACK</code>.</p>
+
+  <h4>Transactions in short</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>BEGIN</code> (or <code>START TRANSACTION</code>)</td><td>Start a group of statements that succeed or fail together</td></tr>
+      <tr><td><code>COMMIT</code></td><td>Make all changes permanent and visible to others</td></tr>
+      <tr><td><code>ROLLBACK</code></td><td>Undo every change since <code>BEGIN</code></td></tr>
+      <tr><td><code>SAVEPOINT name</code> / <code>ROLLBACK TO name</code></td><td>Undo only part of a transaction</td></tr>
+    </tbody>
+  </table></div>
+  <p>PostgreSQL can roll back <code>CREATE TABLE</code>, <code>ALTER TABLE</code> and <code>DROP TABLE</code>
+  too. MySQL cannot: DDL statements commit the open transaction automatically, so there is no undo for them.
+  Transactions, ACID and isolation levels are explained in <a href="#m5">Module 5</a>; in Spring Boot you get
+  them with <code>@Transactional</code>.</p>
+
+  <h4>Where autocommit hides</h4>
+  <ul>
+    <li><strong>psql:</strong> autocommit is on. <code>\set AUTOCOMMIT off</code> makes it open a transaction
+    for you (then you must <code>COMMIT</code>).</li>
+    <li><strong>DBeaver and MySQL Workbench:</strong> an auto-commit toggle sits in the toolbar. Switch to manual
+    commit when you work on important data.</li>
+    <li><strong>JDBC:</strong> <code>connection.setAutoCommit(false)</code> starts a transaction; the default is
+    <code>true</code>.</li>
+    <li><strong>MySQL safe mode:</strong> start the client with <code>mysql --safe-updates</code> (Workbench has a
+    "Safe Updates" option). <code>UPDATE</code> and <code>DELETE</code> without a key condition in
+    <code>WHERE</code> or a <code>LIMIT</code> are then rejected. PostgreSQL has no built-in equivalent.</li>
+  </ul>
+
+  <h4>DELETE vs TRUNCATE vs DROP</h4>
+  <p>Three ways to get rid of data, and one of the most common interview questions:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>DELETE</code></th><th><code>TRUNCATE</code></th><th><code>DROP TABLE</code></th></tr></thead>
+    <tbody>
+      <tr><td>Removes</td><td>The rows you choose, or all</td><td>All rows</td><td>The whole table: rows, columns, indexes, constraints</td></tr>
+      <tr><td><code>WHERE</code></td><td>Yes</td><td>No</td><td>No</td></tr>
+      <tr><td>Group</td><td>DML</td><td>DDL</td><td>DDL</td></tr>
+      <tr><td>Speed on a big table</td><td>Slow (row by row)</td><td>Very fast</td><td>Very fast</td></tr>
+      <tr><td>Roll back</td><td>Yes</td><td>PostgreSQL yes, MySQL no</td><td>PostgreSQL yes, MySQL no</td></tr>
+      <tr><td>Row triggers</td><td>Fire</td><td>Do not fire</td><td>n/a</td></tr>
+      <tr><td>Id counter</td><td>Unchanged</td><td>MySQL resets it; PostgreSQL only with <code>RESTART IDENTITY</code></td><td>Gone with the table</td></tr>
+      <tr><td>Referenced by a foreign key</td><td>Allowed if no child rows remain</td><td>Refused (PostgreSQL: unless <code>CASCADE</code>)</td><td>Refused unless <code>CASCADE</code> (PostgreSQL)</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Syntax"><code class="language-sql">DELETE FROM clearance;                                  -- all rows, row by row, can use WHERE
+TRUNCATE TABLE clearance;                               -- all rows, fast, no WHERE
+TRUNCATE TABLE orders, order_items RESTART IDENTITY;    -- PostgreSQL: several tables, reset ids
+TRUNCATE TABLE orders CASCADE;                          -- PostgreSQL: also empties tables that reference it!
+DROP TABLE clearance;                                   -- error if it does not exist
+DROP TABLE IF EXISTS clearance;                         -- no error if it does not exist</code></pre>
+  <p>Why is <code>DELETE</code> slow on a big table? It removes row by row, writes each change to the log,
+  fires triggers, and in PostgreSQL leaves dead row versions behind for <code>VACUUM</code> to clean.
+  <code>TRUNCATE</code> throws away the table's files in one step. The price is a strong lock (it waits for,
+  and blocks, every other query on that table) and the missing <code>WHERE</code>.
+  <code>TRUNCATE</code> on a table that other tables reference fails in both databases
+  (<code>ERROR:  cannot truncate a table referenced in a foreign key constraint</code>); PostgreSQL's
+  <code>CASCADE</code> option "fixes" it by truncating the child tables too, which is rarely what you want.</p>
+
+  <h4>Keep a way back</h4>
+  <ul>
+    <li>Before a risky change on real data, copy the table:
+    <code>CREATE TABLE employees_backup AS SELECT * FROM employees;</code> (drop it later).</li>
+    <li>Real systems rely on full backups (<code>pg_dump</code>, <code>mysqldump</code>) and point-in-time
+    recovery, and on <strong>least privilege</strong>: analysts get read-only accounts.</li>
+    <li>Schema and data changes in production go through reviewed migration scripts (Flyway or Liquibase), not
+    through someone's SQL window.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: read the row count before you commit</p>
+    <p>The count in <code>UPDATE n</code> or <code>DELETE n</code> must match what the preview
+    <code>SELECT</code> showed. If it does not, <code>ROLLBACK</code>.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: DROP or TRUNCATE on the wrong database</p>
+    <p>The window title says <code>production</code>, you thought it said <code>learn_sql</code>. Check
+    <code>\conninfo</code> before destructive commands, colour production connections red in DBeaver or
+    pgAdmin, and never keep production credentials in a tool you use for practice.</p>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: type the WHERE before the verb</p>
+    <p>Write <code>… WHERE emp_id = 7</code> first, then move the cursor to the start and type
+    <code>DELETE FROM employees</code>. If you press Enter by accident halfway, there is no incomplete
+    destructive statement.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>DELETE vs TRUNCATE vs DROP:</b> some or all rows with <code>WHERE</code> and logging, versus all
+      rows quickly without <code>WHERE</code>, versus the table itself. Add the rollback difference between
+      PostgreSQL and MySQL, and that <code>TRUNCATE</code> is DDL.</li>
+      <li><b>How do you protect against a bad update?</b> Preview with <code>SELECT</code>, use a transaction,
+      check the count, keep backups, use least-privilege accounts.</li>
+      <li><b>Can DDL be rolled back?</b> In PostgreSQL yes; in MySQL no, it commits implicitly.</li>
+    </ul>
+  </div>
+</article>

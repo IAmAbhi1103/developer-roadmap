@@ -1,0 +1,525 @@
+<article class="topic" id="m2-validation">
+  <h3>Bean Validation: @Valid, @NotBlank, @Email, @Size and custom constraints</h3>
+  <p class="tldr">Bean Validation lets you declare rules with annotations on DTO fields; adding @Valid to a @RequestBody makes Spring check them before your method runs and throw an exception, which you turn into a clean 400.</p>
+
+  <p>Never trust data from outside. A client can send an empty name, a negative price, an email without <code>@</code> or a 10 MB string. <strong>Bean Validation</strong> (the Jakarta Validation standard; Hibernate Validator is the implementation Spring Boot uses) lets you write these rules once, as annotations, next to the fields. Add the starter and you are ready:</p>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-validation&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <p>The annotations live in the package <code>jakarta.validation.constraints</code> (older Boot 2 projects used <code>javax.validation</code>).</p>
+
+  <h4>The first example</h4>
+  <pre data-title="CreateProductRequest.java"><code class="language-java">import jakarta.validation.constraints.*;
+
+public record CreateProductRequest(
+
+        @NotBlank(message = "name is required")
+        @Size(max = 120, message = "name must be at most 120 characters")
+        String name,
+
+        @NotBlank @Pattern(regexp = "[A-Z]{2}-\\d{3,6}", message = "sku looks like MS-100")
+        String sku,
+
+        @NotNull @Positive @Digits(integer = 8, fraction = 2)
+        BigDecimal price,
+
+        @PositiveOrZero
+        int stock) {}</code></pre>
+  <pre data-title="ProductController.java"><code class="language-java">@PostMapping
+public ResponseEntity&lt;ProductResponse&gt; create(
+        @Valid @RequestBody CreateProductRequest request) {   // @Valid starts the check
+    ...
+}</code></pre>
+  <p>With <code>@Valid</code>, Spring validates the object right after Jackson builds it. If any rule fails, the method is <strong>not called</strong>; a <code>MethodArgumentNotValidException</code> is thrown and the response is 400. Without <code>@Valid</code> the annotations are simply ignored. That is the number-one "my validation does nothing" cause.</p>
+
+  <h4>The annotation table</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation</th><th>Rule</th><th>Applies to</th></tr></thead>
+    <tbody>
+      <tr><td><code>@NotNull</code></td><td>Not <code>null</code> (empty is fine)</td><td>any type</td></tr>
+      <tr><td><code>@NotEmpty</code></td><td>Not null and length/size &gt; 0</td><td>String, collection, map, array</td></tr>
+      <tr><td><code>@NotBlank</code></td><td>Not null and at least one non-whitespace character</td><td>String only</td></tr>
+      <tr><td><code>@Size(min, max)</code></td><td>Length of a string or size of a collection</td><td>String, collection, map, array</td></tr>
+      <tr><td><code>@Min</code> / <code>@Max</code></td><td>Numeric lower / upper bound (inclusive)</td><td>integers, <code>BigDecimal</code></td></tr>
+      <tr><td><code>@DecimalMin</code> / <code>@DecimalMax</code></td><td>Same, with a decimal string; can be exclusive</td><td>numbers, <code>BigDecimal</code></td></tr>
+      <tr><td><code>@Positive</code> / <code>@PositiveOrZero</code></td><td>&gt; 0 / ≥ 0</td><td>numbers</td></tr>
+      <tr><td><code>@Negative</code> / <code>@NegativeOrZero</code></td><td>&lt; 0 / ≤ 0</td><td>numbers</td></tr>
+      <tr><td><code>@Digits(integer, fraction)</code></td><td>At most that many digits</td><td>number types, numeric strings</td></tr>
+      <tr><td><code>@Email</code></td><td>Looks like an email address</td><td>String</td></tr>
+      <tr><td><code>@Pattern(regexp)</code></td><td>Matches a regular expression</td><td>String</td></tr>
+      <tr><td><code>@Past</code> / <code>@PastOrPresent</code></td><td>Date is in the past</td><td><code>java.time</code> types</td></tr>
+      <tr><td><code>@Future</code> / <code>@FutureOrPresent</code></td><td>Date is in the future</td><td><code>java.time</code> types</td></tr>
+      <tr><td><code>@AssertTrue</code> / <code>@AssertFalse</code></td><td>A boolean must be true / false</td><td>boolean (often on a helper method)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Hibernate Validator adds extras such as <code>@Length</code>, <code>@Range</code> and <code>@URL</code>; they are not part of the standard and may be deprecated, so prefer the standard ones.</p>
+
+  <h4>@NotNull vs @NotEmpty vs @NotBlank</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Input</th><th><code>@NotNull</code></th><th><code>@NotEmpty</code></th><th><code>@NotBlank</code></th></tr></thead>
+    <tbody>
+      <tr><td><code>null</code></td><td>fails</td><td>fails</td><td>fails</td></tr>
+      <tr><td><code>""</code> (empty)</td><td>passes</td><td>fails</td><td>fails</td></tr>
+      <tr><td><code>"   "</code> (spaces)</td><td>passes</td><td>passes</td><td>fails</td></tr>
+      <tr><td><code>"Mouse"</code></td><td>passes</td><td>passes</td><td>passes</td></tr>
+    </tbody>
+  </table></div>
+  <p>Use <code>@NotBlank</code> for text, <code>@NotEmpty</code> for lists that must have an element, <code>@NotNull</code> for numbers, dates and objects.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Most annotations treat null as valid</p>
+    <p>Only the three <code>Not…</code> annotations (and <code>@AssertTrue</code> in some cases) reject <code>null</code>. <code>@Size(min = 3)</code>, <code>@Email</code>, <code>@Pattern</code> and <code>@Positive</code> all <em>pass</em> a <code>null</code> value, because "absent" and "invalid" are different questions. So a required email is <code>@NotBlank @Email</code>, and a required price is <code>@NotNull @Positive</code>. A primitive <code>int</code> can never be null: a missing JSON field becomes <code>0</code>, which <code>@Positive</code> would reject. Use <code>Integer</code> with <code>@NotNull</code> if you must tell "missing" from "zero".</p>
+  </div>
+
+  <h4>Custom messages</h4>
+  <p>Every annotation has a <code>message</code>. Write messages a user can read: not "must not be blank" but "name is required". You can use placeholders from the annotation: <code>@Size(max = 120, message = "at most {max} characters")</code>. For many messages or for translation, put keys in <code>messages.properties</code> (or <code>ValidationMessages.properties</code>) and write <code>message = "{product.name.required}"</code>.</p>
+
+  <h4>Nested objects and lists</h4>
+  <p>Validation does <strong>not</strong> go into nested objects automatically. Mark the field with <code>@Valid</code> to cascade.</p>
+  <pre data-title="OrderRequest.java"><code class="language-java">public record PlaceOrderRequest(
+        @NotNull @Valid Address shippingAddress,           // cascade into Address
+
+        @NotEmpty @Size(max = 50)
+        List&lt;@Valid OrderLine&gt; lines) {}                    // each element is checked
+
+public record Address(
+        @NotBlank String line1,
+        @NotBlank @Pattern(regexp = "\\d{6}", message = "PIN code must have 6 digits")
+        String pin) {}
+
+public record OrderLine(@NotNull Long productId, @Positive int quantity) {}</code></pre>
+  <p>Errors from nested objects get a path such as <code>lines[1].quantity</code> or <code>shippingAddress.pin</code>, so the client can show the message at the right input.</p>
+
+  <h4>@Valid vs @Validated</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>@Valid</code> (Jakarta)</th><th><code>@Validated</code> (Spring)</th></tr></thead>
+    <tbody>
+      <tr><td>Package</td><td><code>jakarta.validation</code></td><td><code>org.springframework.validation.annotation</code></td></tr>
+      <tr><td>Standard</td><td>Yes, part of the spec</td><td>Spring-specific</td></tr>
+      <tr><td>Validation groups</td><td>No</td><td>Yes: <code>@Validated(OnCreate.class)</code></td></tr>
+      <tr><td>Cascade into nested field</td><td>Yes (put it on the field)</td><td>No</td></tr>
+      <tr><td>On a class</td><td>No</td><td>Yes: enables method validation for the class's beans</td></tr>
+      <tr><td>Use for</td><td><code>@RequestBody</code> parameters and nested fields</td><td>Groups; class-level validation of parameters</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Validation groups</h4>
+  <p>Sometimes one DTO is used in two situations with different rules: <code>id</code> must be null on create but required on update. <strong>Groups</strong> are marker interfaces that select a subset of rules. Often separate request records (create vs update) are simpler, but you should know groups for interviews and legacy code.</p>
+  <pre data-title="Groups"><code class="language-java">public interface OnCreate {}
+public interface OnUpdate {}
+
+public record ProductRequest(
+        @Null(groups = OnCreate.class) @NotNull(groups = OnUpdate.class) Long id,
+        @NotBlank(groups = {OnCreate.class, OnUpdate.class}) String name) {}
+
+@PostMapping
+public ... create(@Validated(OnCreate.class) @RequestBody ProductRequest r) { ... }
+
+@PutMapping("/{id}")
+public ... update(@Validated(OnUpdate.class) @RequestBody ProductRequest r) { ... }</code></pre>
+  <p>A constraint without <code>groups</code> belongs to the <code>Default</code> group. Once you use <code>@Validated(OnCreate.class)</code>, only that group runs, not <code>Default</code>, unless <code>OnCreate</code> extends <code>Default</code>.</p>
+
+  <h4>Validating @PathVariable and @RequestParam</h4>
+  <p>Constraints can sit directly on controller method parameters. This is <strong>method validation</strong>.</p>
+  <pre data-title="Method validation"><code class="language-java">@GetMapping("/{id}")
+public ProductResponse get(@PathVariable @Positive Long id) { ... }
+
+@GetMapping
+public Page&lt;ProductResponse&gt; search(
+        @RequestParam @Size(min = 2, max = 50) String q,
+        @RequestParam(defaultValue = "20") @Min(1) @Max(100) int size) { ... }</code></pre>
+  <ul>
+    <li>Since Spring Framework 6.1 (Boot 3.2+) the framework validates these parameters itself and throws <code>HandlerMethodValidationException</code> (a 400). You do not need <code>@Validated</code> on the class.</li>
+    <li>If the controller class has <code>@Validated</code> (older style, a proxy-based check), a failure throws <code>jakarta.validation.ConstraintViolationException</code> instead, which you must handle yourself or you get a 500. Do not mix: pick the built-in 6.1+ approach and leave <code>@Validated</code> off controller classes.</li>
+    <li>On services, <code>@Validated</code> on the class still enables validation of method arguments (<code>ConstraintViolationException</code>) for non-web callers.</li>
+  </ul>
+
+  <h4>A custom constraint</h4>
+  <p>When the built-in set is not enough, write your own annotation plus a validator. Example: a SKU must match the company's format and must not be a reserved word.</p>
+  <pre data-title="ValidSku.java"><code class="language-java">import jakarta.validation.*;
+import java.lang.annotation.*;
+
+@Documented
+@Constraint(validatedBy = SkuValidator.class)       // which class does the check
+@Target({ElementType.FIELD, ElementType.PARAMETER, ElementType.RECORD_COMPONENT})
+@Retention(RetentionPolicy.RUNTIME)
+public @interface ValidSku {
+    String message() default "invalid SKU";          // the three required attributes
+    Class&lt;?&gt;[] groups() default {};
+    Class&lt;? extends Payload&gt;[] payload() default {};
+}</code></pre>
+  <pre data-title="SkuValidator.java"><code class="language-java">public class SkuValidator implements ConstraintValidator&lt;ValidSku, String&gt; {
+
+    private static final Pattern FORMAT = Pattern.compile("[A-Z]{2}-\\d{3,6}");
+    private static final Set&lt;String&gt; RESERVED = Set.of("XX-000");
+
+    @Override
+    public boolean isValid(String value, ConstraintValidatorContext context) {
+        if (value == null) {
+            return true;                  // convention: null is handled by @NotNull
+        }
+        return FORMAT.matcher(value).matches() &amp;&amp; !RESERVED.contains(value);
+    }
+}
+
+// usage
+public record CreateProductRequest(@NotBlank @ValidSku String sku, ...) {}</code></pre>
+  <p>Validators are created as Spring-aware objects, so a validator <em>can</em> have injected dependencies (for example a repository for a "unique email" check). Be careful: a uniqueness check in a validator is a convenience for good error messages only. The database unique constraint is still the real guard (two requests can race).</p>
+  <p>For a rule across several fields (<code>startDate</code> before <code>endDate</code>), either put the custom constraint on the class (<code>@Target(TYPE)</code>), or add a boolean helper to the record with <code>@AssertTrue</code>:</p>
+  <pre data-title="Cross-field rule"><code class="language-java">public record DateRange(@NotNull LocalDate start, @NotNull LocalDate end) {
+    @AssertTrue(message = "end must not be before start")
+    public boolean isValidRange() {
+        return start == null || end == null || !end.isBefore(start);
+    }
+}</code></pre>
+
+  <h4>What exception is thrown, and what the client sees</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Where the rule is</th><th>Exception</th><th>Handled by default?</th></tr></thead>
+    <tbody>
+      <tr><td><code>@Valid @RequestBody</code> object</td><td><code>MethodArgumentNotValidException</code></td><td>400, but a thin body</td></tr>
+      <tr><td>Constraint on a controller parameter (Spring 6.1+)</td><td><code>HandlerMethodValidationException</code></td><td>400, thin body</td></tr>
+      <tr><td>Constraint with class-level <code>@Validated</code></td><td><code>ConstraintViolationException</code></td><td>No: 500 unless you handle it</td></tr>
+      <tr><td>Bean in a service with <code>@Validated</code></td><td><code>ConstraintViolationException</code></td><td>No: 500 unless you handle it</td></tr>
+      <tr><td>JPA entity breaks a constraint at <code>save</code></td><td><code>ConstraintViolationException</code> (wrapped)</td><td>No: 500</td></tr>
+    </tbody>
+  </table></div>
+  <p>The default 400 is not useful to a React form. Map each of these exceptions to one consistent JSON shape with a field-error list. The full code is in <a href="#m2-error-handling">global error handling</a>; the target looks like this:</p>
+  <pre class="out" data-title="400 response with field errors"><code class="language-json">{
+  "type": "about:blank",
+  "title": "Validation failed",
+  "status": 400,
+  "detail": "One or more fields are invalid",
+  "instance": "/api/v1/products",
+  "errors": [
+    { "field": "name",  "message": "name is required" },
+    { "field": "price", "message": "must be greater than 0" }
+  ]
+}</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>No <code>@Valid</code>, no validation. Put it on every <code>@RequestBody</code> that has constraints, and on nested fields to cascade.</li>
+      <li>Most constraints accept null; combine with <code>@NotNull</code>/<code>@NotBlank</code> for required fields.</li>
+      <li>Constraints on a <em>record</em> go on the components (the parameters in the header); they are copied to the right places.</li>
+      <li>The server must validate even if the React form already did. Client-side checks are only for convenience.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Validate <em>format</em> (shape, range, size) at the edge with annotations; validate <em>business rules</em> that need data in the service.</li>
+      <li>Always limit sizes (<code>@Size(max=…)</code>) on strings and lists. Unbounded input is a denial-of-service risk and may overflow your column.</li>
+      <li>Keep messages short, specific and user-readable.</li>
+      <li>Put the same limits in the database schema (<code>VARCHAR(120)</code>, <code>NOT NULL</code>). Two lines of defence.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Forgetting <code>@Valid</code> (the rules never run) or forgetting the starter dependency (the annotations compile but nothing is enforced on some setups, or the classes are missing).</li>
+      <li>Using <code>@NotNull</code> on a string and expecting blank strings to be rejected.</li>
+      <li>Using <code>@Size</code> on an <code>Integer</code> (it is for length); use <code>@Min</code>/<code>@Max</code>.</li>
+      <li>Adding <code>@Valid</code> on a nested object field without validating the outer object, or the reverse.</li>
+      <li>Validating the JPA entity instead of the request DTO, then getting a 500 at <code>save</code> time.</li>
+    </ul>
+  </div>
+
+  <div class="co co-version">
+    <p class="co-t">Boot 3.x and 4.x</p>
+    <p>Everything here works the same in Spring Boot 3.x and 4.x (Jakarta Validation, Hibernate Validator, built-in method validation since Spring 6.1). The thing to remember from older tutorials: the package is <code>jakarta.validation</code>, not <code>javax.validation</code>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Typical questions: "Difference between <code>@NotNull</code>, <code>@NotEmpty</code>, <code>@NotBlank</code>", "What does <code>@Valid</code> do and what is thrown on failure?", "<code>@Valid</code> vs <code>@Validated</code>", "How do you validate a path variable?" and "How do you write a custom validator?" Name the pieces: constraint annotation with <code>@Constraint(validatedBy)</code>, a <code>ConstraintValidator&lt;A, T&gt;</code>, and the exception mapped by <code>@RestControllerAdvice</code>.</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-error-handling">
+  <h3>Global error handling: @RestControllerAdvice and ProblemDetail</h3>
+  <p class="tldr">Throw domain exceptions from your services and map them in one @RestControllerAdvice class to a consistent error JSON (ProblemDetail, RFC 9457) with the right status code, never a stack trace.</p>
+
+  <p>When something goes wrong, the client needs three things: the right <strong>status code</strong>, a <strong>machine-readable shape</strong> it can parse the same way for every error, and a <strong>human message</strong>. It must never get a Java stack trace, a SQL error or a framework page. Spring lets you do this in one central place instead of <code>try/catch</code> in every controller.</p>
+
+  <h4>What Spring Boot does by default</h4>
+  <p>An uncaught exception ends at Boot's <code>/error</code> endpoint and produces this body:</p>
+  <pre class="out" data-title="Default Boot error JSON"><code class="language-json">{
+  "timestamp": "2026-11-10T08:15:30.123+00:00",
+  "status": 500,
+  "error": "Internal Server Error",
+  "path": "/api/v1/products/7"
+}</code></pre>
+  <p>Messages and stack traces are hidden by default (<code>server.error.include-message</code> and <code>include-stacktrace</code> are <code>never</code>). Do not turn them on in production. The default is safe but not helpful, and it is a different shape from your own errors. Fix both with an advice class.</p>
+
+  <h4>Step 1: domain exceptions</h4>
+  <p>Services throw exceptions that describe <em>what went wrong in business terms</em>, not HTTP. Make them unchecked (<code>RuntimeException</code>) so they pass through without <code>throws</code> clutter and, with <code>@Transactional</code>, roll back by default.</p>
+  <pre data-title="Exceptions"><code class="language-java">public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String resource, Object id) {
+        super(resource + " with id " + id + " not found");
+    }
+}
+
+public class DuplicateResourceException extends RuntimeException {
+    public DuplicateResourceException(String message) { super(message); }
+}
+
+public class BusinessRuleException extends RuntimeException {   // 422
+    public BusinessRuleException(String message) { super(message); }
+}</code></pre>
+
+  <h4>Step 2: @RestControllerAdvice and @ExceptionHandler</h4>
+  <p><code>@RestControllerAdvice</code> = <code>@ControllerAdvice</code> + <code>@ResponseBody</code>: a bean whose <code>@ExceptionHandler</code> methods apply to <em>all</em> controllers. Each handler names the exception type it handles; Spring picks the closest match in the class hierarchy. You can narrow an advice to some controllers with <code>@RestControllerAdvice(basePackages = "...")</code>.</p>
+  <pre data-title="A first handler class"><code class="language-java">@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ProblemDetail handleNotFound(ResourceNotFoundException ex) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(
+                HttpStatus.NOT_FOUND, ex.getMessage());
+        pd.setTitle("Resource not found");
+        return pd;
+    }
+}</code></pre>
+
+  <h4>ProblemDetail (RFC 9457)</h4>
+  <p>Instead of inventing an error format for each project, use the standard <strong>Problem Details</strong> format (RFC 9457, which replaced RFC 7807). Spring has the class <code>ProblemDetail</code> and serves it as <code>Content-Type: application/problem+json</code>. Frontend developers and API tools understand it.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Member</th><th>Meaning</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>type</code></td><td>URI that identifies the kind of problem (default <code>about:blank</code>)</td><td><code>https://api.example.com/errors/duplicate</code></td></tr>
+      <tr><td><code>title</code></td><td>Short, the same for every case of this type</td><td><code>Conflict</code></td></tr>
+      <tr><td><code>status</code></td><td>HTTP status code</td><td><code>409</code></td></tr>
+      <tr><td><code>detail</code></td><td>Explanation for this one occurrence</td><td><code>SKU MS-100 already exists</code></td></tr>
+      <tr><td><code>instance</code></td><td>URI of this occurrence (Spring fills it with the request path)</td><td><code>/api/v1/products</code></td></tr>
+      <tr><td>extra members</td><td>Your own fields, via <code>setProperty</code></td><td><code>errors</code>, <code>traceId</code></td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Building a ProblemDetail"><code class="language-java">ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT,
+        "Product with SKU MS-100 already exists");
+pd.setTitle("Duplicate resource");
+pd.setType(URI.create("https://api.example.com/errors/duplicate"));
+pd.setProperty("sku", "MS-100");          // extra member, shown at top level of the JSON
+pd.setProperty("timestamp", Instant.now());
+return pd;</code></pre>
+  <pre class="out" data-title="Response"><code class="language-json">{
+  "type": "https://api.example.com/errors/duplicate",
+  "title": "Duplicate resource",
+  "status": 409,
+  "detail": "Product with SKU MS-100 already exists",
+  "instance": "/api/v1/products",
+  "sku": "MS-100",
+  "timestamp": "2026-11-10T08:15:30.123Z"
+}</code></pre>
+  <p>When a handler returns a <code>ProblemDetail</code>, the HTTP status of the response is taken from its <code>status</code> field.</p>
+
+  <h4>Step 3: the complete advice class</h4>
+  <p>Extending <code>ResponseEntityExceptionHandler</code> gives you handlers for all the standard Spring MVC exceptions (400 malformed JSON, 405, 406, 415, 404 for no handler, missing parameter, type mismatch …) already in ProblemDetail format. You override only what you want to customise and add your own exceptions.</p>
+  <pre data-title="GlobalExceptionHandler.java"><code class="language-java">@RestControllerAdvice
+public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    // --- your domain exceptions ---------------------------------------------
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    ProblemDetail handleNotFound(ResourceNotFoundException ex) {
+        return problem(HttpStatus.NOT_FOUND, "Resource not found", ex.getMessage());
+    }
+
+    @ExceptionHandler(DuplicateResourceException.class)
+    ProblemDetail handleDuplicate(DuplicateResourceException ex) {
+        return problem(HttpStatus.CONFLICT, "Duplicate resource", ex.getMessage());
+    }
+
+    @ExceptionHandler(BusinessRuleException.class)
+    ProblemDetail handleRule(BusinessRuleException ex) {
+        return problem(HttpStatus.UNPROCESSABLE_ENTITY, "Business rule violated",
+                ex.getMessage());
+    }
+
+    // --- database constraint that slipped past the service check ------------
+
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    ProblemDetail handleIntegrity(DataIntegrityViolationException ex) {
+        log.warn("Data integrity violation", ex);                  // details only in the log
+        return problem(HttpStatus.CONFLICT, "Data conflict",
+                "The request conflicts with existing data");
+    }
+
+    // --- validation: @Valid @RequestBody -------------------------------------
+
+    @Override
+    protected ResponseEntity&lt;Object&gt; handleMethodArgumentNotValid(
+            MethodArgumentNotValidException ex, HttpHeaders headers,
+            HttpStatusCode status, WebRequest request) {
+
+        List&lt;Map&lt;String, String&gt;&gt; errors = ex.getBindingResult().getFieldErrors().stream()
+                .map(fe -&gt; Map.of("field", fe.getField(),
+                        "message", String.valueOf(fe.getDefaultMessage())))
+                .toList();
+
+        ProblemDetail pd = problem(HttpStatus.BAD_REQUEST, "Validation failed",
+                "One or more fields are invalid");
+        pd.setProperty("errors", errors);
+        return ResponseEntity.badRequest().body(pd);
+    }
+
+    // --- validation: constraints on path / query parameters (Spring 6.1+) ----
+
+    @Override
+    protected ResponseEntity&lt;Object&gt; handleHandlerMethodValidationException(
+            HandlerMethodValidationException ex, HttpHeaders headers,
+            HttpStatusCode status, WebRequest request) {
+
+        List&lt;Map&lt;String, String&gt;&gt; errors = new ArrayList&lt;&gt;();
+        ex.getParameterValidationResults().forEach(result -&gt;
+                result.getResolvableErrors().forEach(error -&gt;
+                        errors.add(Map.of(
+                                "field", String.valueOf(
+                                        result.getMethodParameter().getParameterName()),
+                                "message", String.valueOf(error.getDefaultMessage())))));
+
+        ProblemDetail pd = problem(HttpStatus.BAD_REQUEST, "Validation failed",
+                "One or more parameters are invalid");
+        pd.setProperty("errors", errors);
+        return ResponseEntity.badRequest().body(pd);
+    }
+
+    // --- validation: class-level @Validated on service or controller ---------
+
+    @ExceptionHandler(ConstraintViolationException.class)
+    ProblemDetail handleConstraintViolation(ConstraintViolationException ex) {
+        List&lt;Map&lt;String, String&gt;&gt; errors = ex.getConstraintViolations().stream()
+                .map(v -&gt; Map.of("field", v.getPropertyPath().toString(),
+                        "message", v.getMessage()))
+                .toList();
+        ProblemDetail pd = problem(HttpStatus.BAD_REQUEST, "Validation failed",
+                "One or more values are invalid");
+        pd.setProperty("errors", errors);
+        return pd;
+    }
+
+    // --- last resort: never leak internals -----------------------------------
+
+    @ExceptionHandler(Exception.class)
+    ProblemDetail handleUnexpected(Exception ex) {
+        String errorId = UUID.randomUUID().toString();
+        log.error("Unexpected error, id={}", errorId, ex);          // full stack trace here
+        ProblemDetail pd = problem(HttpStatus.INTERNAL_SERVER_ERROR, "Internal error",
+                "Something went wrong. Quote this id to support: " + errorId);
+        pd.setProperty("errorId", errorId);
+        return pd;
+    }
+
+    private static ProblemDetail problem(HttpStatus status, String title, String detail) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(status, detail);
+        pd.setTitle(title);
+        return pd;
+    }
+}</code></pre>
+  <ul>
+    <li>The imports you need: <code>org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler</code>, <code>org.springframework.web.method.annotation.HandlerMethodValidationException</code>, <code>org.springframework.web.bind.MethodArgumentNotValidException</code>, <code>org.springframework.dao.DataIntegrityViolationException</code> and <code>jakarta.validation.ConstraintViolationException</code>.</li>
+    <li>The catch-all <code>Exception</code> handler is safe because Spring chooses the <em>most specific</em> matching handler. The standard MVC exceptions are caught by the parent class handler first, so a malformed JSON stays a 400.</li>
+    <li>Log the stack trace on the server (with an id the client can quote); return only a generic message.</li>
+    <li>The catch-all should not swallow Spring Security's <code>AccessDeniedException</code> or <code>AuthenticationException</code> in a way that turns 403 into 500. See <a href="#m4">module 4</a> for the Security handlers; a common pattern is to rethrow them or add specific handlers.</li>
+  </ul>
+
+  <h4>The built-in alternative: spring.mvc.problemdetails.enabled</h4>
+  <p>If you do not want to extend <code>ResponseEntityExceptionHandler</code>, one property gives you ProblemDetail output for the standard MVC exceptions:</p>
+  <pre data-title="application.properties"><code class="language-properties">spring.mvc.problemdetails.enabled=true</code></pre>
+  <p>Boot then registers a built-in advice that extends <code>ResponseEntityExceptionHandler</code>. Do not turn it on <em>and</em> define your own advice that extends the same class: you would have two such beans and an ambiguity. Either use the property and add a plain advice with only your own <code>@ExceptionHandler</code> methods, or extend the class yourself (as above) and leave the property off.</p>
+
+  <h4>Custom exceptions that carry their status: ErrorResponseException</h4>
+  <p><code>ErrorResponseException</code> is an exception that already contains a status and a <code>ProblemDetail</code>. Spring handles it automatically without any <code>@ExceptionHandler</code> (with the standard handler class active). Handy for exceptions that need their own title and type.</p>
+  <pre data-title="An exception that is its own response"><code class="language-java">public class ProductNotFoundException extends ErrorResponseException {
+    public ProductNotFoundException(Long id) {
+        super(HttpStatus.NOT_FOUND,
+              ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND,
+                      "Product " + id + " not found"),
+              null);
+        getBody().setTitle("Product not found");
+    }
+}</code></pre>
+  <p>The trade-off: the exception now knows about HTTP, which goes against the "no HTTP in services" rule. Many teams accept it for convenience; stricter teams keep plain exceptions and map them in the advice.</p>
+
+  <h4>ResponseStatusException: when it is fine</h4>
+  <pre data-title="ResponseStatusException"><code class="language-java">return repository.findById(id).orElseThrow(() -&gt;
+        new ResponseStatusException(HttpStatus.NOT_FOUND, "Product " + id + " not found"));</code></pre>
+  <p>It is a one-liner that needs no custom class. It is fine for prototypes and for small, one-off cases in the controller. For anything reused, a named domain exception is better: it is searchable, testable and keeps HTTP out of the service.</p>
+
+  <h4>Which exception gives which status</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Problem</th><th>Exception</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Malformed JSON</td><td><code>HttpMessageNotReadableException</code></td><td>400</td></tr>
+      <tr><td>Missing query parameter</td><td><code>MissingServletRequestParameterException</code></td><td>400</td></tr>
+      <tr><td>Wrong type in path or query</td><td><code>MethodArgumentTypeMismatchException</code></td><td>400</td></tr>
+      <tr><td>Bean Validation failed</td><td><code>MethodArgumentNotValidException</code></td><td>400</td></tr>
+      <tr><td>Unknown URL</td><td><code>NoResourceFoundException</code> / <code>NoHandlerFoundException</code></td><td>404</td></tr>
+      <tr><td>Wrong HTTP method</td><td><code>HttpRequestMethodNotSupportedException</code></td><td>405</td></tr>
+      <tr><td>Cannot produce requested type</td><td><code>HttpMediaTypeNotAcceptableException</code></td><td>406</td></tr>
+      <tr><td>Unsupported body type</td><td><code>HttpMediaTypeNotSupportedException</code></td><td>415</td></tr>
+      <tr><td>Your <code>ResourceNotFoundException</code></td><td>your handler</td><td>404</td></tr>
+      <tr><td>Unique key broken</td><td><code>DataIntegrityViolationException</code></td><td>409</td></tr>
+      <tr><td>Optimistic lock clash</td><td><code>ObjectOptimisticLockingFailureException</code></td><td>409</td></tr>
+      <tr><td>Anything else</td><td><code>Exception</code></td><td>500</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A consistent error shape for the frontend</h4>
+  <p>The goal: React reads <code>status</code>, shows <code>detail</code>, and puts each item of <code>errors</code> next to its field, for every error in the API. Decide the shape once, put it in this one class, and test it. With ProblemDetail you already have it:</p>
+  <pre class="out" data-title="Every error looks like this"><code class="language-json">{
+  "type": "about:blank",
+  "title": "Validation failed",
+  "status": 400,
+  "detail": "One or more fields are invalid",
+  "instance": "/api/v1/products",
+  "errors": [ { "field": "price", "message": "must be greater than 0" } ]
+}</code></pre>
+  <p>If your team already has its own error class (<code>ApiError(timestamp, status, error, message, path, fieldErrors)</code>), that works as well; what matters is that it is the same everywhere. Authentication and authorization errors from Spring Security filters should use the same shape (<a href="#m4">module 4</a>).</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Never return a stack trace, SQL text, class names or file paths to a client. Log them.</li>
+      <li>The status code must match the error: not 200 with an error body, not 500 for client mistakes.</li>
+      <li>Handlers should be as specific as possible; the catch-all <code>Exception</code> is the last resort only.</li>
+      <li>The advice must be in a package covered by component scanning (the same or a sub-package of your <code>@SpringBootApplication</code> class).</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Controller-local handlers win:</strong> an <code>@ExceptionHandler</code> inside a controller overrides the global one for that controller only.</li>
+      <li><strong>Errors in filters</strong> (such as Spring Security) happen before the DispatcherServlet, so <code>@RestControllerAdvice</code> never sees them. Handle those in the security configuration.</li>
+      <li><strong>A rolled-back transaction:</strong> a <code>@Transactional</code> method rolls back on unchecked exceptions, so throwing your domain exception also undoes the database changes. Checked exceptions do not roll back by default (<a href="#m3">module 3</a>).</li>
+      <li><strong>A 404 for an unknown URL</strong> comes from the framework (<code>NoResourceFoundException</code> in recent versions), not from your code. With the standard handler active it becomes a ProblemDetail as well.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li><code>try { ... } catch (Exception e) { return null; }</code> in controllers. It hides errors and returns 200.</li>
+      <li><code>e.printStackTrace()</code> instead of a logger, or returning <code>e.getMessage()</code> from a catch-all (it may include SQL or paths).</li>
+      <li>Using <code>@ControllerAdvice</code> without <code>@ResponseBody</code> semantics and getting a view-name lookup. <code>@RestControllerAdvice</code> avoids this.</li>
+      <li>Handling <code>Exception</code> in a controller class and accidentally hiding the validation 400s.</li>
+    </ul>
+  </div>
+
+  <div class="co co-version">
+    <p class="co-t">Spring versions</p>
+    <p><code>ProblemDetail</code>, <code>ErrorResponseException</code> and the <code>spring.mvc.problemdetails.enabled</code> property arrived with Spring Framework 6 / Boot 3.0 and work the same in Boot 4. <code>HandlerMethodValidationException</code> needs 6.1+ (Boot 3.2+). If you target an older Boot 2.x codebase, none of these exist; teams there use their own <code>ApiError</code> class.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you handle exceptions in a Spring Boot REST API?" Strong answer: domain exceptions thrown by services; one <code>@RestControllerAdvice</code> with <code>@ExceptionHandler</code> methods that map them to status codes; a consistent body using <code>ProblemDetail</code> (RFC 9457); validation errors as a field list; a catch-all that logs and returns a generic 500; and no stack traces to clients. Bonus: the difference between <code>@ControllerAdvice</code> and <code>@RestControllerAdvice</code>, and why filter-level errors are not caught.</p>
+  </div>
+</article>

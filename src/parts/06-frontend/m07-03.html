@@ -1,0 +1,601 @@
+<article class="topic" id="m7-testing">
+  <h3>Testing the frontend: Vitest, React Testing Library, MSW and Playwright</h3>
+  <p class="tldr">Test what the user sees and does, not how the component is built: Vitest runs the tests,
+  React Testing Library renders components and finds elements by role and label, MSW fakes the API at the
+  network level, and a few Playwright tests check the whole app in a real browser.</p>
+
+  <h4>What to test, and what not to</h4>
+  <p>Frontend tests have a cost: they must be written and kept up to date. Spend that effort where bugs
+  hurt. Think of a pyramid with many fast tests at the bottom and few slow ones at the top:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Level</th><th>Tool</th><th>Tests</th><th>How many</th></tr></thead>
+    <tbody>
+      <tr><td>Unit</td><td>Vitest</td><td>Pure functions: formatters, validators, <code>classifyError</code></td><td>Many</td></tr>
+      <tr><td>Component / integration</td><td>Vitest + React Testing Library (+ MSW)</td><td>A form shows errors; a list shows loading, data, error; a button click calls the API</td><td>Moderate: the sweet spot</td></tr>
+      <tr><td>End-to-end (E2E)</td><td>Playwright</td><td>Login, create an employee, log out, in a real browser against a real or test backend</td><td>Few: the critical journeys</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><strong>Test behaviour</strong>: "when I submit an empty form, I see 'Name is required' and no request is
+    sent". The user does not care that you used <code>useState</code>.</li>
+    <li><strong>Do not test</strong> React itself, library internals, CSS details, or private state. A test that
+    breaks when you refactor without changing behaviour is a bad test.</li>
+    <li>Backend rules (validation, security, transactions) are tested in Spring Boot (<a
+    href="04-spring-boot.html#m5">Spring Boot · Module 5</a>). The frontend tests check that the UI reacts
+    correctly to the responses.</li>
+  </ul>
+
+  <h4>Vitest: setup</h4>
+  <p><strong>Vitest</strong> is a test runner made for Vite projects. It reuses your Vite configuration, so
+  imports, TypeScript and JSX just work, and it is fast. Its API (<code>describe</code>, <code>it</code>,
+  <code>expect</code>) is almost the same as Jest, with <code>vi</code> instead of <code>jest</code> for mocks.
+  <strong>React Testing Library (RTL)</strong> renders components into a simulated browser
+  (<strong>jsdom</strong>, a Node.js implementation of the DOM) and gives you queries that find elements the
+  way a user would.</p>
+
+<pre data-title="Terminal" class="out"><code class="language-shell">$ npm install -D vitest jsdom @testing-library/react @testing-library/jest-dom \
+    @testing-library/user-event msw</code></pre>
+
+<pre data-title="vite.config.ts"><code class="language-typescript">import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    environment: 'jsdom',
+    setupFiles: './src/test/setup.ts',
+  },
+});</code></pre>
+
+<pre data-title="src/test/setup.ts"><code class="language-typescript">import '@testing-library/jest-dom/vitest';   // adds toBeInTheDocument(), toBeDisabled(), ...
+import { afterEach } from 'vitest';
+import { cleanup } from '@testing-library/react';
+
+afterEach(() =&gt; cleanup());                   // unmount rendered components after each test</code></pre>
+
+<pre data-title="package.json (scripts)"><code class="language-json">{
+  "scripts": {
+    "test": "vitest",
+    "test:run": "vitest run"
+  }
+}</code></pre>
+  <p><code>npm test</code> starts watch mode (re-runs affected tests when you save); <code>vitest run</code>
+  runs once, which is what a CI pipeline uses (<a href="07-devops.html#m4">DevOps · Module 4</a>). Vite loads
+  <code>.env.test</code> in test mode, so put <code>VITE_API_URL=http://localhost:8080/api</code> there.</p>
+
+  <h4>A first test: a pure function</h4>
+<pre data-title="src/lib/errors.test.ts"><code class="language-typescript">import { describe, expect, it } from 'vitest';
+import { classifyError } from './errors';
+
+describe('classifyError', () =&gt; {
+  it('treats a missing response as a retryable network error', () =&gt; {
+    const info = classifyError({ code: 'ERR_NETWORK' });       // no "response" property
+    expect(info.kind).toBe('network');
+    expect(info.retryable).toBe(true);
+  });
+
+  it('does not retry a 404', () =&gt; {
+    const info = classifyError({ response: { status: 404, data: {} } });
+    expect(info.kind).toBe('not-found');
+    expect(info.retryable).toBe(false);
+  });
+});</code></pre>
+
+  <h4>Component tests with React Testing Library</h4>
+  <p>The pattern is <strong>arrange, act, assert</strong>: render the component, act like a user (click, type),
+  and check what is on the screen.</p>
+
+<pre data-title="src/components/EmployeeForm.test.tsx"><code class="language-tsx">import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { describe, expect, it, vi } from 'vitest';
+import { EmployeeForm } from './EmployeeForm';
+
+describe('EmployeeForm', () =&gt; {
+  it('shows client errors and does not submit an empty form', async () =&gt; {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();                       // a spy function
+    render(&lt;EmployeeForm onSubmit={onSubmit} /&gt;);
+
+    await user.click(screen.getByRole('button', { name: /save/i }));
+
+    expect(screen.getByText('Name is required')).toBeInTheDocument();
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('submits the typed values', async () =&gt; {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    render(&lt;EmployeeForm onSubmit={onSubmit} /&gt;);
+
+    await user.type(screen.getByLabelText('Name'), 'Asha Rao');
+    await user.type(screen.getByLabelText('Email'), 'asha@acme.in');
+    await user.type(screen.getByLabelText('Department'), 'IT');
+    await user.type(screen.getByLabelText('Salary'), '50000');
+    await user.click(screen.getByRole('button', { name: /save/i }));
+
+    expect(onSubmit).toHaveBeenCalledWith({
+      name: 'Asha Rao', email: 'asha@acme.in', department: 'IT', salary: 50000,
+    });
+  });
+});</code></pre>
+
+  <h4>Which query to use: the priority order</h4>
+  <p>RTL queries are ordered by how close they are to what a real user and assistive technology perceive.
+  Use the first one that works. Choosing queries this way also pushes you to write accessible markup.</p>
+  <ol class="steps">
+    <li><code>getByRole('button', { name: /save/i })</code>: the best default. Works for buttons, links,
+    headings, textboxes, checkboxes.</li>
+    <li><code>getByLabelText('Email')</code>: form fields with a label.</li>
+    <li><code>getByPlaceholderText</code>, then <code>getByText('Employee created')</code>: visible text.</li>
+    <li><code>getByDisplayValue</code>, <code>getByAltText</code>, <code>getByTitle</code>.</li>
+    <li><code>getByTestId('row-7')</code>: the last resort, using a <code>data-testid</code> attribute that users
+    cannot see.</li>
+  </ol>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Query family</th><th>Not found</th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td><code>getBy…</code></td><td>Throws an error at once</td><td>Something that must be there now</td></tr>
+      <tr><td><code>queryBy…</code></td><td>Returns <code>null</code></td><td>Asserting that something is <em>not</em> there: <code>expect(screen.queryByText('Error')).not.toBeInTheDocument()</code></td></tr>
+      <tr><td><code>findBy…</code></td><td>Waits (default about one second), then throws</td><td>Something that appears after an async step (API data)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Add <code>All</code> (<code>getAllByRole</code>) when several elements match. Always
+  <code>await</code> <code>userEvent</code> calls; they are asynchronous.</p>
+
+  <h4>Mocking the API with MSW</h4>
+  <p><strong>MSW (Mock Service Worker)</strong> intercepts HTTP requests at the network layer, so your real
+  Axios code, interceptors and error handling run unchanged and only the server is fake. This is better than
+  mocking Axios with <code>vi.mock</code>, which skips half of the code you want to test. In Node tests you
+  use <code>setupServer</code>.</p>
+
+<pre data-title="src/test/server.ts"><code class="language-typescript">import { http, HttpResponse } from 'msw';
+import { setupServer } from 'msw/node';
+
+export const handlers = [
+  http.get('http://localhost:8080/api/employees', () =&gt;
+    HttpResponse.json({
+      content: [{ id: 1, name: 'Asha Rao', email: 'asha@acme.in', department: 'IT', salary: 50000 }],
+      page: 0, size: 10, totalElements: 1, totalPages: 1,
+    }),
+  ),
+];
+
+export const server = setupServer(...handlers);</code></pre>
+
+<pre data-title="src/test/setup.ts (add)"><code class="language-typescript">import { afterAll, afterEach, beforeAll } from 'vitest';
+import { server } from './server';
+
+beforeAll(() =&gt; server.listen({ onUnhandledRequest: 'error' }));  // fail on unexpected calls
+afterEach(() =&gt; server.resetHandlers());                          // undo per-test overrides
+afterAll(() =&gt; server.close());</code></pre>
+
+<pre data-title="src/pages/EmployeeListPage.test.tsx"><code class="language-tsx">import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { render, screen } from '@testing-library/react';
+import { http, HttpResponse } from 'msw';
+import { MemoryRouter } from 'react-router';
+import { expect, it } from 'vitest';
+import { server } from '../test/server';
+import EmployeeListPage from './EmployeeListPage';
+
+function renderPage() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } }); // no retries
+  return render(
+    &lt;QueryClientProvider client={client}&gt;
+      &lt;MemoryRouter&gt;
+        &lt;EmployeeListPage /&gt;
+      &lt;/MemoryRouter&gt;
+    &lt;/QueryClientProvider&gt;,
+  );   // components that call useAuth also need a test AuthProvider around them
+}
+
+it('shows employees from the API', async () =&gt; {
+  renderPage();
+  expect(await screen.findByText('Asha Rao')).toBeInTheDocument();   // waits for the data
+});
+
+it('shows a friendly message when the server fails', async () =&gt; {
+  server.use(   // override the default handler for this test only
+    http.get('http://localhost:8080/api/employees', () =&gt;
+      HttpResponse.json({ title: 'Internal Server Error' }, { status: 500 })),
+  );
+  renderPage();
+  expect(await screen.findByRole('alert')).toHaveTextContent('Something went wrong on our side');
+});</code></pre>
+  <p>Notes: a fresh <code>QueryClient</code> per test avoids cached data leaking between tests;
+  <code>retry: false</code> makes the error case fast; <code>MemoryRouter</code> provides routing without a
+  browser URL.</p>
+
+  <div class="co co-tip">
+    <p class="co-t">Mocking modules with vi.mock</p>
+    <p>For things you do not want to run, use <code>vi.mock('./employeeApi')</code> to replace a module with
+    mocks, and <code>vi.fn()</code> for spies. Use it for browser APIs, timers (<code>vi.useFakeTimers()</code>)
+    and third-party modules, but prefer MSW for HTTP so that Axios, interceptors and error mapping are part
+    of the test.</p>
+  </div>
+
+  <h4>End-to-end tests with Playwright</h4>
+  <p><strong>Playwright</strong> drives a real browser (Chromium, Firefox, WebKit) through your running app, as a
+  user would. It catches what component tests cannot: CORS problems, wrong routing after deploy, a broken login
+  against the real backend. Because E2E tests are slow and can be flaky, write few of them, for the journeys
+  that must never break: login, the main create flow, checkout.</p>
+
+<pre data-title="e2e/login.spec.ts"><code class="language-typescript">import { expect, test } from '@playwright/test';
+
+test('a logged-out visitor is sent to login, then sees the employee list', async ({ page }) =&gt; {
+  await page.goto('http://localhost:5173/employees');
+  await expect(page).toHaveURL(/\/login/);              // the route guard worked
+
+  await page.getByLabel('Email').fill('admin@acme.in');
+  await page.getByLabel('Password').fill(process.env.E2E_PASSWORD ?? '');
+  await page.getByRole('button', { name: 'Login' }).click();
+
+  await expect(page.getByRole('heading', { name: 'Employees' })).toBeVisible();
+});</code></pre>
+  <p>Create the project with <code>npm init playwright@latest</code> and run tests with
+  <code>npx playwright test</code>. Playwright's locators (<code>getByRole</code>, <code>getByLabel</code>) follow
+  the same ideas as RTL. Use a dedicated test user and test database, and keep the password in an
+  environment variable, not in the file.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for good frontend tests</p>
+    <ul>
+      <li>Each test is independent: no shared state, any order, can run alone.</li>
+      <li>Find elements by role or label before text, and by test id last.</li>
+      <li>Wait with <code>findBy</code> or <code>waitFor</code>, never with <code>setTimeout</code> or fixed
+      sleeps.</li>
+      <li>No real network in unit and component tests. MSW answers; unknown requests fail the test.</li>
+      <li>Tests run in CI on every push.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Testing implementation details (calling an internal function, checking state values) so tests break
+      on every refactor.</li>
+      <li>Forgetting <code>await</code> on <code>user.click</code> or <code>findBy</code>: the assertion runs
+      too early, or you see "not wrapped in act(...)" warnings.</li>
+      <li>Using <code>getBy</code> for data that loads later (throws immediately). Use <code>findBy</code>.</li>
+      <li>Asserting absence with <code>getBy</code> (it throws). Use <code>queryBy</code>.</li>
+      <li>Large snapshot tests that everybody updates without reading.</li>
+      <li>Not wrapping a component in the providers it needs (QueryClient, Router, Auth): "No QueryClient set"
+      errors.</li>
+      <li>Reusing one <code>QueryClient</code> across tests, so cached results leak.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you test a React component that calls an API?"</p>
+    <ul>
+      <li>Vitest + React Testing Library; render inside the needed providers with a fresh QueryClient with
+      retries off.</li>
+      <li>Fake the network with MSW (not by mocking Axios), so interceptors and error handling run.</li>
+      <li>Interact with <code>userEvent</code>, find elements by role/label, assert with <code>findBy</code>
+      for async results, and test loading, success, empty and error states.</li>
+      <li>Add a few Playwright E2E tests for the critical journeys; leave rules and security to backend
+      tests.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m7-learn-next">
+  <h3>What to learn next for full-stack roles</h3>
+  <p class="tldr">After React and a working Spring Boot app, the next gains come from running software
+  (Docker, CI/CD, cloud), designing systems, deeper backend skills and polish on the frontend; pick by what
+  the jobs you target ask for, and always keep one real project moving.</p>
+
+  <h4>Where you stand</h4>
+  <p>If you can build and deploy the Employee Manager from Module 6, you can already do the core work of a
+  junior full-stack developer: model data, expose a secured REST API, build a UI against it, and debug a
+  failing request. What employers look for beyond that falls into four groups. Chips show how soon each
+  matters for most job listings.</p>
+
+  <h4>1. Ship and run it</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Topic</th><th>Why</th><th>Where in these notes</th></tr></thead>
+    <tbody>
+      <tr><td><span class="chip pri-must">Must</span> Docker</td><td>Every team packages apps as containers</td><td><a href="07-devops.html#m3">DevOps · Module 3</a></td></tr>
+      <tr><td><span class="chip pri-must">Must</span> CI/CD with GitHub Actions</td><td>Tests and builds on every push</td><td><a href="07-devops.html#m4">DevOps · Module 4</a></td></tr>
+      <tr><td><span class="chip pri-good">Good to know</span> A cloud provider (deployment basics)</td><td>Real hosting, databases, storage</td><td><a href="07-devops.html#m5">DevOps · Module 5</a></td></tr>
+      <tr><td><span class="chip pri-good">Good to know</span> Logs, metrics, monitoring</td><td>Finding problems in production</td><td><a href="07-devops.html#m6">DevOps · Module 6</a></td></tr>
+      <tr><td><span class="chip pri-later">Later</span> Kubernetes</td><td>Large-scale container platforms</td><td><a href="07-devops.html#m6">DevOps · Module 6</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>2. Go deeper on the backend</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Topic</th><th>Why</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td><span class="chip pri-must">Must</span> Spring Security in depth, JWT and roles</td><td>Every business app has login and roles</td><td><a href="04-spring-boot.html#m4">Spring Boot · Module 4</a></td></tr>
+      <tr><td><span class="chip pri-must">Must</span> Backend testing (JUnit, Mockito, slice tests, Testcontainers)</td><td>Teams expect tests with every pull request</td><td><a href="04-spring-boot.html#m5">Spring Boot · Module 5</a></td></tr>
+      <tr><td><span class="chip pri-good">Good to know</span> JPA performance (N+1, indexes, transactions)</td><td>The usual cause of slow APIs</td><td><a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>, <a href="03-sql-databases.html#m5">SQL · Module 5</a></td></tr>
+      <tr><td><span class="chip pri-good">Good to know</span> Caching and Redis</td><td>Speed and load reduction</td><td><a href="04-spring-boot.html#m6">Spring Boot · Module 6</a></td></tr>
+      <tr><td><span class="chip pri-later">Later</span> Messaging (Kafka, RabbitMQ) and microservices</td><td>Common in larger companies</td><td><a href="04-spring-boot.html#m7">Spring Boot · Module 7</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>3. Design and interviews</h4>
+  <ul>
+    <li><span class="chip pri-must">Must</span> <strong>Data structures and algorithms.</strong> Service and
+    product companies screen with them: <a href="05-dsa.html#m1">DSA · Module 1</a> and onwards.</li>
+    <li><span class="chip pri-must">Must</span> <strong>Core CS</strong> (OS, networks, DBMS, OOP theory) for
+    interview rounds: <a href="09-cs-fundamentals.html#m1">CS Fundamentals</a>.</li>
+    <li><span class="chip pri-good">Good to know</span> <strong>Design patterns and low-level design</strong>:
+    <a href="08-system-design.html#m2">System Design · Module 2</a>.</li>
+    <li><span class="chip pri-good">Good to know</span> <strong>High-level system design</strong> (load
+    balancers, caches, queues, databases at scale): <a href="08-system-design.html#m4">System Design · Module 4</a>.</li>
+  </ul>
+
+  <h4>4. Frontend polish</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Topic</th><th>What to do</th></tr></thead>
+    <tbody>
+      <tr><td><span class="chip pri-good">Good to know</span> A CSS framework or component library</td><td>Tailwind CSS, or a component set such as MUI or shadcn/ui; learn one so that apps look decent quickly</td></tr>
+      <tr><td><span class="chip pri-good">Good to know</span> Accessibility</td><td>Semantic HTML, labels, keyboard use, focus handling, colour contrast; test with the keyboard only</td></tr>
+      <tr><td><span class="chip pri-good">Good to know</span> Web performance</td><td>Code splitting with lazy routes, image sizes, Core Web Vitals, the browser Performance tab</td></tr>
+      <tr><td><span class="chip pri-later">Later</span> Real-time features</td><td>WebSockets or Server-Sent Events for live updates and notifications</td></tr>
+      <tr><td><span class="chip pri-later">Later</span> GraphQL</td><td>An alternative to REST that some teams use; learn when a job needs it</td></tr>
+      <tr><td><span class="chip pri-later">Later</span> Frontend security</td><td>XSS, CSRF, content security policy, safe handling of tokens</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A practical order</h4>
+  <ol class="steps">
+    <li>Finish and deploy Project 3 (React + Spring Boot + PostgreSQL) with a README, screenshots and a live
+    link.</li>
+    <li>Move the frontend to TypeScript, add Vitest tests for the form and list, and add a test for the
+    backend endpoints.</li>
+    <li>Containerise both apps with Docker and add a GitHub Actions workflow that tests and builds on every
+    push.</li>
+    <li>Deploy to a cloud provider with a managed database; add basic monitoring.</li>
+    <li>Practise DSA and interview questions regularly alongside, not after, the projects.</li>
+    <li>Build one more project that uses a new idea (caching, messaging, file upload, or real-time
+    updates), then read about system design.</li>
+  </ol>
+
+  <div class="co co-tip">
+    <p class="co-t">Let the job listings guide you</p>
+    <p>Pick ten job posts for the roles you want and count the keywords. Learn the top five that you do not
+    have yet. Depth in a few things beats shallow contact with everything; a deployed, tested project that you
+    can explain end to end is worth more than ten tutorials.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What would you learn or improve next in this project?"</p>
+    <ul>
+      <li>Show you think about production: tests in CI, Docker, monitoring, secure token handling, pagination
+      and indexes for scale.</li>
+      <li>Name concrete trade-offs you would revisit (localStorage vs cookie tokens, offset vs cursor paging,
+      SPA vs Next.js).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m7-interview">
+  <h3>Interview questions — TypeScript, Next.js, state and testing</h3>
+
+  <details class="qa">
+    <summary>Why use TypeScript instead of JavaScript?</summary>
+    <div class="qa-a">
+      <p>Static types catch typos, wrong argument types and missing null checks before the code runs. They give
+      accurate autocomplete, safe refactoring across a large codebase, and living documentation for data shapes
+      such as API DTOs. The cost is a build step and some extra writing. Types are erased, so they add no
+      run-time overhead and also give no run-time protection.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between <code>any</code> and <code>unknown</code>?</summary>
+    <div class="qa-a">
+      <p>Both accept any value. <code>any</code> turns off type checking for it, so you can call anything on it
+      and errors are hidden. <code>unknown</code> forces you to narrow the type (<code>typeof</code>,
+      <code>instanceof</code>, a type guard) before you use it. Use <code>unknown</code> for external data and
+      <code>catch</code> variables.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary><code>interface</code> or <code>type</code>?</summary>
+    <div class="qa-a">
+      <p>For object shapes they are nearly interchangeable. <code>type</code> can also name unions, tuples and
+      primitives; <code>interface</code> supports <code>extends</code> and declaration merging. A common
+      convention: <code>interface</code> for object shapes and props, <code>type</code> for unions and
+      combinations. Consistency inside the project matters more.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does this print or fail on? <code>const [rows, setRows] = useState([]); setRows(data);</code></summary>
+    <div class="qa-a">
+      <p>It runs, but with <code>strict</code> TypeScript the state type is inferred as <code>never[]</code>, so
+      <code>setRows(data)</code> is a compile error ("not assignable to never[]"). Fix it by giving the type:
+      <code>useState&lt;Employee[]&gt;([])</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you type an API response, and why is it not a guarantee?</summary>
+    <div class="qa-a">
+      <p>Write an interface that mirrors the backend DTO and pass it as a generic:
+      <code>api.get&lt;Page&lt;Employee&gt;&gt;('/employees')</code>. The compiler then checks your usage. It
+      is a promise, not a check: TypeScript types do not exist at run time, so if the server sends another
+      shape, the code still compiles. Close the gap with types generated from the OpenAPI document, schema
+      validation such as Zod at the boundary, and API tests.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does <code>"strict": true</code> do?</summary>
+    <div class="qa-a">
+      <p>It enables a group of strict checks: <code>strictNullChecks</code> (null and undefined are separate
+      types), <code>noImplicitAny</code>, <code>strictFunctionTypes</code>,
+      <code>strictPropertyInitialization</code>, <code>useUnknownInCatchVariables</code> and others. It catches
+      the largest class of run-time errors ("cannot read property of undefined") at compile time. New projects
+      should always start with it.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is narrowing? Give two ways to do it.</summary>
+    <div class="qa-a">
+      <p>Narrowing is the compiler refining a union type inside a branch after a check. Examples:
+      <code>typeof x === 'string'</code>, <code>x instanceof Error</code>, <code>'name' in x</code>, an equality
+      check against <code>null</code>, a discriminated-union <code>switch (state.status)</code>, or a custom type
+      guard function returning <code>x is Employee</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does TypeScript's type system differ from Java's?</summary>
+    <div class="qa-a">
+      <p>TypeScript is structural: an object fits a type if it has the required properties, with no
+      <code>implements</code>. Java is nominal. TypeScript types are erased and unavailable at run time; Java
+      keeps class information for reflection. TypeScript has first-class unions and literal types, and heavy
+      inference; null-safety comes from <code>strictNullChecks</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Server-side rendering vs client-side rendering: what are the trade-offs?</summary>
+    <div class="qa-a">
+      <p>With CSR (a Vite SPA) the browser downloads JavaScript, runs it and then fetches data, so the first
+      content is late and crawlers or link previews may see an empty page. With SSR or static generation the
+      server sends ready HTML, so content appears quickly and is indexable, then React hydrates it. SSR needs a
+      server to run and adds the server/client boundary to think about. CSR is simpler and fine behind a
+      login.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you choose Next.js over Vite and React Router with a Spring Boot backend?</summary>
+    <div class="qa-a">
+      <p>Choose Next.js for public pages that need SEO, social previews and fast first load (catalogues, blogs,
+      marketing), or when you want a backend-for-frontend layer that keeps tokens in httpOnly cookies. Choose a
+      Vite SPA for internal dashboards and apps behind a login, for static hosting, and for the smallest
+      number of moving parts. In both cases Spring Boot remains the API and owns the business rules.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between a Server Component and a Client Component?</summary>
+    <div class="qa-a">
+      <p>In the Next.js App Router, components are Server Components by default: they run on the server, can be
+      <code>async</code> and read data directly, and send no component JavaScript to the browser. A file with
+      <code>'use client'</code> is a Client Component: it also runs in the browser and can use state, effects
+      and event handlers. Keep the client part small and pass data down as props.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When do you need Redux or Zustand, given Context and TanStack Query exist?</summary>
+    <div class="qa-a">
+      <p>Server data belongs to TanStack Query; URL state to the URL; local state to <code>useState</code>;
+      stable app-wide values (user, theme) to Context. A store is for shared client state that is complex or
+      changes often and is used by many distant components, such as a cart, a wizard or editor state. Context
+      re-renders every consumer on any change, while stores let components select a slice. Redux Toolkit fits
+      large teams and strict structure; Zustand fits small, simple global state.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you test a React component that fetches data?</summary>
+    <div class="qa-a">
+      <p>Render it with Vitest and React Testing Library inside the required providers (a new QueryClient with
+      retry off, a MemoryRouter). Fake the server with MSW so the real Axios code and interceptors run. Use
+      <code>await screen.findByText(...)</code> for async results, <code>userEvent</code> for interaction, and
+      test the loading, success, empty and error states. Override an MSW handler per test to simulate a 500.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Which RTL query should you reach for first, and what is the difference between getBy, queryBy and findBy?</summary>
+    <div class="qa-a">
+      <p><code>getByRole</code> first, then <code>getByLabelText</code>, then text, with <code>getByTestId</code> as
+      the last resort. <code>getBy</code> throws immediately if nothing matches; <code>queryBy</code> returns
+      <code>null</code> (use it to assert absence); <code>findBy</code> waits and retries until the element
+      appears (use it for async UI).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What do you test with Playwright instead of component tests?</summary>
+    <div class="qa-a">
+      <p>Whole journeys in a real browser against a running app and backend: login and redirect, creating a
+      record, permissions. It finds integration problems such as CORS, routing and deployment settings. These
+      tests are slower and more fragile, so keep them few and focused on critical paths.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m7-cheatsheet">
+  <h3>Cheat sheet — TypeScript, Next.js, state and testing</h3>
+  <ul class="cheat">
+    <li><b>TypeScript</b> JavaScript plus static types; checked by <code>tsc</code>/editor, erased at build.</li>
+    <li><b>Vite + TS</b> <code>npm create vite@latest app -- --template react-ts</code>; Vite strips types, <code>tsc</code> checks.</li>
+    <li><b>Basic types</b> <code>string</code>, <code>number</code>, <code>boolean</code>, <code>null</code>, <code>undefined</code>, <code>bigint</code>, <code>T[]</code>, <code>[A, B]</code>.</li>
+    <li><b>Union / literal</b> <code>'ADMIN' | 'USER'</code>, <code>string | null</code>; replaces most enums.</li>
+    <li><b>Discriminated union</b> shared tag property (<code>status</code>) + <code>switch</code> for exact narrowing.</li>
+    <li><b>interface vs type</b> objects: either; <code>type</code> for unions/tuples; interface merges and extends.</li>
+    <li><b>Optional / readonly</b> <code>phone?: string</code>, <code>readonly id: number</code> (compile-time only).</li>
+    <li><b>Generics</b> <code>Page&lt;T&gt;</code>, <code>function f&lt;T extends HasId&gt;(x: T)</code>.</li>
+    <li><b>Narrowing</b> <code>typeof</code>, <code>instanceof</code>, <code>in</code>, equality, type guards (<code>x is T</code>).</li>
+    <li><b>any / unknown / never</b> unchecked / must narrow / impossible. Prefer <code>unknown</code>.</li>
+    <li><b>Utility types</b> <code>Partial</code>, <code>Pick</code>, <code>Omit</code>, <code>Record</code>, <code>Readonly</code>, <code>Required</code>.</li>
+    <li><b>React typing</b> props interface; <code>ReactNode</code> for children; <code>useState&lt;User | null&gt;(null)</code>; <code>ChangeEvent&lt;HTMLInputElement&gt;</code>.</li>
+    <li><b>DTO mapping</b> record → interface; <code>LocalDate</code> → string; enum → union; nullable → <code>T | null</code>.</li>
+    <li><b>Types are not checks</b> validate with Zod or generate from OpenAPI.</li>
+    <li><b>tsconfig</b> <code>"strict": true</code> always; <code>noEmit</code>; <code>jsx: "react-jsx"</code>.</li>
+    <li><b>Structural typing</b> shape decides compatibility; Java is nominal.</li>
+    <li><b>Next.js</b> React framework: file routing, SSR/SSG/ISR, Server Components, route handlers, Server Actions.</li>
+    <li><b>Server vs Client Component</b> default server; <code>'use client'</code> for state/effects/events.</li>
+    <li><b>Choose Next.js</b> for SEO and public pages; <b>Vite SPA</b> for logged-in dashboards.</li>
+    <li><b>Env vars (Next)</b> only <code>NEXT_PUBLIC_*</code> reaches the browser.</li>
+    <li><b>State kinds</b> local → <code>useState</code>; server → TanStack Query; URL → search params; shared → Context/Zustand/Redux.</li>
+    <li><b>Redux Toolkit</b> <code>createSlice</code> + <code>configureStore</code> + <code>Provider</code> + <code>useSelector</code>/<code>useDispatch</code>; Immer inside.</li>
+    <li><b>Zustand</b> <code>create((set) =&gt; ({...}))</code>, no provider, select slices.</li>
+    <li><b>Vitest + RTL</b> <code>render</code>, <code>screen.getByRole</code>, <code>await userEvent</code>, <code>findBy</code> for async.</li>
+    <li><b>Query order</b> role → label → placeholder/text → display value → test id.</li>
+    <li><b>MSW</b> <code>http.get(url, () =&gt; HttpResponse.json(...))</code> + <code>setupServer</code>; fresh QueryClient, <code>retry: false</code>.</li>
+    <li><b>Playwright</b> few E2E tests of critical journeys in a real browser.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m7-practice">
+  <h3>Practice — TypeScript, Next.js, state and testing</h3>
+  <ol class="steps">
+    <li><strong>TypeScript warm-up (easy).</strong> In a scratch <code>.ts</code> file write: a union of
+    string literals for roles, a discriminated union for a load state with an exhaustive
+    <code>switch</code>, a generic <code>Page&lt;T&gt;</code> and a type guard <code>isApiError</code>. Done
+    when the compiler flags a missing <code>case</code> after you add a new status.</li>
+    <li><strong>Type the DTOs (easy).</strong> Write TypeScript interfaces for every record your Spring Boot
+    API returns, using <code>Omit</code> for request types. Done when
+    <code>api.get&lt;Page&lt;Employee&gt;&gt;</code> autocompletes every field.</li>
+    <li><strong>Migrate Project 3's frontend to TypeScript (medium).</strong> Rename components to
+    <code>.tsx</code> one at a time with <code>strict</code> on. Type props, state, events, context and
+    the API module. Done when <code>npm run build</code> passes with no <code>any</code> except documented
+    ones, and renaming a DTO field in one place shows errors everywhere it is used.</li>
+    <li><strong>Validate at the boundary (medium).</strong> Add a Zod schema for one response and parse it in
+    the API function. Make the backend return a wrong field and watch the app fail with a clear error. Done
+    when the type is derived with <code>z.infer</code> and you can explain why.</li>
+    <li><strong>Unit and component tests (medium).</strong> Set up Vitest, jsdom and React Testing Library.
+    Test <code>classifyError</code>, then <code>EmployeeForm</code> (empty submit shows errors and does not
+    call <code>onSubmit</code>; valid input calls it with the right values). Done when <code>npm run
+    test:run</code> is green and all queries use role or label.</li>
+    <li><strong>Mock the API with MSW (medium).</strong> Test the list page for data, empty list, 500 and
+    network error. Done when no test touches the real backend and unexpected requests fail the test.</li>
+    <li><strong>One E2E test (medium).</strong> Write a Playwright test for login and creating an employee
+    against a local backend with a test user. Done when it passes headless and the password comes from an
+    environment variable.</li>
+    <li><strong>A shared store (medium).</strong> Add a cart or notification feature with Zustand, then
+    re-implement it with Redux Toolkit. Done when you can state which you would use for this app and why,
+    and the cart badge re-renders only when its count changes.</li>
+    <li><strong>Next.js comparison (hard).</strong> Build a public, read-only "company directory" page in
+    Next.js that renders the employee list on the server from your Spring Boot API, with a client-side search
+    box. Done when "View page source" shows the names in the HTML, and you can write five lines on when you
+    would not use Next.js.</li>
+    <li><strong>Plan your next quarter (easy).</strong> Choose ten job posts, list their required skills, and
+    write a four-week plan from the "What to learn next" article. Done when each week has a concrete output
+    (a deployed app, a pipeline, a test suite).</li>
+  </ol>
+</article>

@@ -1,0 +1,314 @@
+<article class="topic" id="m6-threadlocal">
+  <h3>ThreadLocal: per-thread data and its leaks</h3>
+  <p class="tldr">A ThreadLocal gives every thread its own private copy of a variable, which is handy for per-request context, but in thread pools the copy outlives the task, so you must remove it or you leak data between requests.</p>
+
+  <h4>What it is</h4>
+  <p>Normally a field is shared by all threads. A <code>ThreadLocal&lt;T&gt;</code> is a variable where each thread that calls <code>get()</code> or <code>set()</code> sees its <strong>own</strong> value, stored inside the <code>Thread</code> object itself. No locks are needed because the data is never shared; this is called <strong>thread confinement</strong>.</p>
+  <pre data-title="ThreadLocalDemo.java"><code class="language-java">public class ThreadLocalDemo {
+    // each thread starts with its own value from the supplier
+    private static final ThreadLocal&lt;Integer&gt; counter = ThreadLocal.withInitial(() -&gt; 0);
+
+    public static void main(String[] args) throws InterruptedException {
+        Runnable task = () -&gt; {
+            for (int i = 0; i &lt; 3; i++) {
+                counter.set(counter.get() + 1);
+            }
+            System.out.println(Thread.currentThread().getName() + " counter=" + counter.get());
+        };
+        Thread a = new Thread(task, "worker-A");
+        Thread b = new Thread(task, "worker-B");
+        a.start(); b.start();
+        a.join(); b.join();
+        System.out.println("main counter=" + counter.get());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (one possible run)"><code class="language-plaintext">worker-A counter=3
+worker-B counter=3
+main counter=0</code></pre>
+  <p>Each thread counted to 3 on its own copy, and <code>main</code> still has 0. No race condition is possible because nothing is shared.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>ThreadLocal.withInitial(supplier)</code></td><td>Create with a per-thread default value</td></tr>
+      <tr><td><code>get()</code></td><td>Value for the current thread (initial value if unset)</td></tr>
+      <tr><td><code>set(value)</code></td><td>Set the current thread's value</td></tr>
+      <tr><td><code>remove()</code></td><td>Delete the current thread's value; the next <code>get()</code> gives the initial value again</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Common uses</h4>
+  <ul>
+    <li><strong>Per-request context</strong> in a web server that uses one thread per request: the current user, a request id for logging (SLF4J's <code>MDC</code> is a ThreadLocal map), the tenant id. Spring's <code>SecurityContextHolder</code>, <code>RequestContextHolder</code> and transaction synchronization work this way, so deep service code can find "the current user" without passing it through every method.</li>
+    <li><strong>Non-thread-safe helper objects</strong> that are costly to create, such as the old <code>SimpleDateFormat</code> or a <code>MessageDigest</code>. Each thread gets its own copy. (For dates, simply use the immutable <code>DateTimeFormatter</code> instead.)</li>
+    <li><strong>Per-thread random generators or buffers</strong> to avoid contention (the JDK's <code>ThreadLocalRandom</code> is built on this idea).</li>
+  </ul>
+
+  <h4>The leak in thread pools</h4>
+  <p>Threads in a pool are <strong>reused</strong>. A ThreadLocal value stays attached to the thread until it is removed or the thread dies. So when task 1 sets a value and finishes without cleaning up, task 2 running on the same thread sees task 1's data. That is a bug and a security problem (user B served with user A's identity).</p>
+  <pre data-title="LeakDemo.java"><code class="language-java">import java.util.concurrent.*;
+
+public class LeakDemo {
+    static final ThreadLocal&lt;String&gt; currentUser = new ThreadLocal&lt;&gt;();
+
+    public static void main(String[] args) throws Exception {
+        try (ExecutorService pool = Executors.newSingleThreadExecutor()) {   // 1 thread reused
+            pool.submit(() -&gt; currentUser.set("asha")).get();               // request 1 forgets remove()
+            pool.submit(() -&gt; System.out.println(
+                    "request 2 sees user = " + currentUser.get())).get();
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">request 2 sees user = asha</code></pre>
+  <p>Request 2 never set a user, yet it sees "asha". The cure is always to clean up in <code>finally</code>:</p>
+  <pre data-title="Correct pattern"><code class="language-java">static void handleRequest(String user, Runnable work) {
+    currentUser.set(user);
+    try {
+        work.run();
+    } finally {
+        currentUser.remove();      // always, even when work throws
+    }
+}</code></pre>
+  <p>A second form of leak is memory. The values are strongly referenced from the thread, and a pool thread lives as long as the application. A large object (a big buffer, a user session graph) left in a ThreadLocal stays in memory. In application servers where the web app can be redeployed, a ThreadLocal holding an object of the app's classes can keep the whole old class loader alive ("ClassLoader leak", the cause of <code>OutOfMemoryError: Metaspace</code> after several redeploys). Frameworks like Spring clean their own ThreadLocals; the leaks usually come from your own code.</p>
+
+  <h4>Related: InheritableThreadLocal, virtual threads and scoped values</h4>
+  <ul>
+    <li><code>InheritableThreadLocal</code> copies the parent thread's value to a new child thread at creation. It does not help with pools, because the pool threads were created earlier; frameworks use task decorators to copy context into tasks.</li>
+    <li>Virtual threads support ThreadLocal, but because you may create millions of virtual threads, per-thread caches become expensive. Do not put heavy objects in them.</li>
+    <li><strong>Scoped values</strong> (<code>ScopedValue</code>) are a modern, safer alternative: immutable data bound for the duration of a block of code and automatically gone afterwards. They were a preview API in Java 21 to 24 and became a final feature in Java 25.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Declare ThreadLocal as <code>private static final</code>.</li>
+      <li>Call <code>remove()</code> in <code>finally</code> whenever a thread might be reused (pools, servlet containers).</li>
+      <li>Store small, preferably immutable values; never large caches.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>NullPointerException</code> — <code>get()</code> returns <code>null</code> when no initial value was set, and unboxing it (<code>int x = tl.get()</code>) fails.</li>
+      <li>ThreadLocal values do <strong>not</strong> follow work onto another thread: <code>CompletableFuture.supplyAsync</code>, <code>@Async</code> and parallel streams run on different threads, so the "current user" is missing there unless you pass it explicitly.</li>
+      <li>A ThreadLocal is hidden global state: it makes code harder to test and to reason about. Prefer plain method parameters when the call chain is short.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is ThreadLocal? What problems can it cause?"</p>
+    <ul>
+      <li>Per-thread variable; no locking needed; uses: request context, MDC, non-thread-safe helpers.</li>
+      <li>In pools, values survive between tasks: stale or leaked data and memory leaks; fix with <code>remove()</code> in <code>finally</code>.</li>
+      <li>Does not propagate to async tasks; scoped values (final in Java 25) are the modern alternative.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-virtual-threads">
+  <h3>Virtual threads (Java 21)</h3>
+  <p class="tldr">Virtual threads are lightweight threads managed by the JVM that let you write simple blocking code and still handle hundreds of thousands of concurrent tasks, because a virtual thread that waits on I/O frees its carrier platform thread.</p>
+
+  <h4>The problem they solve</h4>
+  <p>The classic server model is <strong>thread-per-request</strong>: one thread handles one request from start to finish. It is easy to write and debug. The trouble: a platform thread maps one-to-one to an operating-system thread and costs memory (typically about 1 MB of stack is reserved) and scheduling time, so a machine can hold only a few thousand. Most of the time a request thread is not computing; it waits for the database or another service. A server with 200 threads and 200 ms of waiting per request tops out at about 1,000 requests per second, while the CPU is almost idle.</p>
+  <p>Developers escaped this with asynchronous, callback-based code (<code>CompletableFuture</code>, reactive libraries), which is efficient but harder to read, debug and profile. <strong>Virtual threads</strong> (Project Loom, final in Java 21) keep the simple style and remove the thread limit.</p>
+
+  <h4>Platform vs virtual threads</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Platform thread</th><th>Virtual thread</th></tr></thead>
+    <tbody>
+      <tr><td>Managed by</td><td>Operating system</td><td>JVM</td></tr>
+      <tr><td>Mapping</td><td>1 Java thread = 1 OS thread</td><td>Many virtual threads share a few OS threads</td></tr>
+      <tr><td>Stack memory</td><td>Large, reserved up front</td><td>Small, stored on the heap, grows as needed</td></tr>
+      <tr><td>Cost to create</td><td>High: pool them</td><td>Very low: create one per task</td></tr>
+      <tr><td>Practical limit</td><td>Thousands</td><td>Millions</td></tr>
+      <tr><td>Blocking I/O</td><td>Blocks the OS thread</td><td>Unmounts; the OS thread does other work</td></tr>
+      <tr><td>Daemon / priority</td><td>Configurable</td><td>Always daemon; priority fixed</td></tr>
+      <tr><td>Best for</td><td>CPU-heavy work, long-lived workers</td><td>Many tasks that mostly wait on I/O</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>How they work</h4>
+  <p>The JVM runs virtual threads on a small pool of platform threads called <strong>carrier threads</strong> (a <code>ForkJoinPool</code> with, by default, as many carriers as CPU cores). When a virtual thread runs, it is <strong>mounted</strong> on a carrier. When it hits a blocking operation that the JDK has made virtual-thread-aware (socket I/O, <code>Thread.sleep</code>, locks and queues from <code>java.util.concurrent</code>), the JVM saves its stack to the heap and <strong>unmounts</strong> it. The carrier is now free to run another virtual thread. When the I/O completes, the virtual thread is scheduled again, possibly on a different carrier.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Virtual threads (many)      Carrier threads (few, = CPU cores)
+ ┌────┐ ┌────┐ ┌────┐ ┌────┐        ┌───────────┐
+ │ V1 │ │ V2 │ │ V3 │ │ V4 │ ...    │ carrier 1 │ ← runs V1 now
+ └────┘ └────┘ └────┘ └────┘        ├───────────┤
+  V2 waits on DB (unmounted)         │ carrier 2 │ ← runs V3 now
+  V4 sleeping (unmounted)            └───────────┘
+</pre>
+<figcaption>A blocked virtual thread leaves its carrier, so the carrier keeps working</figcaption>
+  </figure>
+
+  <h4>Creating virtual threads</h4>
+  <pre data-title="VirtualDemo.java"><code class="language-java">import java.time.Duration;
+import java.util.concurrent.*;
+import java.util.stream.IntStream;
+
+public class VirtualDemo {
+    public static void main(String[] args) throws Exception {
+        // 1. Builder API
+        Thread t1 = Thread.ofVirtual().name("vt-1").start(
+                () -&gt; System.out.println("virtual? " + Thread.currentThread().isVirtual()));
+        t1.join();
+
+        // 2. Shortcut
+        Thread t2 = Thread.startVirtualThread(() -&gt; System.out.println("hello from t2"));
+        t2.join();
+
+        // 3. Executor: a NEW virtual thread for every task (not a pool)
+        long start = System.currentTimeMillis();
+        try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
+            IntStream.range(0, 10_000).forEach(i -&gt; exec.submit(() -&gt; {
+                Thread.sleep(Duration.ofSeconds(1));      // 10,000 tasks each waiting 1 s
+                return i;
+            }));
+        }   // close() waits for all tasks
+        System.out.println("10,000 tasks took ~"
+                + (System.currentTimeMillis() - start) / 1000.0 + " s");
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (one possible run)"><code class="language-plaintext">virtual? true
+hello from t2
+10,000 tasks took ~1.4 s</code></pre>
+  <p>Ten thousand tasks that each wait one second finish in about one second in total, on a handful of carrier threads. With a fixed pool of 200 platform threads the same job would need about 50 seconds. The code is plain blocking code.</p>
+
+  <h4>When they help and when they do not</h4>
+  <ul>
+    <li><strong>Help:</strong> high-concurrency servers whose requests mostly wait: REST APIs calling databases and other services, batch jobs that fetch thousands of URLs, message consumers doing I/O.</li>
+    <li><strong>Do not help:</strong> CPU-bound work (image processing, encryption, big computations). Throughput is limited by the number of cores no matter how many threads you have. Use a pool sized to the cores.</li>
+    <li>They improve <strong>throughput</strong> under load, not the speed of one request.</li>
+  </ul>
+
+  <h4>Rules and good habits</h4>
+  <ol class="steps">
+    <li><strong>Do not pool virtual threads.</strong> They are cheap; pooling defeats the purpose. Create one per task.</li>
+    <li><strong>Limit concurrency with a Semaphore</strong>, not with pool size, when a downstream resource has limits (for example a database that allows 20 connections, or a partner API).</li>
+    <li>Keep using <code>ReentrantLock</code> or <code>synchronized</code> for short critical sections, but avoid <em>long blocking I/O inside</em> them.</li>
+    <li>Avoid heavy <code>ThreadLocal</code> data (see <a href="#m6-threadlocal">ThreadLocal</a>); a million threads times a big cache is a lot of memory.</li>
+    <li>Do not tune with thread priorities or rely on thread-count assumptions.</li>
+  </ol>
+
+  <h4>Pinning</h4>
+  <p>A virtual thread is <strong>pinned</strong> when it cannot unmount while blocked: it stays stuck to its carrier thread and blocks it. Before Java 24 this happened when the thread blocked <em>inside a <code>synchronized</code> block or method</em>, and it still happens when blocked inside native code or a foreign function call. A few pinned threads are harmless; many pinned threads can starve the small carrier pool. <strong>Java 24 (JEP 491)</strong> removed the <code>synchronized</code> case, so in Java 24 and later (including 25) blocking inside <code>synchronized</code> no longer pins the carrier in most cases. On Java 21 you can switch to <code>ReentrantLock</code> in hot code that blocks, and use the JFR event <code>jdk.VirtualThreadPinned</code> to find pinning.</p>
+
+  <h4>Spring Boot</h4>
+  <p>With Spring Boot 3.2 and later (so also 4.x) on Java 21+, one property switches request handling to virtual threads:</p>
+  <pre data-title="application.properties"><code class="language-properties">spring.threads.virtual.enabled=true</code></pre>
+  <p>Embedded Tomcat or Jetty then runs each request on a virtual thread, and Boot's task execution and scheduling beans also use virtual threads. Your controllers and JDBC code stay unchanged. Details are in <a href="04-spring-boot.html#m6">Spring Boot · Module 6</a>. Remember that the database connection pool (HikariCP, default 10 connections) remains the next bottleneck: ten thousand virtual threads will still wait for ten connections.</p>
+
+  <div class="co co-version">
+    <p class="co-t">Versions and structured concurrency</p>
+    <p>Virtual threads were a preview in Java 19 and 20 and are final in Java 21. Structured concurrency (<code>StructuredTaskScope</code>), which treats a group of subtasks as one unit of work with clean cancellation, was still a preview API in Java 25, so treat it as "coming" and do not use it in production code yet. Observability: thread dumps from <code>jcmd &lt;pid&gt; Thread.dump_to_file -format=json file</code> include virtual threads; the classic <code>jstack</code> output does not list them all.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>IllegalArgumentException</code> — setting a priority on a virtual thread other than normal is ignored; setting it to be non-daemon with <code>setDaemon(false)</code> throws.</li>
+      <li>Code that assumes <code>Thread.currentThread().getName()</code> is unique or non-empty: virtual threads have an empty name unless you set one.</li>
+      <li>Unlimited creation can overwhelm the thing behind them (database, other APIs). Protect it with a semaphore or a bulkhead.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using virtual threads for CPU-bound loops</p>
+    <p>A million virtual threads each crunching numbers will queue on the few carriers and give no speed-up. Pick a fixed pool of about <code>availableProcessors()</code> threads (or a parallel stream) for computation.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What are virtual threads and when would you use them?"</p>
+    <ul>
+      <li>JVM-managed lightweight threads, mounted on carrier threads, unmounted on blocking I/O; final in Java 21.</li>
+      <li>Thread-per-request code scales to very many concurrent waits; not helpful for CPU-bound tasks.</li>
+      <li>Do not pool them; limit with a semaphore; know pinning (fixed for <code>synchronized</code> in Java 24).</li>
+      <li>Spring Boot: <code>spring.threads.virtual.enabled=true</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-thread-safety">
+  <h3>Thread-safety strategies: a decision summary</h3>
+  <p class="tldr">Make code thread-safe in this order of preference: share nothing, share only immutable data, use concurrent collections and atomics, and only then use locks.</p>
+
+  <h4>What thread-safe means</h4>
+  <p>A class is <strong>thread-safe</strong> if it behaves correctly when used by many threads at once, with no extra synchronization by the callers. The dangerous situation always has three ingredients: <strong>shared</strong> data, <strong>mutable</strong> data and <strong>unsynchronized</strong> access. Remove any one and the problem disappears. That gives the five strategies below.</p>
+
+  <h4>The strategies</h4>
+  <ol class="steps">
+    <li><strong>Do not share (confinement).</strong> Keep data in local variables (each thread has its own stack), in method parameters, or in a <code>ThreadLocal</code>. Hand an object to exactly one thread at a time (for example through a <code>BlockingQueue</code>). Local variables are always safe.</li>
+    <li><strong>Do not mutate (immutability).</strong> Immutable objects can be shared freely: <code>String</code>, <code>Integer</code>, <code>LocalDate</code>, records with immutable components, <code>List.of(...)</code>. To change, create a new object. Make fields <code>private final</code>, no setters, copy mutable inputs, and do not leak <code>this</code> from constructors.</li>
+    <li><strong>Use thread-safe building blocks.</strong> <code>ConcurrentHashMap</code>, <code>CopyOnWriteArrayList</code>, <code>BlockingQueue</code>, and atomic classes (<code>AtomicInteger</code>, <code>LongAdder</code>, <code>AtomicReference</code>) give atomic operations without you writing locks.</li>
+    <li><strong>Synchronize access.</strong> <code>synchronized</code> or <code>ReentrantLock</code> around every access to the shared state (reads too), using the same lock; keep the critical section small; use <code>volatile</code> only for a simple flag or safe publication.</li>
+    <li><strong>Use higher-level coordination.</strong> Executors, <code>CompletableFuture</code>, latches, semaphores and virtual threads so that tasks communicate by passing results instead of sharing variables.</li>
+  </ol>
+
+  <h4>Decision table</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Situation</th><th>Choose</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Data is only needed inside one method</td><td>Local variables</td><td>Confined to the thread's stack</td></tr>
+      <tr><td>Configuration or reference data, read often, never changed</td><td>Immutable object / record, safely published (<code>final</code> field or <code>volatile</code> reference)</td><td>No synchronization needed</td></tr>
+      <tr><td>One counter or flag updated by many threads</td><td><code>AtomicInteger</code>, <code>LongAdder</code> (very high contention), <code>volatile boolean</code> for a stop flag</td><td>Lock-free; atomic single operation</td></tr>
+      <tr><td>Shared map with counts or caches</td><td><code>ConcurrentHashMap</code> with <code>merge</code> / <code>computeIfAbsent</code></td><td>Atomic compound operations</td></tr>
+      <tr><td>List read constantly, changed rarely</td><td><code>CopyOnWriteArrayList</code></td><td>Lock-free reads and snapshot iteration</td></tr>
+      <tr><td>Hand work from producers to consumers</td><td><code>BlockingQueue</code></td><td>Built-in waiting and back-pressure</td></tr>
+      <tr><td>Several fields must change together (balance and history)</td><td><code>synchronized</code> / <code>ReentrantLock</code> on one lock</td><td>Invariants that span variables need one lock</td></tr>
+      <tr><td>Read-heavy shared object, occasional writes</td><td><code>ReadWriteLock</code> or <code>StampedLock</code> (after measuring)</td><td>Many readers at once</td></tr>
+      <tr><td>Per-request user or trace id</td><td><code>ThreadLocal</code> with <code>remove()</code> (or <code>ScopedValue</code> in Java 25)</td><td>Confinement; clean up in pools</td></tr>
+      <tr><td>Many blocking I/O tasks</td><td>Virtual threads plus a semaphore for limits</td><td>Simple code, high concurrency</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Real-world application: Spring beans</h4>
+  <p>Spring creates singleton beans (controllers, services, repositories) by default, and one instance serves all request threads. So a service must be <strong>stateless</strong>: no mutable instance fields that hold per-request data. This code is a classic bug:</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: shared mutable state in a singleton</p><pre><code class="language-java">@Service
+public class OrderService {
+    private Order currentOrder;          // shared by all requests!
+    public void process(Order o) {
+        this.currentOrder = o;
+        validate();
+        save(currentOrder);              // may save another user's order
+    }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: pass data through parameters</p><pre><code class="language-java">@Service
+public class OrderService {
+    public void process(Order o) {
+        validate(o);
+        save(o);                         // o is local to this call
+    }
+}</code></pre></div>
+  </div>
+  <p>Other thread-safety hot spots in Spring apps: caches held in plain <code>HashMap</code> fields, <code>SimpleDateFormat</code> as a field, counters as <code>int</code> fields, lazy initialization of fields, and mutable static variables. Each has a fix from the table above.</p>
+
+  <h4>Checking your class</h4>
+  <ul>
+    <li>List all shared mutable fields. For each, name the one thing that protects it: a lock, an atomic, a concurrent type or immutability.</li>
+    <li>Look for check-then-act (<code>if (!map.containsKey)</code>, <code>if (x == null) x = ...</code>) and read-modify-write (<code>count++</code>) sequences. They need to be one atomic step.</li>
+    <li>Do not expose internal mutable collections; return copies or unmodifiable views.</li>
+    <li>Document thread-safety in the class comment (<em>immutable</em>, <em>thread-safe</em>, <em>not thread-safe</em>, <em>guarded by lock X</em>).</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Every access to shared mutable data, reads and writes, needs the same protection.</li>
+      <li>Thread-safe parts do not make a thread-safe whole: two atomic operations in a row are not atomic together.</li>
+      <li>Prefer the simplest tool that works: immutability before atomics, atomics before locks.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Make classes immutable by default; use records for data.</li>
+      <li>Prefer <code>java.util.concurrent</code> over hand-written <code>wait/notify</code>.</li>
+      <li>Test concurrency with many threads and many repetitions, and use tools such as thread dumps and, in bigger projects, stress-testing libraries. A passing single-thread test proves nothing.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you make a class thread-safe?"</p>
+    <ul>
+      <li>Say the three ingredients (shared, mutable, unsynchronized) and the five ways to remove one: confinement, immutability, concurrent collections/atomics, locks, higher-level coordination.</li>
+      <li>Give the Spring example: singleton services must be stateless.</li>
+      <li>Mention check-then-act and read-modify-write as the typical bugs.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,409 @@
+<article class="topic" id="m5-ec2">
+  <h3>EC2: virtual servers, instance types, keys, security groups and disks</h3>
+  <p class="tldr">EC2 rents you a Linux virtual machine: you choose an AMI (the OS image), an instance type (CPU
+  and RAM), a key pair for SSH, a security group (the firewall) and an EBS disk, then pay while it runs.</p>
+
+  <h4>What EC2 is</h4>
+  <p><strong>EC2</strong> (Elastic Compute Cloud) is AWS's virtual-server service, the main IaaS product. An
+  <strong>instance</strong> is one virtual machine. You get a normal Linux server with SSH access, exactly like
+  the machine you practised on in <a href="#m1">Module 1</a>: install Docker, run containers, configure Nginx.
+  When you launch an instance you choose these things:</p>
+  <dl class="terms">
+    <dt>AMI</dt><dd>Amazon Machine Image: the template of the operating system and preinstalled software. For
+    this course use <strong>Ubuntu Server LTS</strong> (the login user is <code>ubuntu</code>). Amazon Linux
+    is AWS's own distribution (login user <code>ec2-user</code>) and also works.</dd>
+    <dt>Instance type</dt><dd>The CPU and memory size, for example <code>t3.micro</code>.</dd>
+    <dt>Key pair</dt><dd>The SSH key used to log in. AWS stores the public half; you download the private half
+    (<code>.pem</code> file) once.</dd>
+    <dt>Security group</dt><dd>A virtual firewall around the instance.</dd>
+    <dt>EBS volume</dt><dd>The virtual disk (Elastic Block Store).</dd>
+  </dl>
+
+  <h4>Instance types and names</h4>
+  <p>A name like <code>t3.micro</code> has three parts: the <strong>family</strong> (<code>t</code>), the
+  <strong>generation</strong> (<code>3</code>) and the <strong>size</strong> (<code>micro</code>). Sizes go
+  nano, micro, small, medium, large, xlarge, 2xlarge and so on, doubling each step.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Family</th><th>Meaning</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>t</code> (t3, t4g)</td><td>Burstable: a low baseline CPU with credits for bursts</td><td>Learning, small apps, dev servers</td></tr>
+      <tr><td><code>m</code></td><td>General purpose, balanced CPU and memory</td><td>Typical application servers</td></tr>
+      <tr><td><code>c</code></td><td>Compute-optimised</td><td>CPU-heavy work</td></tr>
+      <tr><td><code>r</code></td><td>Memory-optimised</td><td>Caches, big in-memory data</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Burstable</strong> (t-family) instances run at a baseline and earn credits while idle, which they
+  spend when busy. If you run at full CPU for long, credits run out and the instance slows (or, in
+  "unlimited" mode, bills extra), so they suit apps that are mostly idle. A letter <code>g</code> in the name
+  (<code>t4g</code>, <code>m7g</code>) means <strong>Graviton</strong>, AWS's ARM processor. Graviton is often
+  cheaper for the same power, but it needs ARM builds of your software. Java runs fine on ARM, and Docker images
+  must be built for <code>linux/arm64</code> (see the multi-platform note in
+  <a href="#m4-docker-publish">the GHCR article</a>). Which types qualify for any free offer changes, so check the
+  current free-tier page before choosing.</p>
+  <p>Size for memory, not only CPU. A Spring Boot app plus Nginx plus Docker needs roughly a gigabyte to run
+  comfortably; on a 1 GiB instance with a database too, memory is tight. Options: a bigger type, a swap file (shown
+  in the runbook), or a managed database so the instance only runs the app.</p>
+
+  <h4>Key pairs and SSH</h4>
+  <p>When you create a key pair, AWS lets you download the private key <strong>only once</strong>. Keep it safe,
+  and restrict its permissions, or SSH refuses it:</p>
+  <pre data-title="Linux, macOS or Git Bash"><code class="language-shell">$ chmod 400 shop-key.pem
+$ ssh -i shop-key.pem ubuntu@203.0.113.25
+Welcome to Ubuntu 24.04 LTS (GNU/Linux 6.8.0-1012-aws x86_64)
+ubuntu@ip-172-31-5-20:~$</code></pre>
+  <pre data-title="Windows PowerShell (OpenSSH): restrict the key file"><code class="language-shell">PS&gt; icacls .\shop-key.pem /inheritance:r
+PS&gt; icacls .\shop-key.pem /grant:r "$($env:USERNAME):(R)"
+PS&gt; ssh -i .\shop-key.pem ubuntu@203.0.113.25</code></pre>
+  <p>If you lose the private key, you cannot recover it; you would create a new key pair and launch a new
+  instance (or use AWS Systems Manager Session Manager or EC2 Instance Connect to get in and add a new key).</p>
+
+  <h4>Security groups</h4>
+  <p>A <strong>security group</strong> is a stateful firewall attached to the instance. <strong>Inbound</strong>
+  traffic is denied unless a rule allows it; <strong>outbound</strong> is allowed by default. "Stateful" means
+  that a reply to an allowed request is allowed automatically. For one web server:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Port</th><th>Source</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>SSH</td><td>22</td><td><strong>My IP</strong> only</td><td>Admin login</td></tr>
+      <tr><td>HTTP</td><td>80</td><td>0.0.0.0/0 (anywhere)</td><td>Nginx, and the Let's Encrypt check</td></tr>
+      <tr><td>HTTPS</td><td>443</td><td>0.0.0.0/0</td><td>Public traffic</td></tr>
+    </tbody>
+  </table></div>
+  <p>Do <strong>not</strong> open port 8080 (the Spring Boot container) to the world; only Nginx on the same
+  machine talks to it. Never leave SSH open to <code>0.0.0.0/0</code>: bots try passwords on port 22 all day.
+  A rule's source can also be <em>another security group</em>, which is how the database lets in only your
+  server (see <a href="#m5-rds">RDS</a>). Your home IP may change; if SSH suddenly times out, update the rule.</p>
+
+  <h4>Disks, IP addresses and user data</h4>
+  <ul>
+    <li><strong>EBS volumes</strong> are network disks. The root volume holds the OS. A volume survives a stop;
+    whether it is deleted at termination is the "delete on termination" setting. Common type: <code>gp3</code>
+    (general-purpose SSD). <strong>Snapshots</strong> are backups of a volume. A volume lives in one AZ.</li>
+    <li><strong>Public IP</strong>: the automatic public address of an instance <em>changes</em> when you stop
+    and start it. An <strong>Elastic IP</strong> is a static public IPv4 address that you own until you release
+    it; associate it with the instance so your DNS record stays valid. AWS now charges for public IPv4
+    addresses, and an unused Elastic IP is a classic waste, so check current pricing and release what you do
+    not need.</li>
+    <li><strong>User data</strong>: a script that runs once as root at first boot (through cloud-init). Good for
+    installing packages automatically. Its output goes to <code>/var/log/cloud-init-output.log</code>.</li>
+  </ul>
+  <pre data-title="User data example (Advanced details when launching)"><code class="language-bash">#!/bin/bash
+apt-get update -y
+apt-get install -y nginx
+systemctl enable --now nginx</code></pre>
+
+  <h4>Stop vs terminate</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Action</th><th>What happens</th><th>Billing</th></tr></thead>
+    <tbody>
+      <tr><td>Reboot</td><td>Restart of the OS; same host, same IPs</td><td>Continues</td></tr>
+      <tr><td>Stop</td><td>Shut down; the instance and disks remain; the public IP changes</td><td>No compute charge, but EBS storage (and any Elastic IP) still bills</td></tr>
+      <tr><td>Terminate</td><td>Instance deleted forever; root volume deleted if "delete on termination" is on</td><td>Stops, except volumes that were kept</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: SSH errors and what they mean</p>
+    <ul>
+      <li><em>Connection timed out</em> — the security group does not allow your IP on port 22, you used the
+      wrong IP, or the instance has no public address.</li>
+      <li><em>Permission denied (publickey)</em> — wrong user (<code>ubuntu</code> vs <code>ec2-user</code>),
+      wrong key file, or the instance was launched with another key pair.</li>
+      <li><em>UNPROTECTED PRIVATE KEY FILE</em> — the <code>.pem</code> permissions are too open;
+      <code>chmod 400</code> it.</li>
+    </ul>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: enable termination protection and IMDSv2</p>
+    <p>Turn on termination protection for the one server you care about. Prefer IMDSv2 (token-based instance
+    metadata, the default on recent AMIs); it blocks a class of attacks where a bug in your app is tricked into
+    reading the server's credentials.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What happens to data when you stop vs terminate an instance?"</p>
+    <ul>
+      <li>Stop: EBS data stays, the public IP changes (unless Elastic IP). Terminate: the instance is gone,
+      and the root volume is deleted by default. Instance-store data is lost on stop.</li>
+      <li>Mention security group statefulness and the t-family credit model.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-deploy-runbook">
+  <h3>Runbook: deploy Spring Boot on EC2 with Docker, Nginx and HTTPS</h3>
+  <p class="tldr">Launch an Ubuntu instance, attach an Elastic IP, install Docker, run your container from
+  GHCR with Compose, put Nginx in front, point an A record at the IP, get a certificate with certbot, and keep
+  two small scripts for updating and rolling back.</p>
+
+  <h4>What we are building</h4>
+  <p>Your Spring Boot image (from <a href="#m3-spring-dockerfile">Module 3</a>), published to GHCR by your
+  pipeline (<a href="#m4-docker-publish">Module 4</a>), runs on one EC2 server. Nginx listens on ports 80 and
+  443 and forwards to the container on <code>127.0.0.1:8080</code>. The database is
+  <a href="#m5-rds">RDS</a> (or a container for a cheap experiment). We use the example name
+  <code>api.example.com</code> and image <code>ghcr.io/asha/shop-api</code>; replace them with yours.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  U[Browser] -->|"HTTPS 443"| N["Nginx on EC2"]
+  N -->|"HTTP 127.0.0.1:8080"| A["Spring Boot container"]
+  A -->|"5432"| D[("RDS PostgreSQL")]
+  G[("GHCR image")] -.->|docker pull| A
+</pre>
+    <figcaption>The deployed system: only Nginx is public; the app and database are private</figcaption>
+  </figure>
+
+  <h4>Step 1: launch the instance</h4>
+  <ol class="steps">
+    <li>In the console, select your region (for example Mumbai), open EC2 → Launch instance.</li>
+    <li>Name: <code>shop-api</code>. AMI: <strong>Ubuntu Server LTS</strong>. Instance type: pick a small one
+    that fits your plan (check the current free-tier page; for a Spring Boot app 2 GiB of RAM is more
+    comfortable than 1 GiB).</li>
+    <li>Key pair: create <code>shop-key</code> (ED25519 or RSA, <code>.pem</code>), and save the download.</li>
+    <li>Network settings: create a security group allowing SSH from <strong>My IP</strong>, and HTTP and HTTPS
+    from anywhere. Do not open 8080.</li>
+    <li>Storage: the default root volume (gp3) is enough; leave "delete on termination" on.</li>
+    <li>Launch. Wait for "Running" and 2/2 status checks.</li>
+    <li>EC2 → Elastic IPs → Allocate, then Associate it with your instance. This is the address for DNS.</li>
+  </ol>
+
+  <h4>Step 2: connect and prepare the server</h4>
+  <pre data-title="Your laptop, then the server"><code class="language-shell">$ ssh -i shop-key.pem ubuntu@203.0.113.25
+$ sudo apt update &amp;&amp; sudo apt -y upgrade
+$ sudo timedatectl set-timezone Asia/Kolkata     # optional, logs in IST
+$ free -h                                         # check the RAM you actually have</code></pre>
+  <p>On a small instance, add a swap file so a short memory spike does not kill the app (swap is slow, so it is
+  a safety net, not a substitute for RAM):</p>
+  <pre data-title="Create 1 GB of swap"><code class="language-shell">$ sudo fallocate -l 1G /swapfile
+$ sudo chmod 600 /swapfile
+$ sudo mkswap /swapfile
+$ sudo swapon /swapfile
+$ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+$ swapon --show</code></pre>
+
+  <h4>Step 3: install Docker</h4>
+  <p>Docker's documentation (docs.docker.com) has the official apt-repository steps for Ubuntu. For a learning
+  server, Docker's convenience script is a short alternative, but read a script before you run it as root and
+  avoid it for production machines.</p>
+  <pre data-title="Install Docker Engine and the Compose plugin"><code class="language-shell">$ curl -fsSL https://get.docker.com -o get-docker.sh
+$ less get-docker.sh                 # read it first
+$ sudo sh get-docker.sh
+$ sudo usermod -aG docker $USER      # allow 'docker' without sudo
+$ exit                               # log out and back in for the group to apply
+$ ssh -i shop-key.pem ubuntu@203.0.113.25
+$ docker run --rm hello-world
+$ docker compose version
+$ sudo systemctl enable docker       # start Docker at boot (usually already on)</code></pre>
+  <p>Members of the <code>docker</code> group effectively have root on the machine, so add only yourself.</p>
+
+  <h4>Step 4: configuration, secrets and the Compose file</h4>
+  <p>Create a folder that holds only configuration, never source code. The <code>.env</code> file holds secrets,
+  so its permissions are strict.</p>
+  <pre data-title="Server"><code class="language-shell">$ sudo mkdir -p /opt/shop &amp;&amp; sudo chown $USER:$USER /opt/shop
+$ cd /opt/shop
+$ nano .env
+$ chmod 600 .env</code></pre>
+  <pre data-title="/opt/shop/.env"><code class="language-properties">IMAGE_TAG=sha-3f9c2ab
+SPRING_PROFILES_ACTIVE=prod
+SPRING_DATASOURCE_URL=jdbc:postgresql://shop-db.abc123.ap-south-1.rds.amazonaws.com:5432/shop
+SPRING_DATASOURCE_USERNAME=shop_app
+SPRING_DATASOURCE_PASSWORD=change-me-long-random
+JWT_SECRET=change-me-another-long-random-value
+JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75</code></pre>
+  <pre data-title="/opt/shop/compose.yaml"><code class="language-yaml">services:
+  api:
+    image: ghcr.io/asha/shop-api:${IMAGE_TAG}
+    env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"        # reachable only from this machine (Nginx)
+    restart: unless-stopped          # comes back after a crash or a reboot
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"              # rotate logs so the disk never fills
+        max-file: "3"</code></pre>
+  <p>The binding <code>127.0.0.1:8080:8080</code> is the important line: Docker publishes the port on the
+  loopback interface only. A plain <code>8080:8080</code> would open it on every interface, and Docker
+  bypasses some host firewall rules, so the security group is your real protection too. In production a
+  <code>HEALTHCHECK</code> is also useful (<a href="#m6-health-checks">Module 6</a>). The Spring property
+  <code>server.forward-headers-strategy=framework</code> makes the app trust Nginx's
+  <code>X-Forwarded-*</code> headers, so generated links and redirects use <code>https</code>.</p>
+
+  <h4>Step 5: pull and run</h4>
+  <p>If your image is private on GHCR, log in with a personal access token that has the
+  <code>read:packages</code> scope. Type the token without leaving it in your shell history:</p>
+  <pre data-title="Server"><code class="language-shell">$ read -rs GHCR_TOKEN                 # paste the token, press Enter (nothing is echoed)
+$ echo "$GHCR_TOKEN" | docker login ghcr.io -u asha --password-stdin
+$ unset GHCR_TOKEN
+$ cd /opt/shop
+$ docker compose pull
+$ docker compose up -d
+$ docker compose ps
+$ docker compose logs -f api          # Ctrl+C to leave; look for "Started ShopApplication"
+$ curl -s http://127.0.0.1:8080/actuator/health
+{"status":"UP"}</code></pre>
+
+  <h4>Step 6: Nginx as a reverse proxy</h4>
+  <p>Nginx accepts public connections and forwards them to the app. The full configuration with TLS settings is
+  in <a href="#m2">Module 2</a>; here is the minimum.</p>
+  <pre data-title="Server"><code class="language-shell">$ sudo apt install -y nginx
+$ sudo nano /etc/nginx/sites-available/shop</code></pre>
+  <pre data-title="/etc/nginx/sites-available/shop"><code class="language-nginx">server {
+    listen 80;
+    listen [::]:80;
+    server_name api.example.com;
+
+    client_max_body_size 10m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }
+}</code></pre>
+  <pre data-title="Enable the site"><code class="language-shell">$ sudo ln -s /etc/nginx/sites-available/shop /etc/nginx/sites-enabled/shop
+$ sudo rm -f /etc/nginx/sites-enabled/default
+$ sudo nginx -t                      # always test the syntax first
+$ sudo systemctl reload nginx
+$ curl -i -H "Host: api.example.com" http://127.0.0.1/actuator/health</code></pre>
+
+  <h4>Step 7: point the domain (A record)</h4>
+  <p>At your DNS provider, add an <strong>A record</strong>: name <code>api</code>, value your Elastic IP.
+  Details are in <a href="#m5-domains-dns">Domains and DNS</a>. Check it from your laptop:</p>
+  <pre data-title="Your laptop"><code class="language-shell">$ dig +short api.example.com
+203.0.113.25
+$ curl -i http://api.example.com/actuator/health</code></pre>
+  <p>Wait until <code>dig</code> returns your IP. Do not run certbot before DNS works; the certificate check
+  needs to reach your server by that name.</p>
+
+  <h4>Step 8: HTTPS with Let's Encrypt</h4>
+  <p><strong>Let's Encrypt</strong> issues free certificates, and <strong>certbot</strong> is the tool that
+  obtains them and edits Nginx for you. (The certbot website also documents a snap-based install, which gives
+  newer versions; the apt packages below are simplest on Ubuntu.)</p>
+  <pre data-title="Server"><code class="language-shell">$ sudo apt install -y certbot python3-certbot-nginx
+$ sudo certbot --nginx -d api.example.com
+# It asks for an email address and for you to accept the terms of service,
+# then offers to redirect HTTP to HTTPS: choose the redirect.
+$ curl -I https://api.example.com/actuator/health
+HTTP/2 200
+$ sudo certbot renew --dry-run         # prove that automatic renewal works
+$ systemctl list-timers | grep certbot # the renewal timer</code></pre>
+  <p>Certificates last a short time (90 days), so renewal must be automatic. The package installs a timer that
+  runs twice a day; the dry run proves it works. Port 80 must stay open for renewals.</p>
+
+  <h4>Step 9: survive crashes and reboots</h4>
+  <p>Three layers keep the app alive: <code>restart: unless-stopped</code> restarts the container if it exits;
+  Docker itself starts at boot (<code>systemctl enable docker</code>); Nginx is a systemd service and starts at
+  boot (<code>systemctl enable nginx</code>, already done by the package). Test it once:</p>
+  <pre data-title="Server"><code class="language-shell">$ sudo reboot
+# wait a minute, ssh in again
+$ docker compose -f /opt/shop/compose.yaml ps
+$ curl -s https://api.example.com/actuator/health</code></pre>
+  <p>If you run a plain JAR without Docker, use a systemd unit instead (see
+  <a href="#m1">Module 1</a> for how units work):</p>
+  <pre data-title="/etc/systemd/system/shop.service"><code class="language-ini">[Unit]
+Description=Shop API
+After=network.target
+
+[Service]
+User=shop
+EnvironmentFile=/etc/shop/shop.env
+ExecStart=/usr/bin/java -jar /opt/shop/app.jar
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+  <h4>Step 10: logs</h4>
+  <pre data-title="Server"><code class="language-shell">$ docker compose logs --tail 100 -f api
+$ sudo tail -f /var/log/nginx/access.log /var/log/nginx/error.log</code></pre>
+  <p>More methods are in <a href="#m6-logs-server">Module 6</a>.</p>
+
+  <h4>Step 11: update to a new version, and roll back</h4>
+  <p>Each build in your pipeline has an immutable tag (<code>sha-xxxxxxx</code>). A small script on the server
+  changes the tag, pulls, restarts, checks health, and goes back automatically if the new version does not
+  become healthy.</p>
+  <pre data-title="/opt/shop/deploy.sh"><code class="language-bash">#!/usr/bin/env bash
+# Usage: ./deploy.sh sha-3f9c2ab
+set -euo pipefail
+cd /opt/shop
+
+NEW_TAG="${1:?usage: deploy.sh &lt;image-tag&gt;}"
+OLD_TAG="$(grep '^IMAGE_TAG=' .env | cut -d= -f2)"
+
+sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${NEW_TAG}/" .env
+echo "${OLD_TAG}" &gt; .previous_tag
+
+docker compose pull api
+docker compose up -d api
+
+for i in $(seq 1 40); do
+  if curl -fsS http://127.0.0.1:8080/actuator/health &gt; /dev/null; then
+    echo "Healthy on ${NEW_TAG}"
+    docker image prune -f &gt; /dev/null
+    exit 0
+  fi
+  sleep 3
+done
+
+echo "New version is not healthy, going back to ${OLD_TAG}"
+sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${OLD_TAG}/" .env
+docker compose up -d api
+exit 1</code></pre>
+  <pre data-title="Use it"><code class="language-shell">$ chmod +x /opt/shop/deploy.sh
+$ /opt/shop/deploy.sh sha-9b1d4e7          # deploy a new version
+$ /opt/shop/deploy.sh "$(cat /opt/shop/.previous_tag)"   # manual rollback</code></pre>
+  <p>Module 4's <a href="#m4-cd">CD workflow</a> runs these same commands over SSH after the image is pushed. A
+  rollback works only because old images still exist (so prune carefully) and because database changes are
+  backward compatible.</p>
+
+  <h4>Troubleshooting table</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Symptom</th><th>Likely cause</th><th>Check</th></tr></thead>
+    <tbody>
+      <tr><td>Browser times out on the domain</td><td>Security group, wrong IP in DNS, Nginx down</td><td><code>dig</code>, security group rules, <code>systemctl status nginx</code></td></tr>
+      <tr><td>502 Bad Gateway</td><td>Nginx cannot reach the app (down, wrong port, still starting)</td><td><code>docker compose ps</code>, <code>curl 127.0.0.1:8080</code></td></tr>
+      <tr><td>Container restarts in a loop</td><td>App crashes at startup (DB, missing env)</td><td><code>docker compose logs api</code></td></tr>
+      <tr><td>certbot fails</td><td>DNS not pointing yet, port 80 blocked</td><td><code>dig</code>, security group port 80</td></tr>
+      <tr><td><em>unauthorized</em> on pull</td><td>Not logged in to GHCR, or token lacks <code>read:packages</code></td><td><code>docker login ghcr.io</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: only 80, 443 (and SSH from your IP) are public</p>
+    <p>The app port and the database port must never be reachable from the internet. From your laptop,
+    <code>curl http://203.0.113.25:8080</code> should time out.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Putting secrets in the Compose file or the image instead of an env file with mode 600.</li>
+      <li>Deploying <code>latest</code>, so you cannot name or roll back what runs.</li>
+      <li>Running certbot before the DNS record exists.</li>
+      <li>Editing files only on the server and not keeping the Compose file and Nginx config in Git.</li>
+      <li>Forgetting that stopping the instance changes the public IP when no Elastic IP is attached.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Let's Encrypt applies rate limits; use <code>--dry-run</code> or its staging server while testing.</li>
+      <li>If the app runs on Cloudflare's proxy (orange cloud), certificate and redirect settings behave
+      differently; see <a href="#m5-domains-dns">Domains and DNS</a>.</li>
+      <li><code>docker compose up -d</code> recreates the container, causing a few seconds of downtime. See
+      <a href="#m5-deploy-strategies">deployment strategies</a>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Walk me through deploying a Spring Boot app to a server."</p>
+    <ul>
+      <li>Provision (EC2, Elastic IP, security group), install Docker, pull the tagged image, run with env vars,
+      Nginx reverse proxy, DNS A record, certbot HTTPS, restart policy, logs, scripted update with health check
+      and rollback.</li>
+      <li>Add: secrets never in the image, only 80/443 public, database private.</li>
+    </ul>
+  </div>
+</article>

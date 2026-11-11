@@ -1,0 +1,531 @@
+<article class="topic" id="m3-fetching">
+  <h3>Lazy vs eager loading, proxies and LazyInitializationException</h3>
+  <p class="tldr">Fetch type decides when a related entity is loaded; make every association LAZY, load what you need explicitly in the service, and turn off Open Session in View so lazy loading cannot leak into the web layer.</p>
+
+  <h4>Lazy and eager</h4>
+  <ul>
+    <li><strong>EAGER</strong>: the related data is loaded together with the owner, always, whether you need it or not.</li>
+    <li><strong>LAZY</strong>: the related data is loaded only when you first touch it (<code>job.getCompany().getName()</code>), with a second query.</li>
+  </ul>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation</th><th>Default fetch</th><th>Meaning of the default</th></tr></thead>
+    <tbody>
+      <tr><td><code>@ManyToOne</code></td><td><strong>EAGER</strong></td><td>Loading a Job also loads its Company</td></tr>
+      <tr><td><code>@OneToOne</code></td><td><strong>EAGER</strong></td><td>Same</td></tr>
+      <tr><td><code>@OneToMany</code></td><td>LAZY</td><td>Children loaded on first access</td></tr>
+      <tr><td><code>@ManyToMany</code></td><td>LAZY</td><td>Join rows loaded on first access</td></tr>
+      <tr><td><code>@Basic</code> fields</td><td>EAGER</td><td>Column loaded with the row (LAZY on a basic field needs bytecode enhancement)</td></tr>
+    </tbody>
+  </table></div>
+  <p>The defaults are historical and dangerous: an eager <code>@ManyToOne</code> on <code>Application.job</code> means "load 20 applications" also loads 20 jobs, and each job eagerly loads its company. With JPQL/derived queries this becomes extra queries per row; with <code>findById</code> it becomes joins you did not ask for. Also, <code>fetch = EAGER</code> cannot be switched off for a single query. LAZY can be switched on per query (join fetch, entity graph), so LAZY is the flexible default.</p>
+  <div class="co co-rule">
+    <p class="co-t">Rule: make every association LAZY</p>
+    <p>Write <code>@ManyToOne(fetch = FetchType.LAZY)</code> and <code>@OneToOne(fetch = FetchType.LAZY)</code> everywhere. Then decide per use case what to load: <code>JOIN FETCH</code>, <code>@EntityGraph</code>, batch fetching, or a DTO projection (see <a href="#m3-n-plus-one">the N+1 article</a>).</p>
+  </div>
+
+  <h4>How lazy loading works: proxies</h4>
+  <p>For a lazy <code>@ManyToOne</code>, Hibernate puts a <strong>proxy</strong> in the field: a generated subclass of <code>Company</code> that holds only the id. Calling <code>job.getCompany().getId()</code> does not hit the database. The first call to any other method (<code>getName()</code>) makes the proxy run <code>select ... from company where id=?</code> through the open session and fill itself. For a lazy collection, Hibernate puts its own collection class (<code>PersistentBag</code>/<code>PersistentSet</code>) that loads on first iteration or <code>size()</code>.</p>
+  <pre data-title="Lazy loading in action (inside a transaction)"><code class="language-java">@Transactional(readOnly = true)
+public String companyOfJob(Long jobId) {
+    Job job = jobRepository.findById(jobId).orElseThrow();   // select from job where id=?
+    Company c = job.getCompany();                             // proxy, no SQL yet
+    return c.getName();                                       // select from company where id=?
+}</code></pre>
+  <p>Consequences of proxies: <code>c.getClass()</code> is not <code>Company</code> but <code>Company$HibernateProxy$...</code>; <code>instanceof</code> and <code>equals</code> need care (<code>Hibernate.getClass</code>, <a href="#m3-entities">entities</a>); final classes and methods cannot be proxied.</p>
+
+  <h4>LazyInitializationException</h4>
+  <p>The proxy can only load data while its <strong>session is open</strong>, that is, inside the transaction. If you touch it after the service method returned, there is no session and you get:</p>
+  <pre class="out" data-title="The famous error"><code class="language-plaintext">org.hibernate.LazyInitializationException: could not initialize proxy
+[com.example.jobs.company.Company#7] - no Session</code></pre>
+  <pre data-title="How it happens"><code class="language-java">// service
+@Transactional(readOnly = true)
+public Job getJob(Long id) { return jobRepository.findById(id).orElseThrow(); }
+
+// controller (no transaction)
+Job job = jobService.getJob(5L);
+return job.getCompany().getName();       // BOOM: session already closed</code></pre>
+  <p>Wrong fixes people copy from the internet: make the association <code>EAGER</code> (slow everywhere), add <code>@Transactional</code> to the controller (wrong layer), or keep Open Session in View. <strong>Right fixes</strong>, in order of preference:</p>
+  <ol class="steps">
+    <li><strong>Map to a DTO inside the service</strong> (inside the transaction) and return the DTO. This is the standard in <a href="#m2">module 2</a>.</li>
+    <li><strong>Load what you need with the query</strong>: <code>join fetch</code>, <code>@EntityGraph</code>, or a DTO/projection query that selects the fields directly.</li>
+    <li><strong>Initialise explicitly</strong> in the service (<code>Hibernate.initialize(job.getTags())</code>) only for rare cases.</li>
+  </ol>
+
+  <h4>Open Session in View (OSIV)</h4>
+  <p><strong>Open Session in View</strong> keeps the Hibernate session open for the whole HTTP request, until the response is written. Lazy loading then works in the controller and in JSON serialization. Spring Boot enables it by default (<code>spring.jpa.open-in-view=true</code>) and prints a warning at startup: <em>"spring.jpa.open-in-view is enabled by default... Explicitly configure spring.jpa.open-in-view to disable this warning"</em>.</p>
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Why it exists</p><ul><li>No <code>LazyInitializationException</code> in controllers or views.</li><li>Convenient for quick demos.</li></ul></div>
+    <div class="pc-con"><p class="pc-t">Why to switch it off</p><ul><li>Hides N+1 queries: every row serialised can fire a query, outside any transaction boundary.</li><li>Holds a database connection for the whole request, including slow JSON writing and calls to other services, so the pool runs out under load.</li><li>Lets the web layer depend on entity internals; the service stops being the data boundary.</li></ul></div>
+  </div>
+  <pre data-title="application.properties"><code class="language-properties">spring.jpa.open-in-view=false</code></pre>
+  <p>With it off, your code must fetch everything the response needs inside the service. That is the discipline you want, and the exceptions will tell you early where a fetch is missing.</p>
+
+  <h4>Eager loading when you do need it</h4>
+  <p>Do not mark the mapping EAGER. Ask for it in the query instead, so only that screen pays:</p>
+  <pre data-title="Fetch the company together with the job, only here"><code class="language-java">@Query("select j from Job j join fetch j.company where j.id = :id")
+Optional&lt;Job&gt; findWithCompany(@Param("id") Long id);
+
+@EntityGraph(attributePaths = "company")
+Optional&lt;Job&gt; findDetailedById(Long id);          // derived query + graph</code></pre>
+  <pre class="out" data-title="SQL: one statement, with a join"><code class="language-sql">select j.*, c.* from job j join company c on c.id = j.company_id where j.id = ?</code></pre>
+
+  <h4>Other lazy-related details</h4>
+  <ul>
+    <li><strong><code>getReferenceById</code></strong> gives a proxy on purpose (<a href="#m3-persistence-context">persistence context</a>).</li>
+    <li><strong>Lazy basic fields and <code>@Lob</code></strong>: to avoid loading a big text column, move it to its own entity or use a projection; true attribute laziness needs Hibernate bytecode enhancement.</li>
+    <li><strong><code>optional = false</code></strong> helps Hibernate use an inner join instead of a left join for fetches.</li>
+    <li><strong>Serialising entities</strong> with Jackson triggers lazy loads on every getter, one more reason for DTOs.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions</p>
+    <ul>
+      <li><code>LazyInitializationException</code> — lazy association touched with no open session (above).</li>
+      <li><code>EntityNotFoundException</code> — a proxy tries to load a row that was deleted.</li>
+      <li><code>HibernateException: Unable to find ... with id</code> — same cause, older style message, from stale foreign keys.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Making associations <code>EAGER</code> to silence <code>LazyInitializationException</code>. You trade one error for hidden slowness.</li>
+      <li>Leaving OSIV on because the app "works", then discovering 300 queries per page in production.</li>
+      <li>Calling a lazy getter in a <code>toString()</code> (Lombok) or in logging.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is <code>LazyInitializationException</code> and how do you fix it?" Explain proxy + closed session, then give the DTO-in-service and fetch-in-query fixes, and say why not EAGER or OSIV. "What are the default fetch types?" ToOne = EAGER, ToMany = LAZY. "What is Open Session in View and should you use it?" Describe it and its connection and N+1 downsides; recommend <code>false</code>.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-n-plus-one">
+  <h3>The N+1 problem: detect and fix with JOIN FETCH, EntityGraph and batching</h3>
+  <p class="tldr">N+1 means one query loads N parents and then N more queries load each parent's relation; find it in the SQL log, and fix it with JOIN FETCH, @EntityGraph, batch fetching or a DTO query.</p>
+
+  <h4>What it is</h4>
+  <p>You load a list of <code>Application</code>s (1 query) and then, for each one, print <code>app.getApplicant().getName()</code>. Because <code>applicant</code> is lazy, Hibernate loads each user separately: N more queries. For 50 applications, that is 51 queries instead of 1 or 2. It looks fine with 5 rows in development and kills the database with 5,000 rows in production.</p>
+  <pre data-title="The innocent-looking code"><code class="language-java">@Transactional(readOnly = true)
+public List&lt;ApplicantRow&gt; applicantsOfJob(Long jobId) {
+    List&lt;Application&gt; apps = applicationRepository.findByJobId(jobId);   // 1 query
+    return apps.stream()
+            .map(a -&gt; new ApplicantRow(a.getId(), a.getApplicant().getName()))  // N queries
+            .toList();
+}</code></pre>
+  <pre class="out" data-title="SQL log (N = 3)"><code class="language-sql">select a.* from application a where a.job_id=?          -- 1 query, 3 rows
+select u.* from app_user u where u.id=?                 -- user 11
+select u.* from app_user u where u.id=?                 -- user 12
+select u.* from app_user u where u.id=?                 -- user 13</code></pre>
+  <p>The same happens with a lazy collection: <code>companies.forEach(c -&gt; c.getJobs().size())</code> runs one extra query per company. And with EAGER associations on a JPQL query: Hibernate loads the parents with your query, then loads each eager relation with separate queries. Eager is not a fix; it is another source of N+1.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant S as Service
+  participant H as Hibernate
+  participant D as Database
+  S->>H: findByJobId(7)
+  H->>D: select from application (1 query)
+  D-->>H: 3 rows
+  loop for each application
+    S->>H: getApplicant().getName()
+    H->>D: select from app_user where id=?
+    D-->>H: 1 row
+  end
+</pre>
+  <figcaption>1 query for the list + N queries for the relation = N+1</figcaption>
+  </figure>
+
+  <h4>Detecting it</h4>
+  <ol class="steps">
+    <li><strong>Read the SQL log.</strong> Turn on <code>logging.level.org.hibernate.SQL=debug</code> in development and look for the same statement repeating with different ids (<a href="#m3-datasource-hikari">SQL logging</a>).</li>
+    <li><strong>Hibernate statistics.</strong> <code>spring.jpa.properties.hibernate.generate_statistics=true</code> plus <code>logging.level.org.hibernate.stat=debug</code> prints, per session, how many statements were prepared. A list page with 100+ statements is a red flag.</li>
+    <li><strong>Tests that count queries.</strong> Libraries such as datasource-proxy or Hypersistence Utils assert "this method runs at most 2 queries". It stops regressions.</li>
+    <li><strong>APM / slow query logs</strong> in production show hundreds of identical short queries per request.</li>
+  </ol>
+
+  <h4>Fix 1: JOIN FETCH</h4>
+  <p><code>join fetch</code> tells JPQL to load the association in the same SQL statement with a join.</p>
+  <pre data-title="JOIN FETCH query"><code class="language-java">@Query("""
+       select a from Application a
+       join fetch a.applicant
+       where a.job.id = :jobId
+       """)
+List&lt;Application&gt; findByJobIdWithApplicant(@Param("jobId") Long jobId);</code></pre>
+  <pre class="out" data-title="SQL: one query"><code class="language-sql">select a.*, u.*
+from application a join app_user u on u.id = a.user_id
+where a.job_id = ?</code></pre>
+  <p>Use <code>left join fetch</code> when the association may be null or empty (a company with no jobs). <code>distinct</code> removes duplicate parents when you fetch a collection: <code>select distinct c from Company c left join fetch c.jobs</code> (Hibernate 6 removes duplicate entities automatically, but keeping <code>distinct</code> is harmless and clearer).</p>
+
+  <h4>Fix 2: @EntityGraph</h4>
+  <p>An <strong>entity graph</strong> says "load these attributes eagerly for this call", without writing JPQL. It works on derived queries and <code>findAll</code> overrides.</p>
+  <pre data-title="@EntityGraph on repository methods"><code class="language-java">public interface ApplicationRepository extends JpaRepository&lt;Application, Long&gt; {
+
+    @EntityGraph(attributePaths = {"applicant", "job"})
+    List&lt;Application&gt; findByJobId(Long jobId);              // derived query + graph
+
+    @EntityGraph(attributePaths = {"job", "job.company"})   // nested path
+    Page&lt;Application&gt; findByApplicantId(Long userId, Pageable pageable);
+}</code></pre>
+  <p>An entity graph is a fetch hint, by default of type "fetch" (the listed attributes are eager, others keep their mapping). It is convenient and keeps method names clean; <code>join fetch</code> gives you more control (filters on the joined rows, aliases).</p>
+
+  <h4>Fix 3: batch fetching</h4>
+  <p>Instead of one query per parent, Hibernate can load many at once: <code>... where id in (?, ?, ?, ...)</code>. This is configured globally, and it makes lazy loading cheap without changing any query.</p>
+  <pre data-title="application.properties"><code class="language-properties">spring.jpa.properties.hibernate.default_batch_fetch_size=16</code></pre>
+  <pre class="out" data-title="SQL with batch size 16: N queries become ceil(N/16)"><code class="language-sql">select a.* from application a where a.job_id=?
+select u.* from app_user u where u.id in (?,?,?, ... up to 16 ids)</code></pre>
+  <p>Per association you can use Hibernate's <code>@BatchSize(size = 16)</code> on the field or class. A value between 10 and 50 is common. It is a good safety net: set it once and many accidental N+1s become 1+1.</p>
+
+  <h4>Fix 4: DTO projection</h4>
+  <p>If the screen needs only a few fields, do not load entities at all (<a href="#m3-query-projections">projections</a>):</p>
+  <pre data-title="One query, only the needed columns"><code class="language-java">public record ApplicantRow(Long applicationId, String name, String email,
+                           ApplicationStatus status) {}
+
+@Query("""
+       select new com.example.jobs.application.ApplicantRow(
+              a.id, u.name, u.email, a.status)
+       from Application a join a.applicant u
+       where a.job.id = :jobId
+       """)
+List&lt;ApplicantRow&gt; findApplicantRows(@Param("jobId") Long jobId);</code></pre>
+  <p>This is the fastest option for read-only lists: no entities, no persistence-context tracking, no lazy loading.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Fix</th><th>Best when</th><th>Watch out for</th></tr></thead>
+    <tbody>
+      <tr><td><code>JOIN FETCH</code></td><td>You need the entities and the relation, one-to-one or many-to-one</td><td>Collections + pagination; duplicates</td></tr>
+      <tr><td><code>@EntityGraph</code></td><td>Same, with derived queries or <code>findAll</code></td><td>Same limits as join fetch</td></tr>
+      <tr><td>Batch fetching</td><td>Many places; collections; pagination</td><td>Still extra queries (but few)</td></tr>
+      <tr><td>DTO projection</td><td>Read-only list or report screens</td><td>No entity behaviour; one DTO per screen</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Pitfall 1: JOIN FETCH of a collection with pagination</h4>
+  <p>SQL pages by rows, but a join with a collection multiplies parent rows (a company with 3 jobs appears 3 times). If you ask for page 0 of size 10 on <code>select c from Company c join fetch c.jobs</code>, Hibernate cannot use <code>limit</code> on the SQL safely. It loads <strong>all</strong> rows, applies the limit in memory and logs a warning (it mentions applying pagination in memory). On a big table this is an outage waiting to happen.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: fetch join on a collection + Pageable</p><pre><code class="language-java">@Query("select c from Company c left join fetch c.jobs")
+Page&lt;Company&gt; findAllWithJobs(Pageable p);   // pagination in memory</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: page the parents, then fetch children</p><pre><code class="language-java">Page&lt;Company&gt; page = companyRepository.findAll(pageable);   // limit in SQL
+// children: default_batch_fetch_size loads jobs for the page with 1 "in" query
+// or: select c from Company c left join fetch c.jobs where c in :companies</code></pre></div>
+  </div>
+  <p>Fetch joins on <em>to-one</em> associations (<code>join fetch a.applicant</code>) are safe with pagination because they do not multiply rows.</p>
+
+  <h4>Pitfall 2: MultipleBagFetchException</h4>
+  <p>Fetching two <code>List</code> (bag) collections in one query, such as <code>join fetch j.tags join fetch j.questions</code>, would produce a Cartesian product and Hibernate refuses: <code>org.hibernate.loader.MultipleBagFetchException: cannot simultaneously fetch multiple bags</code>. Fixes: change the collections to <code>Set</code>, or fetch one collection per query (the second query hits the persistence context and fills the other collection), or use batch fetching. Do not "fix" it with <code>FetchType.EAGER</code>.</p>
+
+  <h4>Pitfall 3: the Cartesian product</h4>
+  <p>Fetching two collections even as Sets multiplies rows (3 tags × 4 questions = 12 rows per job). Prefer one collection per query plus batch fetching.</p>
+
+  <div class="co co-tip">
+    <p class="co-t">A practical routine</p>
+    <ol class="steps">
+      <li>Keep everything LAZY.</li>
+      <li>Set <code>default_batch_fetch_size</code> to a modest number as a net.</li>
+      <li>For each list endpoint, look at the SQL; use DTO projections or <code>join fetch</code> on to-one relations.</li>
+      <li>Add a query-count assertion in the integration test of the heavy endpoints.</li>
+    </ol>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>LazyInitializationException</code> remains if you add the relation to the DTO but forget to fetch it and map outside the transaction (<a href="#m3-fetching">fetching</a>).</li>
+      <li>Batch fetching applies to lazy loads by id and to collections; it does not rewrite your JPQL.</li>
+      <li>Two queries are not "bad": fetching the parents then one batch query for the children is often better than one huge join.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>One of the most common JPA questions. Strong answer: define it with a number ("1 + N queries"), give the lazy-loop example, say how you detect it (SQL log, statistics, query-count tests), list four fixes (join fetch, entity graph, batch size, DTO projection), and mention the two pitfalls: join fetch of a collection with pagination (in-memory) and <code>MultipleBagFetchException</code>. Add why EAGER does not fix it.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-transactional">
+  <h3>@Transactional in depth: proxies, propagation and rollback</h3>
+  <p class="tldr">@Transactional wraps your bean in a proxy that begins a transaction before the method and commits or rolls back after it; know the self-invocation trap, the rollback rules for checked exceptions and what each propagation value does.</p>
+
+  <p>A <strong>transaction</strong> is an all-or-nothing group of database operations (ACID; see <a href="03-sql-databases.html#m5">SQL · Module 5</a>). In Spring you do not write <code>begin</code>/<code>commit</code>; you annotate a method and Spring does it. This works because of the AOP proxies from <a href="#m1">module 1</a>.</p>
+
+  <h4>How it works: the proxy</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Controller
+  participant P as Proxy of OrderService
+  participant T as TransactionManager
+  participant S as Real OrderService
+  C->>P: placeOrder()
+  P->>T: begin (get connection, setAutoCommit false)
+  P->>S: placeOrder()
+  S-->>P: returns, or throws
+  alt returns normally
+    P->>T: commit (flush, then COMMIT)
+  else RuntimeException or Error
+    P->>T: rollback
+  end
+  P-->>C: result or exception
+</pre>
+  <figcaption>The controller talks to a proxy, not to your class</figcaption>
+  </figure>
+  <p>When Spring finds <code>@Transactional</code>, it does not give other beans your object; it gives a <strong>proxy</strong> (a generated subclass with CGLIB, or a JDK interface proxy) with a <code>TransactionInterceptor</code>. The interceptor asks the <code>PlatformTransactionManager</code> (for JPA, <code>JpaTransactionManager</code>) to start a transaction, binds the connection and the <code>EntityManager</code> to the current thread, calls your method, and then commits or rolls back. Hibernate flushes right before the commit, so most SQL runs at the end of the method (<a href="#m3-persistence-context">flush</a>). Repository methods are already transactional by themselves (<code>SimpleJpaRepository</code> has <code>@Transactional(readOnly = true)</code> on reads and <code>@Transactional</code> on writes), but each call is its own transaction; the service method joins them into one.</p>
+  <pre data-title="One transaction for the whole business action"><code class="language-java">@Service
+public class ApplicationService {
+
+    @Transactional
+    public void withdraw(Long applicationId, Long userId) {
+        Application app = applicationRepository.findById(applicationId).orElseThrow();
+        if (!app.getApplicant().getId().equals(userId)) {
+            throw new AccessDeniedException("Not your application");  // rolls back
+        }
+        app.withdraw();                                  // dirty checking: UPDATE
+        notificationRepository.save(Notification.of(app));   // INSERT, same transaction
+    }                                  // both statements commit, or neither
+}</code></pre>
+
+  <h4>The self-invocation pitfall</h4>
+  <p>Only calls that go <em>through the proxy</em> start a transaction. When a method of the same class calls another method of that class, the call is <code>this.method()</code>, which skips the proxy, so the annotation on the second method is ignored.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Other bean ──▶ [ Proxy ] ──▶ placeOrder()  ──┐
+                 (adds tx)        this.audit() │  direct call: no proxy,
+                                       ◀───────┘  @Transactional ignored
+</pre>
+  <figcaption>Calls from inside the object never pass through the proxy</figcaption>
+  </figure>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: self-invocation</p><pre><code class="language-java">@Service
+public class ReportService {
+    public void run() {
+        saveAudit();                   // this.saveAudit(): NO new transaction
+    }
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void saveAudit() { ... }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: call through another bean</p><pre><code class="language-java">@Service
+public class ReportService {
+    private final AuditService auditService;     // separate bean
+    public void run() {
+        auditService.saveAudit();                // goes through the proxy
+    }
+}
+@Service
+public class AuditService {
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void saveAudit() { ... }
+}</code></pre></div>
+  </div>
+  <p>Alternatives: inject the bean into itself (ugly), use <code>TransactionTemplate</code> for programmatic control, or use AspectJ weaving (rare). Splitting into two beans is the usual fix. The same trap affects <code>@Async</code>, <code>@Cacheable</code> and other proxy-based annotations.</p>
+
+  <h4>Where it works</h4>
+  <ul>
+    <li>On <strong>public methods</strong> of Spring beans called from <em>other</em> beans. Spring 6 also supports protected and package-visible methods with class-based proxies, but public is the safe, portable habit.</li>
+    <li>Not on <code>private</code> methods, <code>final</code> methods (CGLIB cannot override them) or objects created with <code>new</code>.</li>
+    <li>Prefer the <strong>service layer</strong>: a service method is the business unit of work. Not on controllers (web concerns, longer than needed) and not on every repository call.</li>
+    <li>Class-level <code>@Transactional</code> applies to all public methods; method-level overrides it. Put <code>@Transactional(readOnly = true)</code> on the class and <code>@Transactional</code> on the writing methods.</li>
+  </ul>
+
+  <h4>Rollback rules</h4>
+  <p>By default a transaction rolls back only for <strong>unchecked exceptions</strong> (<code>RuntimeException</code> and subclasses) and <code>Error</code>. A <strong>checked exception</strong> (<code>IOException</code>, your own <code>extends Exception</code>) does <em>not</em> roll back: the transaction commits whatever was already flushed.</p>
+  <pre data-title="Checked exceptions need rollbackFor"><code class="language-java">@Transactional                                   // checked exception: COMMITS
+public void importJobs(MultipartFile file) throws IOException { ... }
+
+@Transactional(rollbackFor = Exception.class)    // rolls back on any exception
+public void importJobs(MultipartFile file) throws IOException { ... }
+
+@Transactional(noRollbackFor = DuplicateResourceException.class)
+public void tolerateDuplicates() { ... }</code></pre>
+  <p>Many teams make their domain exceptions unchecked (as in <a href="#m2">module 2</a>) to avoid this. A catch that swallows the exception also prevents rollback: <code>try { ... } catch (Exception e) { log.error(...); }</code> inside a transactional method means Spring never sees the failure. Rethrow it, or call <code>TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()</code>.</p>
+
+  <h4>Propagation</h4>
+  <p><strong>Propagation</strong> answers: "if a transaction already exists when this method is called, what do I do?"</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Propagation</th><th>Existing transaction</th><th>No transaction</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><code>REQUIRED</code> (default)</td><td>Join it</td><td>Create one</td><td>Almost everything</td></tr>
+      <tr><td><code>REQUIRES_NEW</code></td><td>Suspend it, run in a new independent transaction</td><td>Create one</td><td>Audit log or outbox write that must survive a rollback of the caller</td></tr>
+      <tr><td><code>NESTED</code></td><td>Run inside a savepoint; rolls back alone</td><td>Create one</td><td>Try something optional, keep the outer work; needs savepoint support (JDBC with <code>JpaTransactionManager</code>)</td></tr>
+      <tr><td><code>SUPPORTS</code></td><td>Join it</td><td>Run without</td><td>Read helper that works either way</td></tr>
+      <tr><td><code>MANDATORY</code></td><td>Join it</td><td>Throw <code>IllegalTransactionStateException</code></td><td>Code that must never run alone</td></tr>
+      <tr><td><code>NOT_SUPPORTED</code></td><td>Suspend it, run without</td><td>Run without</td><td>Long non-transactional work, e.g. a call to a slow service</td></tr>
+      <tr><td><code>NEVER</code></td><td>Throw an exception</td><td>Run without</td><td>Assert "no transaction here"</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>REQUIRED</strong> means inner calls share one transaction, so one failure rolls back everything. <strong>REQUIRES_NEW</strong> uses a second database connection while the first waits, so overuse can exhaust the pool (a deadlock risk with a pool of 1). With REQUIRES_NEW, the inner transaction cannot see uncommitted data of the outer one.</p>
+
+  <h4>The "silently rolled back" surprise</h4>
+  <p>With <code>REQUIRED</code>, inner and outer share one transaction. If the inner method throws a runtime exception, Spring marks the whole transaction <strong>rollback-only</strong>. If the outer method catches that exception and carries on, then at commit Spring throws:</p>
+  <pre class="out" data-title="The error"><code class="language-plaintext">org.springframework.transaction.UnexpectedRollbackException:
+Transaction silently rolled back because it has been marked as rollback-only</code></pre>
+  <pre data-title="How it happens, and the fix"><code class="language-java">@Transactional
+public void outer() {
+    try {
+        inner.doWork();             // REQUIRED, throws RuntimeException: marks rollback-only
+    } catch (RuntimeException e) {
+        log.warn("ignored", e);     // you swallowed it, but the mark stays
+    }
+    repo.save(x);                   // commit fails: UnexpectedRollbackException
+}
+// Fix: make inner REQUIRES_NEW or NESTED if its failure is acceptable,
+// or let the exception propagate.</code></pre>
+
+  <h4>readOnly, isolation and timeout</h4>
+  <pre data-title="Attributes"><code class="language-java">@Transactional(readOnly = true)                              // reads
+@Transactional(isolation = Isolation.READ_COMMITTED)         // see the SQL notes
+@Transactional(timeout = 5)                                  // seconds
+@Transactional(rollbackFor = Exception.class, propagation = Propagation.REQUIRED)</code></pre>
+  <ul>
+    <li><strong><code>readOnly = true</code></strong> is a hint. With Hibernate it sets the flush mode to MANUAL (no dirty checking, less memory and CPU), and with some drivers/databases it marks the connection read-only so a replica can be used. It does not stop you from running a write query on every database. Use it on every query-only service method.</li>
+    <li><strong><code>isolation</code></strong>: default <code>DEFAULT</code> = the database default (PostgreSQL <code>READ COMMITTED</code>, MySQL InnoDB <code>REPEATABLE READ</code>). Raise it only when you understand the anomalies (<a href="03-sql-databases.html#m5">SQL · Module 5</a>).</li>
+    <li><strong><code>timeout</code></strong>: seconds before the transaction is marked for rollback; it is checked at statement boundaries.</li>
+  </ul>
+
+  <h4>@Transactional in tests</h4>
+  <p>In a Spring test (<code>@SpringBootTest</code> or <code>@DataJpaTest</code>), a test method annotated with <code>@Transactional</code> runs inside a transaction that is <strong>rolled back at the end</strong> by default, so tests leave no data behind. <code>@DataJpaTest</code> is already transactional. Beware: because nothing commits, flush-time errors (constraint violations) may never appear; call <code>flush()</code> in the test. A real test client (<code>MockMvc</code> in same thread is fine; an HTTP call from another thread is a different transaction) will not see uncommitted data.</p>
+
+  <h4>Spring's vs Jakarta's annotation</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>org.springframework.transaction.annotation.Transactional</code></th><th><code>jakarta.transaction.Transactional</code></th></tr></thead>
+    <tbody>
+      <tr><td>Attributes</td><td><code>propagation</code>, <code>isolation</code>, <code>timeout</code>, <code>readOnly</code>, <code>rollbackFor</code>, <code>transactionManager</code></td><td>Only <code>value</code> (TxType), <code>rollbackOn</code>, <code>dontRollbackOn</code></td></tr>
+      <tr><td>Read-only, timeout, isolation</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Recommendation</td><td>Use this one in Spring apps</td><td>Works, but with fewer features; auto-complete may import it by mistake</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Transactions belong on service methods (public, called from another bean).</li>
+      <li>Checked exceptions do not roll back unless you add <code>rollbackFor</code>.</li>
+      <li>Keep transactions short: no HTTP calls, file uploads or <code>Thread.sleep</code> inside; they hold a connection and locks.</li>
+      <li>Do your lazy loading and DTO mapping inside the transaction.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Self-invocation: a <code>@Transactional</code> method called from the same class.</li>
+      <li><code>@Transactional</code> on a private method or on a class that is not a Spring bean: silently ignored.</li>
+      <li>Catching and swallowing the exception, so nothing rolls back.</li>
+      <li>Sending an email or a Kafka message inside the transaction, then the commit fails: the message is already out. Use the outbox pattern or send after commit (<code>@TransactionalEventListener(phase = AFTER_COMMIT)</code>).</li>
+      <li>Starting an async thread inside a transaction: the new thread has no transaction (transactions are thread-bound).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How does <code>@Transactional</code> work?" Proxy + interceptor + transaction manager + thread-bound connection; commit or rollback after the call. "Why did my transaction not start?" Self-invocation, private method, not a bean. "What does it roll back on by default?" Unchecked exceptions and Errors only. "Explain REQUIRED vs REQUIRES_NEW." Join vs suspend-and-new; give the audit-log example. "What is <code>UnexpectedRollbackException</code>?" Rollback-only mark set by an inner participating transaction. "Why <code>readOnly = true</code>?" Skips dirty checking, signals intent, may route to a replica.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-locking">
+  <h3>Optimistic and pessimistic locking</h3>
+  <p class="tldr">Use @Version for optimistic locking, which detects lost updates and fails the second writer; use pessimistic locks (SELECT ... FOR UPDATE) only for hot rows where conflicts are frequent and retries are not acceptable.</p>
+
+  <h4>The problem: lost updates</h4>
+  <p>Two recruiters open the same job. Both read <code>vacancies = 5</code>. One saves 4, the other saves 3 a moment later, based on the stale 5. The first change is silently overwritten: a <strong>lost update</strong>. Transactions alone do not prevent this at the default isolation level because each user reads and writes in separate requests. Background on isolation and row locks: <a href="03-sql-databases.html#m5">SQL · Module 5</a>.</p>
+
+  <h4>Optimistic locking with @Version</h4>
+  <p><strong>Optimistic locking</strong> assumes conflicts are rare. It does not lock rows; it checks at write time that nobody changed the row since you read it. Add a version field:</p>
+  <pre data-title="Job.java"><code class="language-java">@Entity
+public class Job extends BaseEntity {
+
+    @Version
+    private Long version;          // wrapper type; managed by Hibernate, no setter
+
+    private int vacancies;
+}</code></pre>
+  <pre class="out" data-title="SQL generated for an update"><code class="language-sql">update job set vacancies=?, version=?, ... where id=? and version=?
+-- version in the WHERE is the value you read. If another transaction
+-- already changed the row, 0 rows match.</code></pre>
+  <p>Hibernate increments <code>version</code> on every update. If the <code>UPDATE</code> affects 0 rows, someone else got there first, and Hibernate throws <code>OptimisticLockException</code>, which Spring translates to <code>ObjectOptimisticLockingFailureException</code> (a subclass of <code>OptimisticLockingFailureException</code>). Supported version types: <code>Long</code>, <code>Integer</code>, <code>Short</code> or timestamp types. Add the column in the migration: <code>version BIGINT NOT NULL DEFAULT 0</code>.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant A as User A
+  participant B as User B
+  participant D as Database
+  A->>D: read job (version 3)
+  B->>D: read job (version 3)
+  A->>D: update ... where version=3 (ok, now 4)
+  B->>D: update ... where version=3 (0 rows)
+  D-->>B: ObjectOptimisticLockingFailureException
+</pre>
+  <figcaption>The second writer loses and must reload and retry</figcaption>
+  </figure>
+
+  <h4>Handling the conflict</h4>
+  <ul>
+    <li><strong>In a REST API</strong>, return <strong>409 Conflict</strong> (or 412 Precondition Failed with ETag / <code>If-Match</code>) so the client reloads and retries. Map it in your <code>@RestControllerAdvice</code> (<a href="#m2">module 2</a>).</li>
+    <li><strong>Expose the version to the client.</strong> The sequence above only helps if the version read when the form was opened travels with the update. Put <code>version</code> in the response DTO and in the update request, then compare in the service (<code>if (!request.version().equals(job.getVersion())) throw ...</code>) or set it on the entity before merging. If the DTO does not carry the version, only conflicts within a single request are caught.</li>
+    <li><strong>Server-side retry</strong> for automatic operations (a counter): catch the exception outside the transaction and re-run the whole transaction a few times (Spring Retry's <code>@Retryable</code>, or a loop).</li>
+  </ul>
+  <pre data-title="Mapping the exception"><code class="language-java">@ExceptionHandler(ObjectOptimisticLockingFailureException.class)
+ProblemDetail conflict(ObjectOptimisticLockingFailureException ex) {
+    return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT,
+            "The record was changed by someone else. Reload and try again.");
+}</code></pre>
+  <p>Important: a bulk <code>@Modifying</code> query does not touch <code>version</code> unless you write <code>set j.version = j.version + 1</code> (or use <code>update versioned Job</code> in HQL).</p>
+
+  <h4>Pessimistic locking</h4>
+  <p><strong>Pessimistic locking</strong> assumes conflicts are likely: it locks the row in the database while you work, and others wait. In SQL that is <code>SELECT ... FOR UPDATE</code>.</p>
+  <pre data-title="@Lock on a repository method"><code class="language-java">public interface JobRepository extends JpaRepository&lt;Job, Long&gt; {
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select j from Job j where j.id = :id")
+    Optional&lt;Job&gt; findByIdForUpdate(@Param("id") Long id);
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000"))
+    Optional&lt;Job&gt; findWithLockById(Long id);          // waits at most 3 seconds
+}
+
+@Transactional
+public void reserveVacancy(Long jobId) {
+    Job job = jobRepository.findByIdForUpdate(jobId).orElseThrow();   // row locked
+    job.decreaseVacancies();
+}                                                                      // lock released at commit</code></pre>
+  <pre class="out" data-title="SQL (PostgreSQL)"><code class="language-sql">select j.* from job j where j.id = ? for update</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Lock mode</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>PESSIMISTIC_WRITE</code></td><td>Exclusive lock (<code>FOR UPDATE</code>): others can neither read-for-update nor write until commit</td></tr>
+      <tr><td><code>PESSIMISTIC_READ</code></td><td>Shared lock (<code>FOR SHARE</code> where supported): others can read, not write</td></tr>
+      <tr><td><code>OPTIMISTIC</code>, <code>OPTIMISTIC_FORCE_INCREMENT</code></td><td>Version check at commit / force a version bump even without changes</td></tr>
+    </tbody>
+  </table></div>
+  <p>The lock exists only inside a transaction, so <code>@Transactional</code> is required. Possible failures: <code>PessimisticLockingFailureException</code> (including <code>CannotAcquireLockException</code> when the timeout expires) and deadlocks (<code>DeadlockLoserDataAccessException</code>) if two transactions lock rows in opposite orders; always lock in a consistent order.</p>
+
+  <h4>Optimistic vs pessimistic</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Optimistic (@Version)</th><th>Pessimistic (FOR UPDATE)</th></tr></thead>
+    <tbody>
+      <tr><td>Locks held</td><td>None</td><td>Row lock until commit</td></tr>
+      <tr><td>Conflict result</td><td>Exception for the loser, retry</td><td>Others wait</td></tr>
+      <tr><td>Throughput</td><td>High when conflicts are rare</td><td>Lower; risk of waiting and deadlock</td></tr>
+      <tr><td>Works across HTTP requests</td><td>Yes (version travels in the DTO)</td><td>No (lock ends with the transaction)</td></tr>
+      <tr><td>Best for</td><td>Most CRUD, user edits</td><td>Counters, stock, seat booking with heavy contention</td></tr>
+    </tbody>
+  </table></div>
+  <p>Sometimes neither is needed: an atomic SQL update such as <code>update job set vacancies = vacancies - 1 where id = ? and vacancies &gt; 0</code> (a <code>@Modifying</code> query) is the simplest and fastest guard for counters.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Adding <code>@Version</code> but never sending the version to the client, so the form-edit race is not caught.</li>
+      <li>Making <code>version</code> a primitive <code>long</code> with a manually set id: <code>save</code> may treat the entity as old (<a href="#m3-persistence-context">isNew</a>).</li>
+      <li>Holding a pessimistic lock while calling an external service.</li>
+      <li>Retrying only the failing line instead of the whole transaction: after the exception the transaction is rollback-only.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you prevent lost updates?" Optimistic locking with <code>@Version</code>: describe the <code>where version=?</code> update, the exception and a 409 response. "When would you choose pessimistic locking?" High contention on the same rows, such as stock or seat booking, plus a lock timeout. Mention the atomic-update alternative for counters.</p>
+  </div>
+</article>

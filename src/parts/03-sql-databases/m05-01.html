@@ -1,0 +1,662 @@
+<div class="mintro">
+  <p>Modules 1 to 4 taught you to write SQL and design tables. This module opens the box and shows what the
+  database does with your statements: how rows sit on disk, why an index turns a minute-long query into a
+  millisecond one, how to read a query plan, how transactions keep money safe when two users act at once, and
+  how your Spring Boot app talks to the database through a connection pool. These are the most
+  asked database topics in Java interviews, and the ones that decide whether your app is fast in production.</p>
+  <p>Everything here uses PostgreSQL, with MySQL InnoDB differences noted. You will run a scripted
+  1-million-row experiment, replay two-session timelines of every isolation anomaly, and meet the N+1 problem
+  that JPA makes so easy to create (<a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>). The tables
+  come from the schema designed in <a href="#m4-food-delivery-design">Module 4</a>.</p>
+  <ul>
+    <li>Explain how a B-tree index works and decide when an index helps or hurts.</li>
+    <li>Design composite indexes with the leftmost-prefix rule, and find out why an index is ignored.</li>
+    <li>Read <code>EXPLAIN</code> and <code>EXPLAIN ANALYZE</code> output and fix a slow query.</li>
+    <li>Use transactions correctly, and explain ACID with a bank transfer.</li>
+    <li>Name each isolation level and the anomalies it prevents, and handle serialization failures.</li>
+    <li>Use row locks, <code>SKIP LOCKED</code>, and optimistic versus pessimistic locking.</li>
+    <li>Size a HikariCP pool and spot pool exhaustion.</li>
+    <li>Recognize, detect and fix the N+1 query problem.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m5-storage-and-scans">
+  <h3>How data is stored, and why a full scan is slow</h3>
+  <p class="tldr">A database stores rows in fixed-size pages (blocks) on disk; without an index it must read every
+  page of a table (a sequential scan), so cost grows with table size.</p>
+
+  <h4>Pages, not rows</h4>
+  <p>Disks and memory do not read single rows. The database divides each table file into <strong>pages</strong>
+  (also called blocks): 8 KB in PostgreSQL, 16 KB in MySQL InnoDB. A page holds many rows. To read one row the
+  database loads the whole page into its memory cache (the <em>buffer pool</em>, called
+  <code>shared_buffers</code> in PostgreSQL). Reading from memory takes microseconds; reading from disk takes
+  far longer, even on SSD. Most database tuning is about touching fewer pages.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Table file (heap)                         One 8 KB page
+┌────────┬────────┬────────┬─────┐        ┌───────────────────────────┐
+│ page 0 │ page 1 │ page 2 │ ... │        │ header                    │
+└────────┴────────┴────────┴─────┘        │ row pointers  (1)(2)(3)   │
+                                          │        free space         │
+ Each page holds ~50-200 rows,            │ row 3 | row 2 | row 1     │
+ depending on row width                   └───────────────────────────┘
+</pre>
+  <figcaption>A table is a file of pages; each page holds many rows</figcaption>
+  </figure>
+
+  <h4>Heap tables and clustered tables</h4>
+  <ul>
+    <li><strong>PostgreSQL</strong> uses a <strong>heap</strong>: rows sit in the table file in roughly the order
+    they were written, with no sorting. Every index is separate and points to a row by its physical address,
+    the <em>tuple id</em> (page number and slot).</li>
+    <li><strong>MySQL InnoDB</strong> uses a <strong>clustered index</strong>: the table <em>is</em> the
+    primary key B-tree, and rows are stored in primary key order. Secondary indexes store the primary key
+    value, so a lookup through a secondary index does a second search in the primary key tree.</li>
+  </ul>
+  <p>This is why a large random primary key (UUID v4) hurts InnoDB more: every insert lands in a random place in
+  the table itself. In PostgreSQL the effect is smaller, because only the index suffers.</p>
+
+  <h4>The full table scan</h4>
+  <p>To answer <code>WHERE customer_id = 42</code> with no index, the database has no choice: read every page of
+  the table, test each row, and keep the matches. This is a <strong>sequential scan</strong> (Seq Scan in
+  PostgreSQL, "ALL" in MySQL). If the table has 1 million rows in 10,000 pages, all 10,000 pages are read to
+  return maybe 10 rows. Doubling the table doubles the work: the cost is O(n).</p>
+  <p>A sequential scan is not always bad. For a tiny table, or a query that needs a large part of the table
+  (say 30% of rows), reading everything in order is the cheapest plan, because sequential reads are fast and an
+  index adds extra lookups. The goal is to avoid scans that read a lot to return a little.</p>
+
+  <h4>Selectivity and cardinality</h4>
+  <p><strong>Cardinality</strong> is the number of distinct values in a column. <strong>Selectivity</strong> is
+  the fraction of rows a condition keeps. <code>WHERE email = 'x'</code> keeps one row in a million: very
+  selective, perfect for an index. <code>WHERE is_active = true</code> keeps 95% of rows: not selective, and an
+  index does not help. A column like <code>status</code> with 5 values has low cardinality; <code>email</code>
+  has high cardinality. Rule of thumb: an index pays off when a query reads a small fraction of the table
+  (a few percent or less). The planner decides using the statistics it collects, see
+  <a href="#m5-explain">EXPLAIN</a>.</p>
+
+  <div class="co co-note">
+    <p class="co-t">The buffer cache hides the first lesson</p>
+    <p>A table that fits in memory scans quickly, which is why a slow query can look fine on your laptop with
+    10,000 rows and collapse on production with 50 million. Always test with realistic row counts; the
+    experiment in the <a href="#m5-explain">EXPLAIN article</a> shows how.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>What is a page/block?</b> The fixed-size unit (8 KB in PostgreSQL, 16 KB in InnoDB) the database
+      reads and caches; many rows per page.</li>
+      <li><b>Heap vs clustered table?</b> PostgreSQL keeps unsorted rows and separate indexes; InnoDB stores
+      rows inside the primary key B-tree.</li>
+      <li><b>Why is a full scan slow?</b> It reads every page, O(n) in table size.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-btree-indexes">
+  <h3>Indexes and B-trees</h3>
+  <p class="tldr">An index is a separate sorted structure (usually a B-tree) that lets the database find rows in
+  O(log n) steps instead of scanning the table; it speeds up reads but costs space and slows every insert,
+  update and delete.</p>
+
+  <h4>The idea: a book's index</h4>
+  <p>To find "Normalization" in a thick book you do not read every page; you look it up in the index at the back,
+  which is sorted and points to page numbers. A database index works the same way: a sorted copy of one or
+  more columns, with a pointer to the row. Because it is sorted, the database can binary-search it.</p>
+<pre data-title="Create, use and drop an index"><code class="language-sql">CREATE INDEX idx_orders_user_id ON orders (user_id);
+
+SELECT id, total_paise FROM orders WHERE user_id = 42;   -- can now use the index
+
+DROP INDEX idx_orders_user_id;</code></pre>
+
+  <h4>How a B-tree looks</h4>
+  <p>The default index type everywhere is the <strong>B-tree</strong> (in practice a B+ tree). It is a balanced
+  tree of pages: a <em>root</em> page, some <em>internal</em> pages, and <em>leaf</em> pages at the bottom. Each
+  internal entry holds a key and a pointer to a child page that covers the range below it. The leaf pages hold
+  every key in sorted order, plus the pointer to the table row, and are linked to their neighbours.</p>
+  <figure class="fig">
+<pre class="diagram">
+                         ┌───────────────┐
+              root       │  40  |  80    │
+                         └──┬────┬────┬──┘
+                ┌───────────┘    │    └───────────┐
+         ┌──────▼──────┐  ┌──────▼──────┐  ┌──────▼──────┐
+internal │  10 | 25    │  │  50 | 65    │  │  90 | 95    │
+         └─┬───┬────┬──┘  └─┬───┬────┬──┘  └─┬───┬────┬──┘
+           ▼   ▼    ▼       ▼   ▼    ▼       ▼   ▼    ▼
+leaves   [1..9]↔[10..24]↔[25..39]↔[40..49]↔[50..64]↔[65..79]↔ ...
+          each key -> row pointer (page, slot)
+</pre>
+  <figcaption>A B+ tree: a few levels of internal pages, and linked leaf pages in sorted order</figcaption>
+  </figure>
+  <p>Looking up key 57: read the root (57 is between 40 and 80, go to the middle child), read that page (57 is
+  between 50 and 65, go to its middle child), read the leaf, find 57 and its row pointer, then read the table
+  page. That is three index pages and one table page, not 10,000.</p>
+
+  <h4>Why lookups are O(log n)</h4>
+  <p>A page holds hundreds of keys, so the tree is very wide and very shallow. With about 300 keys per page, 2
+  levels address 90,000 rows, 3 levels 27 million, and 4 levels 8 billion. A lookup in a table of tens of millions
+  of rows touches about 3 or 4 pages. The top levels stay in memory, so usually only the leaf and the table page
+  come from disk. Inserts keep the tree balanced by <em>splitting</em> a full page into two.</p>
+
+  <h4>What a B-tree is good at</h4>
+  <ul>
+    <li><strong>Equality:</strong> <code>WHERE id = 5</code>.</li>
+    <li><strong>Ranges:</strong> <code>WHERE placed_at &gt;= '2026-11-01' AND placed_at &lt; '2026-12-01'</code>.
+    Find the start in the tree, then walk the linked leaves in order. A hash index cannot do this.</li>
+    <li><strong>Sorting:</strong> <code>ORDER BY placed_at LIMIT 10</code> reads the first 10 leaf entries, no
+    sort needed.</li>
+    <li><strong>Prefix match:</strong> <code>LIKE 'Pan%'</code> is a range in disguise (with the right
+    collation or operator class, see <a href="#m5-index-not-used">When an index is not used</a>).</li>
+    <li><strong><code>MIN</code>/<code>MAX</code>:</strong> the first or last leaf entry.</li>
+  </ul>
+
+  <h4>Index types in PostgreSQL</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td><strong>B-tree</strong> (default)</td><td>Equality, ranges, sorting on almost any column</td></tr>
+      <tr><td><strong>Hash</strong></td><td>Equality only; rarely better than a B-tree</td></tr>
+      <tr><td><strong>GIN</strong></td><td>Values that contain many items: <code>JSONB</code>, arrays, full-text
+      search</td></tr>
+      <tr><td><strong>GiST</strong></td><td>Geometric and range types, nearest-neighbour, some full-text</td></tr>
+      <tr><td><strong>BRIN</strong></td><td>Huge tables where values follow the physical order (time-series logs);
+      tiny index, coarse</td></tr>
+    </tbody>
+  </table></div>
+  <p>MySQL InnoDB uses B-trees by default and also offers full-text and spatial indexes. In an interview, say
+  "B-tree unless I have a special data type".</p>
+
+  <h4>What an index costs</h4>
+  <p>An index is not free. Each one is another structure on disk and in memory, and the database must keep it in
+  step with the table.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operation</th><th>Effect of each extra index</th></tr></thead>
+    <tbody>
+      <tr><td><code>SELECT</code> with a matching condition</td><td>Much faster</td></tr>
+      <tr><td><code>INSERT</code></td><td>One more entry to add, with possible page splits</td></tr>
+      <tr><td><code>UPDATE</code> of an indexed column</td><td>The entry must move; in PostgreSQL this can also
+      block cheap in-place "HOT" updates</td></tr>
+      <tr><td><code>DELETE</code></td><td>One more entry to mark dead and clean later</td></tr>
+      <tr><td>Disk and memory</td><td>Often 10–30% of the table size per index, competing for cache</td></tr>
+      <tr><td>Planner</td><td>More plans to consider (a small cost)</td></tr>
+    </tbody>
+  </table></div>
+  <p>So how many indexes is too many? There is no number. Add an index for a query you have proven slow and that
+  runs often; drop indexes that are never used. A read-heavy reporting table can carry many; a write-heavy table
+  (event log, payment attempts) should have few. Find unused ones with PostgreSQL's statistics view:</p>
+<pre data-title="Which indexes are never used? (PostgreSQL)"><code class="language-sql">SELECT relname AS table_name, indexrelname AS index_name, idx_scan
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0
+ORDER BY relname;</code></pre>
+  <p>Do not drop primary key or unique indexes that show zero scans: they enforce rules, not just speed.</p>
+
+  <h4>Indexes on foreign keys</h4>
+  <p>PostgreSQL does not index a foreign key column automatically. Without an index on
+  <code>orders.user_id</code>, the query "orders of user 42" scans the table, and so does every
+  <code>DELETE</code> on <code>users</code>, which must check that no order still points at that user. Index every
+  foreign key you join on or delete through. MySQL InnoDB creates the index for you.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: primary key and UNIQUE create an index; nothing else does</p>
+    <p>Declaring <code>PRIMARY KEY</code> or <code>UNIQUE</code> builds a unique B-tree index automatically. A
+    plain foreign key, a <code>CHECK</code> or a column you often filter on gets none; you add it with
+    <code>CREATE INDEX</code>.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: add indexes in migrations, named and reviewed</p>
+    <p>Name them <code>idx_&lt;table&gt;_&lt;columns&gt;</code>. On a busy production PostgreSQL table, use
+    <code>CREATE INDEX CONCURRENTLY</code>: it builds without blocking writes (it takes longer and cannot run
+    inside a transaction block).</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "index every column"</p>
+    <p>It slows writes, wastes memory and the planner often ignores indexes on low-selectivity columns anyway.
+    Start from your slow queries, not from the column list.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>What is an index and how does it work?</b> A sorted B-tree of column values with row pointers;
+      lookups take O(log n) page reads; leaves are linked for range scans.</li>
+      <li><b>When does an index slow things down?</b> Writes (every index is updated), disk/cache use, and
+      low-selectivity columns where it is not used.</li>
+      <li><b>B-tree vs hash?</b> Hash does equality only; a B-tree also handles ranges, sorting and prefixes.</li>
+      <li><b>Does a primary key have an index?</b> Yes, a unique one, created automatically.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-index-variants">
+  <h3>Unique, partial, expression and covering indexes</h3>
+  <p class="tldr">Beyond a plain index you can enforce uniqueness, index only some rows (partial), index a
+  computed value (expression), or store extra columns in the index so the table is never touched (covering
+  with <code>INCLUDE</code>, enabling index-only scans).</p>
+
+  <p>A plain B-tree index (see <a href="#m5-btree-indexes">Indexes and B-trees</a>) covers every row and every
+  value of one or more columns exactly as stored. The four variants below change one of those three words:
+  <em>which rows</em> (partial), <em>what value</em> (expression), <em>what else is stored</em> (covering) or
+  <em>what the index promises</em> (unique). They all use the same B-tree underneath, so the reading rules from
+  <a href="#m5-composite-indexes">composite indexes</a> still apply. Examples use the food-app tables
+  <code>users</code> and <code>orders</code> from this module.</p>
+
+  <h4>Unique index</h4>
+  <p><code>CREATE UNIQUE INDEX</code> is what a <code>UNIQUE</code> constraint uses underneath. It speeds
+  lookups and rejects duplicates.</p>
+<pre data-title="Unique index"><code class="language-sql">CREATE UNIQUE INDEX uq_users_email_lower ON users (lower(email));
+
+INSERT INTO users (email, mobile, name) VALUES ('Asha@Example.com', '+919800000001', 'Asha');
+INSERT INTO users (email, mobile, name) VALUES ('asha@example.com', '+919800000002', 'A2');
+-- ERROR:  duplicate key value violates unique constraint "uq_users_email_lower"
+-- DETAIL:  Key (lower(email))=(asha@example.com) already exists.</code></pre>
+
+  <p><strong>How uniqueness is enforced.</strong> On every insert or update the database searches the B-tree for
+  the new key. If it already exists, the statement fails; if another transaction is inserting the same key at
+  that moment, this one waits until the other commits or rolls back, then decides. That is why a unique index is
+  the only reliable duplicate guard: a "check, then insert" in application code lets two parallel requests both
+  pass the check. In Spring this failure arrives as <code>DataIntegrityViolationException</code>.</p>
+  <p>A <code>UNIQUE</code> constraint and a unique index do the same job. The constraint is the declaration
+  ("this must be unique"); the index is the machinery. Use a plain unique <em>index</em> only when you need
+  something a constraint cannot express: a <code>WHERE</code> condition (partial) or an expression. A unique
+  index may span columns, as in <code>UNIQUE (restaurant_id, name)</code>: the <em>pair</em> must be unique,
+  not each column.</p>
+  <div class="co co-version">
+    <p class="co-t">NULLs in a unique index</p>
+    <p>PostgreSQL and MySQL both allow many rows with NULL in a unique column, because NULL is never equal to
+    NULL. PostgreSQL 15 added <code>UNIQUE NULLS NOT DISTINCT</code> for the case where at most one NULL is
+    allowed. On older versions, make the column <code>NOT NULL</code> or build the unique index on an expression
+    such as <code>COALESCE(col, '')</code>.</p>
+  </div>
+
+  <h4>Partial index</h4>
+  <p>A <strong>partial index</strong> covers only rows that match a <code>WHERE</code> condition. It is smaller,
+  cheaper to maintain, and exactly right when queries always target a small subset.</p>
+<pre data-title="Partial indexes"><code class="language-sql">-- Only active orders: the kitchen screen reads these all day
+CREATE INDEX idx_orders_active ON orders (restaurant_id)
+    WHERE status NOT IN ('DELIVERED', 'CANCELLED');
+
+-- Unique only among live rows (soft delete)
+CREATE UNIQUE INDEX uq_users_email_live ON users (email) WHERE deleted_at IS NULL;</code></pre>
+  <p>The planner uses a partial index only when the query's <code>WHERE</code> clause implies the index
+  condition. MySQL does not support partial indexes.</p>
+
+  <p>Typical uses of a partial index:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Situation</th><th>Index</th><th>Why it helps</th></tr></thead>
+    <tbody>
+      <tr><td>Soft delete with a unique rule</td><td><code>UNIQUE (email) WHERE deleted_at IS NULL</code></td>
+      <td>A deleted user's email can be registered again</td></tr>
+      <tr><td>Queue of "pending" rows</td><td><code>(created_at) WHERE status = 'PENDING'</code></td>
+      <td>Millions of finished rows are not in the index at all</td></tr>
+      <tr><td>Rare flag</td><td><code>(user_id) WHERE is_featured</code></td><td>Tiny index for 1% of rows</td></tr>
+      <tr><td>Mostly-NULL column</td><td><code>(coupon_code) WHERE coupon_code IS NOT NULL</code></td>
+      <td>NULL rows add nothing and are skipped</td></tr>
+    </tbody>
+  </table></div>
+  <p>The planner may use a partial index only when it can <em>prove</em> that the query's condition implies the
+  index condition. Repeat the same condition in the query to be safe:</p>
+  <pre data-title="Query that matches the partial index"><code class="language-sql">SELECT order_id
+FROM orders
+WHERE status NOT IN ('DELIVERED', 'CANCELLED')   -- same condition as the index
+  AND restaurant_id = 7;</code></pre>
+  <p>A condition that depends on a bind parameter (<code>status = $1</code>) may not let the planner prove the
+  match for a cached generic plan, so check with <code>EXPLAIN</code> from the real application, not only from
+  <code>psql</code> (<a href="#m5-explain">EXPLAIN</a>). When a row's update changes whether it matches, the
+  database adds or removes its entry in the index; this is cheap.</p>
+
+  <h4>Expression (functional) index</h4>
+  <p>If a query wraps a column in a function, a normal index on the column cannot help. Index the expression:</p>
+<pre data-title="Expression index fixes a function on the column"><code class="language-sql">-- Slow: the function hides the column from a plain index on email
+SELECT * FROM users WHERE lower(email) = 'asha@example.com';
+
+CREATE INDEX idx_users_email_lower ON users (lower(email));
+-- Now the same query can use the index. The expression must match exactly.
+
+-- Dates: orders placed on a given day
+CREATE INDEX idx_orders_placed_date ON orders ((placed_at::date));</code></pre>
+  <p>MySQL 8.0.13 and later supports functional key parts in the same way, written with extra parentheses.</p>
+
+  <p>The database computes the expression when the row is written and stores the <em>result</em> in the index.
+  At query time it computes the expression on your constant and searches the index. If your query writes the
+  expression differently, there is no match and the index is ignored. Functions used in an expression index must
+  be <code>IMMUTABLE</code> (same input, same output, always). <code>lower(email)</code> qualifies;
+  <code>now()</code> or a function that depends on the session time zone does not.</p>
+  <p><strong>MySQL differences.</strong> From 8.0.13 MySQL accepts functional key parts, with an extra pair of
+  parentheses: <code>CREATE INDEX idx_email_lower ON users ((LOWER(email)));</code>. MySQL's default collations
+  are case-insensitive, so a plain index on <code>email</code> already serves <code>email = 'Asha@Example.com'</code>
+  there, and the <code>lower()</code> trick is less common. Before 8.0.13 the workaround was a generated column
+  plus an index on it, which also works in PostgreSQL (12+) as <code>GENERATED ALWAYS AS (…) STORED</code>.</p>
+
+  <h4>Covering index and index-only scan</h4>
+  <p>Normally the index finds the row pointer, then the database fetches the table page for the other columns
+  (a <em>heap fetch</em>). If the index itself contains every column the query needs, the table visit is skipped.
+  This is a <strong>covering index</strong>, and PostgreSQL shows it as <em>Index Only Scan</em>.
+  <code>INCLUDE</code> (PostgreSQL 11+) adds payload columns that are stored in the index but not used for
+  searching or ordering.</p>
+<pre data-title="Covering index with INCLUDE"><code class="language-sql">CREATE INDEX idx_orders_user_cover
+    ON orders (user_id, placed_at DESC) INCLUDE (status, total_paise);
+
+-- All columns are in the index: Index Only Scan
+SELECT placed_at, status, total_paise
+FROM orders
+WHERE user_id = 42
+ORDER BY placed_at DESC
+LIMIT 10;</code></pre>
+  <p>PostgreSQL keeps old row versions (MVCC, see <a href="#m5-isolation-levels">Isolation levels</a>), so an
+  index-only scan must check the table's <em>visibility map</em> to know that a row is visible to everyone. That
+  map is kept current by <code>VACUUM</code>; on a heavily updated table the scan may still visit the heap
+  often. MySQL InnoDB gets the same effect when a secondary index includes all needed columns, because every
+  secondary index already carries the primary key.</p>
+
+  <p>The plan shows whether it worked. The line to look for is <code>Index Only Scan</code> and, below it,
+  <code>Heap Fetches: 0</code> (or a small number):</p>
+  <pre class="out" data-title="EXPLAIN (ANALYZE) fragment, numbers omitted"><code class="language-plaintext">Limit
+  -&gt;  Index Only Scan using idx_orders_user_cover on orders
+        Index Cond: (user_id = 42)
+        Heap Fetches: 0</code></pre>
+  <p>Notice the split inside <code>idx_orders_user_cover</code>: <code>user_id</code> and
+  <code>placed_at</code> are the <em>key</em>, used for searching and sorting; <code>status</code> and
+  <code>total_paise</code> are payload that rides along in the leaf pages. If the query filters or sorts on
+  <code>status</code>, put it in the key, not in <code>INCLUDE</code>. An <code>INCLUDE</code> column also takes
+  no part in uniqueness: <code>CREATE UNIQUE INDEX … (user_id) INCLUDE (status)</code> still guarantees only that
+  <code>user_id</code> is unique.</p>
+  <p><strong>MySQL.</strong> There is no <code>INCLUDE</code>. You get a covering index by adding the extra
+  columns to the end of the key itself, which makes the key larger. <code>EXPLAIN</code> then shows
+  <code>Using index</code> in the <code>Extra</code> column. The primary key columns are always part of every
+  InnoDB secondary index, so selecting the id is free.</p>
+
+  <h4>Choosing between them</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Need</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td>Rule: no duplicates</td><td>Unique index or <code>UNIQUE</code> constraint</td></tr>
+      <tr><td>Queries touch a small, fixed subset</td><td>Partial index</td></tr>
+      <tr><td>Query filters on <code>lower(col)</code>, <code>date(col)</code>, <code>col + 1</code></td>
+      <td>Expression index (or rewrite the query)</td></tr>
+      <tr><td>Hot query reads 2-3 columns of many rows</td><td>Covering index with <code>INCLUDE</code></td></tr>
+      <tr><td>JSONB / array / full-text search</td><td>GIN index</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>What each variant costs</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Variant</th><th>Size</th><th>Write cost</th><th>Main risk</th></tr></thead>
+    <tbody>
+      <tr><td>Unique</td><td>like a plain index</td><td>one lookup per write</td><td>A violation fails the whole
+      statement; plan for it in code</td></tr>
+      <tr><td>Partial</td><td>smaller than plain</td><td>only rows that match</td><td>Ignored if the query does not
+      imply the condition</td></tr>
+      <tr><td>Expression</td><td>like a plain index</td><td>function runs on every write</td><td>Query must use the
+      identical expression</td></tr>
+      <tr><td>Covering</td><td>larger (extra columns)</td><td>higher; payload updates touch the index</td>
+      <td>Heap fetches stay high on tables rarely vacuumed</td></tr>
+    </tbody>
+  </table></div>
+  <p>Every index adds work to each <code>INSERT</code>, <code>UPDATE</code> and <code>DELETE</code> and takes disk
+  and memory. Add an index for a measured slow query (<a href="#m5-explain">EXPLAIN</a>), not "just in case". A
+  covering index that exists for one query is easy to forget; name it for its purpose.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the query must match the index definition</p>
+    <p>Partial: the query's <code>WHERE</code> must imply the index <code>WHERE</code>. Expression: the query
+    must use the same expression. Covering: every column the query reads or sorts by must be in the key or in
+    <code>INCLUDE</code>, and <code>SELECT *</code> almost never qualifies. If the shape does not match, the
+    index is silently ignored; see <a href="#m5-index-not-used">When an index is not used</a>.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: name, create concurrently, verify</p>
+    <ul>
+      <li>Name them by role: <code>uq_users_email_live</code>, <code>idx_orders_active</code>,
+      <code>idx_orders_user_cover</code>.</li>
+      <li>On a live PostgreSQL table use <code>CREATE INDEX CONCURRENTLY</code>: it does not block writes, but
+      cannot run inside a transaction block, and a failed run leaves an <code>INVALID</code> index that you must
+      drop. MySQL builds most secondary indexes online with InnoDB; check the <code>LOCK</code> clause when in
+      doubt.</li>
+      <li>After creating one, run <code>EXPLAIN</code> to confirm it is used, and drop it if it is not.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a plain unique index on a soft-deleted table</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: blocks re-registration</p><pre><code class="language-sql">CREATE UNIQUE INDEX uq_users_email ON users (email);
+-- a user with deleted_at set still owns the address forever</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: unique among live rows</p><pre><code class="language-sql">CREATE UNIQUE INDEX uq_users_email_live
+    ON users (email) WHERE deleted_at IS NULL;</code></pre></div>
+    </div>
+    <p>A similar slip: index <code>email</code>, then query <code>WHERE lower(email) = …</code>. The plain index
+    cannot be used; create the expression index or store the email already lower-cased.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>An expression index works only if the query uses the <em>same</em> expression:
+      <code>lower(email)</code> is not <code>LOWER(TRIM(email))</code>.</li>
+      <li>Wide <code>INCLUDE</code> lists make the index big and slow to write. Include only what the hot
+      query needs.</li>
+      <li>Index-only scans do not help on tables that change constantly and are rarely vacuumed.</li>
+      <li>A unique index treats <code>NULL</code>s as distinct in PostgreSQL, so many rows can have a
+      <code>NULL</code> value.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p><b>What is a covering index?</b> An index that holds every column a query needs, so the database answers
+    from the index alone (index-only scan) without reading the table. <b>What is a partial index?</b> An index
+    over only the rows matching a condition: smaller and cheaper, for queries that always filter on that
+    condition.</p>
+    <p>Follow-ups: "why was my index-only scan still reading the table?" (the visibility map is stale; <code>VACUUM</code> it), "how do you enforce unique emails ignoring case?" (unique index on <code>lower(email)</code>), "why not index every column?" (write cost and memory) and "how do you add an index to a busy table?" (<code>CREATE INDEX CONCURRENTLY</code>).</p>
+  </div>
+</article>
+
+<article class="topic" id="m5-composite-indexes">
+  <h3>Composite indexes and the leftmost-prefix rule</h3>
+  <p class="tldr">A composite index on <code>(a, b, c)</code> is sorted by a, then b within a, then c within
+  b, so it can serve queries that use a leftmost prefix of its columns (a; a, b; a, b, c) but not queries that
+  skip the first column.</p>
+
+  <h4>Why column order matters</h4>
+  <p>Think of a phone book sorted by last name, then first name. You can find "Sharma" quickly. You can find
+  "Sharma, Asha" quickly. But you cannot find everyone called "Asha" quickly, because Ashas are spread across the
+  whole book. A composite B-tree index is that phone book. The first column is the primary sort; each following
+  column sorts inside it.</p>
+<pre data-title="A composite index"><code class="language-sql">CREATE INDEX idx_orders_user_status_placed
+    ON orders (user_id, status, placed_at);</code></pre>
+
+  <h4>Which queries can use (a, b, c)?</h4>
+  <p>With <code>a = user_id</code>, <code>b = status</code>, <code>c = placed_at</code>:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Query condition</th><th>Uses the index?</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>a = ?</code></td><td>Yes</td><td>Leftmost prefix</td></tr>
+      <tr><td><code>a = ? AND b = ?</code></td><td>Yes</td><td>Prefix of two</td></tr>
+      <tr><td><code>a = ? AND b = ? AND c = ?</code></td><td>Yes, fully</td><td>All three</td></tr>
+      <tr><td><code>a = ? AND c = ?</code></td><td>Partly: seeks on a, then filters c inside</td><td>b is
+      skipped, so c cannot narrow the seek</td></tr>
+      <tr><td><code>b = ?</code></td><td>Poorly (full index scan at best)</td><td>Does not start with a</td></tr>
+      <tr><td><code>b = ? AND c = ?</code></td><td>Poorly</td><td>Does not start with a</td></tr>
+      <tr><td><code>c = ?</code></td><td>Poorly</td><td>Does not start with a</td></tr>
+      <tr><td><code>a = ? AND b &gt; ? AND c = ?</code></td><td>Seeks on a, b range; c only filters</td><td>After a
+      range column, later columns cannot narrow the seek</td></tr>
+    </tbody>
+  </table></div>
+  <p>This is the <strong>leftmost-prefix rule</strong>. (PostgreSQL 18 added a "skip scan" that can sometimes use
+  the index without the first column, but do not design around it; write the index so the first column is in
+  the query.) MySQL follows the same prefix rule.</p>
+
+  <h4>How to choose the column order</h4>
+  <ol class="steps">
+    <li><strong>Equality columns first.</strong> Columns tested with <code>=</code> narrow the search to one
+    spot in the tree.</li>
+    <li><strong>Range column last.</strong> A range (<code>&gt;</code>, <code>&lt;</code>,
+    <code>BETWEEN</code>) or sort column goes after the equality columns, because the index can walk a range
+    only along its last used column.</li>
+    <li><strong>Among equalities, put the most selective, or the most commonly used alone, first.</strong> A
+    column that appears alone in other queries is a good first column, so one index serves several queries.</li>
+    <li><strong>Check the sort.</strong> If the query has <code>ORDER BY</code>, make the index order match so
+    no separate sort step is needed.</li>
+  </ol>
+<pre data-title="Equality first, range last, order matches"><code class="language-sql">-- Query: a user's delivered orders in the last 30 days, newest first
+SELECT id, total_paise, placed_at
+FROM orders
+WHERE user_id = 42 AND status = 'DELIVERED' AND placed_at &gt;= now() - INTERVAL '30 days'
+ORDER BY placed_at DESC;
+
+-- Best index: equalities (user_id, status), then the range/sort column
+CREATE INDEX idx_orders_user_status_placed ON orders (user_id, status, placed_at);
+-- A B-tree can be scanned backwards, so ASC also serves ORDER BY ... DESC.</code></pre>
+  <p>With one index on <code>(user_id)</code> and another on <code>(status)</code>, PostgreSQL can combine them
+  (a bitmap AND) but a single composite index is faster and cheaper. Also notice: an index on
+  <code>(a, b)</code> makes a separate index on <code>(a)</code> redundant. Drop the single-column one.</p>
+
+  <h4>Sort order and ORDER BY</h4>
+  <p>The index can return rows already sorted, which turns <code>ORDER BY ... LIMIT 10</code> into reading 10
+  index entries. For mixed directions (<code>ORDER BY user_id ASC, placed_at DESC</code>) declare the same
+  directions in the index: <code>(user_id ASC, placed_at DESC)</code>. For a single direction, a backwards scan
+  covers the opposite order.</p>
+
+  <h4>Index with a join</h4>
+  <p>For a join, the column used to match rows on the inner side needs an index. In the food-delivery schema the
+  join <code>order_items.order_id = orders.id</code> uses the composite primary key
+  <code>(order_id, menu_item_id)</code> of <code>order_items</code>, whose leftmost column is
+  <code>order_id</code>, so no extra index is required. The reverse lookup ("all orders containing this item")
+  filters on the second column and needs <code>idx_order_items_menu_item_id</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the first column decides whether the index can be used</p>
+    <p>Put in the first position a column that appears in the <code>WHERE</code> clause of the queries you
+    want to speed up. An index starting with a column your query never filters on is nearly useless to it.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: guessing the order from the table definition</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: range column first</p><pre><code class="language-sql">CREATE INDEX idx_o ON orders (placed_at, user_id);
+-- WHERE user_id = 42 AND placed_at &gt;= ...: seeks on placed_at,
+-- then must test user_id on every entry in the range</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: equality first</p><pre><code class="language-sql">CREATE INDEX idx_o ON orders (user_id, placed_at);
+-- seeks straight to user 42, then walks the date range</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: one index for several queries</p>
+    <p>List your top five queries on a table and look for columns they share as the first filter. One composite
+    index with that column first often replaces three single-column ones.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Explain the leftmost-prefix rule.</b> An index on (a, b, c) is sorted by a then b then c, so it
+      helps queries filtering on a, on a and b, or on a, b and c, but not on b or c alone.</li>
+      <li><b>How do you order columns?</b> Equality columns first, then the range or sort column last.</li>
+      <li><b>Is an index on (a, b) enough for queries on a?</b> Yes; the extra index on (a) is redundant.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-index-not-used">
+  <h3>When an index is not used (and how to fix it)</h3>
+  <p class="tldr">An index is ignored when the query hides the column behind a function or cast, uses a leading
+  wildcard, has low selectivity, queries a tiny table, uses <code>OR</code> across columns, or breaks the
+  column order; check the plan with <code>EXPLAIN</code> and rewrite the query or the index.</p>
+
+  <h4>The usual suspects</h4>
+  <p>"I created an index but the query is still slow" almost always matches one of these cases. Each shows the
+  wrong query, why, and the fix.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Cause</th><th>Example</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>Function on the column</td><td><code>WHERE lower(email) = 'x'</code></td><td>Expression index, or
+      store lowercase</td></tr>
+      <tr><td>Arithmetic on the column</td><td><code>WHERE total_paise + 100 &gt; 5000</code></td>
+      <td>Move math to the constant: <code>total_paise &gt; 4900</code></td></tr>
+      <tr><td>Leading wildcard</td><td><code>WHERE name LIKE '%tikka'</code></td><td>Trigram index (<code>pg_trgm</code>)
+      or full-text search</td></tr>
+      <tr><td>Implicit type cast</td><td><code>WHERE mobile = 9810000001</code> (text column, number)</td>
+      <td>Use the right type: <code>'+919810000001'</code></td></tr>
+      <tr><td>Low selectivity</td><td><code>WHERE is_open = true</code> (95% of rows)</td><td>No index; or a partial
+      index for the rare value</td></tr>
+      <tr><td>Tiny table</td><td>Table of 200 rows</td><td>Nothing: a scan is cheaper</td></tr>
+      <tr><td><code>OR</code> across columns</td><td><code>WHERE user_id = 1 OR restaurant_id = 2</code></td>
+      <td>An index on each (bitmap OR), or <code>UNION</code> two queries</td></tr>
+      <tr><td>Wrong column order</td><td>Index <code>(a, b)</code>, query <code>WHERE b = ?</code></td>
+      <td>Index <code>(b, a)</code>, or add one on <code>(b)</code></td></tr>
+      <tr><td><code>NOT IN</code>, <code>&lt;&gt;</code>, <code>!=</code></td><td><code>WHERE status &lt;&gt; 'DELIVERED'</code></td>
+      <td>Usually matches most rows; use a partial index on the positive condition</td></tr>
+      <tr><td>Stale statistics</td><td>Plan thinks the table is empty after a big load</td><td>Run <code>ANALYZE</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Example 1: function on the column</h4>
+<pre data-title="Plan with a function on an indexed column"><code class="language-sql">CREATE INDEX idx_users_email ON users (email);
+
+EXPLAIN SELECT * FROM users WHERE lower(email) = 'asha@example.com';
+-- Seq Scan on users  (Filter: (lower(email) = 'asha@example.com'::text))
+
+-- Fix: index the expression the query uses
+CREATE INDEX idx_users_email_lower ON users (lower(email));
+EXPLAIN SELECT * FROM users WHERE lower(email) = 'asha@example.com';
+-- Index Scan using idx_users_email_lower on users</code></pre>
+
+  <h4>Example 2: leading wildcard</h4>
+  <p>A B-tree is sorted from the first character. <code>LIKE 'Pan%'</code> is a range from "Pan" to "Pao", so
+  it can use the index (in PostgreSQL the index needs the <code>text_pattern_ops</code> operator class unless the
+  database uses the C collation). <code>LIKE '%tikka'</code> could match anywhere, so every entry must be tested.</p>
+<pre data-title="Substring search needs a different index"><code class="language-sql">CREATE INDEX idx_menu_items_name_prefix ON menu_items (name text_pattern_ops);
+SELECT * FROM menu_items WHERE name LIKE 'Pan%';        -- can use the index
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX idx_menu_items_name_trgm ON menu_items USING gin (name gin_trgm_ops);
+SELECT * FROM menu_items WHERE name LIKE '%tikka%';     -- can use the trigram index</code></pre>
+
+  <h4>Example 3: implicit cast</h4>
+<pre data-title="Comparing text to a number"><code class="language-sql">-- mobile is TEXT with an index
+SELECT * FROM users WHERE mobile = 9810000001;
+-- ERROR:  operator does not exist: text = integer   (PostgreSQL refuses)
+-- MySQL would silently convert every row's text to a number and ignore the index.</code></pre>
+  <p>PostgreSQL is strict, but ORMs and JDBC can still send a parameter with the wrong type
+  (a <code>bigint</code> parameter against a <code>numeric</code> column, or a <code>varchar</code> against a
+  <code>text</code>/<code>char</code> mismatch in older drivers), which turns the index off. Keep Java types and
+  column types aligned.</p>
+
+  <h4>Example 4: low selectivity</h4>
+<pre data-title="Why the planner chooses a scan"><code class="language-sql">-- 95% of restaurants are open
+EXPLAIN SELECT * FROM restaurants WHERE is_open = true;
+-- Seq Scan on restaurants  (Filter: is_open)
+-- Reading 95% of the table through an index is slower than just scanning it.</code></pre>
+  <p>The planner is not broken; it compared costs and chose the cheaper plan. Don't force an index in this case.</p>
+
+  <h4>How to diagnose</h4>
+  <ol class="steps">
+    <li>Run <code>EXPLAIN (ANALYZE, BUFFERS) your_query</code> and read the scan node.</li>
+    <li>If it says Seq Scan on a big table, check which of the causes above applies.</li>
+    <li>Check estimated vs actual rows. A big difference means stale statistics: run
+    <code>ANALYZE table_name</code>.</li>
+    <li>Fix the query or the index, then run <code>EXPLAIN</code> again and compare.</li>
+  </ol>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Sometimes the index is ignored because the planner is <em>right</em>. Test with
+      <code>SET enable_seqscan = off;</code> in a session to see what the index plan would cost, but never leave
+      that setting in production.</li>
+      <li>After a bulk load or a large delete, the planner may use old statistics. <code>ANALYZE</code> fixes
+      it; autovacuum does this in the background but not instantly.</li>
+      <li>A query that returns a large fraction of rows can legitimately do a Seq Scan even with a good
+      index.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: adding an index without looking at the plan</p>
+    <p>Adding an index and assuming it works is the most common tuning error. Always run
+    <code>EXPLAIN</code> before and after.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Name cases when an index is not used.</b> Function or cast on the column, leading wildcard, low
+      selectivity, tiny table, <code>OR</code> over different columns, wrong column order, stale statistics.</li>
+      <li><b>How do you fix <code>LIKE '%x%'</code>?</b> Trigram (GIN) index or full-text search.</li>
+      <li><b>You created an index; the query is still slow. What now?</b> Read the <code>EXPLAIN ANALYZE</code>
+      output, compare estimated and actual rows, and check each cause above.</li>
+    </ul>
+  </div>
+</article>

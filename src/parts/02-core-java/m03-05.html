@@ -1,0 +1,730 @@
+<article class="topic" id="m3-nio-path">
+  <h3>Paths: Path, Path.of and the working directory</h3>
+  <p class="tldr">A Path is an immutable object that names a location in the file system; build one with
+  Path.of("data", "orders.csv"), combine paths with resolve, and remember that a relative path is looked up
+  from the working directory of the running JVM.</p>
+
+  <p>Almost every program touches files: configuration, uploads, reports, logs. Java 7 added a modern file
+  API in the package <code>java.nio.file</code> (called <strong>NIO.2</strong>), and it is what you should
+  use in new code. It has three main parts:</p>
+  <ul>
+    <li><code>Path</code> — an object that <em>describes where</em> a file or folder is. It does not touch
+    the disk.</li>
+    <li><code>Files</code> — a class of static methods that <em>do things</em>: read, write, copy, move,
+    delete, list. The next articles cover it.</li>
+    <li><code>Paths</code> — an older helper with one method, <code>Paths.get(...)</code>. Since Java 11
+    you can write <code>Path.of(...)</code> instead; both give the same result.</li>
+  </ul>
+  <p>The older <code>java.io.File</code> class still exists; <a href="#m3-java-io">File vs Path</a>
+  compares the two.</p>
+
+  <h4>Creating a Path</h4>
+<pre data-title="Ways to create a Path"><code class="language-java">Path a = Path.of("data", "2026", "orders.csv");        // pieces: separators added for you
+Path b = Path.of("data/2026/orders.csv");              // one string works too
+Path c = Paths.get("data", "orders.csv");              // older style, same result
+Path d = new java.io.File("data/orders.csv").toPath(); // from a legacy File
+Path e = Path.of("/var/app/uploads");                  // absolute on Linux and macOS
+Path f = Path.of("C:\\Users\\priya\\shop");            // absolute on Windows (escape the \)</code></pre>
+  <p>Pass the pieces as separate arguments and let Java insert the right separator
+  (<code>/</code> on Linux and macOS, <code>\</code> on Windows). Never build paths with string
+  concatenation and a hard-coded separator. A <code>Path</code> is only a <em>name</em>: the file does not
+  have to exist, and creating a <code>Path</code> never fails because of a missing file. Like
+  <code>String</code>, a <code>Path</code> is <strong>immutable</strong>: every method that "changes" it
+  returns a new <code>Path</code>.</p>
+
+  <h4>Absolute, relative and the working directory</h4>
+  <p>An <strong>absolute path</strong> starts at the root of the file system (<code>/var/app</code>, or
+  <code>C:\app</code> on Windows) and means the same thing wherever the program runs. A <strong>relative
+  path</strong> (<code>data/orders.csv</code>) has no root. Java resolves it against the
+  <strong>working directory</strong>: the folder in which the JVM was started, stored in the system
+  property <code>user.dir</code>.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Working directory (user.dir) = /home/priya/shop
+
+   /home/priya/shop
+   ├── data
+   │    └── orders.csv      &lt;-- Path.of("data", "orders.csv") means this file
+   ├── src
+   └── pom.xml
+</pre>
+    <figcaption>A relative path is resolved against the working directory</figcaption>
+  </figure>
+  <p>The working directory depends on <em>how</em> you start the program, which is the root of many
+  "works on my machine" problems. IntelliJ uses the project or module folder by default, Maven and Gradle
+  tests use the module folder, a Docker container uses its <code>WORKDIR</code>, and a service started by
+  systemd uses whatever the unit file says. When a file is "not found", print where Java really looks:</p>
+<pre data-title="Where will this file be looked up?"><code class="language-java">Path orders = Path.of("data", "orders.csv");
+System.out.println(orders.toAbsolutePath());        // /home/priya/shop/data/orders.csv
+System.out.println(System.getProperty("user.dir")); // /home/priya/shop
+System.out.println(Path.of("").toAbsolutePath());   // the working directory itself</code></pre>
+  <p>For anything that must not depend on the working directory — uploads, data, logs of a server — use
+  an <em>absolute</em> base directory taken from configuration (an environment variable or
+  <code>application.properties</code>), and build paths below it with <code>resolve</code>.</p>
+
+  <h4>Taking a path apart</h4>
+<pre data-title="PathDemo.java"><code class="language-java">import java.nio.file.Path;
+
+public class PathDemo {
+    public static void main(String[] args) {
+        Path p = Path.of("data", "2026", "orders.csv");
+        System.out.println("path         : " + p);
+        System.out.println("getFileName  : " + p.getFileName());
+        System.out.println("getParent    : " + p.getParent());
+        System.out.println("getRoot      : " + p.getRoot());
+        System.out.println("getNameCount : " + p.getNameCount());
+        System.out.println("getName(0)   : " + p.getName(0));
+        System.out.println("subpath(1, 3): " + p.subpath(1, 3));
+        System.out.println("isAbsolute   : " + p.isAbsolute());
+        System.out.println("startsWith(\"data\")    : " + p.startsWith("data"));
+        System.out.println("endsWith(\"orders.csv\"): " + p.endsWith("orders.csv"));
+        System.out.println("endsWith(\"csv\")       : " + p.endsWith("csv"));
+    }
+}</code></pre>
+<pre class="out" data-title="Output (Linux/macOS; Windows prints backslashes)"><code class="language-plaintext">path         : data/2026/orders.csv
+getFileName  : orders.csv
+getParent    : data/2026
+getRoot      : null
+getNameCount : 3
+getName(0)   : data
+subpath(1, 3): 2026/orders.csv
+isAbsolute   : false
+startsWith("data")    : true
+endsWith("orders.csv"): true
+endsWith("csv")       : false</code></pre>
+  <p>Two details. <code>startsWith</code> and <code>endsWith</code> compare whole <em>name elements</em>,
+  not characters, so <code>endsWith("csv")</code> is false: the last element is
+  <code>orders.csv</code>, not <code>csv</code>. And <code>getParent()</code> and <code>getRoot()</code> can
+  return <code>null</code> (a single name has no parent; a relative path has no root), so check before you
+  chain calls.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Returns</th></tr></thead>
+    <tbody>
+      <tr><td><code>getFileName()</code></td><td>The last element: the file or folder name</td></tr>
+      <tr><td><code>getParent()</code></td><td>The path without its last element, or <code>null</code></td></tr>
+      <tr><td><code>getRoot()</code></td><td><code>/</code> or <code>C:\</code>, or <code>null</code> for a relative path</td></tr>
+      <tr><td><code>getNameCount()</code>, <code>getName(i)</code></td><td>Number of elements, and one element</td></tr>
+      <tr><td><code>subpath(from, to)</code></td><td>A relative path made of some elements</td></tr>
+      <tr><td><code>isAbsolute()</code>, <code>toAbsolutePath()</code></td><td>Whether it starts at a root; the absolute form</td></tr>
+      <tr><td><code>toString()</code>, <code>toUri()</code>, <code>toFile()</code></td><td>Text, <code>file:</code> URI, legacy <code>File</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Combining paths: resolve, relativize, normalize</h4>
+<pre data-title="Combining paths (Linux/macOS)"><code class="language-java">Path base = Path.of("uploads");
+Path file = base.resolve("avatars/asha.png");
+System.out.println(file);                                  // uploads/avatars/asha.png
+System.out.println(file.resolveSibling("asha-small.png")); // uploads/avatars/asha-small.png
+System.out.println(base.relativize(file));                 // avatars/asha.png
+
+Path messy = Path.of("reports/./2026/../2025/summary.txt");
+System.out.println(messy.normalize());                     // reports/2025/summary.txt
+
+System.out.println(base.resolve("/etc/passwd"));           // /etc/passwd</code></pre>
+  <ul>
+    <li><strong><code>resolve(other)</code></strong> appends <code>other</code> to this path. It is the
+    right way to build "folder + file name". If <code>other</code> is <em>absolute</em>, it wins and is
+    returned unchanged (the last line).</li>
+    <li><strong><code>resolveSibling(name)</code></strong> replaces the last element: "the file next to
+    this one".</li>
+    <li><strong><code>relativize(other)</code></strong> is the opposite of resolve: the path that leads
+    from this one to <code>other</code>. Both paths must be of the same kind (both relative or both
+    absolute), or you get <code>IllegalArgumentException: 'other' is different type of Path</code>.</li>
+    <li><strong><code>normalize()</code></strong> removes <code>.</code> and folds <code>name/..</code>.
+    It works on the text only; it does not look at the disk, so it cannot know about symbolic links.</li>
+  </ul>
+
+  <h4>Never trust a user-supplied file name</h4>
+  <p>If a web application builds a path from a name the user sends, a name such as
+  <code>../../etc/passwd</code> climbs out of the upload folder. This attack is called <strong>path
+  traversal</strong> and it is a classic security hole. The defence is to normalize and then check that
+  the result is still inside the base folder.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: uses the name as it comes</p><pre><code class="language-java">Path target = uploadDir.resolve(userFileName);
+Files.copy(in, target);          // userFileName = "../../etc/passwd" escapes uploadDir</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: normalize, then check</p><pre><code class="language-java">static Path safeResolve(Path base, String userFileName) {
+    Path target = base.resolve(userFileName).normalize();
+    if (!target.startsWith(base)) {              // compares whole name elements
+        throw new IllegalArgumentException("Illegal file name: " + userFileName);
+    }
+    return target;
+}
+// base = /var/app/uploads (absolute and normalized)
+// safeResolve(base, "avatars/asha.png")  -&gt; /var/app/uploads/avatars/asha.png
+// safeResolve(base, "../../etc/passwd")  -&gt; IllegalArgumentException</code></pre></div>
+  </div>
+  <p>Even better, do not use the client's name at all: store the file under a generated name (a UUID) and
+  keep the original name in the database.</p>
+
+  <h4>Comparing paths and finding the real file</h4>
+  <ul>
+    <li><code>equals</code> compares the <em>text</em> of the paths:
+    <code>Path.of("a/../b").equals(Path.of("b"))</code> is <code>false</code>, but it is
+    <code>true</code> after <code>normalize()</code>.</li>
+    <li><code>Files.isSameFile(p1, p2)</code> asks the file system whether both paths lead to the same
+    file, following symbolic links. For two different paths, both files must exist.</li>
+    <li><code>toRealPath()</code> returns the real, absolute, normalized path with symbolic links
+    resolved. Unlike <code>toAbsolutePath()</code>, it touches the disk and throws
+    <code>NoSuchFileException</code> when the file does not exist.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and exceptions</p>
+    <ul>
+      <li><code>InvalidPathException</code> (unchecked) is thrown by <code>Path.of</code> for a string the
+      operating system cannot accept as a path, such as a NUL character anywhere, or <code>&lt;</code>,
+      <code>?</code> or <code>|</code> in a name on Windows.</li>
+      <li><code>Path.of("")</code> is the empty path; operations treat it as the current directory.</li>
+      <li>Whether names are case-sensitive depends on the operating system and file system:
+      <code>Orders.csv</code> and <code>orders.csv</code> are the same file on Windows and usually
+      different files on Linux. Be exact with names so that code behaves the same everywhere.</li>
+      <li>A <code>Path</code> is <code>Iterable&lt;Path&gt;</code> over its name elements and
+      <code>Comparable</code>, so you can sort paths (the order is lexicographic by name).</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Use <code>Path</code> (not <code>String</code>) as the parameter and field type for files, so
+      callers cannot pass nonsense.</li>
+      <li>Build paths with <code>resolve</code> from a configured base directory; never concatenate
+      strings.</li>
+      <li>Use forward slashes in string literals if you must write one; Java accepts them on Windows too.
+      A single backslash in a Java string literal is an escape character (<code>"C:\data"</code> does not
+      compile).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Path vs File, relative vs absolute"</p>
+    <ul>
+      <li><code>Path</code> (Java 7, <code>java.nio.file</code>) describes a location and is used together
+      with <code>Files</code>; <code>File</code> is the old class from Java 1.0 with weaker error
+      reporting.</li>
+      <li>A relative path is resolved against the working directory (<code>user.dir</code>), which differs
+      between IDE, Maven, Docker and servers — a common source of "file not found".</li>
+      <li><code>resolve</code>, <code>relativize</code> and <code>normalize</code> are text operations;
+      <code>toRealPath</code> and <code>isSameFile</code> use the real file system.</li>
+      <li>Mention path traversal and how to prevent it.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-files-read-write">
+  <h3>Reading and writing text files with Files</h3>
+  <p class="tldr">For small files use Files.readString, writeString and readAllLines; for big files stream
+  with Files.lines or a buffered reader; always know your charset (UTF-8) and say with StandardOpenOption
+  whether you create, overwrite or append.</p>
+
+  <p>The <code>Files</code> class turns most file work into one line. Before NIO.2 (Java 7) the same job
+  needed a reader, a loop and a try/finally. Every method below throws the checked <code>IOException</code>, so
+  they sit inside a method that declares <code>throws IOException</code> or inside a try block.</p>
+
+  <h4>The methods you will use</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Purpose</th><th>Memory</th></tr></thead>
+    <tbody>
+      <tr><td><code>Files.readString(path)</code></td><td>Whole file as one <code>String</code> (Java 11)</td>
+      <td>Whole file</td></tr>
+      <tr><td><code>Files.readAllLines(path)</code></td><td>Whole file as a <code>List&lt;String&gt;</code></td>
+      <td>Whole file</td></tr>
+      <tr><td><code>Files.readAllBytes(path)</code></td><td>Whole file as <code>byte[]</code> (binary data)</td>
+      <td>Whole file</td></tr>
+      <tr><td><code>Files.lines(path)</code></td><td>A lazy <code>Stream&lt;String&gt;</code> of lines — must be closed</td>
+      <td>One line at a time</td></tr>
+      <tr><td><code>Files.newBufferedReader(path)</code></td><td>A <code>BufferedReader</code> for a manual loop</td>
+      <td>One line at a time</td></tr>
+      <tr><td><code>Files.writeString(path, text, options...)</code></td><td>Write a <code>String</code> (Java 11)</td>
+      <td>Text in memory</td></tr>
+      <tr><td><code>Files.write(path, lines, options...)</code></td><td>Write an <code>Iterable</code> of lines, or a <code>byte[]</code></td>
+      <td>Lines in memory</td></tr>
+      <tr><td><code>Files.newBufferedWriter(path, options...)</code></td><td>A <code>BufferedWriter</code> for many small writes</td>
+      <td>Small buffer</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Example: a to-do file and a log file</h4>
+<pre data-title="FilesReadWrite.java"><code class="language-java">import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.List;
+import java.util.stream.Stream;
+
+public class FilesReadWrite {
+    public static void main(String[] args) throws IOException {
+        Path dir = Files.createTempDirectory("notes-");
+        Path todo = dir.resolve("todo.txt");
+
+        // 1. write a String: creates the file, or overwrites it
+        Files.writeString(todo, "Buy milk\nCall the bank\n");
+
+        // 2. read it all back
+        System.out.print(Files.readString(todo));
+
+        // 3. append lines (the file already exists, so CREATE is not needed)
+        Files.write(todo, List.of("Pay electricity bill", "Book train ticket"),
+                StandardOpenOption.APPEND);
+
+        // 4. read as a list of lines
+        List&lt;String&gt; lines = Files.readAllLines(todo);
+        System.out.println(lines.size() + " lines: " + lines);
+
+        // 5. a log file: create it if missing, otherwise append
+        Path log = dir.resolve("app.log");
+        for (String msg : List.of("INFO  Order 1042 placed", "ERROR Payment timeout",
+                "INFO  Order 1043 placed")) {
+            try (BufferedWriter writer = Files.newBufferedWriter(log, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
+                writer.write(msg);
+                writer.newLine();
+            }
+        }
+
+        // 6. stream a file lazily and close it
+        try (Stream&lt;String&gt; stream = Files.lines(log)) {
+            stream.filter(l -&gt; l.startsWith("ERROR")).forEach(System.out::println);
+        }
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">Buy milk
+Call the bank
+4 lines: [Buy milk, Call the bank, Pay electricity bill, Book train ticket]
+ERROR Payment timeout</code></pre>
+  <p>Step 5 opens and closes the log file on every message just to keep the example short. In a real
+  program, open the writer once before the loop and close it after.</p>
+
+  <h4>StandardOpenOption: create, overwrite or append</h4>
+  <p>The <code>write</code> and <code>writeString</code> methods and the buffered-writer methods take a
+  list of options. <strong>If you give none, the default is <code>CREATE</code>,
+  <code>TRUNCATE_EXISTING</code> and <code>WRITE</code></strong>: create the file if missing, and
+  <em>erase the old content</em> if it exists. Once you give any option, only the ones you list apply.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>CREATE</code></td><td>Create the file if it does not exist (no error if it does)</td></tr>
+      <tr><td><code>CREATE_NEW</code></td><td>Create it; fail with <code>FileAlreadyExistsException</code> if it
+      already exists. The check and the creation are one atomic step</td></tr>
+      <tr><td><code>TRUNCATE_EXISTING</code></td><td>Empty an existing file before writing</td></tr>
+      <tr><td><code>APPEND</code></td><td>Write at the end of the file. The file must exist unless you also give
+      <code>CREATE</code></td></tr>
+      <tr><td><code>WRITE</code>, <code>READ</code></td><td>Open for writing or reading (usually implied)</td></tr>
+      <tr><td><code>DELETE_ON_CLOSE</code></td><td>Delete the file when the stream is closed (temporary files)</td></tr>
+    </tbody>
+  </table></div>
+<pre data-title="Common combinations"><code class="language-java">Files.writeString(p, text);                                   // create or overwrite
+Files.writeString(p, text, CREATE, APPEND);                   // create or append (logs)
+Files.writeString(p, text, CREATE_NEW);                       // only if it does not exist yet
+Files.writeString(p, text, APPEND);                           // append; fails if the file is missing
+// (with: import static java.nio.file.StandardOpenOption.*;)</code></pre>
+  <p>Running the failure cases from the example program prints:</p>
+<pre class="out" data-title="Output"><code class="language-plaintext">APPEND on a missing file -&gt; NoSuchFileException
+CREATE_NEW on an existing file -&gt; FileAlreadyExistsException
+missing parent directory -&gt; NoSuchFileException</code></pre>
+  <p>The last line is the third common one: <code>Files</code> never creates missing parent folders. Call
+  <code>Files.createDirectories(path.getParent())</code> first (see
+  <a href="#m3-files-manage">the next article</a>). Two details about line endings:
+  <code>write(path, lines)</code> ends each line with the platform's separator (<code>\r\n</code> on
+  Windows), while <code>writeString</code> writes exactly the text you give it, so add
+  <code>"\n"</code> yourself.</p>
+
+  <h4>Charsets: always UTF-8</h4>
+  <p>A text file is bytes; a <strong>charset</strong> (character encoding) says how bytes map to
+  characters. UTF-8 is the standard for new files: it covers every language, and <code>₹</code> or
+  <code>é</code> survive a round trip. The <code>Files</code> methods without a charset parameter always
+  use UTF-8. Many other APIs use the <em>default charset</em> of the machine instead.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>API</th><th>Charset when you do not pass one</th></tr></thead>
+    <tbody>
+      <tr><td><code>Files.readString</code>, <code>readAllLines</code>, <code>lines</code>,
+      <code>writeString</code>, <code>newBufferedReader/Writer</code></td><td>UTF-8, always</td></tr>
+      <tr><td><code>new FileReader(f)</code>, <code>new FileWriter(f)</code>, <code>new Scanner(file)</code>,
+      <code>new String(bytes)</code>, <code>text.getBytes()</code></td><td>The default charset: depended on the
+      operating system before Java 18; UTF-8 from Java 18 on (JEP 400)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Because you may meet Java 8, 11 or 17 projects, and files from other tools, pass
+  <code>StandardCharsets.UTF_8</code> explicitly whenever the API accepts a charset.</p>
+  <div class="co co-exc">
+    <p class="co-t">Real-life trap: a CSV from Excel is not valid UTF-8</p>
+    <p>Windows tools often save "CSV" as <em>windows-1252</em> (a single-byte encoding, close to
+    ISO-8859-1). A name like <code>café</code> then contains the byte <code>0xE9</code>, which is not valid
+    UTF-8, and <code>Files.readString</code> throws <code>java.nio.charset.MalformedInputException</code>
+    (<em>Input length = ...</em>). <code>Files.lines</code> throws an <code>UncheckedIOException</code>
+    whose cause is the same exception. Fix it by reading with the charset the file really has:</p>
+<pre><code class="language-java">List&lt;String&gt; lines = Files.readAllLines(path, Charset.forName("windows-1252"));
+// [name, café]</code></pre>
+    <p>The other classic is the <strong>BOM</strong> (byte order mark): Excel's "CSV UTF-8" starts the file
+    with the three bytes <code>EF BB BF</code>. Java does not remove them, so the first header becomes
+    <code>"\uFEFFid"</code> and <code>header.equals("id")</code> is false although it prints like
+    <code>id</code>:</p>
+<pre><code class="language-java">String header = lines.get(0);
+if (header.startsWith("\uFEFF")) {      // strip the byte order mark
+    header = header.substring(1);
+}</code></pre>
+  </div>
+
+  <h4>Large files: do not load them whole</h4>
+  <p><code>readString</code>, <code>readAllLines</code> and <code>readAllBytes</code> put the entire file
+  into memory — fine for a config file, an <code>OutOfMemoryError</code> for a 3 GB log. For big files use
+  <code>Files.lines</code> or <code>Files.newBufferedReader</code> and process one line at a time. The CSV
+  article after next builds on this.</p>
+  <p><code>Files.lines</code> returns a <strong>lazy stream</strong>: the file is read as you consume the
+  stream, and the stream holds an open file handle. Close it with try-with-resources, as in step 6 above.
+  If you forget, the handle can stay open for a long time: on Windows you cannot delete the file, and on a
+  busy server you eventually hit "Too many open files". If reading fails halfway,
+  the stream throws <code>UncheckedIOException</code> instead of <code>IOException</code>, because
+  stream lambdas cannot throw checked exceptions.</p>
+
+  <h4>Common mistakes</h4>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: every call overwrites the file</p><pre><code class="language-java">for (String line : report) {
+    Files.writeString(file, line + "\n");   // default option = TRUNCATE_EXISTING
+}
+// the file now contains only the LAST line</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: append, or open the file once</p><pre><code class="language-java">try (BufferedWriter writer = Files.newBufferedWriter(file)) {
+    for (String line : report) {
+        writer.write(line);
+        writer.newLine();
+    }
+}</code></pre></div>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">More mistakes</p>
+    <ul>
+      <li><strong>Forgetting to close <code>Files.lines</code>, <code>Files.list</code> or
+      <code>Files.walk</code></strong> — use try-with-resources.</li>
+      <li><strong><code>readAllLines</code> on a huge file</strong> — stream it instead.</li>
+      <li><strong>Relying on the default charset</strong> — pass UTF-8 or the file's real charset.</li>
+      <li><strong><code>APPEND</code> without <code>CREATE</code></strong> on a file that may not exist yet.</li>
+      <li><strong>A single backslash in a Windows path string</strong> — write <code>"C:\\data\\a.txt"</code>
+      or use <code>Path.of("C:", "data", "a.txt")</code>.</li>
+      <li><strong>Swallowing the <code>IOException</code></strong> with an empty catch. Report which file
+      failed: the exception message already contains the path.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you read a file in Java?"</p>
+    <ul>
+      <li>Small text file: <code>Files.readString</code> or <code>readAllLines</code>. Large file:
+      <code>Files.lines</code> (close it!) or <code>newBufferedReader</code> in a loop — constant
+      memory.</li>
+      <li>Always state the charset; know that <code>Files</code> methods default to UTF-8 while
+      <code>FileReader</code> depended on the platform before Java 18.</li>
+      <li>Writing: <code>writeString</code> / <code>write</code> with <code>StandardOpenOption</code>
+      (<code>CREATE</code>, <code>APPEND</code>, <code>TRUNCATE_EXISTING</code>, <code>CREATE_NEW</code>);
+      the default truncates.</li>
+      <li>Handle <code>IOException</code> (checked), and use try-with-resources for readers, writers and
+      streams.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-files-manage">
+  <h3>Files and directories: create, copy, move, delete, list, walk</h3>
+  <p class="tldr">Files has one-liners to check, create, copy, move, delete, list and walk files and
+  folders; handle the specific failures (already exists, not empty, missing) and close every Stream that
+  holds a directory open.</p>
+
+  <p>Reading and writing content is half of file work. The other half is managing the files themselves:
+  does it exist, create a folder, move a processed file to an archive, clean up a temp folder. All of
+  these are static methods of <code>Files</code>, and all of them throw <code>IOException</code> subclasses
+  that tell you exactly what went wrong.</p>
+
+  <h4>Checking: exists, size, type</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Answers</th></tr></thead>
+    <tbody>
+      <tr><td><code>Files.exists(p)</code></td><td>Does something exist at this path? <code>false</code> also when
+      the answer cannot be determined (no permission)</td></tr>
+      <tr><td><code>Files.notExists(p)</code></td><td>Is it certain that nothing exists there? Not the same as
+      <code>!exists(p)</code> in the "cannot tell" case</td></tr>
+      <tr><td><code>Files.isRegularFile(p)</code>, <code>isDirectory(p)</code></td><td>A normal file? A folder?</td></tr>
+      <tr><td><code>Files.isReadable(p)</code>, <code>isWritable(p)</code></td><td>Does the JVM have access?</td></tr>
+      <tr><td><code>Files.size(p)</code></td><td>Size in bytes; <code>NoSuchFileException</code> if missing. Do not use it for
+      folders</td></tr>
+      <tr><td><code>Files.getLastModifiedTime(p)</code></td><td>A <code>FileTime</code> (<code>.toInstant()</code> converts it)</td></tr>
+      <tr><td><code>Files.readAttributes(p, BasicFileAttributes.class)</code></td><td>Size, times and type in one call</td></tr>
+    </tbody>
+  </table></div>
+  <div class="co co-tip">
+    <p class="co-t">Do not check first, then act</p>
+    <p><code>if (!Files.exists(p)) Files.createFile(p);</code> has a gap: another thread or process can create
+    the file between the two lines. Prefer the operation that does the check atomically and handle the
+    exception: <code>Files.createFile(p)</code> throws <code>FileAlreadyExistsException</code>, and
+    <code>writeString(..., CREATE_NEW)</code> does the same. This "check-then-act" race is called
+    <strong>time-of-check to time-of-use</strong> (TOCTOU).</p>
+  </div>
+
+  <h4>Creating</h4>
+  <ul>
+    <li><code>Files.createFile(p)</code> — an empty file; fails if it exists.</li>
+    <li><code>Files.createDirectory(p)</code> — one folder; the parent must exist; fails if it exists.</li>
+    <li><code>Files.createDirectories(p)</code> — the folder <em>and every missing parent</em>, like
+    <code>mkdir -p</code>. It does nothing if the folder already exists. It fails with
+    <code>FileAlreadyExistsException</code> only if the path exists and is a <em>file</em>. This is the
+    method you want before writing into a new folder.</li>
+    <li><code>Files.createTempFile("report-", ".csv")</code> and <code>createTempDirectory("work-")</code>
+    — a uniquely named file or folder in the system's temp location (<code>/tmp</code> on Linux).</li>
+  </ul>
+
+  <h4>Copy, move and delete</h4>
+  <ul>
+    <li><strong><code>Files.copy(source, target, options...)</code></strong> fails with
+    <code>FileAlreadyExistsException</code> when the target exists, unless you pass
+    <code>StandardCopyOption.REPLACE_EXISTING</code>. File attributes such as times and permissions are only
+    copied if you add <code>COPY_ATTRIBUTES</code>. Copying a <em>folder</em> creates only an empty folder; its contents
+    are not copied. There are also <code>copy(InputStream, Path)</code> and
+    <code>copy(Path, OutputStream)</code>, which are handy for saving an upload or sending a file.</li>
+    <li><strong><code>Files.move(source, target, options...)</code></strong> moves or renames. Moving inside
+    one folder is a rename. Options: <code>REPLACE_EXISTING</code> and <code>ATOMIC_MOVE</code> (all or
+    nothing, cannot leave a half-moved file).</li>
+    <li><strong><code>Files.delete(p)</code></strong> throws <code>NoSuchFileException</code> if the path is
+    missing and <code>DirectoryNotEmptyException</code> for a folder with content.
+    <strong><code>Files.deleteIfExists(p)</code></strong> returns <code>false</code> instead of throwing for
+    a missing path (but still throws for a non-empty folder).</li>
+  </ul>
+<pre data-title="The safe-write idiom: write a temp file, then move it into place"><code class="language-java">Path temp = Files.createTempFile(target.getParent(), "settings-", ".tmp");
+Files.writeString(temp, newContent);
+Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE);   // readers see the old or the new file, never half</code></pre>
+  <p>With <code>ATOMIC_MOVE</code> all other options are ignored, and whether an existing target is replaced
+  is up to the file system (on Linux and macOS it is). The temp file must be in the same folder (the same
+  file store) as the target.</p>
+
+  <h4>Listing and walking</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Gives you</th></tr></thead>
+    <tbody>
+      <tr><td><code>Files.list(dir)</code></td><td>A <code>Stream&lt;Path&gt;</code> of the entries of one folder, not
+      recursive (files and sub-folders)</td></tr>
+      <tr><td><code>Files.walk(start)</code> / <code>walk(start, maxDepth)</code></td><td>All entries below
+      <code>start</code>, depth-first, including <code>start</code> itself</td></tr>
+      <tr><td><code>Files.find(start, depth, matcher)</code></td><td>Like <code>walk</code>, filtered by a
+      <code>(path, attributes)</code> predicate</td></tr>
+      <tr><td><code>Files.newDirectoryStream(dir, "*.csv")</code></td><td>An <code>Iterable</code> of one folder's
+      entries that match a glob pattern</td></tr>
+      <tr><td><code>Files.walkFileTree(start, visitor)</code></td><td>Full control with a
+      <code>FileVisitor</code>: skip folders, act before and after each folder</td></tr>
+    </tbody>
+  </table></div>
+  <p>Three rules apply to all of them. The <strong>order is not guaranteed</strong>, so call
+  <code>sorted()</code> when the result must be predictable. The streams from <code>list</code>,
+  <code>walk</code> and <code>find</code> keep the directory open, so <strong>close them</strong> with
+  try-with-resources. And problems that occur while iterating (a folder you may not read) surface as
+  <code>UncheckedIOException</code>. <code>walk</code> does not follow symbolic links unless you pass
+  <code>FileVisitOption.FOLLOW_LINKS</code>.</p>
+
+  <h4>Example: process an inbox and archive the files</h4>
+<pre data-title="FilesManage.java"><code class="language-java">import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.DirectoryNotEmptyException;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.Comparator;
+import java.util.stream.Stream;
+
+public class FilesManage {
+
+    static void tree(Path root) throws IOException {
+        try (Stream&lt;Path&gt; walk = Files.walk(root)) {
+            walk.sorted().skip(1).forEach(p -&gt;
+                    System.out.println("  " + root.relativize(p) + (Files.isDirectory(p) ? "/" : "")));
+        }
+    }
+
+    static void deleteTree(Path root) throws IOException {
+        try (Stream&lt;Path&gt; walk = Files.walk(root)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(p -&gt; {   // children before parents
+                try {
+                    Files.delete(p);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+        Path root = Files.createTempDirectory("inbox-demo-");
+        Path inbox = Files.createDirectories(root.resolve("inbox"));
+        Path archive = root.resolve("archive");
+        Files.createDirectories(archive.resolve("2026").resolve("10"));   // creates every missing level
+
+        Files.writeString(inbox.resolve("order-1.csv"), "id,total\n1,250\n");
+        Files.writeString(inbox.resolve("order-2.csv"), "id,total\n2,990\n");
+        Files.writeString(inbox.resolve("notes.txt"), "ignore me");
+        System.out.println("After setup:");
+        tree(root);
+
+        // list ONE level, only CSV files, sorted
+        System.out.println("CSV files in inbox:");
+        try (Stream&lt;Path&gt; files = Files.list(inbox)) {
+            files.filter(p -&gt; p.getFileName().toString().endsWith(".csv"))
+                 .sorted()
+                 .forEach(p -&gt; System.out.println("  " + p.getFileName() + " (" + sizeOf(p) + " bytes)"));
+        }
+
+        // copy keeps the original; a second copy fails unless REPLACE_EXISTING is given
+        Path backup = root.resolve("backup-order-1.csv");
+        Files.copy(inbox.resolve("order-1.csv"), backup);
+        try {
+            Files.copy(inbox.resolve("order-1.csv"), backup);
+        } catch (FileAlreadyExistsException e) {
+            System.out.println("second copy -&gt; FileAlreadyExistsException");
+        }
+        Files.copy(inbox.resolve("order-1.csv"), backup, StandardCopyOption.REPLACE_EXISTING);
+
+        // move processed files into the archive folder
+        try (Stream&lt;Path&gt; files = Files.list(inbox)) {
+            for (Path p : files.filter(f -&gt; f.toString().endsWith(".csv")).toList()) {
+                Files.move(p, archive.resolve("2026").resolve("10").resolve(p.getFileName()));
+            }
+        }
+        System.out.println("After moving:");
+        tree(root);
+
+        // delete variants
+        try {
+            Files.delete(inbox);
+        } catch (DirectoryNotEmptyException e) {
+            System.out.println("delete(inbox) -&gt; DirectoryNotEmptyException (notes.txt is still inside)");
+        }
+        try {
+            Files.delete(root.resolve("nothing.txt"));
+        } catch (NoSuchFileException e) {
+            System.out.println("delete(missing) -&gt; NoSuchFileException");
+        }
+        System.out.println("deleteIfExists(missing) -&gt; " + Files.deleteIfExists(root.resolve("nothing.txt")));
+
+        deleteTree(root);
+        System.out.println("root still exists after deleteTree? " + Files.exists(root));
+    }
+
+    static long sizeOf(Path p) {
+        try {
+            return Files.size(p);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+}</code></pre>
+<pre class="out" data-title="Output (Linux/macOS separators)"><code class="language-plaintext">After setup:
+  archive/
+  archive/2026/
+  archive/2026/10/
+  inbox/
+  inbox/notes.txt
+  inbox/order-1.csv
+  inbox/order-2.csv
+CSV files in inbox:
+  order-1.csv (15 bytes)
+  order-2.csv (15 bytes)
+second copy -&gt; FileAlreadyExistsException
+After moving:
+  archive/
+  archive/2026/
+  archive/2026/10/
+  archive/2026/10/order-1.csv
+  archive/2026/10/order-2.csv
+  backup-order-1.csv
+  inbox/
+  inbox/notes.txt
+delete(inbox) -&gt; DirectoryNotEmptyException (notes.txt is still inside)
+delete(missing) -&gt; NoSuchFileException
+deleteIfExists(missing) -&gt; false
+root still exists after deleteTree? false</code></pre>
+  <p>Three things are worth studying in this program. <code>deleteTree</code> deletes a whole folder tree.
+  A folder must be empty before it can be deleted, so children must go first. A path always sorts after its
+  own parent, so sorting in <em>reverse</em> order puts every child before its parent. The helper
+  <code>sizeOf</code> exists because lambdas cannot throw <code>IOException</code> (see
+  <a href="#m3-rethrow-chaining">wrapping</a>). And the move loop first collects the list with
+  <code>toList()</code>, so the directory stream is not being read while files leave the folder.</p>
+  <p>The same cleanup with a <code>FileVisitor</code> needs no lambda wrapping, because the visitor methods
+  may throw <code>IOException</code>:</p>
+<pre data-title="Deleting a tree with walkFileTree"><code class="language-java">Files.walkFileTree(root, new SimpleFileVisitor&lt;&gt;() {
+    @Override
+    public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+        Files.delete(file);                    // every file first
+        return FileVisitResult.CONTINUE;
+    }
+
+    @Override
+    public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+        Files.delete(dir);                     // then the now-empty folder
+        return FileVisitResult.CONTINUE;
+    }
+});</code></pre>
+  <p>Spring users also have <code>FileSystemUtils.deleteRecursively(Path)</code> for this.</p>
+
+  <h4>The IOException family for files</h4>
+  <p>The file exceptions live in <code>java.nio.file</code>. Most extend <code>FileSystemException</code>
+  (itself an <code>IOException</code>), whose <code>getFile()</code> and <code>getReason()</code> methods
+  describe the failure. Catch the specific one when you can react differently:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Exception</th><th>Typical cause</th></tr></thead>
+    <tbody>
+      <tr><td><code>NoSuchFileException</code></td><td>Reading, deleting or appending to a path that does not exist,
+      or writing into a missing folder</td></tr>
+      <tr><td><code>FileAlreadyExistsException</code></td><td><code>createFile</code>, <code>createDirectory</code>,
+      <code>copy</code> or <code>move</code> onto an existing path (without a replace option);
+      <code>CREATE_NEW</code></td></tr>
+      <tr><td><code>DirectoryNotEmptyException</code></td><td>Deleting a folder that still has content</td></tr>
+      <tr><td><code>NotDirectoryException</code></td><td><code>Files.list</code> or <code>newDirectoryStream</code> on
+      something that is not a folder</td></tr>
+      <tr><td><code>AccessDeniedException</code></td><td>No permission to read, write or list. (On Windows, deleting a file
+      that is still open elsewhere, even by your own unclosed stream, gives a plain
+      <code>FileSystemException</code>: "being used by another process")</td></tr>
+      <tr><td><code>MalformedInputException</code></td><td>The bytes are not valid in the charset you read with (a
+      <code>CharacterCodingException</code>)</td></tr>
+      <tr><td><code>UncheckedIOException</code></td><td>An <code>IOException</code> that happened inside a stream pipeline</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-real">
+    <p class="co-t">Real project: handling uploaded files</p>
+    <ul>
+      <li>At startup call <code>Files.createDirectories(uploadDir)</code>, so the folder always exists.</li>
+      <li>Save with a generated name (<code>UUID.randomUUID() + ".png"</code>), never the client's name:
+      <code>Files.copy(file.getInputStream(), target)</code>; see path traversal in
+      <a href="#m3-nio-path">Paths</a>.</li>
+      <li>Keep uploads outside the application folder, because a container filesystem is thrown away
+      with the container; mount a volume or use object storage (S3).</li>
+      <li>Use <code>createTempFile</code> for intermediate files and delete them in
+      <code>finally</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Using the old <code>File.delete()</code> or <code>mkdir()</code>, which only return
+      <code>false</code> when they fail and say nothing about why.</li>
+      <li>Assuming <code>Files.copy</code> copies a folder's contents. It copies the folder entry only.</li>
+      <li>Forgetting that <code>Files.walk</code> includes the start folder itself (use
+      <code>skip(1)</code>, or filter it out) — especially in a recursive delete.</li>
+      <li>Not closing <code>Files.list</code> / <code>walk</code> streams.</li>
+      <li>Expecting a stable order from <code>list</code> or <code>walk</code>; the result differs between
+      operating systems.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you delete a directory with files in Java?"</p>
+    <ul>
+      <li><code>Files.delete</code> throws <code>DirectoryNotEmptyException</code> for a non-empty folder, so you
+      delete the contents first.</li>
+      <li>Either walk the tree and delete in reverse order (<code>Files.walk(root).sorted(Comparator.reverseOrder())</code>),
+      or use <code>Files.walkFileTree</code> with a visitor that deletes files in <code>visitFile</code> and folders in
+      <code>postVisitDirectory</code>.</li>
+      <li>Close the walk stream, and wrap <code>IOException</code> in <code>UncheckedIOException</code> inside a
+      lambda.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,574 @@
+<article class="topic" id="m3-topological-sort">
+  <h3>Topological sort: Kahn's algorithm and DFS, Course Schedule</h3>
+  <p class="tldr">A topological order lists the vertices of a directed acyclic graph so that every edge u → v has u before v; Kahn's algorithm builds it with a queue of zero in-degree vertices, the DFS method reverses the finishing order, and if not all vertices can be placed the graph has a cycle.</p>
+
+  <p>You cannot wear shoes before socks, build module B before module A if B depends on A, or take Algorithms before its prerequisite Data Structures. These are dependencies, and a <strong>topological sort</strong> turns them into one valid order. It exists exactly when the directed graph has no cycle (a DAG). If tasks A and B depend on each other, no order is possible. A DAG usually has many valid orders; any one is accepted unless the problem asks for the smallest.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  C0[Course 0] --> C1[Course 1]
+  C0 --> C2[Course 2]
+  C1 --> C3[Course 3]
+  C2 --> C3
+</pre>
+    <figcaption>Prerequisites as a DAG: valid orders are 0,1,2,3 and 0,2,1,3</figcaption>
+  </figure>
+
+  <h4>Method 1: Kahn's algorithm (BFS with in-degrees)</h4>
+  <p>The <strong>in-degree</strong> of a vertex is the number of edges pointing into it, that is, the number of unfinished prerequisites. A vertex with in-degree 0 has no prerequisites and can go next.</p>
+  <ol class="steps">
+    <li>Compute the in-degree of every vertex.</li>
+    <li>Put all vertices with in-degree 0 into a queue.</li>
+    <li>Remove a vertex from the queue and append it to the order. For each edge u → v, decrease the in-degree of v; if it becomes 0, enqueue v.</li>
+    <li>Repeat until the queue is empty. If the order contains all V vertices, it is a topological order. If it has fewer, the remaining vertices sit on or behind a cycle: <strong>cycle detected</strong>.</li>
+  </ol>
+
+  <h4>Problem — Course Schedule I and II (LeetCode 207, 210)</h4>
+  <p>There are <code>numCourses</code> courses labelled 0..n−1. Each pair <code>[a, b]</code> in <code>prerequisites</code> means "to take a, you must first take b", an edge b → a. Course Schedule I asks: can you finish all courses (is there no cycle)? Course Schedule II asks for one valid order, or an empty array if impossible.</p>
+<pre data-title="CourseSchedule.java"><code class="language-java">import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Deque;
+import java.util.List;
+
+public class CourseSchedule {
+    // Course Schedule II: returns a valid order, or an empty array if there is a cycle
+    public static int[] findOrder(int numCourses, int[][] prerequisites) {
+        List&lt;List&lt;Integer>> g = new ArrayList&lt;>();
+        for (int i = 0; i &lt; numCourses; i++) g.add(new ArrayList&lt;>());
+        int[] indegree = new int[numCourses];
+        for (int[] p : prerequisites) {
+            g.get(p[1]).add(p[0]);                 // edge: prerequisite p[1] → course p[0]
+            indegree[p[0]]++;
+        }
+        Deque&lt;Integer> queue = new ArrayDeque&lt;>();
+        for (int i = 0; i &lt; numCourses; i++) {
+            if (indegree[i] == 0) queue.add(i);    // courses with no prerequisites
+        }
+        int[] order = new int[numCourses];
+        int count = 0;
+        while (!queue.isEmpty()) {
+            int u = queue.poll();
+            order[count++] = u;                    // "take" the course
+            for (int v : g.get(u)) {
+                if (--indegree[v] == 0) queue.add(v);   // its last prerequisite is done
+            }
+        }
+        return count == numCourses ? order : new int[0];
+    }
+
+    // Course Schedule I: can all courses be finished?
+    public static boolean canFinish(int numCourses, int[][] prerequisites) {
+        return findOrder(numCourses, prerequisites).length == numCourses;
+    }
+
+    public static void main(String[] args) {
+        int[][] pre = {{1, 0}, {2, 0}, {3, 1}, {3, 2}};
+        System.out.println(Arrays.toString(findOrder(4, pre)));       // [0, 1, 2, 3]
+        int[][] cyc = {{1, 0}, {0, 1}};
+        System.out.println(canFinish(2, cyc));                        // false
+    }
+}</code></pre>
+  <p><strong>Dry run</strong> for the four-course example: in-degrees are <code>[0, 1, 1, 2]</code>. Queue <code>[0]</code>. Take 0: in-degree of 1 and 2 become 0 → queue <code>[1, 2]</code>. Take 1: course 3 drops to 1. Take 2: course 3 drops to 0 → enqueue. Take 3. Order <code>[0, 1, 2, 3]</code>, count 4 = n → valid. For the cycle <code>[[1,0],[0,1]]</code> both courses start with in-degree 1, the queue is empty from the beginning, count 0 &lt; 2 → impossible.</p>
+  <p><strong>Complexity:</strong> O(V + E) time, O(V + E) space.</p>
+
+  <h4>Method 2: DFS and reverse post-order</h4>
+  <p>Run DFS; when a vertex is <em>finished</em> (all its outgoing neighbours are done), push it on a stack. The finishing order puts a vertex after everything it points to, so the reverse of the finishing order is a topological order. Detect cycles with the same three colours as in <a href="#m3-graph-cycles-bipartite">directed cycle detection</a>.</p>
+<pre data-title="TopoSortDfs.java"><code class="language-java">import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
+
+public class TopoSortDfs {
+    public static List&lt;Integer> topoSort(List&lt;List&lt;Integer>> g) {
+        int n = g.size();
+        int[] state = new int[n];                         // 0 white, 1 grey, 2 black
+        Deque&lt;Integer> stack = new ArrayDeque&lt;>();
+        for (int s = 0; s &lt; n; s++) {
+            if (state[s] == 0 &amp;&amp; !dfs(g, s, state, stack)) return List.of();  // cycle
+        }
+        return new ArrayList&lt;>(stack);                    // stack top first = topological order
+    }
+
+    private static boolean dfs(List&lt;List&lt;Integer>> g, int u, int[] state, Deque&lt;Integer> stack) {
+        state[u] = 1;
+        for (int v : g.get(u)) {
+            if (state[v] == 1) return false;              // back edge: cycle
+            if (state[v] == 0 &amp;&amp; !dfs(g, v, state, stack)) return false;
+        }
+        state[u] = 2;
+        stack.push(u);                                    // post-order: add after all descendants
+        return true;
+    }
+
+    public static void main(String[] args) {
+        int[][] edges = {{0, 1}, {0, 2}, {1, 3}, {2, 3}};
+        System.out.println(topoSort(GraphBuilder.build(4, edges, true)));   // [0, 2, 1, 3]
+    }
+}</code></pre>
+  <p>The order printed, <code>[0, 2, 1, 3]</code>, differs from Kahn's but is also valid. <strong>Complexity:</strong> O(V + E).</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Kahn (BFS)</th><th>DFS</th></tr></thead>
+    <tbody>
+      <tr><td>Cycle detection</td><td>Count placed vertices &lt; V</td><td>Grey vertex reached</td></tr>
+      <tr><td>Recursion</td><td>None — no stack overflow</td><td>Depth up to V</td></tr>
+      <tr><td>Easy variants</td><td>Layers (Parallel Courses), smallest order with a <code>PriorityQueue</code></td><td>Fits when you already run a DFS</td></tr>
+      <tr><td>Output</td><td>Order built front to back</td><td>Order read from the stack</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Where else it appears</h4>
+  <ul>
+    <li><strong>Parallel Courses:</strong> the number of Kahn "rounds" (levels) is the minimum number of semesters.</li>
+    <li><strong>Alien Dictionary:</strong> compare adjacent words to get letter-order edges, then topologically sort the letters; a cycle means the dictionary is inconsistent.</li>
+    <li><strong>Longest path in a DAG / critical path:</strong> process vertices in topological order and relax edges; this is O(V + E), even with negative weights.</li>
+    <li><strong>Build tools:</strong> Gradle, Maven, Make, and Spring's bean creation order resolve dependencies this way.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: reversing the edge direction</p>
+    <p><code>[a, b]</code> means "b before a", so the edge is <code>b → a</code>. Building <code>a → b</code> gives a valid-looking but reversed order, and it passes simple cycle tests. Write the comment "prerequisite → course" next to the line and check the example by hand.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: returning the partial order when there is a cycle</p>
+    <p>When <code>count &lt; n</code> the array is only partly filled. Return an empty array (or false), as the problem asks, never the half-filled array.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>No prerequisites: any order is valid; Kahn returns 0..n−1.</li>
+      <li>Self-dependency <code>[0, 0]</code>: in-degree of 0 is 1 and it can never reach 0 — a cycle, reported correctly.</li>
+      <li>Duplicate prerequisite pairs add the edge twice and increment the in-degree twice; that is consistent, because it is decremented twice too.</li>
+      <li>Disconnected pieces are handled automatically: every in-degree-0 vertex starts in the queue.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Say: "topological order exists iff the graph is a DAG; I use Kahn's algorithm, O(V + E); if I cannot place all vertices, there is a cycle." Mention the DFS alternative. Follow-ups: "return the lexicographically smallest order" (swap the queue for a <code>PriorityQueue</code>), "minimum semesters" (count Kahn levels) and "is the order unique?" (it is unique only if the queue never holds more than one vertex).</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-dijkstra">
+  <h3>Dijkstra's shortest path algorithm</h3>
+  <p class="tldr">Dijkstra finds the shortest distance from one source to every vertex in a graph with non-negative edge weights by always finalising the closest unfinished vertex, using a min-heap of {distance, vertex} pairs; it runs in O((V + E) log V) and breaks when an edge is negative.</p>
+
+  <p>BFS finds the shortest path when every edge costs 1. When edges have different weights (kilometres, minutes, rupees), the path with the fewest edges is not the cheapest. <strong>Dijkstra's algorithm</strong> fixes this. It is behind route finding in maps, network routing (OSPF) and "cheapest way to do X" problems. The restriction: <strong>all weights must be ≥ 0</strong>.</p>
+
+  <h4>The idea</h4>
+  <p>Keep a best-known distance <code>dist[v]</code> for each vertex, starting at infinity (0 for the source). Repeatedly take the unfinished vertex with the smallest distance — that distance is now final — and <strong>relax</strong> its outgoing edges: for an edge u → v with weight w, if <code>dist[u] + w &lt; dist[v]</code>, update <code>dist[v]</code>. Why is the smallest distance final? Any other path to that vertex would have to leave the finished region through some vertex with an equal or larger distance and then add a non-negative weight, so it cannot be shorter. This argument is exactly where non-negative weights are needed.</p>
+  <p>A <code>PriorityQueue</code> picks the smallest distance in O(log n). Java's <code>PriorityQueue</code> has no "decrease key", so the standard trick is <strong>lazy deletion</strong>: when a distance improves, push a new entry, and when you poll an entry whose distance is larger than the current <code>dist[u]</code>, it is stale — skip it.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A -->|2| B
+  A -->|4| C
+  C -->|1| B
+  B -->|1| D
+  C -->|5| D
+</pre>
+    <figcaption>Small weighted digraph: A→B 2, A→C 4, C→B 1, B→D 1, C→D 5; the shortest A→D is A→B→D with cost 3</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Step</th><th>Poll {dist, vertex}</th><th>Relaxations</th><th>dist (A, B, C, D)</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>—</td><td>start</td><td>0, ∞, ∞, ∞</td></tr>
+      <tr><td>1</td><td>{0, A}</td><td>B = 2, C = 4</td><td>0, 2, 4, ∞</td></tr>
+      <tr><td>2</td><td>{2, B}</td><td>D = 3</td><td>0, 2, 4, 3</td></tr>
+      <tr><td>3</td><td>{3, D}</td><td>no outgoing edges</td><td>0, 2, 4, 3</td></tr>
+      <tr><td>4</td><td>{4, C}</td><td>B: 4+1 = 5 not &lt; 2; D: 4+5 = 9 not &lt; 3</td><td>0, 2, 4, 3</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Template</h4>
+<pre data-title="Dijkstra.java"><code class="language-java">import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.PriorityQueue;
+
+public class Dijkstra {
+    // g.get(u) holds {neighbour, weight}; returns shortest distance from src to every vertex
+    public static int[] shortestPaths(List&lt;List&lt;int[]>> g, int src) {
+        int n = g.size();
+        int[] dist = new int[n];
+        Arrays.fill(dist, Integer.MAX_VALUE);
+        dist[src] = 0;
+        PriorityQueue&lt;int[]> pq = new PriorityQueue&lt;>((a, b) -> Integer.compare(a[0], b[0]));
+        pq.add(new int[]{0, src});                       // {distance, vertex}
+        while (!pq.isEmpty()) {
+            int[] cur = pq.poll();
+            int d = cur[0], u = cur[1];
+            if (d > dist[u]) continue;                   // stale entry: a better one was processed
+            for (int[] edge : g.get(u)) {
+                int v = edge[0], nd = d + edge[1];
+                if (nd &lt; dist[v]) {                      // relax
+                    dist[v] = nd;
+                    pq.add(new int[]{nd, v});
+                }
+            }
+        }
+        return dist;                                     // MAX_VALUE means unreachable
+    }
+
+    public static void main(String[] args) {
+        // A=0, B=1, C=2, D=3
+        int[][] edges = {{0, 1, 2}, {0, 2, 4}, {2, 1, 1}, {1, 3, 1}, {2, 3, 5}};
+        List&lt;List&lt;int[]>> g = GraphBuilder.buildWeighted(4, edges, true);
+        System.out.println(Arrays.toString(shortestPaths(g, 0)));
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">[0, 2, 4, 3]</code></pre>
+  <p><strong>Complexity.</strong> Each edge can add at most one entry to the heap, so the heap holds up to E entries and each push/poll costs O(log E) = O(log V) (since E ≤ V²). Total <strong>O((V + E) log V)</strong>, usually written O(E log V) for connected graphs. Space: O(V + E). With a Fibonacci heap it is O(E + V log V), but nobody uses that in interviews.</p>
+  <p>To get the path itself, store <code>parent[v] = u</code> whenever you relax <code>v</code>, then walk back from the target as in BFS. To stop early when you only need one target, return as soon as that vertex is polled with a non-stale entry.</p>
+
+  <h4>Problem 1 — Network Delay Time (LeetCode 743)</h4>
+  <p>A signal is sent from node <code>k</code> in a network of <code>n</code> nodes (labelled 1..n). <code>times[i] = {u, v, w}</code> means the signal takes w time to go from u to v. Return the time until all nodes have received the signal, or −1 if some node cannot be reached. The time for everyone is the <em>largest</em> shortest-distance.</p>
+<pre data-title="NetworkDelayTime.java"><code class="language-java">import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.PriorityQueue;
+
+public class NetworkDelayTime {
+    public static int networkDelayTime(int[][] times, int n, int k) {
+        List&lt;List&lt;int[]>> g = new ArrayList&lt;>();
+        for (int i = 0; i &lt;= n; i++) g.add(new ArrayList&lt;>());   // nodes are 1..n
+        for (int[] t : times) g.get(t[0]).add(new int[]{t[1], t[2]});
+
+        int[] dist = new int[n + 1];
+        Arrays.fill(dist, Integer.MAX_VALUE);
+        dist[k] = 0;
+        PriorityQueue&lt;int[]> pq = new PriorityQueue&lt;>((a, b) -> Integer.compare(a[0], b[0]));
+        pq.add(new int[]{0, k});
+        while (!pq.isEmpty()) {
+            int[] cur = pq.poll();
+            if (cur[0] > dist[cur[1]]) continue;
+            for (int[] e : g.get(cur[1])) {
+                int nd = cur[0] + e[1];
+                if (nd &lt; dist[e[0]]) {
+                    dist[e[0]] = nd;
+                    pq.add(new int[]{nd, e[0]});
+                }
+            }
+        }
+        int answer = 0;
+        for (int v = 1; v &lt;= n; v++) {
+            if (dist[v] == Integer.MAX_VALUE) return -1;     // someone never receives it
+            answer = Math.max(answer, dist[v]);
+        }
+        return answer;
+    }
+
+    public static void main(String[] args) {
+        int[][] times = {{2, 1, 1}, {2, 3, 1}, {3, 4, 1}};
+        System.out.println(networkDelayTime(times, 4, 2));   // 2
+    }
+}</code></pre>
+  <p>From node 2: node 1 at time 1, node 3 at time 1, node 4 at time 2. The largest is 2. <strong>Complexity:</strong> O((V + E) log V).</p>
+
+  <h4>Problem 2 — Path With Minimum Effort (LeetCode 1631), briefly</h4>
+  <p>You walk from the top-left to the bottom-right of a height grid. The <em>effort</em> of a route is the largest absolute height difference between consecutive cells on it. Minimise the effort. This is Dijkstra on a grid where the "distance" of a route is the <strong>maximum</strong> edge instead of the sum. The greedy argument still works because the maximum never decreases as the route grows.</p>
+<pre data-title="MinimumEffort.java"><code class="language-java">import java.util.Arrays;
+import java.util.PriorityQueue;
+
+public class MinimumEffort {
+    private static final int[][] DIRS = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
+    public static int minimumEffortPath(int[][] h) {
+        int rows = h.length, cols = h[0].length;
+        int[][] effort = new int[rows][cols];
+        for (int[] row : effort) Arrays.fill(row, Integer.MAX_VALUE);
+        effort[0][0] = 0;
+        PriorityQueue&lt;int[]> pq = new PriorityQueue&lt;>((a, b) -> Integer.compare(a[0], b[0]));
+        pq.add(new int[]{0, 0, 0});                          // {effort, row, col}
+        while (!pq.isEmpty()) {
+            int[] cur = pq.poll();
+            int eff = cur[0], r = cur[1], c = cur[2];
+            if (r == rows - 1 &amp;&amp; c == cols - 1) return eff;  // first arrival is optimal
+            if (eff > effort[r][c]) continue;                // stale entry
+            for (int[] d : DIRS) {
+                int nr = r + d[0], nc = c + d[1];
+                if (nr &lt; 0 || nc &lt; 0 || nr >= rows || nc >= cols) continue;
+                int ne = Math.max(eff, Math.abs(h[r][c] - h[nr][nc]));   // max, not sum
+                if (ne &lt; effort[nr][nc]) {
+                    effort[nr][nc] = ne;
+                    pq.add(new int[]{ne, nr, nc});
+                }
+            }
+        }
+        return 0;
+    }
+
+    public static void main(String[] args) {
+        int[][] heights = {{1, 2, 2}, {3, 8, 2}, {5, 3, 5}};
+        System.out.println(minimumEffortPath(heights));      // 2
+    }
+}</code></pre>
+  <p>Route 1 → 3 → 5 → 3 → 5 has differences 2, 2, 2, 2, so the effort is 2. <strong>Complexity:</strong> O(m · n · log(m · n)). Cheapest Flights Within K Stops (LeetCode 787) looks like Dijkstra but adds a limit on the number of edges; the clean solution is a limited <a href="#m3-bellman-ford">Bellman-Ford</a>.</p>
+
+  <h4>Why Dijkstra fails with negative edges</h4>
+  <p>Take edges A → B (4), A → C (5) and C → B (−3). Dijkstra finalises B at distance 4 (it is the smallest after A), but the route A → C → B costs 5 − 3 = 2. The assumption "once the smallest is chosen, nothing can improve it" is false, because a later edge can reduce a total. A re-insertion version can sometimes repair the answer, but it can become very slow, and with a <strong>negative cycle</strong> (a loop whose total weight is negative) it never ends, because every lap lowers the distance again. For negative edges use <a href="#m3-bellman-ford">Bellman-Ford</a>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: skipping the stale-entry check</p>
+    <p>Without <code>if (d &gt; dist[u]) continue;</code> the result is still correct, but the same vertex is expanded many times and the running time can degrade toward O(V · E). The check costs one comparison; always include it.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: integer overflow with MAX_VALUE</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: MAX_VALUE + w wraps around to a negative number</p><pre><code class="language-java">int nd = dist[u] + w;            // dist[u] could be Integer.MAX_VALUE
+if (nd &lt; dist[v]) { ... }        // the negative value wins</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: only relax from reached vertices (as polled entries are), or use long</p><pre><code class="language-java">int d = cur[0];                  // distance of a polled, reached vertex
+int nd = d + w;                  // safe unless the sum itself exceeds 2^31 - 1
+// for huge weights use long[] dist and Long.MAX_VALUE as infinity</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: comparing heap entries by subtraction</p>
+    <p>A comparator like <code>(a, b) -> a[0] - b[0]</code> overflows for large distances and corrupts the heap order. Use <code>Integer.compare</code> (or <code>Long.compare</code>).</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Unreachable vertices keep the "infinity" value; check for it before using or printing the distance.</li>
+      <li>Zero-weight edges are fine. Parallel edges and self-loops are harmless (a non-negative self-loop never improves anything).</li>
+      <li>Undirected graph: add each edge in both directions. A single negative undirected edge is already a negative cycle.</li>
+      <li>If all weights are equal use plain BFS; if weights are only 0 and 1 use <a href="#m3-floyd-zero-one">0-1 BFS</a>; both are faster.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real-project usage</p>
+    <p>Maps and delivery apps (Swiggy, Zomato, Ola) compute routes with Dijkstra-like search, usually A* (Dijkstra plus a distance-to-goal estimate) on a road graph with travel times as weights. Network routers run it to compute forwarding tables.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Say the three facts: greedy on the smallest tentative distance, correct only for non-negative weights, O((V + E) log V) with a binary heap. Explain lazy deletion and why there is no decrease-key in <code>PriorityQueue</code>. Be ready for "what if there is a negative edge?" (Bellman-Ford) and "what if you need only one target?" (stop when it is polled). Also be able to modify the relaxation (max instead of sum, or multiply probabilities) — it shows you understand why it works.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-bellman-ford">
+  <h3>Bellman-Ford: negative edges and limited-edge paths</h3>
+  <p class="tldr">Bellman-Ford relaxes every edge V − 1 times to compute single-source shortest paths even with negative edge weights, detects a reachable negative cycle with one extra pass, and runs in O(V · E); a version with k + 1 rounds solves "at most k edges" problems such as Cheapest Flights Within K Stops.</p>
+
+  <p>Dijkstra needs non-negative weights. Some real graphs have negative edges: a refund, a discount, a currency exchange that gains money. <strong>Bellman-Ford</strong> is slower but handles them, and it can also tell you when the answer does not exist because a <strong>negative cycle</strong> (a cycle whose weights add to less than zero) lets you reduce the cost forever by going round again.</p>
+
+  <h4>The idea</h4>
+  <p>A shortest path without a cycle uses at most V − 1 edges (a path through V vertices has V − 1 edges). Round 1 of "relax every edge" makes all paths of 1 edge correct, round 2 makes all paths of up to 2 edges correct, and so on. After V − 1 rounds every shortest path is correct. If a V-th round still improves some distance, then an unbounded improvement is possible, so a negative cycle is reachable from the source.</p>
+  <p>It does not use an adjacency list at all; the natural input is an <strong>edge list</strong>, one of the three representations from the <a href="#m3-graph-basics">graph basics</a> article.</p>
+
+<pre data-title="BellmanFord.java"><code class="language-java">import java.util.Arrays;
+
+public class BellmanFord {
+    private static final int INF = Integer.MAX_VALUE;
+
+    // edges[i] = {u, v, w}; returns distances, or null if a negative cycle is reachable
+    public static int[] shortestPaths(int n, int[][] edges, int src) {
+        int[] dist = new int[n];
+        Arrays.fill(dist, INF);
+        dist[src] = 0;
+        for (int round = 1; round &lt; n; round++) {            // V - 1 rounds
+            boolean changed = false;
+            for (int[] e : edges) {
+                int u = e[0], v = e[1], w = e[2];
+                if (dist[u] != INF &amp;&amp; dist[u] + w &lt; dist[v]) {   // relax; skip unreached u
+                    dist[v] = dist[u] + w;
+                    changed = true;
+                }
+            }
+            if (!changed) break;                               // early exit: already stable
+        }
+        for (int[] e : edges) {                                // one more pass: any change?
+            if (dist[e[0]] != INF &amp;&amp; dist[e[0]] + e[2] &lt; dist[e[1]]) return null;
+        }
+        return dist;
+    }
+
+    public static void main(String[] args) {
+        int[][] edges = {{0, 1, 4}, {0, 2, 5}, {1, 2, -3}, {2, 3, 2}};
+        System.out.println(Arrays.toString(shortestPaths(4, edges, 0)));
+        int[][] bad = {{0, 1, 1}, {1, 2, -2}, {2, 1, 1}};      // cycle 1→2→1 costs -1
+        System.out.println(shortestPaths(3, bad, 0));
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">[0, 4, 1, 3]
+null</code></pre>
+  <p><strong>Dry run</strong> on the first graph: round 1 relaxes in list order: 1 = 4, 2 = 5, then edge 1→2 gives 4 − 3 = 1, then 3 = 3. Round 2 changes nothing, so the loop stops. Note that vertex 2 got the improved value 1 in the same round because we updated the array in place; that only speeds convergence and keeps the guarantee.</p>
+  <p>In the second graph, vertices 1 and 2 form a cycle of total weight −1. Each lap lowers the distance, so after V − 1 rounds the extra pass still finds an improvement and returns <code>null</code>.</p>
+  <p><strong>Complexity:</strong> O(V · E) time — V − 1 rounds, each scanning E edges — and O(V) extra space. Compare with Dijkstra's O((V + E) log V): Bellman-Ford is far slower on big graphs, so use it only when negative weights or an edge limit require it. The queue-based version, often called SPFA, is faster on average but has the same worst case.</p>
+
+  <h4>Problem — Cheapest Flights Within K Stops (LeetCode 787)</h4>
+  <p>There are <code>n</code> cities and flights <code>{from, to, price}</code>. Find the cheapest price from <code>src</code> to <code>dst</code> with at most <code>k</code> stops (at most k + 1 flights), or −1.</p>
+  <p>A "stops" limit is a limit on the number of edges, and the cheapest path may have more edges than a slightly pricier one that fits the limit — plain Dijkstra, which finalises vertices by cost alone, cannot enforce this. Bellman-Ford with exactly k + 1 rounds fits perfectly: after round i, <code>dist[v]</code> is the cheapest price using at most i flights. One detail is essential: in each round read from the previous round's array and write to a copy. Otherwise a flight updated in this round could be used again in the same round, and you would exceed the limit.</p>
+<pre data-title="CheapestFlights.java"><code class="language-java">import java.util.Arrays;
+
+public class CheapestFlights {
+    public static int findCheapestPrice(int n, int[][] flights, int src, int dst, int k) {
+        final int INF = Integer.MAX_VALUE;
+        int[] dist = new int[n];
+        Arrays.fill(dist, INF);
+        dist[src] = 0;
+        for (int i = 0; i &lt;= k; i++) {                    // k stops → k + 1 flights → k + 1 rounds
+            int[] next = dist.clone();                     // read old values, write new ones
+            for (int[] f : flights) {
+                int u = f[0], v = f[1], price = f[2];
+                if (dist[u] != INF &amp;&amp; dist[u] + price &lt; next[v]) {
+                    next[v] = dist[u] + price;
+                }
+            }
+            dist = next;
+        }
+        return dist[dst] == INF ? -1 : dist[dst];
+    }
+
+    public static void main(String[] args) {
+        int[][] flights = {{0, 1, 100}, {1, 2, 100}, {2, 0, 100}, {1, 3, 600}, {2, 3, 200}};
+        System.out.println(findCheapestPrice(4, flights, 0, 3, 1));   // 700
+        System.out.println(findCheapestPrice(4, flights, 0, 3, 2));   // 400
+    }
+}</code></pre>
+  <p>With k = 1 the route 0 → 1 → 3 costs 700 (the cheaper 0 → 1 → 2 → 3 uses two stops and is not allowed). With k = 2 it costs 400. <strong>Complexity:</strong> O(k · E) time, O(V) space.</p>
+
+  <h4>Detecting arbitrage with a negative cycle</h4>
+  <p>Currency exchange rates can be turned into a graph: edge a → b with weight −log(rate). A cycle whose rates multiply to more than 1 has a negative total weight, so a negative cycle means an arbitrage opportunity. Bellman-Ford finds it. (Floating-point care is needed; this is a conceptual example for interviews.)</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: relaxing from an unreachable vertex</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: INF + w overflows to a negative number</p><pre><code class="language-java">if (dist[u] + w &lt; dist[v]) dist[v] = dist[u] + w;</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: guard with the infinity check</p><pre><code class="language-java">if (dist[u] != INF &amp;&amp; dist[u] + w &lt; dist[v]) dist[v] = dist[u] + w;</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: updating in place in the "at most k edges" version</p>
+    <p>If you drop the <code>clone()</code> in Cheapest Flights, a chain of flights can be relaxed several times within one round, so the code behaves as if k were larger and returns a cheaper, illegal answer.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li>A negative <em>undirected</em> edge is itself a negative cycle (go back and forth). Bellman-Ford is for directed graphs with negative edges.</li>
+      <li>A negative cycle that is <em>not reachable</em> from the source does not affect the answer; the check above ignores it because its vertices stay at infinity.</li>
+      <li>If a negative cycle is reachable, shortest distances to the vertices that can be reached through it are undefined (minus infinity); report the cycle, do not print numbers.</li>
+      <li>Weights large enough to overflow <code>int</code> need <code>long</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Likely questions: "Dijkstra or Bellman-Ford?" (negative edges or an edge limit → Bellman-Ford), "why V − 1 rounds?" (a simple path has at most V − 1 edges), "how do you detect a negative cycle?" (an extra round that still improves). You rarely need to code it in a service-company round, but you must know the O(V · E) cost and the use cases.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-floyd-zero-one">
+  <h3>Floyd-Warshall (all pairs) and 0-1 BFS</h3>
+  <p class="tldr">Floyd-Warshall computes the shortest distance between every pair of vertices with three nested loops in O(V³), trying each vertex k as an intermediate stop; 0-1 BFS finds single-source shortest paths in O(V + E) when every edge weighs 0 or 1, using a deque.</p>
+
+  <h4>Floyd-Warshall: all-pairs shortest paths</h4>
+  <p>Dijkstra and Bellman-Ford answer "how far is everything from <em>one</em> source?". Sometimes you need the distance between <em>every pair</em> — for example "find the city with the fewest neighbours within a distance threshold" or a lookup table of travel times. Running Dijkstra from every vertex costs O(V · E log V). <strong>Floyd-Warshall</strong> does it with a very short algorithm in O(V³) time and O(V²) space, and it works with negative edges as long as there is no negative cycle.</p>
+  <p><strong>Idea (dynamic programming).</strong> Let <code>dist[i][j]</code> be the best known distance from i to j. Allow the vertices 0, 1, 2, … one at a time as <em>intermediate</em> stops. When vertex k becomes allowed, a path from i to j can either avoid k (keep <code>dist[i][j]</code>) or go through it (<code>dist[i][k] + dist[k][j]</code>). Take the smaller. After all k have been tried, the matrix is final.</p>
+<pre data-title="FloydWarshall.java"><code class="language-java">import java.util.Arrays;
+
+public class FloydWarshall {
+    private static final int INF = 1_000_000_000;      // big, but INF + INF still fits in an int
+
+    // edges[i] = {u, v, w} (directed); returns the n x n matrix of shortest distances
+    public static int[][] allPairs(int n, int[][] edges) {
+        int[][] dist = new int[n][n];
+        for (int[] row : dist) Arrays.fill(row, INF);
+        for (int i = 0; i &lt; n; i++) dist[i][i] = 0;      // distance to itself is 0
+        for (int[] e : edges) dist[e[0]][e[1]] = Math.min(dist[e[0]][e[1]], e[2]);
+
+        for (int k = 0; k &lt; n; k++) {                    // k MUST be the outermost loop
+            for (int i = 0; i &lt; n; i++) {
+                for (int j = 0; j &lt; n; j++) {
+                    if (dist[i][k] + dist[k][j] &lt; dist[i][j]) {
+                        dist[i][j] = dist[i][k] + dist[k][j];
+                    }
+                }
+            }
+        }
+        return dist;                                     // dist[i][i] &lt; 0 → negative cycle
+    }
+
+    public static void main(String[] args) {
+        int[][] edges = {{0, 1, 3}, {0, 2, 8}, {1, 2, 2}, {2, 3, 1}, {3, 0, 4}};
+        for (int[] row : allPairs(4, edges)) System.out.println(Arrays.toString(row));
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">[0, 3, 5, 6]
+[7, 0, 2, 3]
+[5, 8, 0, 1]
+[4, 7, 9, 0]</code></pre>
+  <p>Check one cell: the direct edge 0 → 2 costs 8, but 0 → 1 → 2 costs 3 + 2 = 5, so <code>dist[0][2] = 5</code>; and <code>dist[0][3] = 5 + 1 = 6</code>. <strong>Complexity:</strong> O(V³) time, O(V²) space. For V = 400 that is 64 million steps — fine; for V = 5,000 it is too slow. Use it when V is at most a few hundred.</p>
+  <ul>
+    <li><strong>Negative cycle:</strong> after the run, if any <code>dist[i][i] &lt; 0</code>, a negative cycle exists.</li>
+    <li><strong>Path recovery:</strong> keep a <code>next[i][j]</code> matrix and update it whenever <code>dist[i][j]</code> improves.</li>
+    <li><strong>Transitive closure:</strong> replace the min-plus step by <code>reach[i][j] |= reach[i][k] &amp;&amp; reach[k][j]</code> to learn who can reach whom.</li>
+    <li><strong>Problems:</strong> Find the City With the Smallest Number of Neighbors at a Threshold Distance (LeetCode 1334) and many "all-pairs on a tiny graph" questions.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: putting k in the inner loop</p>
+    <p>The order of the loops is not cosmetic. The intermediate vertex <code>k</code> must be the <em>outermost</em> loop, because the correctness proof says "after iteration k, all shortest paths that use only vertices 0..k as intermediates are right". With k inside, the matrix is wrong.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: INF = Integer.MAX_VALUE in the matrix</p>
+    <p><code>dist[i][k] + dist[k][j]</code> adds two infinities and overflows to a negative number, which then "wins" the comparison. Use a large value that is safe to add to itself (such as 10<sup>9</sup>), or skip the update when either term is INF.</p>
+  </div>
+
+  <h4>0-1 BFS: shortest path when weights are only 0 or 1</h4>
+  <p>If every edge costs 0 or 1, you do not need a heap. Use a <strong>deque</strong> (double-ended queue). When you relax an edge of weight 0, the new vertex has the same distance as the current one, so push it at the <em>front</em>; when the weight is 1, push it at the <em>back</em>. The deque then always holds vertices in non-decreasing order of distance, the same job that the priority queue does in Dijkstra, in O(1) per operation. This is also called a "deque-based Dijkstra".</p>
+<pre data-title="ZeroOneBfs.java"><code class="language-java">import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.Deque;
+import java.util.List;
+
+public class ZeroOneBfs {
+    // g.get(u) holds {neighbour, weight} with weight 0 or 1
+    public static int[] shortestPaths(List&lt;List&lt;int[]>> g, int src) {
+        int[] dist = new int[g.size()];
+        Arrays.fill(dist, Integer.MAX_VALUE);
+        dist[src] = 0;
+        Deque&lt;Integer> deque = new ArrayDeque&lt;>();
+        deque.addFirst(src);
+        while (!deque.isEmpty()) {
+            int u = deque.pollFirst();
+            for (int[] e : g.get(u)) {
+                int v = e[0], nd = dist[u] + e[1];
+                if (nd &lt; dist[v]) {
+                    dist[v] = nd;
+                    if (e[1] == 0) deque.addFirst(v);     // free move: process it next
+                    else deque.addLast(v);                // cost 1: process it later
+                }
+            }
+        }
+        return dist;
+    }
+
+    public static void main(String[] args) {
+        int[][] edges = {{0, 1, 1}, {0, 2, 0}, {2, 1, 0}, {1, 3, 1}, {2, 3, 1}};
+        List&lt;List&lt;int[]>> g = GraphBuilder.buildWeighted(4, edges, true);
+        System.out.println(Arrays.toString(shortestPaths(g, 0)));   // [0, 0, 0, 1]
+    }
+}</code></pre>
+  <p><strong>Complexity:</strong> O(V + E). A vertex can be pushed more than once if its distance improves, but each edge triggers at most one push per successful relaxation, so the total stays linear. Typical problems: grids where moving in one direction is free and turning costs 1 (Minimum Cost to Make at Least One Valid Path in a Grid, LeetCode 1368), "minimum obstacles to remove" (LeetCode 2290), and graphs where some edges are "free".</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Exception: weights other than 0 and 1</p>
+    <p>0-1 BFS is correct only for edge weights 0 and 1. For small integer weights up to W you can split edges into unit edges (BFS with levels) or use buckets, but in an interview use Dijkstra instead.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Floyd-Warshall: "three loops, k outermost, O(V³), good for V up to a few hundred, handles negative edges but not negative cycles." 0-1 BFS: "Dijkstra with a deque — push front for weight 0 and back for weight 1 — in O(V + E)". Naming 0-1 BFS when a grid problem has "free" and "paid" moves is a strong signal.</p>
+  </div>
+</article>

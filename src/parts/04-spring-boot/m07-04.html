@@ -1,0 +1,430 @@
+<article class="topic" id="m7-rabbitmq-spring">
+  <h3>RabbitMQ with Spring AMQP, and Kafka vs RabbitMQ</h3>
+  <p class="tldr">RabbitMQ routes messages from producers through exchanges to queues using bindings and routing keys; Spring AMQP gives you RabbitTemplate to publish and @RabbitListener to consume, with acknowledgements, retries and dead-letter exchanges for failures.</p>
+
+  <h4>The RabbitMQ model</h4>
+  <p><strong>RabbitMQ</strong> is a traditional message broker that implements the AMQP protocol. Its main difference from Kafka: the producer never writes to a queue directly. It publishes to an <strong>exchange</strong>, and the exchange routes the message to zero or more <strong>queues</strong> according to <strong>bindings</strong> and a <strong>routing key</strong>. Consumers read from queues, and a message is removed from the queue once it is acknowledged.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  P[Producer] -->|routing key application.submitted| X{{Topic exchange}}
+  X -->|application.*| Q1[notification queue]
+  X -->|application.submitted| Q2[analytics queue]
+  Q1 --> C1[Notification service]
+  Q2 --> C2[Analytics service]
+</pre>
+  <figcaption>Producer to exchange to queues through bindings</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Exchange type</th><th>Routing rule</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><strong>direct</strong></td><td>Routing key must equal the binding key exactly</td><td>Task queues, one destination per key</td></tr>
+      <tr><td><strong>topic</strong></td><td>Binding patterns with <code>*</code> (one word) and <code>#</code> (zero or more words), e.g. <code>application.*</code></td><td>Event routing by category</td></tr>
+      <tr><td><strong>fanout</strong></td><td>Copies the message to every bound queue, ignoring the key</td><td>Broadcast: cache invalidation, notifications to many</td></tr>
+      <tr><td><strong>headers</strong></td><td>Matches on message headers</td><td>Rare</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><strong>Acknowledgements:</strong> the consumer acks after processing; if it dies or rejects (nack), the broker re-queues or dead-letters the message. This gives at-least-once delivery.</li>
+    <li><strong>Durability:</strong> mark queues durable and messages persistent so they survive a broker restart.</li>
+    <li><strong>Competing consumers:</strong> several consumers on one queue share its messages round-robin (<code>prefetch</code> controls how many unacknowledged messages each holds).</li>
+    <li><strong>Dead-letter exchange (DLX):</strong> rejected or expired messages are re-routed to another exchange for inspection.</li>
+  </ul>
+
+  <h4>Spring AMQP setup</h4>
+  <pre data-title="pom.xml and application.yml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-amqp&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <pre data-title="application.yml"><code class="language-yaml">spring:
+  rabbitmq:
+    host: ${RABBIT_HOST:localhost}
+    port: 5672
+    username: ${RABBIT_USER:guest}
+    password: ${RABBIT_PASSWORD:guest}      # guest works only from localhost
+    listener:
+      simple:
+        acknowledge-mode: auto              # ack when the method returns, nack on exception
+        prefetch: 10
+        retry:
+          enabled: true                     # local retries before giving up
+          max-attempts: 3
+          initial-interval: 1s
+          multiplier: 2.0
+        default-requeue-rejected: false     # after retries: reject, do not loop (goes to DLX)</code></pre>
+
+  <h4>Declaring exchange, queue and bindings</h4>
+  <p>Spring declares these on the broker at startup when you create them as beans:</p>
+  <pre data-title="RabbitConfig.java"><code class="language-java">@Configuration
+public class RabbitConfig {
+
+    public static final String EXCHANGE = "jobs.events";
+    public static final String QUEUE = "notification.application-submitted";
+    public static final String DLX = "jobs.events.dlx";
+    public static final String DLQ = "notification.application-submitted.dlq";
+
+    @Bean TopicExchange eventsExchange() { return new TopicExchange(EXCHANGE, true, false); }
+    @Bean DirectExchange deadLetterExchange() { return new DirectExchange(DLX); }
+
+    @Bean
+    Queue notificationQueue() {
+        return QueueBuilder.durable(QUEUE)
+                .deadLetterExchange(DLX)                    // rejected messages go here
+                .deadLetterRoutingKey(DLQ)
+                .build();
+    }
+
+    @Bean Queue deadLetterQueue() { return QueueBuilder.durable(DLQ).build(); }
+
+    @Bean
+    Binding notificationBinding() {
+        return BindingBuilder.bind(notificationQueue()).to(eventsExchange())
+                .with("application.submitted");             // routing key pattern
+    }
+
+    @Bean
+    Binding deadLetterBinding() {
+        return BindingBuilder.bind(deadLetterQueue()).to(deadLetterExchange()).with(DLQ);
+    }
+
+    @Bean
+    MessageConverter jsonMessageConverter() {
+        return new Jackson2JsonMessageConverter();         // JSON instead of Java serialization
+    }
+}</code></pre>
+  <div class="co co-version">
+    <p class="co-t">Version note</p>
+    <p><code>Jackson2JsonMessageConverter</code> uses Jackson 2. Boot 4 moves to Jackson 3, and Spring AMQP offers a Jackson 3 converter with a different class name; check the Spring AMQP reference for your version. Define one <code>MessageConverter</code> bean and Boot wires it into <code>RabbitTemplate</code> and the listener containers.</p>
+  </div>
+
+  <h4>Producer and consumer</h4>
+  <pre data-title="Publish and listen"><code class="language-java">@Component
+public class ApplicationEventsPublisher {
+
+    private final RabbitTemplate rabbitTemplate;
+    public ApplicationEventsPublisher(RabbitTemplate rabbitTemplate) { this.rabbitTemplate = rabbitTemplate; }
+
+    public void publish(ApplicationSubmitted event) {
+        rabbitTemplate.convertAndSend(RabbitConfig.EXCHANGE, "application.submitted", event);
+    }
+}
+
+@Component
+public class NotificationListener {
+
+    private static final Logger log = LoggerFactory.getLogger(NotificationListener.class);
+
+    @RabbitListener(queues = RabbitConfig.QUEUE)
+    public void onSubmitted(ApplicationSubmitted event) {
+        log.info("Notifying recruiter for application {}", event.applicationId());
+        // throw an exception -> retry -> after max attempts the message goes to the DLQ
+    }
+}</code></pre>
+  <p>If the listener method returns normally, the message is acknowledged. If it throws, Spring retries locally (the retry settings above), and when retries are exhausted the message is rejected without requeue and RabbitMQ routes it to the dead-letter exchange. Throw <code>AmqpRejectAndDontRequeueException</code> to reject at once for unrecoverable data. Publisher-side reliability uses <strong>publisher confirms</strong> (<code>spring.rabbitmq.publisher-confirm-type=correlated</code>) and returns for unroutable messages.</p>
+
+  <h4>Kafka vs RabbitMQ</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Kafka</th><th>RabbitMQ</th></tr></thead>
+    <tbody>
+      <tr><td>Model</td><td>Distributed commit log; consumers pull and track offsets</td><td>Smart broker: exchanges, queues, routing; broker pushes to consumers</td></tr>
+      <tr><td>After consumption</td><td>Messages stay until retention expires; replay is possible</td><td>Message is removed after ack</td></tr>
+      <tr><td>Routing</td><td>By topic and key only</td><td>Flexible: direct, topic, fanout, headers</td></tr>
+      <tr><td>Ordering</td><td>Per partition</td><td>Per queue (lost with competing consumers and redelivery)</td></tr>
+      <tr><td>Throughput</td><td>Very high (millions of records per second per cluster)</td><td>High (tens of thousands per second per node)</td></tr>
+      <tr><td>Best for</td><td>Event streaming, event sourcing, analytics, data pipelines, many independent readers</td><td>Task queues, request routing, per-message TTL, priorities, delayed retries</td></tr>
+      <tr><td>Operations</td><td>Heavier cluster; partitions to plan</td><td>Simpler to start</td></tr>
+    </tbody>
+  </table></div>
+  <p>Rule of thumb: <strong>work to be done once</strong> (send this email, resize this image) fits RabbitMQ; <strong>facts that many parties read and may replay</strong> (a stream of order events) fit Kafka. For a small project either works; choose what your team can run. Cloud alternatives exist too: AWS SQS/SNS, Google Pub/Sub, Azure Service Bus.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Non-durable queues, so messages vanish on a broker restart.</li>
+      <li>Requeueing a poison message for ever (<code>default-requeue-rejected: true</code> with a permanent error).</li>
+      <li>A huge <code>prefetch</code> with slow consumers: one consumer holds many messages while others idle.</li>
+      <li>Using the default <code>guest</code> account in production.</li>
+      <li>Expecting Kafka-style replay from RabbitMQ.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Explain exchange, queue, binding and routing key." Producer to exchange, bindings route to queues. "Exchange types?" Direct, topic, fanout, headers. "How does RabbitMQ avoid message loss?" Durable queues, persistent messages, publisher confirms, consumer acks. "Kafka or RabbitMQ?" Streaming and replay and scale versus routing flexibility and task queues.</p>
+  </div>
+</article>
+
+<article class="topic" id="m7-delivery-outbox">
+  <h3>Delivery semantics, idempotent consumers and the outbox pattern</h3>
+  <p class="tldr">Networks make exactly-once delivery impossible in general, so build for at-least-once delivery with idempotent consumers, and use the outbox pattern to publish events atomically with your database change.</p>
+
+  <h4>Delivery guarantees</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Guarantee</th><th>Meaning</th><th>How it happens</th><th>Risk</th></tr></thead>
+    <tbody>
+      <tr><td><strong>At-most-once</strong></td><td>0 or 1 times</td><td>Send and forget; commit the offset before processing</td><td>Lost messages</td></tr>
+      <tr><td><strong>At-least-once</strong></td><td>1 or more times</td><td>Retry until acknowledged; commit the offset after processing</td><td><strong>Duplicates</strong></td></tr>
+      <tr><td><strong>Exactly-once</strong></td><td>Exactly 1 effect</td><td>Idempotent processing, or transactions inside one system (Kafka transactions)</td><td>Complex; works only within defined boundaries</td></tr>
+    </tbody>
+  </table></div>
+  <p>Why duplicates? A consumer processes a message, then crashes before acknowledging. The broker redelivers. Or a producer sends, the broker stores it, but the acknowledgement is lost, so the producer retries. You cannot tell "lost request" from "lost response". The practical industry answer: <strong>at-least-once delivery + idempotent handling = effectively-once</strong>. Kafka's "exactly-once semantics" (idempotent producer plus transactions) is real, but it covers reading from Kafka and writing to Kafka; once you touch an email server or your database, you need your own idempotency.</p>
+
+  <h4>Idempotent consumers</h4>
+  <p>An operation is <strong>idempotent</strong> if doing it twice has the same effect as doing it once. "Set status to SHORTLISTED" is idempotent; "add 100 to the balance" and "send an email" are not. Make a handler idempotent by recording the ids of events already processed, in the same transaction as the effect:</p>
+  <pre data-title="processed_event table and a guard (SQL + Java)"><code class="language-sql">CREATE TABLE processed_event (
+    event_id     UUID PRIMARY KEY,
+    consumer     VARCHAR(100) NOT NULL,
+    processed_at TIMESTAMP NOT NULL DEFAULT now()
+);</code></pre>
+  <pre data-title="IdempotentHandler.java"><code class="language-java">@Transactional
+public void handle(ApplicationSubmitted event) {
+    try {
+        processedEventRepository.saveAndFlush(
+                new ProcessedEvent(event.eventId(), "notification-service"));   // unique key
+    } catch (DataIntegrityViolationException duplicate) {
+        log.info("Event {} already processed, skipping", event.eventId());
+        return;
+    }
+    notificationRepository.save(Notification.forRecruiter(event));   // same transaction
+}</code></pre>
+  <p>If the handler fails, the transaction rolls back including the "processed" row, and a retry works. Natural idempotence is even better: <code>INSERT ... ON CONFLICT DO NOTHING</code>, an upsert, "set" instead of "increment", or a unique constraint on <code>(application_id, type)</code>. For external side effects (an email), store a "mail sent" flag, or pass an idempotency key to the provider. Producers should include a unique <code>eventId</code> in every event.</p>
+
+  <h4>The dual-write problem</h4>
+  <p>The application service must (1) save the application in its database and (2) publish an event. These are two systems, and there is no transaction across both:</p>
+  <ul>
+    <li>Save, then publish: if the app crashes between, the data exists but <strong>no event</strong> was sent; the recruiter is never told.</li>
+    <li>Publish, then save: if the save fails, an event describes something that <strong>never happened</strong>.</li>
+    <li>Publish inside the transaction: the commit may still fail after the event left.</li>
+  </ul>
+
+  <h4>The outbox pattern</h4>
+  <p>Write the event to an <strong>outbox table</strong> in the same local database transaction as the business data. Because both rows are in one ACID transaction, either both exist or neither. A separate process then reads the outbox and publishes to the broker, marking rows as sent.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant S as Application service
+  participant D as Database
+  participant R as Outbox relay
+  participant B as Broker
+  S->>D: BEGIN: insert application + insert outbox row: COMMIT
+  R->>D: read unsent outbox rows
+  R->>B: publish event
+  B-->>R: ack
+  R->>D: mark row as sent
+</pre>
+  <figcaption>The event is saved atomically with the data, then published later</figcaption>
+  </figure>
+  <pre data-title="Writing to the outbox in the business transaction"><code class="language-java">@Transactional
+public ApplicationResponse apply(Long jobId, Long userId) {
+    Application saved = applicationRepository.save(new Application(jobId, userId));
+
+    outboxRepository.save(new OutboxEvent(
+            UUID.randomUUID(),
+            "application-events",                       // topic
+            String.valueOf(jobId),                      // key
+            objectMapper.writeValueAsString(ApplicationSubmitted.from(saved)),   // JSON payload
+            Instant.now()));
+    return mapper.toResponse(saved);                    // one commit covers both rows
+}</code></pre>
+  <pre data-title="A simple polling relay"><code class="language-java">@Component
+public class OutboxRelay {
+
+    @Scheduled(fixedDelay = 1000)
+    @SchedulerLock(name = "outboxRelay", lockAtMostFor = "PT30S")      // one relay at a time
+    public void publishPending() {
+        List&lt;OutboxEvent&gt; batch = outboxRepository.findTop100BySentAtIsNullOrderByCreatedAtAsc();
+        for (OutboxEvent e : batch) {
+            try {
+                kafkaTemplate.send(e.getTopic(), e.getKey(), e.getPayload()).get(5, TimeUnit.SECONDS);
+                e.markSent(Instant.now());
+                outboxRepository.save(e);
+            } catch (Exception ex) {
+                log.warn("Outbox publish failed for {}, will retry", e.getId(), ex);
+                break;                                   // keep order; try again next tick
+            }
+        }
+    }
+}</code></pre>
+  <p>The relay itself is at-least-once (it may publish and crash before marking), which is why consumers must be idempotent. Variants: a polling relay as above (simple, adds a second or so of delay), or <strong>change data capture (CDC)</strong> with a tool such as Debezium that reads the database's transaction log and publishes outbox rows to Kafka (low latency, no polling, more infrastructure). Delete or archive sent rows regularly. The Spring Modulith project has built-in support for an event publication log with similar goals. Pattern background: <a href="08-system-design.html#m6">System Design · Module 6</a>.</p>
+
+  <h4>Ordering, retries and sagas in one paragraph</h4>
+  <p>Ordering holds only per partition (Kafka) or per queue (RabbitMQ without competing consumers), so key by the entity id and design handlers that tolerate late or reordered events (include a version or timestamp and ignore older ones). A <strong>saga</strong> coordinates a multi-service workflow as a chain of local transactions plus compensations, either <em>choreographed</em> (each service reacts to events) or <em>orchestrated</em> (a coordinator tells each service what to do).</p>
+
+  <h4>A worked event flow: OrderPlaced to payment to notification</h4>
+  <p>Food-delivery example, with three services and one broker:</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant O as Order service
+  participant B as Broker
+  participant P as Payment service
+  participant N as Notification service
+  O->>O: save order PENDING + outbox OrderPlaced
+  O->>B: OrderPlaced (key=orderId)
+  B->>P: OrderPlaced
+  P->>P: charge once (idempotent by orderId)
+  P->>B: PaymentCompleted or PaymentFailed
+  B->>O: PaymentCompleted
+  O->>O: set order CONFIRMED
+  B->>N: PaymentCompleted
+  N->>N: send confirmation SMS and email
+</pre>
+  <figcaption>Choreography: each service reacts to the previous event</figcaption>
+  </figure>
+  <ol class="steps">
+    <li>The order service stores the order as PENDING and an <code>OrderPlaced</code> row in its outbox, in one transaction.</li>
+    <li>The relay publishes <code>OrderPlaced</code> keyed by order id.</li>
+    <li>The payment service charges the customer; a duplicate delivery finds the payment for this order id already exists and does nothing. It publishes <code>PaymentCompleted</code> or <code>PaymentFailed</code>.</li>
+    <li>The order service consumes the result and moves the order to CONFIRMED (or CANCELLED, the compensation).</li>
+    <li>The notification service sends the SMS and email; it deduplicates by event id.</li>
+  </ol>
+  <p>Notice what the user sees: the order API returns "accepted" immediately; confirmation arrives a moment later. The system is <strong>eventually consistent</strong>, and the UI must reflect that ("processing payment...").</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Assume every message can arrive twice, late or out of order.</li>
+      <li>Give every event a unique id, and every consumer a way to ignore a repeat.</li>
+      <li>Never do "save to DB and publish to broker" as two independent steps; use an outbox or an after-commit mechanism with a recovery path.</li>
+      <li>Check duplicates in the same transaction as the side effect.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Believing a broker setting makes the whole flow "exactly-once".</li>
+      <li>Idempotency check outside the transaction, leaving a window where a crash marks an event processed without its effect (or the reverse).</li>
+      <li>Deleting outbox rows before the broker confirmed.</li>
+      <li>Retrying a non-idempotent step (charging) without a key.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What delivery guarantees exist?" At-most, at-least, exactly-once; explain why at-least-once plus idempotence is the practical choice. "What is the dual-write problem and how do you solve it?" Outbox with a relay or CDC. "How do you make a consumer idempotent?" Event id table or natural idempotence, in the same transaction. "Orchestration vs choreography?" Central coordinator versus event reactions.</p>
+  </div>
+</article>
+
+<article class="topic" id="m7-tracing">
+  <h3>Distributed tracing with Micrometer Tracing</h3>
+  <p class="tldr">A trace follows one request across all services using a trace id that travels in the traceparent header; Micrometer Tracing creates spans automatically, propagates the context over HTTP and messaging, exports them to Zipkin, Jaeger or Tempo, and puts the trace id in your logs.</p>
+
+  <h4>The problem and the vocabulary</h4>
+  <p>A user clicks "Apply". The request passes the gateway, the application service, the job service, the payment service and a Kafka consumer. It is slow. Which hop is slow? Logs from five services do not tell the story unless something links them. <strong>Distributed tracing</strong> records the path and timing of a request across services.</p>
+  <dl class="terms">
+    <dt>Trace</dt><dd>The whole journey of one request; identified by a <strong>trace id</strong> (128-bit, 32 hex characters).</dd>
+    <dt>Span</dt><dd>One unit of work inside a trace (an incoming HTTP request, a database query, an outgoing call, a Kafka send); has a <strong>span id</strong>, a parent span id, a start time and a duration, and tags.</dd>
+    <dt>Context propagation</dt><dd>Passing the trace id and current span id to the next service, so it continues the same trace. Over HTTP it travels in headers; over messaging in message headers.</dd>
+  </dl>
+  <figure class="fig">
+<pre class="diagram">
+ trace 4bf92f35...  (total 480 ms)
+ gateway               |██████████████████████████████████████| 480 ms
+  application-service  |  ███████████████████████████████    | 420 ms
+   job-service (REST)  |    ███                              |  40 ms
+   payment (REST)      |        ██████████████████████       | 300 ms  &lt;- slow
+   kafka send          |                                 █   |   5 ms
+</pre>
+  <figcaption>A trace as a timeline of spans: the slow hop is obvious</figcaption>
+  </figure>
+
+  <h4>The W3C traceparent header</h4>
+  <p>The standard format for HTTP propagation is the W3C Trace Context header:</p>
+  <pre class="out" data-title="HTTP header added to outgoing calls"><code class="language-http">traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01</code></pre>
+  <p>The fields are: version (<code>00</code>), the 32-hex <strong>trace id</strong>, the 16-hex <strong>parent span id</strong>, and flags (<code>01</code> means "sampled"). The receiving service creates a new child span under that parent. Older Zipkin systems used the B3 headers; Micrometer Tracing can be configured for either.</p>
+
+  <h4>Micrometer Tracing</h4>
+  <p><strong>Micrometer Tracing</strong> is the tracing facade in Spring Boot 3 and later (the successor of Spring Cloud Sleuth, which is not used any more). It is built on the Micrometer <em>Observation</em> API: one instrumented operation produces both a metric and a span. You choose a <strong>bridge</strong> to a tracer implementation, and an <strong>exporter</strong> to a backend:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Piece</th><th>Choices</th></tr></thead>
+    <tbody>
+      <tr><td>Bridge (tracer)</td><td>OpenTelemetry (<code>micrometer-tracing-bridge-otel</code>) or Brave (<code>micrometer-tracing-bridge-brave</code>)</td></tr>
+      <tr><td>Exporter</td><td>OTLP (<code>opentelemetry-exporter-otlp</code>) to any OpenTelemetry-compatible backend; or Zipkin reporter for Brave</td></tr>
+      <tr><td>Backend (UI)</td><td>Zipkin, Jaeger, Grafana Tempo, commercial APM tools</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="pom.xml (Boot 3.x): OpenTelemetry bridge with OTLP export"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-actuator&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;io.micrometer&lt;/groupId&gt;
+    &lt;artifactId&gt;micrometer-tracing-bridge-otel&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;io.opentelemetry&lt;/groupId&gt;
+    &lt;artifactId&gt;opentelemetry-exporter-otlp&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <pre data-title="application.yml"><code class="language-yaml">spring:
+  application:
+    name: application-service              # shown as the service name in every span
+management:
+  tracing:
+    sampling:
+      probability: 1.0                      # trace 100% in dev; the default is 0.1 (10%)
+  otlp:
+    tracing:
+      endpoint: http://tempo:4318/v1/traces   # OTLP over HTTP</code></pre>
+  <p>For Zipkin with Brave, use <code>micrometer-tracing-bridge-brave</code> plus <code>io.zipkin.reporter2:zipkin-reporter-brave</code>, and set <code>management.zipkin.tracing.endpoint=http://zipkin:9411/api/v2/spans</code>. Run Zipkin with <code>docker run -p 9411:9411 openzipkin/zipkin</code> and open <code>http://localhost:9411</code>.</p>
+  <div class="co co-version">
+    <p class="co-t">Version note</p>
+    <p>The dependencies and <code>management.tracing.*</code> settings above are for Boot 3.x. Spring Boot 4 adds a dedicated OpenTelemetry starter and its own configuration for OTLP; the concepts (traces, spans, sampling, propagation) are identical. Check the Boot 4 reference for the exact starter name before copying the dependencies.</p>
+  </div>
+
+  <h4>What is traced automatically</h4>
+  <ul>
+    <li>Incoming HTTP requests (Spring MVC and WebFlux).</li>
+    <li>Outgoing calls made with the Boot-provided <code>RestClient.Builder</code>, <code>RestTemplateBuilder</code> or <code>WebClient.Builder</code>: they add the <code>traceparent</code> header. <strong>You must build clients from the injected builders</strong> (<code>RestClient.create()</code> or <code>new RestTemplate()</code> are not instrumented).</li>
+    <li>Messaging: set <code>spring.kafka.template.observation-enabled=true</code> and <code>spring.kafka.listener.observation-enabled=true</code> for Kafka; Spring AMQP has similar observation settings. The trace id then travels in message headers and the consumer continues the trace.</li>
+    <li>JDBC and others, with extra libraries (datasource-micrometer, OpenTelemetry instrumentation).</li>
+    <li>Your own code: annotate with <code>@Observed</code> (needs <code>ObservedAspect</code> bean) or create a span by hand:</li>
+  </ul>
+  <pre data-title="A custom span with the Observation API"><code class="language-java">@Service
+public class ResumeScoringService {
+
+    private final ObservationRegistry observationRegistry;
+    public ResumeScoringService(ObservationRegistry observationRegistry) {
+        this.observationRegistry = observationRegistry;
+    }
+
+    public int score(Long applicationId) {
+        return Observation.createNotStarted("resume.score", observationRegistry)
+                .lowCardinalityKeyValue("type", "pdf")
+                .observe(() -&gt; doScore(applicationId));        // a timer metric AND a span
+    }
+}</code></pre>
+
+  <h4>Trace ids in your logs</h4>
+  <p>When tracing is on, Spring Boot 3.2 and later add the trace and span ids to the log lines automatically (the application name, trace id and span id appear in the default pattern), and they are fields in the JSON log formats. Then the loop closes: find a slow trace in Tempo or Zipkin, copy the trace id, and search the central log system for every log line of that request across all services. If you write your own pattern, use <code>%X{traceId:-}</code> and <code>%X{spanId:-}</code>, or the property <code>logging.pattern.correlation</code>. Return the trace id to clients in an error response or header, so a bug report can include it. This replaces the hand-made request id from <a href="#m6-logging">module 6</a>.</p>
+
+  <h4>Sampling and cost</h4>
+  <p>Tracing every request in a busy system produces a lot of data. <strong>Sampling</strong> keeps a percentage: <code>management.tracing.sampling.probability: 0.1</code> keeps 10%. The decision is made at the start of the trace and respected by all services (the "sampled" flag). Production systems often sample 1 to 10%, or use tail-based sampling in a collector (keep all slow or failed traces). Errors you care about may be missed at low rates, which is the trade-off.</p>
+
+  <h4>The three pillars of observability</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pillar</th><th>Question it answers</th><th>Spring tool</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Logs</strong></td><td>What happened, exactly, in this component?</td><td>SLF4J + Logback (JSON)</td></tr>
+      <tr><td><strong>Metrics</strong></td><td>Is the system healthy, and how is it trending?</td><td>Micrometer + Prometheus</td></tr>
+      <tr><td><strong>Traces</strong></td><td>Where did this one request spend its time, across services?</td><td>Micrometer Tracing + OTLP/Zipkin</td></tr>
+    </tbody>
+  </table></div>
+  <p>The usual workflow: an alert on a metric (error rate up) leads to traces of failing requests, which lead to the logs of the failing span, joined by the trace id. Setting up Prometheus, Grafana, Loki and Tempo is covered in <a href="07-devops.html#m6">DevOps · Module 6</a>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Creating <code>new RestTemplate()</code> or <code>RestClient.create()</code> by hand: no propagation, broken traces.</li>
+      <li>Leaving the default 10% sampling and wondering why the trace for a failing request is missing during a test.</li>
+      <li>Forgetting <code>spring.application.name</code>: every service shows as <code>unknown_service</code>.</li>
+      <li>Tracing everything at 100% in production without a plan for the storage cost.</li>
+      <li>Putting personal data (emails, tokens) into span tags.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is distributed tracing?" Trace, span, trace id, parent-child, propagation via <code>traceparent</code>. "How do you add it in Spring Boot?" Actuator, Micrometer Tracing bridge (OTel or Brave), exporter, sampling property. "How do you correlate logs and traces?" Trace id in MDC and in the log pattern. "What are the three pillars?" Logs, metrics, traces, and what each answers.</p>
+  </div>
+</article>

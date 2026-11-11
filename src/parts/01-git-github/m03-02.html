@@ -1,0 +1,653 @@
+<article class="topic" id="m3-merge">
+  <h3>Merging: fast-forward, three-way merge and merge commits</h3>
+  <p class="tldr"><code>git merge</code> brings the commits of another branch into the branch you are on — by just moving the pointer forward (fast-forward) when history is a straight line, or by creating a new merge commit with two parents when both branches have moved on.</p>
+
+  <p>Branches let you work apart. A <strong>merge</strong> is how the work comes back together. You stand on the branch that should <em>receive</em> the changes and name the branch to bring in:</p>
+  <pre data-title="The basic merge"><code class="language-bash">git switch main              # the branch that receives the work
+git merge feature/login      # the branch that is brought in</code></pre>
+  <p>Direction matters: the branch you are on changes; the branch you name does not. What Git does next depends on how the two branches look.</p>
+
+  <h4 id="m3-merge-ff">Fast-forward merge</h4>
+  <p>If <code>main</code> has no new commits since you created your branch, the history is a straight line: everything on <code>main</code> is already part of your branch. Git has nothing to combine. It simply moves the <code>main</code> label forward to the tip of your branch. This is a <strong>fast-forward</strong>, and it creates no new commit.</p>
+  <figure class="fig">
+<pre class="diagram">
+Before: main has not moved since the branch was created
+
+   M1 ◀─ M2 ◀─ F1 ◀─ F2
+          ▲           ▲
+          │           └── feature/login
+          └── main ◀─ HEAD
+
+After: git merge feature/login   (fast-forward: only the label moves)
+
+   M1 ◀─ M2 ◀─ F1 ◀─ F2
+                      ▲
+                      ├── main ◀─ HEAD
+                      └── feature/login
+</pre>
+    <figcaption>A fast-forward moves the main label from M2 to F2; no merge commit is created</figcaption>
+  </figure>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git switch main
+Switched to branch 'main'
+$ git merge feature/login
+Updating 3f2a1bc..9d4e7f0
+Fast-forward
+ AuthController.java | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+ create mode 100644 AuthController.java</code></pre>
+  <p>The line <code>Updating 3f2a1bc..9d4e7f0</code> shows the label moving from the old commit to the new one, and <code>Fast-forward</code> confirms nothing else was needed.</p>
+
+  <h4 id="m3-merge-three-way">Three-way merge and the merge commit</h4>
+  <p>Now suppose a teammate added commit <code>M3</code> to <code>main</code> while you worked on <code>feature/login</code>. The branches have <strong>diverged</strong>, so moving a label is not enough: Git must combine the two lines. It builds a new commit that has <strong>two parents</strong> — a <strong>merge commit</strong>.</p>
+  <figure class="fig">
+<pre class="mermaid">
+gitGraph
+  commit id: "M1"
+  commit id: "M2"
+  branch feature-login
+  commit id: "F1"
+  commit id: "F2"
+  checkout main
+  commit id: "M3"
+  merge feature-login
+</pre>
+    <figcaption>After the merge, the joining commit on main has two parents: M3 and F2</figcaption>
+  </figure>
+  <p>The method is called a <strong>three-way merge</strong> because Git compares three snapshots:</p>
+  <ol class="steps">
+    <li>Git finds the <strong>merge base</strong> — the newest commit both branches share (<code>M2</code> here). You can see it with <code>git merge-base main feature/login</code>.</li>
+    <li>It compares the merge base with the tip of your branch ("<strong>ours</strong>") and with the tip of the other branch ("<strong>theirs</strong>").</li>
+    <li>For every part of every file: if only one side changed it, Git takes that change. If both sides made the same change, Git takes it once. If both changed the same lines in different ways, Git stops with a <a href="#m3-merge-conflicts">conflict</a>.</li>
+    <li>Git saves the combined result as a new commit whose first parent is your branch's tip and whose second parent is the tip you merged.</li>
+  </ol>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git merge feature/search
+Merge made by the 'ort' strategy.
+ Search.java | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 Search.java
+$ git log --oneline --graph
+*   0448514 Merge branch 'feature/search'
+|\
+| * 94b84dd Add search
+* | 39d975f Add pay
+|/
+* 1eb5322 Add login endpoint
+$ git log -1 --format=%p
+39d975f 94b84dd</code></pre>
+  <p>The graph shows the two lines meeting. <code>%p</code> prints the parent ids: the first is where <code>main</code> was, the second is the branch that was merged. (<code>ort</code> is the name of Git's default merge strategy since Git 2.34; older versions print <code>recursive</code>. You never need to choose one.) An editor opens for the merge message; the default, <code>Merge branch 'feature/search'</code>, is fine. On GitHub the default is <code>Merge pull request #12 from acme/feature/search</code>.</p>
+
+  <h4 id="m3-merge-flags">Control the result: --no-ff, --ff-only, --squash</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>What it does</th><th>Use it when</th></tr></thead>
+    <tbody>
+      <tr><td><code>git merge x</code></td><td>Fast-forward if possible, otherwise a merge commit</td><td>Quick merges on your own machine</td></tr>
+      <tr><td><code>git merge --no-ff x</code></td><td>Always create a merge commit, even if a fast-forward is possible</td><td>You want a visible record that the feature existed</td></tr>
+      <tr><td><code>git merge --ff-only x</code></td><td>Fast-forward or fail; never creates a commit</td><td>Updating <code>main</code> from <code>origin/main</code> safely</td></tr>
+      <tr><td><code>git merge --squash x</code></td><td>Stages all changes of <code>x</code> but does not commit; no merge link is recorded</td><td>Turning a messy branch into one commit</td></tr>
+      <tr><td><code>git merge --abort</code></td><td>Cancels a merge that stopped on conflicts</td><td>The conflicts are too much right now</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong><code>--no-ff</code></strong> forces a merge commit even when Git could fast-forward. The merge commit marks the exact point where a feature was brought in, and the feature's commits stay grouped together on a side line:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git merge --no-ff feature/wishlist
+Merge made by the 'ort' strategy.
+ Wishlist.java | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 Wishlist.java
+$ git log --oneline --graph -4
+*   6ed4667 Merge branch 'feature/wishlist'
+|\
+| * 3e16943 Add wishlist
+|/
+* 0448514 Merge branch 'feature/search'</code></pre>
+  <p>Why teams like this: <code>git log --first-parent main</code> then reads like a list of finished features, and <code>git revert -m 1 &lt;merge-commit&gt;</code> removes a whole feature with one command (see <a href="#m4-revert">revert</a>).</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git log --first-parent --oneline main
+6ed4667 Merge branch 'feature/wishlist'
+0448514 Merge branch 'feature/search'
+39d975f Add pay
+1eb5322 Add login endpoint</code></pre>
+  <p><strong><code>--ff-only</code></strong> is the safe way to bring in someone else's work when you do not expect your own commits to be mixed in. If a fast-forward is not possible, Git refuses instead of creating a surprise merge commit:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git merge --ff-only feature/search
+fatal: Not possible to fast-forward, aborting.</code></pre>
+  <p><code>git pull --ff-only</code> does the same for pulling. Many people set it as the default with <code>git config --global pull.ff only</code>.</p>
+  <p><strong><code>--squash</code></strong> stages the combined changes but stops before committing, and it records no link to the merged branch:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git merge --squash feature/search
+Squash commit -- not updating HEAD
+Automatic merge went well; stopped before committing as requested
+$ git commit -m "feat: add product search"</code></pre>
+  <p>Because Git never saw a real merge, <code>git branch -d feature/search</code> will say the branch is not merged. GitHub's "Squash and merge" button works the same way (<a href="#m3-merge-options">merge options</a>).</p>
+
+  <h4 id="m3-merge-compare">Fast-forward vs merge commit vs squash</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Fast-forward</th><th>Merge commit</th><th>Squash</th></tr></thead>
+    <tbody>
+      <tr><td>Needs diverged branches?</td><td>No — only works on a straight line</td><td>Works on any branches</td><td>Works on any branches</td></tr>
+      <tr><td>New commit?</td><td>No</td><td>Yes, with two parents</td><td>Yes, an ordinary commit with one parent</td></tr>
+      <tr><td>Keeps the feature's own commits?</td><td>Yes</td><td>Yes</td><td>No — collapsed into one</td></tr>
+      <tr><td>History shape</td><td>Straight line</td><td>Visible side branch</td><td>Straight line</td></tr>
+      <tr><td>Git treats the branch as merged?</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4 id="m3-merge-update">Merging main into your branch</h4>
+  <p>You can also merge in the other direction to keep your feature branch up to date. This brings the latest <code>main</code> into your branch; <code>main</code> itself does not change:</p>
+  <pre data-title="Update your branch"><code class="language-bash">git switch feature/login
+git merge main                # or: git merge origin/main after a git fetch</code></pre>
+  <p>The default message is <code>Merge branch 'main' into feature/login</code> (Git adds "into …" for any branch other than main). It works, but too many of these commits make a branch noisy; Module 4 shows the alternative, <a href="#m4-rebase">rebase</a>. GitHub's <em>Update branch</em> button on a pull request does this same merge.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: merge from the receiving branch, with a clean working folder</p>
+    <ul>
+      <li>Switch to the branch that should receive the changes <em>first</em>, then run <code>git merge &lt;other&gt;</code>.</li>
+      <li>Commit or stash your own edits before merging. With uncommitted changes in the way, Git may refuse: <code>error: Your local changes to the following files would be overwritten by merge</code>.</li>
+      <li>Update the receiving branch (<code>git pull</code>) before you merge into it.</li>
+      <li>Run the build and tests after every merge — even a merge without conflicts.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>Already up to date.</code> — the other branch is already part of your branch; nothing happens. You see this if you run <code>git merge</code> while standing on the wrong branch.</li>
+      <li><code>fatal: refusing to merge unrelated histories</code> — the two branches share no common commit. It happens when you <code>git init</code> locally and also create the repository on GitHub with a README, then pull. Only if you are sure, add <code>--allow-unrelated-histories</code>.</li>
+      <li>A merge without any Git conflict can still break the code (a <strong>semantic conflict</strong>): one person renames <code>getTotal()</code>, another adds a new call to <code>getTotal()</code> in a different file. Git sees no clash, but the build fails. Only compiling and testing finds this.</li>
+      <li>If you save an empty message in the merge message editor, Git does not create the merge commit. The merge stays unfinished until you run <code>git commit</code> again or <code>git merge --abort</code>.</li>
+      <li>To test a merge without committing, use <code>git merge --no-commit --no-ff x</code>, look around, then run <code>git merge --abort</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: merging into a stale local main</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: local main is behind origin/main</p><pre><code class="language-shell">$ git switch main
+$ git merge feature/login
+$ git push
+ ! [rejected]  main -&gt; main (fetch first)</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: update first, then merge, then push</p><pre><code class="language-shell">$ git switch main
+$ git pull --ff-only
+$ git merge --no-ff feature/login
+$ git push</code></pre></div>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: preview before you merge</p>
+    <p><code>git log main..feature/login --oneline</code> lists the commits you are about to bring in, and <code>git diff main...feature/login --stat</code> shows which files they touch. <code>git log --merges</code> lists only merge commits; <code>git log --no-merges</code> hides them.</p>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects: GitHub does the merging</p>
+    <p>On a team, <code>main</code> is usually protected, so you do not run <code>git merge feature/x</code> on <code>main</code> yourself. You press the merge button on a pull request and GitHub performs the merge on its server. You still use <code>git merge main</code> on your own branch to catch up, and <code>git pull</code> is really <code>git fetch</code> followed by <code>git merge</code>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Fast-forward vs three-way merge? What is a merge commit?"</p>
+    <ul>
+      <li>Fast-forward: the target branch has no new commits, so Git just moves its pointer to the other branch's tip. No new commit; history stays linear.</li>
+      <li>Three-way merge: both branches have new commits. Git compares the merge base, ours and theirs, combines the changes and creates a <strong>merge commit with two parents</strong>.</li>
+      <li><code>--no-ff</code> forces a merge commit to keep the feature visible in history and easy to revert as a unit; <code>--ff-only</code> refuses anything that is not a fast-forward.</li>
+      <li>The merge base is the nearest common ancestor; if both sides edit the same lines differently, you get a conflict.</li>
+      <li>Add that <code>git pull</code> = <code>fetch</code> + <code>merge</code>, and that squash merges do not record a merge relationship.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-merge-conflicts">
+  <h3>Merge conflicts: why they happen and how to resolve one by hand</h3>
+  <p class="tldr">A conflict happens when two branches changed the same lines (or one deleted what the other edited); Git marks the clash inside the file, you choose the final text, then <code>git add</code> the file and commit.</p>
+
+  <p>Git merges <em>line by line</em>. When two branches changed different parts of a file, Git combines them without asking. When both changed the <strong>same lines</strong> in different ways, Git cannot know which version is right — a human has to decide. That stop is a <strong>merge conflict</strong>. It is not an error and nothing is broken; Git is asking for help.</p>
+
+  <h4 id="m3-merge-conflicts-why">When conflicts happen</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Situation</th><th>How Git reports it</th></tr></thead>
+    <tbody>
+      <tr><td>Both branches edited the same lines of a file</td><td><code>both modified</code></td></tr>
+      <tr><td>One branch edited a file, the other deleted it</td><td><code>deleted by us</code> / <code>deleted by them</code></td></tr>
+      <tr><td>Both branches created a file with the same path but different content</td><td><code>both added</code></td></tr>
+      <tr><td>A binary file (image, JAR) changed on both sides</td><td><code>both modified</code> — Git cannot merge bytes, you pick one version</td></tr>
+    </tbody>
+  </table></div>
+  <p>Different lines in the same file are <em>not</em> a conflict. Two people editing the top and the bottom of <code>PriceCalculator.java</code> merge cleanly.</p>
+
+  <h4 id="m3-merge-conflicts-example">A conflict, step by step</h4>
+  <p>Start with this method on <code>main</code>:</p>
+  <pre data-title="PriceCalculator.java (before)"><code class="language-java">public class PriceCalculator {
+    public static final int GST_PERCENT = 18;
+
+    public long total(long amount) {
+        return amount + amount * GST_PERCENT / 100;
+    }
+}</code></pre>
+  <p>Ravi changes the <em>same return line</em> on <code>main</code> to round the result. Asha, on <code>feature/discount</code>, adds a discount and rewrites the same line. She also adds a <code>DISCOUNT_PERCENT</code> constant near the top — a change in a different place. Both changes are now committed. Someone merges the feature branch into <code>main</code> (locally here, to keep the example simple):</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git switch main
+Switched to branch 'main'
+$ git merge feature/discount
+Auto-merging src/main/java/com/acme/crm/PriceCalculator.java
+CONFLICT (content): Merge conflict in src/main/java/com/acme/crm/PriceCalculator.java
+Automatic merge failed; fix conflicts and then commit the result.</code></pre>
+  <p>Read the three lines: Git merged what it could (<code>Auto-merging</code>), found a clash (<code>CONFLICT (content)</code>) and stopped halfway (<code>Automatic merge failed</code>). The merge is now <strong>in progress</strong>. <code>git status</code> tells you what to do:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git status
+On branch main
+You have unmerged paths.
+  (fix conflicts and run "git commit")
+  (use "git merge --abort" to abort the merge)
+
+Unmerged paths:
+  (use "git add &lt;file&gt;..." to mark resolution)
+	both modified:   src/main/java/com/acme/crm/PriceCalculator.java
+
+no changes added to commit (use "git commit -a")</code></pre>
+
+  <h4 id="m3-merge-conflicts-markers">Reading the conflict markers</h4>
+  <p>Git rewrote the file and put <strong>conflict markers</strong> around the clashing lines. The untouched parts, and the parts that merged cleanly (like the new constant), look normal:</p>
+  <pre data-title="PriceCalculator.java (conflicted)"><code class="language-plaintext">public class PriceCalculator {
+    public static final int GST_PERCENT = 18;
+    public static final int DISCOUNT_PERCENT = 10;
+
+    public long total(long amount) {
+&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD
+        return Math.round(amount * (1 + GST_PERCENT / 100.0));
+=======
+        long discounted = amount - amount * DISCOUNT_PERCENT / 100;
+        return discounted + discounted * GST_PERCENT / 100;
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; feature/discount
+    }
+}</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Marker</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD</code></td><td>Start of the conflict. Below it is <strong>your side</strong> — the branch you are on (<strong>ours</strong>, "current change")</td></tr>
+      <tr><td><code>=======</code></td><td>The divider between the two versions</td></tr>
+      <tr><td><code>&gt;&gt;&gt;&gt;&gt;&gt;&gt; feature/discount</code></td><td>End of the conflict. Above it is the <strong>incoming side</strong> — from the branch you merged (<strong>theirs</strong>, "incoming change")</td></tr>
+    </tbody>
+  </table></div>
+  <p>Your job is to replace the whole block — markers included — with the code that should exist after the merge. You have four choices: keep ours, keep theirs, keep both, or write something new. Here the right answer is new: apply the discount, then GST, and keep Ravi's rounding.</p>
+  <pre data-title="PriceCalculator.java (resolved)"><code class="language-java">public class PriceCalculator {
+    public static final int GST_PERCENT = 18;
+    public static final int DISCOUNT_PERCENT = 10;
+
+    public long total(long amount) {
+        long discounted = amount - amount * DISCOUNT_PERCENT / 100;
+        return Math.round(discounted * (1 + GST_PERCENT / 100.0));
+    }
+}</code></pre>
+
+  <h4 id="m3-merge-conflicts-steps">Resolve it in the terminal</h4>
+  <ol class="steps">
+    <li><strong>Find the files.</strong> <code>git status</code> lists them under <em>Unmerged paths</em>.</li>
+    <li><strong>Edit each file.</strong> Decide the final code and delete all three marker lines (<code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code>, <code>=======</code>, <code>&gt;&gt;&gt;&gt;&gt;&gt;&gt;</code>).</li>
+    <li><strong>Build and test.</strong> Run <code>mvn test</code> (or <code>./mvnw test</code>). A file without markers can still be wrong.</li>
+    <li><strong>Mark it resolved.</strong> <code>git add src/main/java/com/acme/crm/PriceCalculator.java</code>. For a conflict, <code>git add</code> means "I have resolved this file".</li>
+    <li><strong>Check.</strong> <code>git status</code> now says <em>All conflicts fixed but you are still merging</em>.</li>
+    <li><strong>Finish the merge.</strong> <code>git commit</code> — Git has already prepared the message <code>Merge branch 'feature/discount'</code>. Save and close the editor, or run <code>git commit --no-edit</code>.</li>
+    <li><strong>Verify and share.</strong> <code>git log --oneline --graph</code>, then <code>git push</code>.</li>
+  </ol>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git add src/main/java/com/acme/crm/PriceCalculator.java
+$ git status
+On branch main
+All conflicts fixed but you are still merging.
+  (use "git commit" to conclude merge)
+
+Changes to be committed:
+	modified:   src/main/java/com/acme/crm/PriceCalculator.java
+
+$ git commit --no-edit
+[main 7cefc3f] Merge branch 'feature/discount'
+$ git log --oneline --graph
+*   7cefc3f Merge branch 'feature/discount'
+|\
+| * f8137a4 Add discount before GST
+* | 69d195c Round the total to whole rupees
+|/
+* 83cf9f4 Add PriceCalculator</code></pre>
+
+  <h4 id="m3-merge-conflicts-tools">Commands that help while you are in a conflict</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>git status</code></td><td>Lists unmerged files and tells you the next step</td></tr>
+      <tr><td><code>git diff</code></td><td>Shows what is still in conflict (a combined diff, explained below)</td></tr>
+      <tr><td><code>git diff --name-only --diff-filter=U</code></td><td>Prints only the names of unresolved files</td></tr>
+      <tr><td><code>git log --merge --oneline</code></td><td>Lists the commits from both sides that touch the conflicted files — shows who changed what</td></tr>
+      <tr><td><code>git ls-files -u</code></td><td>Shows the three versions Git keeps: stage 1 = base, 2 = ours, 3 = theirs</td></tr>
+      <tr><td><code>git restore --ours file</code></td><td>Take your whole version of the file (old form: <code>git checkout --ours file</code>)</td></tr>
+      <tr><td><code>git restore --theirs file</code></td><td>Take the incoming version of the whole file (old form: <code>git checkout --theirs file</code>)</td></tr>
+      <tr><td><code>git restore --merge file</code></td><td>Recreate the conflict markers if you messed up the file (old form: <code>git checkout --merge file</code>)</td></tr>
+      <tr><td><code>git merge --abort</code></td><td>Cancel the merge and go back to before you started</td></tr>
+      <tr><td><code>git mergetool</code></td><td>Open the merge tool you configured with <code>merge.tool</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>During a conflict, <code>git diff</code> shows a <strong>combined diff</strong> with two columns of <code>+</code> and <code>-</code> signs — one column compares the file with your side, the other with the incoming side. For a small <code>Config.txt</code> in which both branches changed the line <code>price = 100</code>, it looks like this:</p>
+  <pre class="out" data-title="Terminal"><code class="language-plaintext">$ git diff
+diff --cc Config.txt
+index 62b723e,66f6ddf..0000000
+--- a/Config.txt
++++ b/Config.txt
+@@@ -1,3 -1,3 +1,7 @@@
+  line1
+++&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD
+ +price = 120
+++=======
++ price = 90
+++&gt;&gt;&gt;&gt;&gt;&gt;&gt; feature/discount
+  line3</code></pre>
+  <p>The first column compares the working file with your side, the second with the incoming side. A <code>+</code> in a column means "this line is new compared with that side". So <code> +price = 120</code> (plus in the second column) exists on your side only, <code>+ price = 90</code> (plus in the first column) exists on the incoming side only, and <code>++</code> means the line is new compared with both — here, the markers themselves. Once you resolve the file, the diff for it becomes empty.</p>
+  <p>A one-file shortcut: if you decide the entire file from one side is right, <code>git restore --theirs file</code> followed by <code>git add file</code> resolves it at once. Use it for binary files and for files you know you want completely from one side. For code, read both sides first.</p>
+  <p>Git can show you the <em>original</em> code too, which often makes a conflict easier to understand. Set <code>git config --global merge.conflictStyle zdiff3</code> (Git 2.35 and later; <code>diff3</code> on older versions). Each conflict then gets a third section, starting with <code>|||||||</code>, with the version from the common ancestor.</p>
+
+  <h4 id="m3-merge-conflicts-abort">Changing your mind: <code>git merge --abort</code></h4>
+  <p>If the conflict is bigger than you expected, or you merged the wrong branch, stop:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git merge --abort
+$ git status -sb
+## main</code></pre>
+  <p>The command is silent. Your working folder and your branch are back exactly as they were before <code>git merge</code>. It works best when you started the merge with a clean working folder; with uncommitted changes, Git may not be able to restore them. That is one more reason to commit or stash before you merge.</p>
+
+  <h4 id="m3-merge-conflicts-other">Delete conflicts and binary files</h4>
+  <p>When one branch edits a file that the other deleted, <code>git status</code> shows <code>deleted by us</code> or <code>deleted by them</code>. Decide which is right:</p>
+  <pre data-title="Modify/delete conflict"><code class="language-bash">git status                      # deleted by them: LegacyReport.java
+git add LegacyReport.java       # keep the file (with the edits)
+# or
+git rm LegacyReport.java        # accept the deletion</code></pre>
+  <p>For a binary file such as a logo or a JAR, you cannot merge the bytes. Pick a side with <code>git restore --ours logo.png</code> or <code>--theirs</code>, then <code>git add logo.png</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for resolving</p>
+    <ul>
+      <li>Remove <strong>all three</strong> markers from every conflicted file. Search for <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code> before you commit: <code>git grep -n "&lt;&lt;&lt;&lt;&lt;&lt;&lt;"</code>.</li>
+      <li>A conflicted file stays "unmerged" until you run <code>git add</code> on it; the merge cannot finish before that.</li>
+      <li>Build and run the tests before committing the merge.</li>
+      <li>Resolve conflicts on the branch that receives the merge result. If you are updating your feature branch from <code>main</code>, resolve on the feature branch, never on <code>main</code>.</li>
+      <li>If you do not understand the other side's change, ask the person who wrote it. Do not guess.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Whole-file conflicts</strong> usually mean line endings or formatting changed (CRLF vs LF, or a tool re-indented the file). Fix the cause (a shared formatter, <code>.gitattributes</code>) instead of resolving hundreds of lines by hand.</li>
+      <li>In a <code>git pull</code>, "ours" is your local branch and "theirs" is the remote's. In a <em>rebase</em> it is the other way round — see <a href="#m4-rebase-workflow">rebase workflow</a>.</li>
+      <li><code>git merge -X theirs</code> resolves only the <em>clashing</em> lines automatically in favour of the other branch. It is quick but silent; it can throw away your work without telling you. Avoid it unless you understand the result.</li>
+      <li>A conflict can appear in a file you never touched, if a teammate's merged branch changed the same lines you changed. Always read the whole conflict.</li>
+      <li>Already committed a wrong resolution and not pushed? <code>git reset --hard ORIG_HEAD</code> undoes the merge (see <a href="#m4-reset">reset</a>). If you pushed, use <a href="#m4-revert">revert</a>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: committing with the markers still in the file</p>
+    <p>The file still contains <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code> and <code>=======</code>. Java will not compile (<code>javac</code> reports errors such as <em>illegal start of expression</em>), and a broken <code>application.properties</code> may fail only at startup. Another common mistake is choosing "accept mine" for every conflict, which silently deletes a teammate's work.</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: markers left behind</p><pre><code class="language-plaintext">&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD
+        return Math.round(amount * 1.18);
+=======
+        return amount + amount * 18 / 100;
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; feature/discount</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: one final version, no markers</p><pre><code class="language-java">        return Math.round(amount * 1.18);</code></pre></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a merge conflict and how do you resolve it?"</p>
+    <ul>
+      <li>A conflict occurs when two branches change the same lines (or one deletes a file the other edits) and Git cannot choose automatically.</li>
+      <li>Git stops the merge, marks the file with <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code>, <code>=======</code> and <code>&gt;&gt;&gt;&gt;&gt;&gt;&gt;</code>, and lists it as unmerged in <code>git status</code>.</li>
+      <li>Resolve: edit the file to the correct final code and remove the markers, build and test, <code>git add</code> the file, then <code>git commit</code>. Use <code>git merge --abort</code> to cancel.</li>
+      <li>Explain ours (the branch you are on) vs theirs (the branch being merged).</li>
+      <li>Finish with prevention: small PRs, merge or rebase from <code>main</code> often, a shared formatter, and talking to teammates about shared files.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-resolve-tools">
+  <h3>Resolving conflicts in VS Code and IntelliJ — and avoiding them</h3>
+  <p class="tldr">Editors give you buttons for "keep mine", "keep theirs" and "keep both" plus a three-pane merge view; use them for speed, but the real skill is reading the markers yourself and preventing conflicts with small branches, frequent updates and shared formatters.</p>
+
+  <p>The terminal steps from the previous article always work. IDEs make the editing part faster by turning the markers into buttons. They do <em>not</em> change what a conflict means, so learn the markers first. The tools differ only in names: what Git calls "ours" and "theirs", each tool labels in its own words.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Meaning</th><th>Git markers</th><th>VS Code</th><th>IntelliJ IDEA</th></tr></thead>
+    <tbody>
+      <tr><td>Your branch (the one you are on)</td><td><code>&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD</code></td><td>Current Change</td><td>Your version (<em>Accept Yours</em>)</td></tr>
+      <tr><td>The branch being merged in</td><td><code>&gt;&gt;&gt;&gt;&gt;&gt;&gt; branch-name</code></td><td>Incoming Change</td><td>Their version (<em>Accept Theirs</em>)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4 id="m3-resolve-tools-vscode">VS Code</h4>
+  <ol class="steps">
+    <li>After a conflicting <code>git merge</code> or <code>git pull</code>, open the <strong>Source Control</strong> panel. Conflicted files are listed under <em>Merge Changes</em>.</li>
+    <li>Open a file. VS Code colours the two sides and shows small links above each conflict: <em>Accept Current Change</em>, <em>Accept Incoming Change</em>, <em>Accept Both Changes</em> and <em>Compare Changes</em>.</li>
+    <li>Click one, or edit the text by hand for a custom result. Recent VS Code versions also offer <em>Resolve in Merge Editor</em>: a three-way view with the incoming and current versions on top and the result below, where you tick the changes you want and press <em>Complete Merge</em>.</li>
+    <li>Stage the file with the <strong>+</strong> next to it (this is <code>git add</code>).</li>
+    <li>When no file is left under <em>Merge Changes</em>, type a message (it is pre-filled with <code>Merge branch …</code>) and commit.</li>
+  </ol>
+
+  <h4 id="m3-resolve-tools-intellij">IntelliJ IDEA</h4>
+  <ol class="steps">
+    <li>After the conflicting merge or pull, IntelliJ opens a <strong>Conflicts</strong> dialog listing the files. You can reopen it any time from <em>Git → Resolve Conflicts…</em>.</li>
+    <li>For each file you can click <em>Accept Yours</em>, <em>Accept Theirs</em>, or <em>Merge…</em>.</li>
+    <li><em>Merge…</em> opens a three-pane window: your version on the left, the <strong>result</strong> in the middle, the incoming version on the right. The small arrows (<code>&gt;&gt;</code> and <code>&lt;&lt;</code>) next to each change copy it into the result; the cross ignores it. You can also type in the middle pane.</li>
+    <li>Click <em>Apply</em>. IntelliJ marks the file as resolved. When all files are done, commit (the merge message is pre-filled).</li>
+  </ol>
+  <p>The same dialog appears during a rebase; there you finish with <em>Git → Continue Rebase</em> (<a href="#m4-rebase-workflow">Module 4</a>).</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: clicking "Accept" without reading</p>
+    <p>The buttons are so convenient that people click <em>Accept Incoming</em> on every conflict just to get rid of the red marks. Each click can delete a colleague's change. Read both sides, and when it is not your code, ask the author. After resolving, always compile and run the tests.</p>
+  </div>
+
+  <h4 id="m3-resolve-tools-mergetool">External merge tools</h4>
+  <p><code>git mergetool</code> opens the tool you configured with <code>merge.tool</code> (for example Meld or KDiff3) for each conflicted file. It leaves backup files named <code>file.orig</code> behind. They are noise, so add <code>*.orig</code> to <code>.gitignore</code>. Most developers simply use their IDE.</p>
+
+  <h4 id="m3-resolve-tools-avoid">How to avoid conflicts</h4>
+  <p>You cannot avoid all conflicts, but good habits make most of them disappear:</p>
+  <ol>
+    <li><strong>Keep branches small and short-lived.</strong> A branch that lives for two days sees few changes on <code>main</code>. A branch that lives for three weeks sees many.</li>
+    <li><strong>Update from <code>main</code> often.</strong> Merge or rebase <code>origin/main</code> into your branch at least once a day, so you solve small conflicts early instead of one huge one at the end.</li>
+    <li><strong>Make small pull requests.</strong> A pull request that touches ten lines can conflict in at most ten lines.</li>
+    <li><strong>Do not reformat unrelated code</strong> in a feature branch. A formatting change touches every line and conflicts with everyone. Do formatting in its own pull request.</li>
+    <li><strong>Use one shared formatter</strong> that runs the same way for everyone and in CI: Spotless or google-java-format for Java, Prettier for JavaScript and TypeScript, and an <code>.editorconfig</code> file for indentation. Add a <code>.gitattributes</code> file (<code>* text=auto</code>) so Windows and Linux machines agree on line endings (<a href="#m4-more-tools">Module 4</a>).</li>
+    <li><strong>Split big classes.</strong> Small classes with one job are rarely edited by two people at once.</li>
+    <li><strong>Talk.</strong> "I am refactoring <code>OrderService</code> today" saves hours.</li>
+    <li><strong>Do not hand-edit generated files</strong> (for example OpenAPI clients). Regenerate them after merging.</li>
+  </ol>
+
+  <h4 id="m3-resolve-tools-hotspots">Conflict hot spots in Java and full-stack projects</h4>
+  <ul>
+    <li><code>pom.xml</code> or <code>build.gradle</code>: two people add a dependency at the end of the same list. Usually you keep <em>both</em> entries.</li>
+    <li><code>application.properties</code> / <code>application.yml</code>: both add settings in the same place. Keep both; check for duplicate keys.</li>
+    <li><code>package-lock.json</code>: do not merge it by hand. Accept one side (or merge <code>package.json</code> first), then run <code>npm install</code> to regenerate the lock file.</li>
+    <li>Database migrations: two developers both create <code>V12__add_orders.sql</code>. Git sees two different files, so there is <em>no</em> Git conflict — but Flyway fails at startup with an error about more than one migration with the same version. Rename one to the next free number before merging.</li>
+  </ul>
+
+  <div class="co co-note">
+    <p class="co-t">Semantic conflicts: green merge, red build</p>
+    <p>Sometimes there is no Git conflict, yet the merged code is broken: one branch renames a method, the other adds a call to the old name. This is why you build and test after every merge, and why GitHub Actions workflows triggered by <code>pull_request</code> test the <em>result of merging</em> your branch into the base branch, not just your branch alone.</p>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: git rerere</p>
+    <p>If you resolve the same conflict repeatedly (long-running branches, repeated rebases), turn on <strong>rerere</strong> ("reuse recorded resolution") with <code>git config --global rerere.enabled true</code>. Git then remembers how you resolved a conflict and applies the same fix automatically next time.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Resolve conflicts on <em>your</em> feature branch before the pull request is merged — never leave them to the reviewer.</li>
+      <li>After resolving, push and let CI run again; a resolution is new code and needs the same checks.</li>
+      <li>Mention in the merge commit or PR comment when you resolved something non-obvious.</li>
+      <li>Agree as a team on one formatter and one line-ending policy, and enforce both in CI.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you avoid merge conflicts?"</p>
+    <ul>
+      <li>Short-lived branches, small pull requests and frequent updates from <code>main</code>.</li>
+      <li>A shared formatter and consistent line endings, so formatting never causes conflicts.</li>
+      <li>Communication about files that several people touch, and splitting large classes.</li>
+      <li>When one happens: read both sides, resolve in the feature branch, compile, run tests, then push.</li>
+      <li>Mention semantic conflicts: even a clean merge needs a build and tests.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-pull-requests">
+  <h3>Pull requests: open, review and merge</h3>
+  <p class="tldr">A pull request (PR) is a GitHub page where you ask to merge one branch into another, so teammates can read the change, discuss it and run automated checks before it reaches <code>main</code>.</p>
+
+  <p>You have a branch with commits. You want them in <code>main</code>. You <em>could</em> merge it yourself, but on a team nobody wants unreviewed code in <code>main</code>. A <strong>pull request</strong> is the polite, tracked way: you propose the change, others review it, and when it is approved and the tests pass, it is merged.</p>
+  <div class="co co-note">
+    <p class="co-t">Pull requests are a GitHub feature, not a Git feature</p>
+    <p>Git itself only has branches and merges. Pull requests belong to the hosting service. GitLab calls the same thing a <em>merge request</em>; Bitbucket and Azure DevOps also call them pull requests. The commands you run (<code>git push</code>, <code>git merge</code>) are Git; the page with reviews, comments and the merge button is GitHub.</p>
+  </div>
+
+  <h4 id="m3-pull-requests-why">Why teams use them</h4>
+  <ul>
+    <li><strong>Review:</strong> a second pair of eyes finds bugs, design problems and security holes before production does.</li>
+    <li><strong>Automated checks:</strong> CI builds the code and runs the tests on every pull request (<a href="07-devops.html#m4">DevOps · Module 4</a>).</li>
+    <li><strong>Knowledge sharing:</strong> reviewers learn the code; authors learn the team's standards.</li>
+    <li><strong>History and discussion:</strong> the PR page keeps the "why" — questions, decisions, links to the issue — long after the branch is deleted.</li>
+    <li><strong>Protection for <code>main</code>:</strong> with branch protection, changes can only enter through a reviewed, passing PR (<a href="#m4-branch-protection">Module 4</a>).</li>
+  </ul>
+
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A["Push branch"] --&gt; B["Open pull request"]
+  B --&gt; C["CI checks and review"]
+  C --&gt;|changes requested| D["Push more commits"]
+  D --&gt; C
+  C --&gt;|approved and checks green| E["Merge"]
+  E --&gt; F["Delete branch"]
+</pre>
+    <figcaption>The life of a pull request. Feedback loops through "push more commits" until the PR is approved</figcaption>
+  </figure>
+
+  <h4 id="m3-pull-requests-open">Opening a pull request</h4>
+  <ol class="steps">
+    <li>Push your branch: <code>git push -u origin feature/12-login-endpoint</code>. GitHub prints a link in the terminal and shows a yellow <em>Compare &amp; pull request</em> banner on the repository page.</li>
+    <li>Click the banner (or <em>Pull requests → New pull request</em>). Check the two branch selectors: <strong>base</strong> is where the change should go (usually <code>main</code>), <strong>compare</strong> is your branch.</li>
+    <li>Write a clear <strong>title</strong> and a <strong>description</strong> (next article shows how). Add <code>Closes #12</code> to link the issue.</li>
+    <li>On the right, pick <strong>reviewers</strong>, <strong>labels</strong> and, if your team uses them, assignees, a milestone and a project.</li>
+    <li>Click <em>Create pull request</em> — or the arrow next to it for <em>Create draft pull request</em>.</li>
+    <li>Watch the <strong>Checks</strong>: CI starts automatically. A green tick is good, a red cross means read the log and fix it.</li>
+  </ol>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git push -u origin feature/12-login-endpoint
+remote:
+remote: Create a pull request for 'feature/12-login-endpoint' on GitHub by visiting:
+remote:      https://github.com/acme/crm/pull/new/feature/12-login-endpoint
+remote:
+To github.com:acme/crm.git
+ * [new branch]      feature/12-login-endpoint -&gt; feature/12-login-endpoint
+branch 'feature/12-login-endpoint' set up to track 'origin/feature/12-login-endpoint'.</code></pre>
+  <p>If you use the GitHub command-line tool <code>gh</code> (optional), the same can be done from the terminal:</p>
+  <pre data-title="GitHub CLI"><code class="language-bash">gh pr create --base main --title "Add login endpoint" --body "Closes #12"
+gh pr create --fill --draft        # title and body from your commits, as a draft
+gh pr list                         # open pull requests
+gh pr checkout 12                  # fetch and switch to PR number 12
+gh pr checks                       # CI status of the current branch's PR
+gh pr view --web                   # open the PR page in the browser</code></pre>
+  <p>Without <code>gh</code>, you can still fetch a pull request locally: GitHub keeps a read-only ref for each one, so <code>git fetch origin pull/12/head:pr-12</code> followed by <code>git switch pr-12</code> lets you run a teammate's code.</p>
+
+  <h4 id="m3-pull-requests-anatomy">Anatomy of a pull request</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Part</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td>Base and compare branches</td><td>Where the change goes, and the branch that contains it</td></tr>
+      <tr><td>Title</td><td>One line, like a commit subject: <code>Add login endpoint</code></td></tr>
+      <tr><td>Description</td><td>Markdown text: what changed, why, how it was tested, screenshots, the linked issue</td></tr>
+      <tr><td>Reviewers and assignees</td><td>Reviewers must look at the code; the assignee is the person responsible for getting it merged (usually the author)</td></tr>
+      <tr><td>Labels, milestone, project</td><td>Organisation: <code>bug</code>, <code>enhancement</code>, release v1.4.0, a board column</td></tr>
+      <tr><td>Linked issues</td><td>Issues the PR relates to or will close (the <em>Development</em> section in the sidebar)</td></tr>
+      <tr><td>Tabs</td><td><em>Conversation</em> (discussion), <em>Commits</em>, <em>Checks</em> (CI results), <em>Files changed</em> (the diff, where reviews happen)</td></tr>
+      <tr><td>Merge box</td><td>At the bottom of Conversation: shows checks, approvals and conflicts, and has the merge button</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4 id="m3-pull-requests-draft">Draft pull requests</h4>
+  <p>A <strong>draft pull request</strong> says "this is not ready for a final review yet". Use it to share work early and get feedback on the direction, or to see whether CI passes. A draft cannot be merged (<em>Draft pull requests cannot be merged</em>), and code owners are not asked to review it. When you are finished, click <em>Ready for review</em>.</p>
+
+  <h4 id="m3-pull-requests-link">Linking issues</h4>
+  <p>Write a <strong>closing keyword</strong> followed by the issue number in the PR description: <code>Closes #12</code>. The keywords are <code>close</code>, <code>closes</code>, <code>closed</code>, <code>fix</code>, <code>fixes</code>, <code>fixed</code>, <code>resolve</code>, <code>resolves</code> and <code>resolved</code>. When the PR is merged into the repository's <em>default branch</em>, GitHub closes the issue automatically. A plain <code>#12</code> only links the two without closing anything. You can also link by hand from the <em>Development</em> section of the sidebar.</p>
+  <div class="co co-exc">
+    <p class="co-t">Exception: closing keywords only work for the default branch</p>
+    <p>If your PR targets another branch — for example <code>release/1.4</code> — and not the default branch, the issue is not closed automatically when it merges. Close it by hand or retarget your workflow.</p>
+  </div>
+
+  <h4 id="m3-pull-requests-states">What the merge box tells you</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>You see</th><th>It means</th><th>What to do</th></tr></thead>
+    <tbody>
+      <tr><td>All checks have passed; no conflicts</td><td>Ready to merge</td><td>Merge (after approval)</td></tr>
+      <tr><td>Merging is blocked — review required</td><td>Branch protection needs approvals</td><td>Ask a reviewer; nobody can approve their own PR</td></tr>
+      <tr><td>Some checks were not successful</td><td>CI failed</td><td>Open <em>Checks</em>, read the log, fix, push</td></tr>
+      <tr><td>This branch has conflicts that must be resolved</td><td>The PR and the base changed the same lines</td><td>Resolve locally (<a href="#m3-merge-conflicts">conflicts</a>) or in the web editor</td></tr>
+      <tr><td>This branch is out-of-date with the base branch</td><td>The base moved on and your repo requires an up-to-date branch</td><td>Click <em>Update branch</em>, or merge/rebase <code>main</code> locally and push</td></tr>
+      <tr><td>Changes requested</td><td>A reviewer asked for changes</td><td>Fix them, push, and re-request review</td></tr>
+      <tr><td>Draft pull requests cannot be merged</td><td>The PR is still a draft</td><td>Click <em>Ready for review</em></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4 id="m3-pull-requests-update">Updating a pull request</h4>
+  <p>A pull request is not a snapshot; it follows the branch. To address feedback, you simply commit on the same branch and push. GitHub adds the new commits to the PR, re-runs CI and shows what changed:</p>
+  <pre data-title="Respond to review"><code class="language-bash">git switch feature/12-login-endpoint
+# ...fix the code...
+git add -p
+git commit -m "fix(auth): return 401 for a wrong password"
+git push</code></pre>
+  <p>You do <strong>not</strong> open a new PR, and you do not need <code>-u</code> again. When you have fixed everything, reply to the comments and click the re-request review icon next to the reviewer's name.</p>
+
+  <h4 id="m3-pull-requests-merge">Merging and after</h4>
+  <p>When the PR is approved and green, a person with write access clicks the merge button. GitHub offers three ways to merge (see <a href="#m3-merge-options">merge options</a>), and a <em>Delete branch</em> button appears afterwards. If you delete a branch by mistake, the PR page offers <em>Restore branch</em>. Finally, update your own machine: <code>git switch main</code>, <code>git pull</code>, then delete the local branch.</p>
+
+  <h4 id="m3-pull-requests-forks">Same repository or a fork?</h4>
+  <p>Inside a company you normally push branches to the <em>same</em> repository and open the PR from there. In open source, you do not have write access, so you <strong>fork</strong> the repository (your own copy on GitHub), push a branch to the fork and open a PR from the fork to the original repository (the <em>upstream</em>). Forks and remotes are explained in <a href="#m2">Module 2</a>; the review and merge steps are identical.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules of a healthy pull request process</p>
+    <ul>
+      <li>No direct pushes to <code>main</code>. All changes arrive through a PR.</li>
+      <li>One purpose per PR. Keep it small enough for a reviewer to understand in one sitting.</li>
+      <li>CI must pass before merging. Never merge on red.</li>
+      <li>At least one approval from someone other than the author.</li>
+      <li>All review conversations are resolved (or answered) before merging.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Write the title like a commit subject: present tense, specific (<code>Add login endpoint</code>, or <code>feat(auth): add login endpoint</code> if your team uses Conventional Commits).</li>
+      <li>Open a draft early when you want feedback on direction.</li>
+      <li>Link the issue with <code>Closes #12</code>; add screenshots for UI changes.</li>
+      <li>Review other people's PRs promptly — teams usually aim for the same working day.</li>
+      <li>Delete the branch after merging.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li><strong>Wrong base branch</strong> — for example opening against <code>release</code> when you meant <code>main</code>. Check the base selector before clicking create.</li>
+      <li><strong>Unrelated commits in the PR</strong> — you branched from an old branch, not from <code>main</code>. Check the <em>Commits</em> tab; it should list only your commits.</li>
+      <li><strong>Giant PRs</strong> with hundreds of changed files that nobody can review properly.</li>
+      <li><strong>No description</strong> — reviewers have to guess what and why.</li>
+      <li>Pushing new commits after approval and merging without telling anyone.</li>
+      <li>Committing secrets (<code>.env</code>, keys) into a PR — once it is on GitHub, treat the secret as leaked (<a href="#m4-disaster-recovery">playbook</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>On a typical team the PR link goes into the team chat, CI runs automatically, a bot adds labels, <code>CODEOWNERS</code> requests the right reviewers, and the board moves the ticket to <em>In review</em>. The author usually merges after approval — or turns on <em>auto-merge</em>, which merges the PR by itself once the required checks pass and approvals are in.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a pull request? How is it different from git merge?"</p>
+    <ul>
+      <li>A PR is a GitHub feature: a request to merge a branch into another, with a page for review, discussion and automated checks. Git itself has no pull requests.</li>
+      <li>The merge is still a Git merge; the PR adds review, approvals, CI and an audit trail before it happens.</li>
+      <li>Flow: push the branch, open the PR (base = <code>main</code>, compare = your branch), reviewers comment, you push more commits to the same branch, approval and green checks, merge, delete the branch.</li>
+      <li>Pushing more commits to the branch updates the same PR automatically.</li>
+      <li>Mention draft PRs, linking issues with <code>Closes #12</code>, and required reviews and status checks from branch protection.</li>
+    </ul>
+  </div>
+</article>

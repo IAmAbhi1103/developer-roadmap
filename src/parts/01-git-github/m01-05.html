@@ -1,0 +1,259 @@
+<article class="topic" id="m1-undo">
+  <h3>Undo safely: restore, restore --staged and commit --amend</h3>
+  <p class="tldr">Discard working changes with <code>git restore file</code>, unstage with <code>git restore --staged file</code>, and fix the last commit with <code>git commit --amend</code> — all before you push.</p>
+
+  <p>Everybody makes mistakes: you edit the wrong file, stage too much, or misspell a commit message. Git makes most mistakes fixable, but the right command depends on <em>where</em> the mistake is: working folder, staging area, or the last commit. This article covers the safe commands. Dangerous ones (<code>reset --hard</code>, force push, rebase) are in <a href="#m4">Module 4</a>.</p>
+
+  <h4>The undo matrix</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>You want to…</th><th>Command</th><th>Safe?</th></tr></thead>
+    <tbody>
+      <tr><td>Discard edits in a file (back to staged or last commit version)</td><td><code>git restore &lt;file&gt;</code></td><td>Careful: edits are lost for good</td></tr>
+      <tr><td>Unstage a file but keep the edits</td><td><code>git restore --staged &lt;file&gt;</code></td><td>Yes</td></tr>
+      <tr><td>Fix the message of the last commit</td><td><code>git commit --amend -m "New message"</code></td><td>Yes, if not pushed</td></tr>
+      <tr><td>Add a forgotten file to the last commit</td><td><code>git add file</code> then <code>git commit --amend --no-edit</code></td><td>Yes, if not pushed</td></tr>
+      <tr><td>Bring one file back from an older commit</td><td><code>git restore --source=&lt;commit&gt; &lt;file&gt;</code></td><td>Overwrites your edits to it</td></tr>
+      <tr><td>Recover a file you deleted but did not commit</td><td><code>git restore &lt;file&gt;</code></td><td>Yes</td></tr>
+      <tr><td>Remove untracked files</td><td><code>git clean -n</code> (preview), then <code>git clean -f</code></td><td>Careful: cannot be undone</td></tr>
+      <tr><td>Undo a commit that is already pushed</td><td><code>git revert &lt;commit&gt;</code> (<a href="#m4">Module 4</a>)</td><td>Yes, adds a new commit</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>1. Discard changes in the working folder</h4>
+  <pre data-title="git restore"><code class="language-shell">$ git status -s
+ M src/main/java/InvoiceService.java
+$ git restore src/main/java/InvoiceService.java
+$ git status -s
+$ </code></pre>
+  <p><code>git restore &lt;file&gt;</code> copies the version from the staging area (or from the last commit, if nothing is staged) back into the working folder. Your edits are gone — Git never saw them, so Git cannot bring them back. Check with <code>git diff</code> first when unsure. Restore a whole folder with <code>git restore src/</code>; restore everything with <code>git restore .</code>.</p>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: restoring work you wanted to keep</p>
+    <p>Uncommitted changes that were never staged or committed are the one thing Git cannot recover. If you are not sure, <code>git stash</code> (<a href="#m3">Module 3</a>) or make a temporary commit first.</p>
+  </div>
+
+  <h4>2. Unstage a file</h4>
+  <pre data-title="git restore --staged"><code class="language-shell">$ git add .
+$ git status -s
+M  pom.xml
+A  scratch.txt
+$ git restore --staged scratch.txt
+$ git status -s
+M  pom.xml
+?? scratch.txt</code></pre>
+  <p><code>--staged</code> makes the command act on the staging area instead of the working folder: it resets the staged version to match the last commit, and your edits stay in the folder. It is the exact opposite of <code>git add</code>. To change both areas at once, use <code>git restore --staged --worktree &lt;file&gt;</code>. In a repository with no commits yet, <code>git restore --staged</code> fails; use <code>git rm --cached &lt;file&gt;</code> there.</p>
+
+  <h4>3. Fix the last commit: git commit --amend</h4>
+  <p><code>--amend</code> <strong>replaces</strong> the latest commit with a new one. Use it for a typo in the message, or a file you forgot.</p>
+  <pre data-title="Change the message"><code class="language-shell">$ git commit -m "Add invoce total"
+[main 2c8a1be] Add invoce total
+$ git commit --amend -m "Add invoice total"
+[main 9f1d3a7] Add invoice total
+ Date: Mon Nov 9 19:05:44 2026 +0530</code></pre>
+  <pre data-title="Add a forgotten file"><code class="language-shell">$ git commit -m "Add Coupon entity and repository"
+$ git add src/main/java/CouponRepository.java
+$ git commit --amend --no-edit
+[main 4e6b8c2] Add Coupon entity and repository
+ 2 files changed, 41 insertions(+)</code></pre>
+  <p>Notice the hash changed from <code>2c8a1be</code> to <code>9f1d3a7</code>. The old commit was not edited — Git made a new commit with a new hash (a commit's hash includes its message and content, see <a href="#m1-how-git-stores">How Git stores your work</a>) and moved the branch to it. <code>--no-edit</code> keeps the old message. Running <code>git commit --amend</code> with nothing staged and no <code>-m</code> opens the editor to change just the message.</p>
+
+  <h4>Why amend is fine before push and dangerous after</h4>
+  <div class="co co-rule">
+    <p class="co-t">Rule: amend only commits you have not pushed</p>
+    <p>Amend <strong>rewrites history</strong>: the old commit is replaced by a different one. If the old commit is only on your computer, nobody else is affected. If you already pushed it, teammates may have built work on the old hash. Your next push is rejected as a non-fast-forward; forcing it over their work creates duplicate commits and conflicts for everyone. For pushed commits use <code>git revert</code>, or, on your own feature branch only, a force push with care (<a href="#m4">Module 4</a>, and <a href="#m2-push-rejected">Push rejected</a>).</p>
+  </div>
+
+  <h4>The older commands: checkout -- file</h4>
+  <p>Before Git 2.23 (2019) the same jobs were done by <code>git checkout</code>, which also switches branches — one command with two very different meanings. Git added <code>git restore</code> and <code>git switch</code> to split them. You will still see the old forms in tutorials and old scripts:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Old form</th><th>Modern form</th><th>Job</th></tr></thead>
+    <tbody>
+      <tr><td><code>git checkout -- file</code></td><td><code>git restore file</code></td><td>Discard working changes</td></tr>
+      <tr><td><code>git reset HEAD file</code></td><td><code>git restore --staged file</code></td><td>Unstage</td></tr>
+      <tr><td><code>git checkout &lt;commit&gt; -- file</code></td><td><code>git restore --source=&lt;commit&gt; file</code></td><td>File from another commit</td></tr>
+      <tr><td><code>git checkout main</code></td><td><code>git switch main</code></td><td>Change branch (<a href="#m3">Module 3</a>)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Getting an old version of a file</h4>
+  <pre data-title="Restore a file from an earlier commit"><code class="language-shell">$ git log --oneline -- src/main/java/InvoiceService.java
+8d41b7e Fix rounding error in order total
+3f2a9c1 Add GST calculation to order total
+$ git restore --source=3f2a9c1 src/main/java/InvoiceService.java
+$ git status -s
+ M src/main/java/InvoiceService.java</code></pre>
+  <p>The old version arrives as an ordinary modification. Review it with <code>git diff</code>, then stage and commit — or restore it again.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and errors</p>
+    <ul>
+      <li><code>error: pathspec 'x' did not match any file(s) known to git</code> — the path is wrong or the file is untracked. <code>git restore</code> cannot touch untracked files; delete them by hand or with <code>git clean</code>.</li>
+      <li>If you deleted a tracked file in your folder, <code>git restore &lt;file&gt;</code> brings it back from the staging area or last commit.</li>
+      <li><code>git restore --staged</code> on a file staged for deletion makes it unstaged-deleted; run <code>git restore</code> on it again to bring the file back.</li>
+      <li>Amending during a merge or a rebase has special rules; finish the operation first.</li>
+      <li><code>git clean -f</code> deletes untracked files for good. Always preview with <code>git clean -n</code>; add <code>-d</code> for folders.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: when something looks very wrong, stop and check</p>
+    <p>Run <code>git status</code> and <code>git log --oneline -5</code>. Git almost never loses committed work. Even after a wrong amend, the previous commit still exists for a while and the reflog can find it (<a href="#m4">Module 4</a>). Panic and random commands cause more damage than the first mistake.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you undo changes in Git?"</p>
+    <ul>
+      <li>Say where the change is: working folder → <code>git restore file</code>; staged → <code>git restore --staged file</code>; last commit → <code>git commit --amend</code>.</li>
+      <li>Warn that discarding unstaged edits is permanent, and that amend rewrites history, so it is only for unpushed commits.</li>
+      <li>For pushed commits, use <code>git revert</code>, which adds a new commit instead of rewriting history.</li>
+      <li>Mention that <code>git restore</code>/<code>git switch</code> replaced the overloaded <code>git checkout</code> in Git 2.23.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m1-interview">
+  <h3>Interview questions — Daily Git basics</h3>
+
+  <details class="qa">
+    <summary>What is Git, and how is it different from GitHub?</summary>
+    <div class="qa-a">
+      <p>Git is a distributed version control system that runs on your computer and records the history of your files. GitHub is a website that hosts Git repositories and adds pull requests, issues, code review and automation. You can use Git without GitHub (local use, GitLab, Bitbucket, your own server), but not GitHub without Git.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does "distributed" mean in a version control system?</summary>
+    <div class="qa-a">
+      <p>Every clone holds the full repository, including the whole history. You can commit, view logs, diff and branch offline. A central server such as GitHub is a convenient shared copy, not the only copy. In a centralized system (SVN) the history lives only on the server.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain the working directory, staging area and repository.</summary>
+    <div class="qa-a">
+      <p>The working directory holds the files you edit. The staging area (index) holds the snapshot being prepared for the next commit. The repository (<code>.git</code>) holds the committed history. <code>git add</code> moves changes from the first to the second; <code>git commit</code> moves them from the second to the third. The staging area lets you build clean, focused commits, even from part of a file with <code>git add -p</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Does Git store snapshots or differences?</summary>
+    <div class="qa-a">
+      <p>Snapshots. Each commit points to a tree that describes the whole project at that moment; unchanged files point to the same stored blob, so nothing is duplicated. Differences are calculated when you run <code>git diff</code>. Internally Git compresses objects into pack files with deltas for disk space, but that is only storage optimisation.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a commit hash, and why does it change when you amend a commit?</summary>
+    <div class="qa-a">
+      <p>A SHA hash computed from the commit's content: its tree, parent hash(es), author, date and message. Because the hash depends on all of these, changing anything — even the message — produces a new hash. That makes a commit and its history tamper-evident, and it is why amend and rebase "rewrite history": they create new commits.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What are HEAD, HEAD~1 and HEAD^?</summary>
+    <div class="qa-a">
+      <p><code>HEAD</code> points to the current commit, usually through the current branch name. <code>HEAD~1</code> and <code>HEAD^</code> both mean its first parent, one commit back. <code>HEAD~3</code> goes three commits back; <code>HEAD^2</code> selects the second parent of a merge commit.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between git add ., git add -A and git add -u?</summary>
+    <div class="qa-a">
+      <p><code>git add -u</code> stages modifications and deletions of already tracked files only. <code>git add -A</code> also stages new files, across the whole repository. <code>git add .</code> does the same as <code>-A</code> for the current directory and everything below it. Before committing, review with <code>git status</code> and <code>git diff --staged</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>I edited a file, ran git add, and now git diff shows nothing. Why?</summary>
+    <div class="qa-a">
+      <p><code>git diff</code> compares the working folder with the staging area. After <code>git add</code> both are equal, so there is no difference. Use <code>git diff --staged</code> to see what is staged for the next commit, or <code>git diff HEAD</code> to see all changes since the last commit.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you write a good commit message?</summary>
+    <div class="qa-a">
+      <p>A subject of about 50 characters in the imperative mood ("Fix null pointer in cart"), a blank line, then a body that explains why the change was made, plus a ticket reference if the team uses one. Keep each commit to one logical change that builds and passes tests.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>I added <code>.env</code> to .gitignore but git status still shows it as modified. What is wrong?</summary>
+    <div class="qa-a">
+      <p>The file was committed earlier, so it is tracked, and <code>.gitignore</code> only affects untracked files. Run <code>git rm --cached .env</code> and commit; the file stays on your disk but leaves the repository. Because it is still in old commits, rotate any secret it contained.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you undo each of these: unstaged edits, a staged file, the last commit message?</summary>
+    <div class="qa-a">
+      <p>Unstaged edits: <code>git restore &lt;file&gt;</code> (permanent). Staged file: <code>git restore --staged &lt;file&gt;</code> (edits stay). Last commit message or a forgotten file: <code>git commit --amend</code>, only if the commit is not pushed. For a pushed commit use <code>git revert</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does <code>git commit -am "msg"</code> do, and what does it miss?</summary>
+    <div class="qa-a">
+      <p>It stages every modified and deleted tracked file and commits in one step. It does not include new untracked files. It also skips the chance to review what is staged, so check with <code>git status</code> and <code>git diff</code> first.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What are the Git config levels, and which one wins?</summary>
+    <div class="qa-a">
+      <p>System (all users on the machine), global (<code>~/.gitconfig</code>, your user) and local (<code>.git/config</code>, one repository). The most specific wins: local over global over system. <code>git config --list --show-origin</code> shows the value and the file each setting comes from.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why does Git not track an empty folder, and how do you keep one?</summary>
+    <div class="qa-a">
+      <p>Git stores file content in trees; a tree needs at least one file to have an entry. To keep an empty directory, put a placeholder file in it, conventionally named <code>.gitkeep</code>.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m1-cheatsheet">
+  <h3>Cheat sheet — Daily Git basics</h3>
+  <ul class="cheat">
+    <li><b>git --version</b> check the installed Git version</li>
+    <li><b>git config --global user.name "Name"</b> and <b>user.email "mail"</b> set your identity once</li>
+    <li><b>git config --list --show-origin</b> show every setting and the file it comes from</li>
+    <li><b>git config --global init.defaultBranch main</b> new repos start on <code>main</code></li>
+    <li><b>git init</b> make the current folder a repository; <b>git clone &lt;url&gt;</b> copy a repository with history</li>
+    <li><b>Three areas</b> working folder → (<code>git add</code>) → staging area → (<code>git commit</code>) → repository</li>
+    <li><b>File states</b> untracked, unmodified, modified, staged</li>
+    <li><b>git status</b> / <b>git status -s</b> what is changed, staged or untracked (<code>??</code> new, <code>M_</code> staged, <code>_M</code> not staged)</li>
+    <li><b>git add file</b>, <b>git add .</b>, <b>git add -A</b>, <b>git add -u</b>, <b>git add -p</b> stage whole files, everything, tracked only, or chosen hunks</li>
+    <li><b>git commit -m "msg"</b> save the staged snapshot; <b>-am</b> also stages tracked changes first</li>
+    <li><b>git log --oneline --graph --all</b> compact history of all branches</li>
+    <li><b>git log -p / --stat / -n 5 / --author / --since / --grep / -S"text"</b> show patches, file stats, limit, or filter history</li>
+    <li><b>git show &lt;commit&gt;</b> one commit with its diff; <b>git show &lt;commit&gt;:path</b> a file as it was then</li>
+    <li><b>git diff</b> unstaged changes; <b>git diff --staged</b> what the next commit will contain; <b>git diff HEAD</b> both</li>
+    <li><b>HEAD~1 / HEAD^</b> the parent of HEAD; <b>HEAD~3</b> three commits back</li>
+    <li><b>git rm file</b> delete and stage; <b>git rm --cached file</b> stop tracking, keep on disk; <b>git mv old new</b> rename</li>
+    <li><b>.gitignore</b> patterns: <code>*.log</code>, <code>target/</code> (dir at any depth), <code>/target</code> (root only), <code>**/logs</code>, <code>!keep.txt</code> (negation)</li>
+    <li><b>git check-ignore -v path</b> tells which rule ignores a path</li>
+    <li><b>Already tracked file in .gitignore?</b> <code>git rm --cached file</code> then commit</li>
+    <li><b>git restore file</b> discard working changes (permanent); <b>git restore --staged file</b> unstage</li>
+    <li><b>git commit --amend</b> fix the last commit (message or forgotten file); only before push</li>
+    <li><b>git checkout -- file</b> is the old form of <code>git restore file</code></li>
+    <li><b>Commit message</b> imperative subject ≤ 50 chars, blank line, body explains why</li>
+    <li><b>Never commit</b> secrets, <code>.env</code>, build output (<code>target/</code>), IDE folders; rotate any secret that leaked</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m1-practice">
+  <h3>Practice — Daily Git basics</h3>
+  <ol class="steps">
+    <li><strong>Set up (easy).</strong> Install Git, set <code>user.name</code>, <code>user.email</code> and <code>init.defaultBranch main</code>, and run <code>git config --list --show-origin</code>. Done when you can point to the file each of your three settings comes from.</li>
+    <li><strong>First repository (easy).</strong> Create a folder <code>java-practice</code>, run <code>git init</code>, add a <code>README.md</code> and <code>Hello.java</code>, and make your first commit. Done when <code>git log --oneline</code> shows one commit and <code>git status</code> says the working tree is clean.</li>
+    <li><strong>Five small commits (easy).</strong> Make five small, separate changes to the project (for example a new class, a bug fix, a README line, a rename with <code>git mv</code>, a new test) with a clear imperative message each. Done when <code>git log --oneline --graph</code> reads like a story and every message is under 50 characters.</li>
+    <li><strong>Watch the states (easy).</strong> Create a file, then run <code>git status -s</code> after each step: create, <code>git add</code>, edit again, <code>git commit</code>. Write down the code you saw each time (<code>??</code>, <code>A_</code>, <code>AM</code>). Done when you can predict each code before running the command.</li>
+    <li><strong>Partial staging (medium).</strong> Change two unrelated places in one file. Use <code>git add -p</code> to commit them separately. Done when <code>git log -p -n 2</code> shows one change per commit.</li>
+    <li><strong>Java .gitignore (medium).</strong> Add a <code>.gitignore</code> for Java/Maven/IntelliJ (use the template in this module). Create a <code>target/</code> folder and a <code>.env</code> file. Done when <code>git status</code> shows neither, and <code>git check-ignore -v .env</code> prints your rule.</li>
+    <li><strong>Untrack a mistake (medium).</strong> Commit a file <code>secrets.txt</code> on purpose, then add it to <code>.gitignore</code> and stop tracking it without deleting it. Done when the file is still on disk, is not in <code>git ls-files</code>, and <code>git status</code> is clean. Note why the old commit still contains it.</li>
+    <li><strong>Undo drill (medium).</strong> (a) Edit a file and discard the change with <code>git restore</code>. (b) Stage a file and unstage it with <code>git restore --staged</code>. (c) Make a commit with a typo in the message and fix it with <code>--amend</code>. (d) Forget a file, then add it to the last commit with <code>--amend --no-edit</code>. Done when each case ends with a clean <code>git status</code> and a changed hash after (c) and (d).</li>
+    <li><strong>History detective (hard).</strong> Clone any open-source Java repository. Find the commit that introduced a given string with <code>git log -S</code>, show that commit with <code>git show</code>, list the five most recent commits by one author, and view a file as it was ten commits ago. Done when you can explain each commit you found.</li>
+    <li><strong>Line endings (hard).</strong> Add a <code>.gitattributes</code> with <code>* text=auto</code> and <code>*.sh text eol=lf</code>. Create a <code>run.sh</code>, commit it, and verify with <code>git ls-files --eol</code> that it is stored as LF. Done when you can explain why the setting belongs in the repository and not only in <code>core.autocrlf</code>.</li>
+  </ol>
+</article>

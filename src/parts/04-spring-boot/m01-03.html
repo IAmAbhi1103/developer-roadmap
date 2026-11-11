@@ -1,0 +1,858 @@
+<article class="topic" id="m1-configuration-files">
+  <h3>Configuration: application.properties, application.yml and property precedence</h3>
+  <p class="tldr">Boot reads settings from <code>application.properties</code> or <code>application.yml</code>, and from many other sources; when the same key appears twice, the higher-priority source (command-line arguments, then environment variables, then files) wins.</p>
+
+  <p>Code should not contain a database URL, a port or an API key. Those change between your laptop, the test server and production. <strong>Externalised configuration</strong> means keeping them outside the compiled code, so the same JAR runs everywhere with different settings.</p>
+
+  <h4>properties vs YAML: the same keys</h4>
+  <p>Boot reads <code>src/main/resources/application.properties</code> or <code>application.yml</code> (or <code>.yaml</code>). Pick one format per project. The keys are identical; YAML nests them by indentation.</p>
+  <pre data-title="application.properties"><code class="language-properties">server.port=8081
+spring.application.name=order-service
+spring.datasource.url=jdbc:postgresql://localhost:5432/shop
+spring.datasource.username=shop_user
+spring.jpa.hibernate.ddl-auto=validate
+logging.level.com.example.shop=DEBUG</code></pre>
+  <pre data-title="application.yml — exactly the same settings"><code class="language-yaml">server:
+  port: 8081
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: jdbc:postgresql://localhost:5432/shop
+    username: shop_user
+  jpa:
+    hibernate:
+      ddl-auto: validate
+logging:
+  level:
+    com.example.shop: DEBUG</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>.properties</th><th>.yml</th></tr></thead>
+    <tbody>
+      <tr><td>Repetition</td><td>Full key on every line</td><td>Shared prefixes written once</td></tr>
+      <tr><td>Lists</td><td><code>app.hosts[0]=a</code>, or comma separated</td><td>Natural <code>- a</code> list syntax</td></tr>
+      <tr><td>Pitfall</td><td>Few</td><td>Indentation errors; use spaces, never tabs; a value like <code>on</code>, <code>no</code> or <code>08</code> may change meaning, so quote strings</td></tr>
+      <tr><td>Per-profile files</td><td><code>application-dev.properties</code></td><td><code>application-dev.yml</code> or multi-document</td></tr>
+    </tbody>
+  </table></div>
+  <p>If both <code>application.properties</code> and <code>application.yml</code> exist, the <code>.properties</code> values win. Do not mix them.</p>
+
+  <h4>Where Boot looks</h4>
+  <p>In order of increasing priority: the classpath root, then a <code>/config</code> folder on the classpath, then the current directory, then <code>./config/</code> and its sub-folders. A file next to the JAR can therefore override the one packed inside it, which is handy on servers. Change the name or the location with <code>spring.config.name</code> and <code>spring.config.location</code>.</p>
+
+  <h4>Property source precedence (highest first)</h4>
+  <p>Boot gathers settings from many places and merges them. For a given key, the first source in this list that has it wins:</p>
+  <ol class="steps">
+    <li><strong>Command-line arguments</strong>: <code>java -jar app.jar --server.port=9090</code></li>
+    <li><strong>Java system properties</strong>: <code>-Dserver.port=9090</code> (<code>SPRING_APPLICATION_JSON</code> sits near here too)</li>
+    <li><strong>Operating-system environment variables</strong>: <code>SERVER_PORT=9090</code></li>
+    <li><strong>Profile-specific files</strong>: <code>application-prod.yml</code> (outside the JAR beats inside)</li>
+    <li><strong><code>application.yml</code> / <code>application.properties</code></strong>: outside the JAR beats inside</li>
+    <li><strong><code>@PropertySource</code> files and default properties</strong>: the lowest priority, including defaults in your <code>@Value("${x:default}")</code></li>
+  </ol>
+  <p>The simplified rule to remember: <strong>command line &gt; environment &gt; profile files &gt; <code>application.yml</code> &gt; defaults</strong>. This gives a clean design: put safe defaults in <code>application.yml</code>, specific values in a profile file, and secrets or per-server overrides in environment variables.</p>
+  <pre data-title="Same JAR, different ports"><code class="language-shell">$ java -jar app.jar                               # 8081 from application.yml
+$ SERVER_PORT=9000 java -jar app.jar              # environment variable wins
+$ java -jar app.jar --server.port=9100            # command line wins over all</code></pre>
+
+  <h4>Relaxed binding: one setting, many spellings</h4>
+  <p>Boot matches names loosely, so the same setting can be written in different ways depending on where it lives.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Where</th><th>Form</th><th>Example for property <code>app.max-retries</code></th></tr></thead>
+    <tbody>
+      <tr><td><code>.properties</code> / <code>.yml</code></td><td>kebab-case (recommended)</td><td><code>app.max-retries=3</code></td></tr>
+      <tr><td><code>.properties</code> / <code>.yml</code></td><td>camelCase and underscore also accepted</td><td><code>app.maxRetries=3</code></td></tr>
+      <tr><td>Environment variable</td><td>UPPER_CASE with underscores</td><td><code>APP_MAXRETRIES=3</code> or <code>APP_MAX_RETRIES=3</code></td></tr>
+      <tr><td>Java class field</td><td>camelCase</td><td><code>int maxRetries;</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>That is why <code>SPRING_DATASOURCE_PASSWORD</code> sets <code>spring.datasource.password</code>. Write keys in <strong>kebab-case</strong> in files.</p>
+
+  <h4>Secrets</h4>
+  <p>Never commit passwords, API keys or JWT secrets. Use environment variables, a secrets manager, or a file that is not in Git. Reference them with a placeholder so the file stays safe to commit:</p>
+  <pre data-title="application.yml"><code class="language-yaml">spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/shop}
+    username: ${DB_USER:shop_user}
+    password: ${DB_PASSWORD}              # no default: must be provided
+app:
+  jwt-secret: ${JWT_SECRET}</code></pre>
+  <p><code>${NAME:default}</code> reads the environment (or any property) and falls back to the default after the colon. With no default and no value, startup fails with <code>Could not resolve placeholder</code>, which is what you want for a missing secret.</p>
+
+  <h4>spring.config.import and the Environment</h4>
+  <p>Pull in extra files with <code>spring.config.import</code>. The prefix <code>optional:</code> means "do not fail if it is missing".</p>
+  <pre data-title="application.yml"><code class="language-yaml">spring:
+  config:
+    import: optional:file:./local-secrets.properties</code></pre>
+  <p>Inside code, the <code>Environment</code> bean gives programmatic access: <code>env.getProperty("app.name")</code>, <code>env.getActiveProfiles()</code>. Prefer <code>@Value</code> or <code>@ConfigurationProperties</code> in normal code (<a href="#m1-configuration-properties">next articles</a>).</p>
+
+  <h4>Seeing which value won</h4>
+  <p>With Actuator, <code>/actuator/env</code> lists each property source and each value (expose it only in dev; it can reveal secrets, so Boot masks values by default). In the log, <code>The following 1 profile is active: "dev"</code> tells you the profile.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>YAML uses spaces only, a consistent indent (2 spaces), and <code>key: value</code> with a space after the colon.</li>
+      <li>A key set in a higher-priority source completely overrides lower ones; lists are replaced as a whole, not merged.</li>
+      <li>Changing a property file needs a restart (DevTools restarts for you in development).</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Use kebab-case keys, a common prefix for your own settings (<code>app.*</code> or the company name), and YAML for nested data.</li>
+      <li>Defaults for local development live in <code>application.yml</code>; production differences arrive through profile files and environment variables.</li>
+      <li>Secrets only through environment variables or a secret store; never in Git.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A password containing <code>#</code> or <code>:</code> in YAML or properties needs quotes in YAML (<code>"p#ss"</code>); in <code>.properties</code>, <code>#</code> inside a value is fine but a leading <code>#</code> starts a comment.</li>
+      <li>A YAML key <code>spring.datasource.url</code> written as one dotted key works, but mixing dotted and nested forms in the same file is confusing.</li>
+      <li>Unknown keys are silently ignored for <code>@Value</code>; <code>@ConfigurationProperties</code> can be told to fail on unknown fields, which catches typos.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: committing the production password</p>
+    <p>A password in a file in Git stays in the history forever, even after you delete it. Rotate the secret and move it to an environment variable.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you externalise configuration? What is the precedence?"</p>
+    <ul>
+      <li>Properties/YAML files, environment variables, system properties and command-line arguments; the same JAR works in every environment.</li>
+      <li>Order, highest first: command line, environment, profile-specific files, <code>application.yml</code>, defaults.</li>
+      <li>Relaxed binding maps <code>SPRING_DATASOURCE_URL</code> to <code>spring.datasource.url</code>. Secrets come from the environment, never from Git.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-profiles">
+  <h3>Profiles: dev, test and prod settings</h3>
+  <p class="tldr">A profile is a named set of configuration and beans that is switched on with <code>spring.profiles.active</code>, so the same code uses an H2 database and debug logs in <code>dev</code> and PostgreSQL and quiet logs in <code>prod</code>.</p>
+
+  <p>You rarely run an application with the same settings everywhere. On your laptop you want a local database and detailed logs; in production a managed database, small logs and real payment keys. <strong>Profiles</strong> let you describe each environment once and pick one when starting. The build artifact stays the same (one JAR); only the profile changes. This idea is called <em>build once, configure per environment</em>, and it is the base of every Docker or Kubernetes deployment.</p>
+
+  <h4>Activating a profile</h4>
+  <pre data-title="Four ways, from convenient to production-style"><code class="language-shell">$ java -jar app.jar --spring.profiles.active=prod
+$ java -Dspring.profiles.active=prod -jar app.jar
+$ SPRING_PROFILES_ACTIVE=prod java -jar app.jar          # typical in Docker
+$ ./mvnw spring-boot:run -Dspring-boot.run.profiles=dev</code></pre>
+  <p>You can also set <code>spring.profiles.active=dev</code> in <code>application.yml</code> as a local default, but do not commit a hard-coded <code>prod</code> there. Several profiles are separated by commas (<code>dev,debug</code>). In tests, use <code>@ActiveProfiles("test")</code> (<a href="#m5">Module 5</a>). If no profile is set, the profile named <code>default</code> is active. IntelliJ users set the same value in the run configuration under "Active profiles".</p>
+  <p>Boot tells you what it chose in the first lines of the log. Always look at this line when something behaves strangely:</p>
+  <pre class="out" data-title="Startup log"><code class="language-plaintext">The following 1 profile is active: "prod"
+# or, when nothing was set:
+No active profile set, falling back to 1 default profile: "default"</code></pre>
+
+  <h4>Profile-specific files</h4>
+  <p>Boot loads <code>application.yml</code> first, then <code>application-{profile}.yml</code> for every active profile, which overrides the base values. The same naming works for <code>.properties</code> files.</p>
+  <figure class="fig">
+<pre class="diagram">
+src/main/resources/
+├── application.yml          shared settings, always loaded
+├── application-dev.yml      loaded when profile "dev" is active
+├── application-test.yml     loaded when profile "test" is active
+└── application-prod.yml     loaded when profile "prod" is active
+</pre>
+    <figcaption>File naming for profile-specific configuration</figcaption>
+  </figure>
+  <pre data-title="application.yml"><code class="language-yaml">spring:
+  application:
+    name: order-service
+  jpa:
+    hibernate:
+      ddl-auto: validate
+app:
+  notification:
+    channel: email</code></pre>
+  <pre data-title="application-dev.yml"><code class="language-yaml">spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/shop_dev
+    username: dev
+    password: dev
+logging:
+  level:
+    com.example.shop: DEBUG
+app:
+  notification:
+    channel: console</code></pre>
+  <pre data-title="application-prod.yml"><code class="language-yaml">spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+logging:
+  level:
+    root: WARN
+    com.example.shop: INFO</code></pre>
+
+  <h4>How Boot decides which value wins</h4>
+  <p>When the same key appears in several places, the more specific source wins. From weakest to strongest, the order that matters in daily work is:</p>
+  <ol class="steps">
+    <li><code>application.yml</code> inside the JAR (the shared defaults).</li>
+    <li><code>application-{profile}.yml</code> inside the JAR.</li>
+    <li>An <code>application.yml</code> and <code>application-{profile}.yml</code> placed <em>outside</em> the JAR (next to it, or in a <code>config/</code> folder).</li>
+    <li>Operating-system environment variables (<code>SPRING_DATASOURCE_URL</code>).</li>
+    <li>Command-line arguments (<code>--server.port=9090</code>).</li>
+  </ol>
+  <p>So a base file gives defaults, the profile file overrides them for one environment, and the deployment can still override a single value without rebuilding. When two profiles are active (<code>dev,debug</code>), the profile listed <em>later</em> overrides the earlier one. The full list of sources is in the <a href="#m1-configuration-files">configuration files article</a>.</p>
+
+  <h4>Multi-document YAML in one file</h4>
+  <p>A YAML file can hold several documents separated by <code>---</code>. Each can be tied to a profile with <code>spring.config.activate.on-profile</code>.</p>
+  <pre data-title="application.yml (one file, three parts)"><code class="language-yaml">app:
+  notification:
+    channel: email
+---
+spring:
+  config:
+    activate:
+      on-profile: dev
+app:
+  notification:
+    channel: console
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+app:
+  notification:
+    channel: sms</code></pre>
+  <p>In <code>.properties</code> files use the separate-file naming instead (the multi-document form exists with <code>#---</code> but is rare). Older tutorials use <code>spring.profiles: dev</code> for this; that key was removed in Boot 2.4, so use <code>spring.config.activate.on-profile</code>.</p>
+
+  <h4>@Profile: beans that depend on the environment</h4>
+  <p>Put <code>@Profile</code> on a bean or configuration class and it is registered only when the profile is active. Internally it is a condition checked while the container reads bean definitions, so a bean in an inactive profile is never even created (see <a href="#m1-application-context">the container</a>). This is how the notification app chooses its sender.</p>
+  <pre data-title="Choose an implementation by profile"><code class="language-java">public interface NotificationSender {
+    void send(String to, String text);
+}
+
+@Component
+@Profile("dev")
+public class ConsoleSender implements NotificationSender {
+    public void send(String to, String text) {
+        System.out.println("[DEV] to " + to + ": " + text);
+    }
+}
+
+@Component
+@Profile("prod")
+public class SmsSender implements NotificationSender {
+    public void send(String to, String text) { /* call the SMS gateway */ }
+}
+
+@Component
+@Profile("!dev &amp; !prod")       // every other profile, including 'default'
+public class NoOpSender implements NotificationSender {
+    public void send(String to, String text) { }
+}</code></pre>
+  <p>Expressions use <code>!</code> (not), <code>&amp;</code> (and) and <code>|</code> (or); mixing <code>&amp;</code> and <code>|</code> needs parentheses. Without a matching sender the app fails to start with <code>NoSuchBeanDefinitionException</code>, so make sure every profile has exactly one implementation, or add a catch-all like the last one. The opposite problem, two matching senders, gives <code>NoUniqueBeanDefinitionException</code> (<a href="#m1-bean-errors">bean errors</a>).</p>
+  <p><code>@Profile</code> also works on a <code>@Bean</code> method and on a whole <code>@Configuration</code> class. You can read the profiles in code when you really need to:</p>
+  <pre data-title="Reading profiles at runtime"><code class="language-java">@Component
+class ProfileInfo {
+    ProfileInfo(Environment env) {
+        String[] active = env.getActiveProfiles();           // e.g. ["prod"]
+        boolean prod = env.acceptsProfiles(Profiles.of("prod"));
+    }
+}</code></pre>
+
+  <h4>Profile, property or condition?</h4>
+  <p>Profiles describe <em>environments</em>; properties describe <em>choices</em>. Pick the smallest tool that fits.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Need</th><th>Best tool</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Different values per environment</td><td>Profile file or env var</td><td><code>spring.datasource.url</code></td></tr>
+      <tr><td>A bean only in some environments</td><td><code>@Profile</code></td><td>Fake payment gateway in <code>dev</code></td></tr>
+      <tr><td>A feature switched on by a setting</td><td><code>@ConditionalOnProperty</code></td><td><code>app.notification.channel=sms</code></td></tr>
+      <tr><td>A bean only if a class or bean exists</td><td><code>@ConditionalOnClass</code>, <code>@ConditionalOnMissingBean</code></td><td>Library auto-configuration</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Select by property instead of profile"><code class="language-java">@Component
+@ConditionalOnProperty(name = "app.notification.channel", havingValue = "sms")
+public class SmsSender implements NotificationSender {
+    public void send(String to, String text) { /* call the SMS gateway */ }
+}</code></pre>
+
+  <h4>Other profile features</h4>
+  <ul>
+    <li><code>spring.profiles.include</code> adds profiles unconditionally (for example <code>dev</code> always includes <code>local-db</code>).</li>
+    <li><code>spring.profiles.group.prod: prod-db,prod-logging</code> activates a group with one name. Starting with <code>prod</code> then activates all three.</li>
+    <li><code>Environment.getActiveProfiles()</code> returns the active profiles at runtime; the Actuator <code>/actuator/env</code> endpoint shows them too, if you expose it (<a href="#m6-actuator">Actuator</a>).</li>
+    <li><code>spring.profiles.default</code> changes the name of the fallback profile, which is rarely needed.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Profile-specific files override <code>application.yml</code>, and the active profile list order matters: later profiles override earlier ones.</li>
+      <li><code>@Profile</code> without a value is invalid; a bean without it exists in every profile.</li>
+      <li>An unknown profile name is not an error: it only means no file matches.</li>
+      <li><code>spring.profiles.active</code> and <code>spring.profiles.include</code> cannot be set inside a profile-specific file or a document with <code>on-profile</code>. Boot refuses to start with an <code>InvalidConfigDataPropertyException</code>, because the profile would depend on itself. Set them in the base file, an environment variable or an argument.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Keep profile names few and standard: <code>dev</code>, <code>test</code>, <code>prod</code> (and maybe <code>staging</code>).</li>
+      <li>Do not branch on <code>"prod"</code> inside business code; use properties and let configuration differ.</li>
+      <li>Keep real production values out of <code>application-prod.yml</code>; read them from the environment.</li>
+      <li>Make <code>dev</code> work with one command on a fresh laptop (Docker Compose for the database, <a href="#m7-compose">Compose</a>), so new team members start without a setup document.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: secrets and environment checks in the code</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: password in Git, profile test in code</p><pre><code class="language-yaml">spring:
+  datasource:
+    password: Sup3rSecret!      # committed to the repository</code></pre><pre><code class="language-java">if (env.acceptsProfiles(Profiles.of("prod"))) {
+    sendRealSms(to, text);
+} else {
+    log.info("fake sms");
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: placeholder, and two beans</p><pre><code class="language-yaml">spring:
+  datasource:
+    password: ${DB_PASSWORD}    # injected by the deployment</code></pre><pre><code class="language-java">@Profile("prod")  class SmsSender implements NotificationSender { ... }
+@Profile("!prod") class LogSender implements NotificationSender { ... }</code></pre></div>
+    </div>
+    <p>A password in Git stays in the history even after you delete it. Branching on the profile name makes the production path impossible to test on your laptop.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and errors</p>
+    <ul>
+      <li>With no active profile, <code>application-default.yml</code> is loaded if present. Do not rely on this; it confuses people.</li>
+      <li>Too many profiles combine in unexpected ways (<code>dev,debug,local</code>). If you need more than three, use properties.</li>
+      <li>A <strong>list</strong> in a profile file replaces the whole list from the base file; it is not merged. If <code>application.yml</code> has three <code>app.allowed-origins</code> and the profile file has one, only that one remains. Scalar keys are overridden one by one, maps are merged key by key.</li>
+      <li>A typo in a profile name (<code>SPRING_PROFILES_ACTIVE=prd</code>) is silent: the app starts with base settings, often connecting to the dev database. Check the startup log line.</li>
+      <li>A <code>${DB_URL}</code> placeholder with no value fails at startup with <code>IllegalArgumentException: Could not resolve placeholder 'DB_URL'</code>. That is good: it stops a misconfigured prod start.</li>
+      <li>On Windows PowerShell set an environment variable with <code>$env:SPRING_PROFILES_ACTIVE="dev"</code>; <code>cmd</code> uses <code>set SPRING_PROFILES_ACTIVE=dev</code>.</li>
+      <li>Profile-specific files are loaded only for <em>active</em> profiles, so a test that forgets <code>@ActiveProfiles("test")</code> silently uses the base settings.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>A typical setup: <code>application.yml</code> with local defaults, <code>application-test.yml</code> pointing to Testcontainers or H2, and production values injected by the deployment (Kubernetes or Docker env vars, <a href="07-devops.html#m3">DevOps · Module 3</a>) with <code>SPRING_PROFILES_ACTIVE=prod</code>. Some teams add a <code>staging</code> profile that equals prod but with a smaller database and test payment keys. Secrets come from a secret store (Kubernetes Secrets, Vault, AWS Secrets Manager), never from Git.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What are Spring profiles? How do you use them?"</p>
+    <ul>
+      <li>Profiles group configuration and beans per environment. Activate with <code>spring.profiles.active</code> (property, argument or env var).</li>
+      <li>Config: <code>application-{profile}.yml</code> or multi-document YAML with <code>spring.config.activate.on-profile</code>. Beans: <code>@Profile</code>, with expressions like <code>!prod</code>.</li>
+      <li>Precedence: command line and environment beat profile files, which beat <code>application.yml</code>; later profiles beat earlier ones.</li>
+      <li>Add that you keep secrets in environment variables, and prefer properties over profile checks for feature choices. A follow-up is often "how do you run tests with a different database?" (<code>@ActiveProfiles("test")</code> and <code>application-test.yml</code>).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-configuration-properties">
+  <h3>@Value and @ConfigurationProperties: reading settings in code</h3>
+  <p class="tldr">Use <code>@Value("${key:default}")</code> for one simple setting; use <code>@ConfigurationProperties</code> with a record and <code>@Validated</code> for a group of related settings, because it is type-safe, validated and easy to test.</p>
+
+  <p>Once a value is in <code>application.yml</code>, your classes need to read it. Spring offers two main ways, and a quick look at the third.</p>
+
+  <h4>@Value: one value at a time</h4>
+  <pre data-title="Reading single values"><code class="language-java">@Service
+public class OrderService {
+
+    private final String appName;
+    private final int maxItems;
+    private final boolean giftWrapEnabled;
+
+    public OrderService(@Value("${spring.application.name}") String appName,
+                        @Value("${app.order.max-items:20}") int maxItems,
+                        @Value("${app.order.gift-wrap:false}") boolean giftWrapEnabled) {
+        this.appName = appName;
+        this.maxItems = maxItems;               // 20 if the key is missing
+        this.giftWrapEnabled = giftWrapEnabled;
+    }
+}</code></pre>
+  <ul>
+    <li><code>${key}</code> reads a property; <code>${key:default}</code> uses the default after the colon if the key is missing; without a default a missing key fails startup.</li>
+    <li>Spring converts the string to <code>int</code>, <code>boolean</code>, <code>Duration</code>, <code>List</code> and more. A list: <code>@Value("${app.hosts}") List&lt;String&gt;</code> with <code>a,b,c</code>.</li>
+    <li><code>#{...}</code> is a <strong>SpEL</strong> expression (Spring Expression Language): <code>@Value("#{2 * 60}")</code>, <code>@Value("#{systemProperties['user.home']}")</code>. Use it rarely.</li>
+  </ul>
+  <p>It is perfect for one value. Its limits show up quickly: the keys are strings spread across many classes (a typo is found only at runtime), there is no grouping, no validation, no IDE help, and testing needs every key set. Relaxed binding is also weaker: <code>@Value</code> wants the exact kebab-case key.</p>
+
+  <h4>@ConfigurationProperties: a typed group</h4>
+  <p>Bind a whole prefix to an object. With a <strong>record</strong> the settings become immutable and the object is created through its constructor (constructor binding).</p>
+  <pre data-title="application.yml"><code class="language-yaml">app:
+  payment:
+    base-url: https://pay.example.com
+    api-key: ${PAYMENT_API_KEY}
+    timeout: 5s
+    max-retries: 3
+    allowed-methods:
+      - upi
+      - card</code></pre>
+  <pre data-title="PaymentProperties.java"><code class="language-java">import java.time.Duration;
+import java.util.List;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotEmpty;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.DefaultValue;
+import org.springframework.validation.annotation.Validated;
+
+@ConfigurationProperties(prefix = "app.payment")
+@Validated
+public record PaymentProperties(
+        @NotBlank String baseUrl,
+        @NotBlank String apiKey,
+        @DefaultValue("5s") Duration timeout,
+        @DefaultValue("3") @Min(0) @Max(10) int maxRetries,
+        @NotEmpty List&lt;String&gt; allowedMethods) {
+}</code></pre>
+  <p>Register it. The easiest is to scan for such classes on the main class:</p>
+  <pre data-title="Registering configuration properties"><code class="language-java">@SpringBootApplication
+@ConfigurationPropertiesScan          // finds all @ConfigurationProperties classes
+public class ShopApplication { /* ... */ }
+
+// or, one by one:
+@Configuration
+@EnableConfigurationProperties(PaymentProperties.class)
+class PaymentConfig { }</code></pre>
+  <p>Then inject it like any bean:</p>
+  <pre data-title="Using the properties"><code class="language-java">@Service
+public class PaymentService {
+    private final PaymentProperties props;
+
+    public PaymentService(PaymentProperties props) {
+        this.props = props;
+    }
+
+    public void pay(long paise) {
+        System.out.println("POST " + props.baseUrl() + " timeout " + props.timeout());
+        // retry up to props.maxRetries() times ...
+    }
+}</code></pre>
+  <p>What you gain:</p>
+  <ul>
+    <li><strong>Type conversion</strong> — <code>5s</code> becomes a <code>Duration</code>, <code>10MB</code> a <code>DataSize</code>, <code>true</code> a boolean, nested objects and lists work.</li>
+    <li><strong>Validation at startup</strong> — a blank <code>api-key</code> stops the app with a clear message:</li>
+  </ul>
+  <pre class="out" data-title="Startup failure"><code class="language-plaintext">Binding to target PaymentProperties[...] failed:
+
+    Property: app.payment.apiKey
+    Value: ""
+    Reason: must not be blank
+
+Action: Update your application's configuration</code></pre>
+  <ul>
+    <li><strong>Relaxed binding</strong> — <code>base-url</code>, <code>baseUrl</code> and <code>BASE_URL</code> all match the field <code>baseUrl</code>.</li>
+    <li><strong>One place</strong> — easy to find, easy to construct in a test with <code>new PaymentProperties(...)</code>.</li>
+  </ul>
+  <p>Validation needs the <code>spring-boot-starter-validation</code> dependency. You can also generate IDE auto-complete and documentation for your keys by adding the <code>spring-boot-configuration-processor</code> dependency (optional, annotation-processor only).</p>
+
+  <h4>Nested records and the class-style alternative</h4>
+  <pre data-title="Nested groups"><code class="language-java">@ConfigurationProperties(prefix = "app.mail")
+public record MailProperties(String from, Smtp smtp) {
+    public record Smtp(String host, int port, boolean tls) { }
+}
+// app.mail.from, app.mail.smtp.host, app.mail.smtp.port, app.mail.smtp.tls</code></pre>
+  <p>Before records, properties were a class with getters and setters (JavaBean binding). That still works and is common in older code. A class with a single constructor and no setters also uses constructor binding. If a class has several constructors, mark the one for binding with <code>@ConstructorBinding</code>.</p>
+
+  <h4>@Value vs @ConfigurationProperties</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>@Value</code></th><th><code>@ConfigurationProperties</code></th></tr></thead>
+    <tbody>
+      <tr><td>Best for</td><td>One or two simple values</td><td>A group of related settings</td></tr>
+      <tr><td>Binding</td><td>By exact key, per field</td><td>By prefix, relaxed rules</td></tr>
+      <tr><td>Validation</td><td>None built in</td><td><code>@Validated</code> with Bean Validation</td></tr>
+      <tr><td>Nested and list data</td><td>Awkward</td><td>Natural</td></tr>
+      <tr><td>Defaults</td><td><code>${key:default}</code></td><td><code>@DefaultValue</code> or field initialisers</td></tr>
+      <tr><td>Supports SpEL</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Test it</td><td>Needs Spring or reflection</td><td>Plain <code>new</code> of a record</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>A <code>@ConfigurationProperties</code> class is a bean only when registered (<code>@ConfigurationPropertiesScan</code>, <code>@EnableConfigurationProperties</code>, or <code>@Component</code> on a mutable class).</li>
+      <li>Validation annotations are checked only when the class also has <code>@Validated</code>.</li>
+      <li>For a prefix use kebab-case lowercase (<code>app.payment</code>), not camelCase.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Default to <code>@ConfigurationProperties</code> records for anything beyond a single flag; keep <code>@Value</code> for one-off values.</li>
+      <li>Give optional settings sensible defaults and mark required ones with <code>@NotBlank</code>, <code>@NotNull</code>.</li>
+      <li>Never log a properties object that contains secrets; override <code>toString</code> or avoid printing it.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>@Value</code> is not applied to <code>static</code> fields. And a <code>@Value</code> field is still <code>null</code> in the constructor if you use field injection (use constructor parameters).</li>
+      <li>Unknown keys: by default <code>@ConfigurationProperties</code> ignores unknown properties. Set <code>ignoreUnknownFields = false</code> to make typos fail.</li>
+      <li>Changing a property file does not change a running application; a restart (or Spring Cloud refresh) is needed.</li>
+      <li><code>@Value("${a.b}")</code> with an empty value gives an empty string, not null; <code>@Value("${a.b:}")</code> gives an empty string when missing.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: 15 @Value fields scattered everywhere</p>
+    <p>The same key typed in five classes, with different defaults, is a bug waiting to happen. Group them in one properties record.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "@Value vs @ConfigurationProperties?"</p>
+    <ul>
+      <li><code>@Value</code> injects a single property with optional default and SpEL support. <code>@ConfigurationProperties</code> binds a whole prefix into a typed object.</li>
+      <li>The latter gives relaxed binding, type conversion, nested objects, validation (<code>@Validated</code>) and IDE metadata; it is the recommended style.</li>
+      <li>Constructor binding with records keeps settings immutable.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-spring-boot-application">
+  <h3>What @SpringBootApplication does</h3>
+  <p class="tldr"><code>@SpringBootApplication</code> is three annotations in one: <code>@SpringBootConfiguration</code> (this class is a configuration), <code>@EnableAutoConfiguration</code> (turn on Boot's auto-configuration) and <code>@ComponentScan</code> (scan this package and below).</p>
+
+  <p>The annotation on your main class is short but carries the whole Boot idea. It is a <strong>meta-annotation</strong>: an annotation built from other annotations, so one line on your class has the effect of several. Here is what it contains.</p>
+  <pre data-title="Simplified source of the annotation"><code class="language-java">@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@SpringBootConfiguration
+@EnableAutoConfiguration
+@ComponentScan(excludeFilters = { /* skip some test configurations */ })
+public @interface SpringBootApplication {
+    // attributes: exclude, excludeName, scanBasePackages, scanBasePackageClasses ...
+}</code></pre>
+  <p>And this is the typical main class it sits on:</p>
+  <pre data-title="ShopApplication.java"><code class="language-java">package com.example.shop;                 // the ROOT package
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class ShopApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ShopApplication.class, args);
+    }
+}</code></pre>
+
+  <h4>The three annotations, one by one</h4>
+  <dl class="terms">
+    <dt><code>@SpringBootConfiguration</code></dt>
+    <dd>A specialised <code>@Configuration</code>. It marks the class as a source of bean definitions, so you can put <code>@Bean</code> methods directly in the main class. It exists as a separate annotation so that tests can find your main class: <code>@SpringBootTest</code> and the slice tests search upwards from the test package until they find a class with this annotation, and use it as the configuration (<a href="#m5">Module 5</a>).</dd>
+    <dt><code>@EnableAutoConfiguration</code></dt>
+    <dd>Tells Boot to load all matching <strong>auto-configuration classes</strong>: beans created for you because of what is on your classpath and in your properties (<a href="#m1-auto-configuration">next article</a>).</dd>
+    <dt><code>@ComponentScan</code></dt>
+    <dd>Scans the main class's package and sub-packages for stereotype annotations (<a href="#m1-stereotypes-scanning">scanning</a>).</dd>
+  </dl>
+  <p>You could write the three annotations yourself and get the same behaviour. The combined annotation is just convenient.</p>
+
+  <h4>Inside @EnableAutoConfiguration</h4>
+  <p>This is the most interesting of the three. It is itself made of two parts:</p>
+  <ul>
+    <li><code>@AutoConfigurationPackage</code> records the package of your main class. Later, JPA auto-configuration uses it as the default place to look for <code>@Entity</code> classes and Spring Data repositories. That is why entities in a package outside your root package are "not found" even though you never configured scanning.</li>
+    <li><code>@Import(AutoConfigurationImportSelector.class)</code> runs while the context reads configuration. The selector reads the list of auto-configuration class names from the file <code>META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports</code> inside each JAR on the classpath, removes the ones you excluded, and imports the rest. Each of those classes carries <code>@Conditional...</code> rules, so only those that fit your classpath and properties actually create beans.</li>
+  </ul>
+  <p>The same trick is how any library can plug into Boot: it ships a configuration class and lists it in that <code>.imports</code> file. Your own code is never touched.</p>
+
+  <h4>Inside @ComponentScan on this annotation</h4>
+  <p>The <code>@ComponentScan</code> on <code>@SpringBootApplication</code> has two exclude filters. One (<code>TypeExcludeFilter</code>) lets test slices such as <code>@WebMvcTest</code> remove beans they do not need. The other (<code>AutoConfigurationExcludeFilter</code>) stops the scan from picking up auto-configuration classes as ordinary configuration, because they must go through the conditional import route described above. You normally never think about these filters, but they explain why a sliced test loads only part of your app.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A["@SpringBootApplication"] --> B["@SpringBootConfiguration"]
+  A --> C["@EnableAutoConfiguration"]
+  A --> D["@ComponentScan"]
+  B --> B1["@Configuration: @Bean methods allowed"]
+  C --> C1["@AutoConfigurationPackage"]
+  C --> C2["AutoConfigurationImportSelector"]
+  D --> D1["Your @Component, @Service, @Repository ..."]
+</pre>
+<figcaption>The meta-annotations behind @SpringBootApplication</figcaption>
+  </figure>
+
+  <h4>What SpringApplication.run does</h4>
+  <p>The annotation is a description; <code>SpringApplication.run</code> does the work. In simplified order:</p>
+  <ol class="steps">
+    <li>Decide the application type from the classpath: servlet web (Spring MVC), reactive web, or none.</li>
+    <li>Load configuration: <code>application.yml</code>, environment variables, command-line arguments, and set the active profiles (<a href="#m1-profiles">profiles</a>).</li>
+    <li>Print the banner and create the right <code>ApplicationContext</code>.</li>
+    <li>Register bean definitions from your classes (component scan, <code>@Bean</code>) and from auto-configuration.</li>
+    <li>Refresh the context: create all singleton beans; the web context starts the embedded server (<a href="#m1-embedded-server">embedded server</a>).</li>
+    <li>Call all <code>CommandLineRunner</code> and <code>ApplicationRunner</code> beans, then return.</li>
+  </ol>
+  <p>Boot publishes events along the way (<code>ApplicationStartedEvent</code>, <code>ApplicationReadyEvent</code> and more); you can listen to them (<a href="#m1-application-events">events</a>). If anything fails, Boot catches the exception, prints a readable <em>failure analysis</em> ("APPLICATION FAILED TO START", with a Description and an Action) and exits with a non-zero code (<a href="#m1-bean-errors">bean errors</a>). The run method returns the <code>ConfigurableApplicationContext</code>, which is useful in plain programs and tests; in a web app the JVM stays alive because the server threads keep running.</p>
+
+  <h4>Running code at startup</h4>
+  <p>A runner is a bean that executes once after the context is ready. Use it for small start-up tasks such as seeding demo data. It is not a place for heavy business logic.</p>
+  <pre data-title="A CommandLineRunner bean"><code class="language-java">@Component
+@Order(1)                                   // lower number runs first
+class DemoDataLoader implements CommandLineRunner {
+
+    private static final Logger log = LoggerFactory.getLogger(DemoDataLoader.class);
+
+    @Override
+    public void run(String... args) {
+        log.info("Seeding demo data, args = {}", List.of(args));
+    }
+}</code></pre>
+  <p><code>ApplicationRunner</code> is the same but receives parsed <code>ApplicationArguments</code> (so you can ask <code>args.containsOption("seed")</code> for <code>--seed</code>). A runner that throws an exception stops the application with a failure exit.</p>
+
+  <h4>Customising startup</h4>
+  <pre data-title="A customised main method"><code class="language-java">public static void main(String[] args) {
+    SpringApplication app = new SpringApplication(ShopApplication.class);
+    app.setBannerMode(Banner.Mode.OFF);
+    app.setAdditionalProfiles("local");
+    app.run(args);
+}
+
+// or the fluent builder:
+new SpringApplicationBuilder(ShopApplication.class)
+        .profiles("local")
+        .run(args);</code></pre>
+  <p>Most of these switches also exist as properties (<code>spring.main.banner-mode=off</code>, <code>spring.main.web-application-type=none</code>), which is usually better because you do not touch the code. For a command-line tool without a web server, set <code>spring.main.web-application-type=none</code> or leave out the web starter.</p>
+
+  <h4>Attributes you will use</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Attribute</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>exclude</code> / <code>excludeName</code></td><td>Disable specific auto-configurations (see next article)</td></tr>
+      <tr><td><code>scanBasePackages</code></td><td>Scan other packages than the default</td></tr>
+      <tr><td><code>scanBasePackageClasses</code></td><td>A type-safe version: pass a marker class from each package</td></tr>
+      <tr><td><code>proxyBeanMethods</code></td><td>Whether the main class is proxied like a <code>@Configuration</code></td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Two common uses"><code class="language-java">// do not auto-configure a datasource (for a service that has no database yet)
+@SpringBootApplication(exclude = DataSourceAutoConfiguration.class)
+
+// scan an extra package that is not below the main class
+@SpringBootApplication(scanBasePackages = {"com.example.shop", "com.example.common"})</code></pre>
+
+  <h4>Comparison: the long form and the short form</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>You write</th><th>You get</th></tr></thead>
+    <tbody>
+      <tr><td><code>@SpringBootApplication</code></td><td>Configuration + auto-configuration + scan of the root package</td></tr>
+      <tr><td><code>@Configuration @EnableAutoConfiguration @ComponentScan</code></td><td>The same; <code>@Configuration</code> instead of <code>@SpringBootConfiguration</code> works, but tests can no longer find it by that annotation</td></tr>
+      <tr><td><code>@SpringBootApplication</code> in the default (no) package</td><td>Scan of every class on the classpath: slow start and a warning, so always use a named package</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Use exactly one <code>@SpringBootApplication</code> per application, in the root package.</li>
+      <li>Keep the main class small: <code>main</code>, annotations, maybe a few shared beans. Put real configuration in separate <code>@Configuration</code> classes.</li>
+      <li>Do not add <code>@EnableAutoConfiguration</code> a second time; it is already there.</li>
+      <li>All your code (controllers, services, entities, repositories) must live in the root package or below, unless you list the extra package in <code>scanBasePackages</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Name the class after the application, ending in <code>Application</code> (<code>ShopApplication</code>), in the top package of the group id and artifact (<code>com.example.shop</code>).</li>
+      <li>Prefer properties (<code>spring.autoconfigure.exclude</code>) or the <code>exclude</code> attribute over deleting dependencies just to silence one auto-configuration.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: sprinkling extra annotations on the main class</p>
+    <p>Adding <code>@EnableJpaRepositories</code>, <code>@EntityScan</code> or <code>@EnableScheduling</code> to the main class changes more than you expect: <code>@EnableJpaRepositories</code> switches off Boot's own repository scanning defaults. This also affects sliced tests, which load the main class. Put such annotations on dedicated configuration classes.</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: main class in a sub-package</p><pre><code class="language-plaintext">com.example.shop.web.ShopApplication   (scans only ...shop.web)
+com.example.shop.service.OrderService  (never found)</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: main class in the root package</p><pre><code class="language-plaintext">com.example.shop.ShopApplication       (scans all of ...shop)
+com.example.shop.service.OrderService  (found)</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and errors</p>
+    <ul>
+      <li>In a multi-module project, beans in another module's package are not scanned unless that package is under yours or you list it in <code>scanBasePackages</code>. Libraries should expose their beans through auto-configuration instead.</li>
+      <li>Running a Boot app inside an external Tomcat (WAR) needs a <code>SpringBootServletInitializer</code>; this is the legacy deployment style.</li>
+      <li>Excluding a class that is not an auto-configuration (for example your own <code>@Configuration</code>) fails with <code>IllegalStateException: The following classes could not be excluded because they are not auto-configuration classes</code>. To remove your own bean, use a profile or a condition instead.</li>
+      <li>A class in the default package (no <code>package</code> line) makes the scan cover the whole classpath; Boot warns that the context is unlikely to start. Always declare a package.</li>
+      <li>Two classes with <code>@SpringBootApplication</code> in one module give <code>IllegalStateException: Found multiple @SpringBootConfiguration annotated classes</code> in tests, because the search finds more than one.</li>
+      <li>The <code>main</code> method is not a bean: you cannot inject anything into it. Use a runner or an event listener.</li>
+    </ul>
+  </div>
+
+  <div class="co co-version">
+    <p class="co-t">Boot 3 and Boot 4</p>
+    <p>The annotation and its three parts work the same in both lines. Before Boot 2.7 the auto-configuration list lived in <code>META-INF/spring.factories</code>; modern versions use the <code>.imports</code> file shown above. Boot 4 also splits its large auto-configuration JAR into smaller per-technology modules, which changes dependency names but not how you write your main class.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What does @SpringBootApplication do?"</p>
+    <ul>
+      <li>It combines <code>@SpringBootConfiguration</code>, <code>@EnableAutoConfiguration</code> and <code>@ComponentScan</code>.</li>
+      <li>Scan covers the main class's package and below; auto-configuration creates beans from the classpath and properties, using the imports file and <code>@Conditional</code> rules.</li>
+      <li><code>SpringApplication.run</code> creates the context, starts the embedded server and calls runners.</li>
+      <li>A strong answer adds why the main class belongs in the root package and how you would exclude one auto-configuration. A common follow-up: "how do you run code at startup?" (<code>CommandLineRunner</code> or <code>ApplicationRunner</code>).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-auto-configuration">
+  <h3>How auto-configuration works</h3>
+  <p class="tldr">Boot ships hundreds of ordinary <code>@Configuration</code> classes, listed in an <code>.imports</code> file; each is guarded by conditions (is this class on the classpath? is this property set? is a bean of this type already defined?), so only the ones that fit your app apply.</p>
+
+  <p>You add <code>spring-boot-starter-web</code> and, with no setup, a <code>DispatcherServlet</code>, a Tomcat server and a JSON converter exist. You add a PostgreSQL driver and a datasource properties, and a pooled <code>DataSource</code> appears. This is <strong>auto-configuration</strong>: Boot decides what beans you probably want, then creates them, unless you say otherwise.</p>
+
+  <h4>The mechanism, step by step</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A["@EnableAutoConfiguration"] --> B["Read AutoConfiguration.imports from all JARs"]
+  B --> C[Candidate configuration classes - several hundred]
+  C --> D{Conditions pass?}
+  D -->|Yes| E[Register its beans]
+  D -->|No| F[Skip the class]
+  E --> G{Do you already define that bean?}
+  G -->|Yes| H[Back off: your bean wins]
+  G -->|No| I[Boot's default bean is used]
+</pre>
+    <figcaption>From the import file to the beans in your context</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><strong><code>@EnableAutoConfiguration</code></strong> triggers an import selector.</li>
+    <li>The selector reads the file <code>META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports</code> from every JAR on the classpath. It is a plain text file with one fully qualified class name per line. (Before Boot 2.7/3.0 the list lived in <code>spring.factories</code>; that is the old way.)</li>
+    <li>Each listed class is a normal <code>@AutoConfiguration</code> (a variant of <code>@Configuration</code>) with <code>@Bean</code> methods and <strong>conditions</strong>.</li>
+    <li>Conditions are evaluated: a class whose conditions fail contributes nothing.</li>
+    <li>The surviving classes are processed after your own configuration, so your beans are already known and can win.</li>
+  </ol>
+
+  <h4>A real example, simplified</h4>
+  <pre data-title="Simplified shape of an auto-configuration"><code class="language-java">@AutoConfiguration
+@ConditionalOnClass(DataSource.class)                 // JDBC classes are present
+@EnableConfigurationProperties(DataSourceProperties.class)
+public class DataSourceAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean(DataSource.class)       // you did not define one
+    public DataSource dataSource(DataSourceProperties props) {
+        return props.initializeDataSourceBuilder().build();   // Hikari pool
+    }
+}</code></pre>
+  <p>Read it as: "<em>If</em> JDBC is on the classpath <em>and</em> the user has not made their own <code>DataSource</code>, create one from the <code>spring.datasource.*</code> properties." Spring's actual classes are bigger, but the idea is exactly this.</p>
+
+  <h4>The conditions</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Condition</th><th>True when</th><th>Example use</th></tr></thead>
+    <tbody>
+      <tr><td><code>@ConditionalOnClass</code></td><td>A class is on the classpath</td><td>Set up MVC only if <code>DispatcherServlet</code> is present</td></tr>
+      <tr><td><code>@ConditionalOnMissingClass</code></td><td>A class is absent</td><td>Fallbacks</td></tr>
+      <tr><td><code>@ConditionalOnBean</code></td><td>A bean of that type exists</td><td>Add a metrics binder if a registry exists</td></tr>
+      <tr><td><code>@ConditionalOnMissingBean</code></td><td>No bean of that type is defined yet</td><td><strong>Back-off</strong>: use my default unless the user made their own</td></tr>
+      <tr><td><code>@ConditionalOnProperty</code></td><td>A property has a value</td><td>Feature toggles: <code>app.cache.enabled=true</code></td></tr>
+      <tr><td><code>@ConditionalOnWebApplication</code></td><td>The app is a web app</td><td>Servlet-only beans</td></tr>
+      <tr><td><code>@ConditionalOnResource</code></td><td>A file exists</td><td>Optional config files</td></tr>
+    </tbody>
+  </table></div>
+  <p>You can use the same annotations in your own configuration, for example to create a bean only when a flag is set:</p>
+  <pre data-title="A feature toggle in your own code"><code class="language-java">@Configuration
+public class SmsConfig {
+
+    @Bean
+    @ConditionalOnProperty(name = "app.sms.enabled", havingValue = "true")
+    public SmsSender smsSender() {
+        return new SmsSender();
+    }
+}</code></pre>
+
+  <h4>Back-off: how you override a default</h4>
+  <p>Because Boot's beans are guarded by <code>@ConditionalOnMissingBean</code>, defining your own bean replaces the default:</p>
+  <pre data-title="Replace Boot's ObjectMapper"><code class="language-java">@Configuration
+public class JacksonConfig {
+
+    @Bean
+    public ObjectMapper objectMapper() {         // Boot's ObjectMapper backs off
+        return new ObjectMapper()
+                .findAndRegisterModules()
+                .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    }
+}</code></pre>
+  <p>Note the trade-off: when you replace a Boot bean, you lose Boot's other customisations of it (for example properties like <code>spring.jackson.*</code>). Often a smaller tool is better: a <code>Jackson2ObjectMapperBuilderCustomizer</code> bean, or just a property. Check the reference docs for the right extension point before replacing a whole bean.</p>
+
+  <h4>Seeing what was applied: the conditions report</h4>
+  <p>Start with <code>--debug</code> (or <code>debug=true</code> in properties) and Boot prints a <strong>conditions evaluation report</strong>.</p>
+  <pre data-title="Run with the report"><code class="language-shell">$ java -jar app.jar --debug</code></pre>
+  <pre class="out" data-title="Excerpt of the report"><code class="language-plaintext">============================
+CONDITIONS EVALUATION REPORT
+============================
+
+Positive matches:
+-----------------
+   DataSourceAutoConfiguration matched:
+      - @ConditionalOnClass found required class 'javax.sql.DataSource'
+
+Negative matches:
+-----------------
+   MongoAutoConfiguration:
+      Did not match:
+         - @ConditionalOnClass did not find required class 'com.mongodb.client.MongoClient'</code></pre>
+  <p>The same data is available live through Actuator: add <code>spring-boot-starter-actuator</code>, set <code>management.endpoints.web.exposure.include=conditions</code> and open <code>/actuator/conditions</code> (only in a safe environment). <a href="#m6">Module 6</a> covers Actuator.</p>
+
+  <h4>Excluding an auto-configuration</h4>
+  <pre data-title="Two ways to switch one off"><code class="language-java">@SpringBootApplication(exclude = DataSourceAutoConfiguration.class)
+public class ShopApplication { }</code></pre>
+  <pre data-title="application.yml — the same, without code"><code class="language-yaml">spring:
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration</code></pre>
+  <p>Typical reason: you added a starter transitively but have no database in this module, and startup fails with <code>Failed to configure a DataSource</code>.</p>
+
+  <h4>Writing your own auto-configuration (the idea)</h4>
+  <p>Company teams package a shared logging or client library as a <strong>starter</strong>. The recipe: a <code>@AutoConfiguration</code> class with conditions, a properties class, and one line in <code>META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports</code>. Not needed for day-to-day work, but it shows there is no magic.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Auto-configuration never overrides a bean you defined (for beans guarded by <code>@ConditionalOnMissingBean</code>); your configuration is always processed first.</li>
+      <li>Conditions are about the state at startup. They do not react to later changes.</li>
+      <li>Auto-configuration classes must not be found by component scanning; they are loaded only through the imports file.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Prefer changing a property over replacing a bean, and a customizer over a full replacement.</li>
+      <li>Define your own bean with the same type to take control; do not edit or copy Boot's classes.</li>
+      <li>Use <code>--debug</code> before guessing why a bean does or does not exist.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A transitive dependency can trigger an unwanted auto-configuration (a JDBC jar brings <code>DataSource</code> requirements). Exclude it or remove the jar.</li>
+      <li>Defining a bean of the type Boot expects with a <em>different bean name</em> still makes Boot back off, because the condition checks the type.</li>
+      <li>In sliced tests (<code>@WebMvcTest</code>, <code>@DataJpaTest</code>) only a chosen subset of auto-configurations is imported.</li>
+      <li>Boot 4 splits its auto-configuration into smaller modules; the mechanism (conditions, back-off, the <code>.imports</code> file) is unchanged.</li>
+    </ul>
+  </div>
+
+  <div class="co co-version">
+    <p class="co-t">Version note: spring.factories vs the imports file</p>
+    <p>Old tutorials say auto-configurations are listed under <code>EnableAutoConfiguration</code> in <code>META-INF/spring.factories</code>. That was Boot 2.x. From Boot 3.0 the only supported place is the <code>AutoConfiguration.imports</code> file shown above.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How does Spring Boot auto-configuration work?"</p>
+    <ul>
+      <li><code>@EnableAutoConfiguration</code> loads class names from <code>META-INF/spring/...AutoConfiguration.imports</code> in every JAR.</li>
+      <li>Each class has conditions such as <code>@ConditionalOnClass</code>, <code>@ConditionalOnProperty</code> and <code>@ConditionalOnMissingBean</code>; only matching ones register beans.</li>
+      <li>"Back-off": if you define your own bean, Boot's default is skipped.</li>
+      <li>Debug with <code>--debug</code> or <code>/actuator/conditions</code>; disable with <code>exclude</code> or <code>spring.autoconfigure.exclude</code>.</li>
+    </ul>
+  </div>
+</article>

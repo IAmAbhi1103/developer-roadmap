@@ -1,0 +1,637 @@
+<article class="topic" id="m5-stream-terminal-ops">
+  <h3>Terminal operations: collect, reduce, count, match and find</h3>
+  <p class="tldr">A terminal operation starts the pipeline and closes the stream: it returns a result (a collection, a number, an Optional, a boolean) or acts on every element, and the short-circuiting ones — findFirst, anyMatch and a few others — can stop before the end.</p>
+
+  <p>Intermediate operations only describe work. The <strong>terminal operation</strong> is the one that makes the stream run, and it decides what you get back: a list, a number, a yes/no answer, or nothing at all. A pipeline has exactly one, at the end. When it finishes, the stream is used up (see <a href="#m5-streams-basics">What a stream is</a>).</p>
+
+  <h4>Terminal operations at a glance</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operation</th><th>Returns</th><th>Short-circuits?</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><code>forEach(Consumer)</code>, <code>forEachOrdered(Consumer)</code></td><td><code>void</code></td><td>No</td><td>An action per element: print, log, send</td></tr>
+      <tr><td><code>collect(Collector)</code></td><td>Whatever the collector builds</td><td>No</td><td>List, Set, Map, String, statistics</td></tr>
+      <tr><td><code>toList()</code> (Java 16)</td><td>Unmodifiable <code>List&lt;T&gt;</code></td><td>No</td><td>The everyday "give me a list"</td></tr>
+      <tr><td><code>toArray()</code>, <code>toArray(String[]::new)</code></td><td><code>Object[]</code> or <code>T[]</code></td><td>No</td><td>When an API needs an array</td></tr>
+      <tr><td><code>reduce(...)</code></td><td><code>Optional&lt;T&gt;</code> or one value</td><td>No</td><td>Combine all elements into one value</td></tr>
+      <tr><td><code>count()</code></td><td><code>long</code></td><td>No</td><td>How many elements</td></tr>
+      <tr><td><code>min(Comparator)</code>, <code>max(Comparator)</code></td><td><code>Optional&lt;T&gt;</code></td><td>No</td><td>Smallest or largest element</td></tr>
+      <tr><td><code>anyMatch</code>, <code>allMatch</code>, <code>noneMatch</code></td><td><code>boolean</code></td><td>Yes</td><td>Yes/no questions about the data</td></tr>
+      <tr><td><code>findFirst()</code>, <code>findAny()</code></td><td><code>Optional&lt;T&gt;</code></td><td>Yes</td><td>One element that passed the pipeline</td></tr>
+      <tr><td><code>sum()</code>, <code>average()</code>, <code>min()</code>, <code>max()</code>, <code>summaryStatistics()</code></td><td>A number, an <code>OptionalInt</code> / <code>OptionalDouble</code>, or a statistics object</td><td>No</td><td>Only on <code>IntStream</code>, <code>LongStream</code>, <code>DoubleStream</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The sample data for this article and the next three</h4>
+  <p>Eight employees. Two earn exactly 90,000 and two names start with A and K — that is on purpose, because ties and repeated letters are where stream code goes wrong.</p>
+  <pre data-title="Employee list"><code class="language-java">record Employee(String name, String dept, int salary, int age) {}
+
+List&lt;Employee&gt; emps = List.of(
+        new Employee("Ravi",   "IT",      90000, 31),
+        new Employee("Asha",   "HR",      60000, 28),
+        new Employee("Kiran",  "IT",      90000, 26),
+        new Employee("Meera",  "IT",     120000, 35),
+        new Employee("John",   "HR",      75000, 40),
+        new Employee("Kavya",  "Finance", 82000, 29),
+        new Employee("Sanjay", "Finance", 95000, 45),
+        new Employee("Anita",  "IT",      70000, 24));</code></pre>
+
+  <h4>forEach and forEachOrdered</h4>
+  <p><code>forEach</code> runs an action for each element and returns nothing. On a normal (sequential) stream it follows the encounter order. On a parallel stream it does not: elements can be handled in any order, by different threads. <code>forEachOrdered</code> keeps the encounter order even in parallel, but loses part of the speed-up.</p>
+  <pre data-title="forEach"><code class="language-java">emps.stream()
+        .filter(e -&gt; e.dept().equals("HR"))
+        .forEach(e -&gt; System.out.println(e.name() + " works in HR"));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Asha works in HR
+John works in HR</code></pre>
+  <p>Use <code>forEach</code> only for actions that leave the pipeline — printing, logging, sending an e-mail. Do not use it to <em>build</em> a result; that is the job of <code>collect</code> and <code>toList()</code>. If you already have a collection, <code>list.forEach(...)</code> works without <code>.stream()</code>, and <code>map.forEach((key, value) -&gt; ...)</code> works on a map. Inside the lambda, <code>return</code> only leaves the lambda — it behaves like <code>continue</code>. You cannot <code>break</code> out of a <code>forEach</code>.</p>
+
+  <h4>Getting a list: <code>toList()</code> vs <code>Collectors.toList()</code></h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>stream.toList()</code> (Java 16)</th><th><code>collect(Collectors.toList())</code></th><th><code>Collectors.toUnmodifiableList()</code> (Java 10)</th></tr></thead>
+    <tbody>
+      <tr><td>Can you add or remove?</td><td>No — <code>UnsupportedOperationException</code></td><td>Yes in practice (an <code>ArrayList</code>), but the Javadoc promises nothing</td><td>No</td></tr>
+      <tr><td>Allows <code>null</code> elements?</td><td>Yes</td><td>Yes</td><td>No — <code>NullPointerException</code></td></tr>
+      <tr><td>Best for</td><td>Read-only results — most code</td><td>Old code; or when you modify the list afterwards</td><td>Read-only, and you want <code>null</code> rejected early</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Read-only vs editable lists"><code class="language-java">List&lt;String&gt; readOnly = emps.stream().map(Employee::name).toList();
+// readOnly.add("Zoya");   // throws UnsupportedOperationException
+
+// Need to modify the result? Say so explicitly. It guarantees an ArrayList.
+List&lt;String&gt; editable = emps.stream()
+        .map(Employee::name)
+        .collect(Collectors.toCollection(ArrayList::new));
+editable.add("Zoya");
+System.out.println(editable.size());
+
+Object[] objects = emps.stream().map(Employee::name).toArray();
+String[] names = emps.stream().map(Employee::name).toArray(String[]::new);
+int[] salaries = emps.stream().mapToInt(Employee::salary).toArray();
+System.out.println(names.length + " " + salaries[0]);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">9
+8 90000</code></pre>
+  <p><code>toArray()</code> without arguments gives an <code>Object[]</code>, which is rarely what you want. Pass an array constructor reference (<code>String[]::new</code>) to get a typed array.</p>
+
+  <h4>reduce: many values into one</h4>
+  <p><code>reduce</code> repeatedly combines two values into one. "Sum of a list" is the classic case: start at 0, add the first element, add the second, and so on. It has three forms:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Form</th><th>Returns</th><th>Use it when</th></tr></thead>
+    <tbody>
+      <tr><td><code>reduce(BinaryOperator&lt;T&gt; op)</code></td><td><code>Optional&lt;T&gt;</code></td><td>There is no natural starting value and the stream may be empty</td></tr>
+      <tr><td><code>reduce(T identity, BinaryOperator&lt;T&gt; op)</code></td><td><code>T</code></td><td>Input and result have the same type; the identity is the answer for an empty stream</td></tr>
+      <tr><td><code>reduce(U identity, BiFunction&lt;U, T, U&gt; accumulator, BinaryOperator&lt;U&gt; combiner)</code></td><td><code>U</code></td><td>The result type differs from the element type; the combiner merges partial results of a parallel run</td></tr>
+    </tbody>
+  </table></div>
+  <p>The <strong>identity</strong> is a value that changes nothing when combined with any element: <code>0</code> for addition, <code>1</code> for multiplication, <code>""</code> for string concatenation. Form 1 has no identity, so it cannot answer for an empty stream — it returns an empty <code>Optional</code> instead.</p>
+  <pre data-title="The three forms"><code class="language-java">List&lt;Integer&gt; nums = List.of(1, 2, 3, 4);
+
+int sum = nums.stream().reduce(0, Integer::sum);                       // form 2
+Optional&lt;Integer&gt; product = nums.stream().reduce((a, b) -&gt; a * b);    // form 1
+int totalLetters = List.of("java", "is", "fun").stream()               // form 3
+        .reduce(0, (acc, word) -&gt; acc + word.length(), Integer::sum);
+System.out.println(sum + " " + product + " " + totalLetters);
+
+// What happens step by step
+int total = nums.stream().reduce(0, (acc, n) -&gt; {
+    System.out.println(acc + " + " + n);
+    return acc + n;
+});
+System.out.println("total = " + total);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">10 Optional[24] 9
+0 + 1
+1 + 2
+3 + 3
+6 + 4
+total = 10</code></pre>
+  <p>In the three-argument form the accumulator folds one element into the running result (a number plus a word's length). The combiner is only used when the stream runs in parallel: each thread reduces its own chunk, and the combiner joins the chunk results. Even if you never go parallel, supply a correct one.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: a reduce function must be associative, stateless and consistent with the identity</p>
+    <ul>
+      <li><strong>Associative:</strong> <code>(a op b) op c</code> must equal <code>a op (b op c)</code>. Addition, multiplication, <code>max</code> and string concatenation qualify. Subtraction and division do not, so <code>reduce(0, (a, b) -&gt; a - b)</code> gives wrong answers in parallel.</li>
+      <li><strong>Identity:</strong> <code>op(identity, x)</code> must equal <code>x</code>. Using 10 as the "starting value" of a sum is not an identity (see the next mistake).</li>
+      <li><strong>Stateless:</strong> the function must not read or change outside variables.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a starting value that is not an identity</p>
+    <p><code>nums.stream().reduce(10, Integer::sum)</code> returns 20 on a sequential stream. On a parallel stream every chunk starts from 10. If the list splits into four one-element chunks, you get (10+1) + (10+2) + (10+3) + (10+4) = 50. Add the offset <em>after</em> the reduce: <code>10 + nums.stream().reduce(0, Integer::sum)</code>.</p>
+  </div>
+
+  <h4>reduce vs collect</h4>
+  <p><code>reduce</code> builds one <em>immutable</em> value (a number, a maximum). <code>collect</code> uses a <em>mutable container</em> (a list, a map, a <code>StringBuilder</code>) that it fills in place. Building a container with <code>reduce</code> means creating a new one at every step — slow, and unsafe in parallel.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: string building with reduce</p><pre><code class="language-java">String s = emps.stream()
+        .limit(2)
+        .map(Employee::name)
+        .reduce("", (a, b) -&gt; a + ", " + b);
+// ", Ravi, Asha"  (leading comma, and O(n²) copying)</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: collect with joining</p><pre><code class="language-java">String s = emps.stream()
+        .limit(2)
+        .map(Employee::name)
+        .collect(Collectors.joining(", "));
+// "Ravi, Asha"</code></pre></div>
+  </div>
+
+  <h4>count, min and max</h4>
+  <p><code>count()</code> returns a <code>long</code>. <code>min</code> and <code>max</code> take a <code>Comparator</code> and return an <code>Optional</code>, because an empty stream has no smallest element.</p>
+  <pre data-title="count, min, max, match, find"><code class="language-java">long itCount = emps.stream().filter(e -&gt; e.dept().equals("IT")).count();
+String top = emps.stream()
+        .max(Comparator.comparingInt(Employee::salary))
+        .map(Employee::name).orElse("nobody");
+String youngest = emps.stream()
+        .min(Comparator.comparingInt(Employee::age))
+        .map(Employee::name).orElse("nobody");
+
+boolean anyAbove1Lakh = emps.stream().anyMatch(e -&gt; e.salary() &gt; 100000);
+boolean allAdults = emps.stream().allMatch(e -&gt; e.age() &gt;= 18);
+boolean noneInSales = emps.stream().noneMatch(e -&gt; e.dept().equals("Sales"));
+String firstHr = emps.stream()
+        .filter(e -&gt; e.dept().equals("HR"))
+        .findFirst().map(Employee::name).orElse("nobody");
+
+System.out.println(itCount + " " + top + " " + youngest);
+System.out.println(anyAbove1Lakh + " " + allAdults + " " + noneInSales + " " + firstHr);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">4 Meera Anita
+true true true Asha</code></pre>
+
+  <h4>anyMatch, allMatch, noneMatch — and the empty stream</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operation</th><th>True when</th><th>On an empty stream</th><th>Stops at</th></tr></thead>
+    <tbody>
+      <tr><td><code>anyMatch(p)</code></td><td>At least one element matches</td><td><code>false</code></td><td>The first match</td></tr>
+      <tr><td><code>allMatch(p)</code></td><td>Every element matches</td><td><code>true</code></td><td>The first non-match</td></tr>
+      <tr><td><code>noneMatch(p)</code></td><td>No element matches</td><td><code>true</code></td><td>The first match</td></tr>
+    </tbody>
+  </table></div>
+  <p>On an empty stream, <code>allMatch</code> and <code>noneMatch</code> return <code>true</code> because nothing breaks the rule — logicians call this <em>vacuous truth</em>. It surprises people when a filter removes everything: <code>orders.stream().filter(Order::isPaid).allMatch(Order::hasInvoice)</code> is <code>true</code> even when there are no paid orders.</p>
+
+  <h4>findFirst vs findAny</h4>
+  <p>Both return an <code>Optional</code> with one element of the stream. <code>findFirst()</code> returns the first element in encounter order. <code>findAny()</code> may return any element: on a sequential stream it almost always returns the first, but on a parallel stream it is free to return whichever thread finishes first — and that is faster. Use <code>findAny()</code> when any match will do and the stream is parallel; otherwise use <code>findFirst()</code>.</p>
+
+  <h4>Terminal operations on primitive streams</h4>
+  <pre data-title="IntStream results"><code class="language-java">int[] marks = {72, 85, 64, 91};
+IntSummaryStatistics st = Arrays.stream(marks).summaryStatistics();
+System.out.println(st);
+System.out.println(Arrays.stream(marks).average().orElse(0));
+System.out.println(IntStream.empty().sum());
+System.out.println(IntStream.empty().max());
+System.out.println(IntStream.empty().average());</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">IntSummaryStatistics{count=4, sum=312, min=64, average=78.000000, max=91}
+78.0
+0
+OptionalInt.empty
+OptionalDouble.empty</code></pre>
+  <p><code>sum()</code> of an empty stream is 0. <code>max()</code>, <code>min()</code> and <code>average()</code> return <code>OptionalInt</code> or <code>OptionalDouble</code>, because there is no sensible answer for no data. Read them with <code>getAsInt()</code>, <code>orElse(...)</code> or <code>orElseThrow()</code>.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong><code>count()</code> may skip your pipeline.</strong> Since Java 9, if the count can be worked out from the source alone (a <code>List</code> with no <code>filter</code> in between), the stream does not run — so <code>peek</code> and <code>map</code> never execute. A <code>filter</code> makes the size unknown, and then the pipeline runs. Do not put side effects in a stream that ends in <code>count()</code>.</li>
+      <li><strong><code>IntStream.sum()</code> overflows silently.</strong> <code>IntStream.of(Integer.MAX_VALUE, 1).sum()</code> is <code>-2147483648</code>. Use <code>mapToLong</code> or <code>asLongStream()</code> when totals can be large: <code>IntStream.of(Integer.MAX_VALUE, 1).asLongStream().sum()</code> is <code>2147483648</code>.</li>
+      <li><strong><code>findFirst()</code> and <code>findAny()</code> throw <code>NullPointerException</code></strong> if the element they would return is <code>null</code>, because an <code>Optional</code> cannot hold <code>null</code>.</li>
+      <li><strong><code>Optional.get()</code> on an empty result</strong> throws <code>NoSuchElementException: No value present</code>.</li>
+      <li><strong>A second terminal operation</strong> on the same stream throws <code>IllegalStateException</code>.</li>
+    </ul>
+  </div>
+  <pre data-title="count() and peek"><code class="language-java">List&lt;Integer&gt; nums = List.of(1, 2, 3);
+long a = nums.stream().peek(n -&gt; System.out.println("peek " + n)).count();
+System.out.println("count = " + a);
+long b = nums.stream().filter(n -&gt; n &gt; 1)
+        .peek(n -&gt; System.out.println("peek " + n)).count();
+System.out.println("count = " + b);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">count = 3
+peek 2
+peek 3
+count = 2</code></pre>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes: forEach to build a result, and get() without a check</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: side effect on an outside list</p><pre><code class="language-java">List&lt;String&gt; names = new ArrayList&lt;&gt;();
+emps.stream().forEach(e -&gt; names.add(e.name()));
+// breaks (lost updates) on a parallel stream</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: let the stream build it</p><pre><code class="language-java">List&lt;String&gt; names = emps.stream()
+        .map(Employee::name)
+        .toList();</code></pre></div>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: NoSuchElementException</p><pre><code class="language-java">String n = emps.stream()
+        .filter(e -&gt; e.dept().equals("Sales"))
+        .findFirst()
+        .get().name();</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: decide what "not found" means</p><pre><code class="language-java">String n = emps.stream()
+        .filter(e -&gt; e.dept().equals("Sales"))
+        .findFirst()
+        .map(Employee::name)
+        .orElse("nobody");</code></pre></div>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: prefer mapToInt(...).sum() over reduce(0, Integer::sum)</p>
+    <p>For sums, averages and maximums of numbers, map to a primitive stream first. It reads better, avoids boxing every number into an <code>Integer</code>, and gives you <code>average()</code> and <code>summaryStatistics()</code> for free: <code>emps.stream().mapToInt(Employee::salary).sum()</code>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "reduce vs collect?", "findFirst vs findAny?", "toList() vs Collectors.toList()?"</p>
+    <ul>
+      <li><code>reduce</code> combines elements into one immutable value; <code>collect</code> accumulates into a mutable container. Strings and collections belong to <code>collect</code>.</li>
+      <li>Three <code>reduce</code> forms: no identity (returns <code>Optional</code>), identity, and identity + accumulator + combiner. The function must be associative, and the identity a true identity, or parallel runs give wrong answers.</li>
+      <li><code>findFirst</code> respects encounter order; <code>findAny</code> does not and is cheaper in parallel. Both return <code>Optional</code>.</li>
+      <li><code>toList()</code> (Java 16) returns an unmodifiable list and allows nulls; <code>Collectors.toList()</code> returns a modifiable list in practice but promises nothing.</li>
+      <li><code>allMatch</code> and <code>noneMatch</code> are <code>true</code> on an empty stream; <code>anyMatch</code> is <code>false</code>.</li>
+      <li>Short-circuiting terminals: <code>anyMatch</code>, <code>allMatch</code>, <code>noneMatch</code>, <code>findFirst</code>, <code>findAny</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-collectors-basics">
+  <h3>Collectors: toList, toSet, toMap, joining and summaries</h3>
+  <p class="tldr">A Collector is a ready-made recipe that turns the elements of a stream into one result — a list, a set, a map, a string, a count or a set of statistics — and you hand it to collect().</p>
+
+  <p><code>collect</code> is the most important terminal operation. You give it a <strong>Collector</strong>, and the <code>Collectors</code> class (note the "s") offers dozens of ready-made ones. Under the hood a collector is made of four small functions:</p>
+  <dl class="terms">
+    <dt>Supplier</dt>
+    <dd>Creates an empty container, for example <code>ArrayList::new</code>.</dd>
+    <dt>Accumulator</dt>
+    <dd>Adds one element to the container, for example <code>ArrayList::add</code>.</dd>
+    <dt>Combiner</dt>
+    <dd>Merges two containers. Only a parallel stream needs it, because each thread fills its own container.</dd>
+    <dt>Finisher</dt>
+    <dd>An optional last step that converts the container into the final result, for example turning a <code>StringJoiner</code> into a <code>String</code>.</dd>
+  </dl>
+  <p>You can pass the first three directly to <code>collect(supplier, accumulator, combiner)</code>. You will mostly use the ready-made collectors, but it helps to know that nothing magic is going on.</p>
+  <pre data-title="What collect does"><code class="language-java">ArrayList&lt;String&gt; list = Stream.of("a", "b", "c")
+        .collect(ArrayList::new, ArrayList::add, ArrayList::addAll);   // 3-argument form
+
+// Writing a collector of your own is rare, but possible:
+Collector&lt;String, StringJoiner, String&gt; csv = Collector.of(
+        () -&gt; new StringJoiner(","), StringJoiner::add,
+        StringJoiner::merge, StringJoiner::toString);
+System.out.println(list + " " + Stream.of("a", "b", "c").collect(csv));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[a, b, c] a,b,c</code></pre>
+
+  <h4>The collectors you will use</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Goal</th><th>Collector</th><th>Result type</th></tr></thead>
+    <tbody>
+      <tr><td>A list</td><td><code>toList()</code>, <code>toUnmodifiableList()</code></td><td><code>List&lt;T&gt;</code></td></tr>
+      <tr><td>A set</td><td><code>toSet()</code>, <code>toUnmodifiableSet()</code></td><td><code>Set&lt;T&gt;</code></td></tr>
+      <tr><td>Any collection you choose</td><td><code>toCollection(TreeSet::new)</code></td><td>Your collection type</td></tr>
+      <tr><td>A map</td><td><code>toMap(key, value)</code> and two longer forms</td><td><code>Map&lt;K, V&gt;</code></td></tr>
+      <tr><td>One string</td><td><code>joining()</code>, <code>joining(sep)</code>, <code>joining(sep, prefix, suffix)</code></td><td><code>String</code></td></tr>
+      <tr><td>Count, total, average</td><td><code>counting()</code>, <code>summingInt(f)</code>, <code>averagingInt(f)</code> (also <code>Long</code> and <code>Double</code> versions)</td><td><code>Long</code>, <code>Integer</code>, <code>Double</code></td></tr>
+      <tr><td>Smallest or largest</td><td><code>minBy(cmp)</code>, <code>maxBy(cmp)</code></td><td><code>Optional&lt;T&gt;</code></td></tr>
+      <tr><td>Several statistics at once</td><td><code>summarizingInt(f)</code></td><td><code>IntSummaryStatistics</code></td></tr>
+      <tr><td>Groups and splits</td><td><code>groupingBy</code>, <code>partitioningBy</code>, <code>mapping</code>, <code>filtering</code>, <code>flatMapping</code></td><td>See <a href="#m5-collectors-grouping">the next article</a></td></tr>
+      <tr><td>Post-process or combine</td><td><code>collectingAndThen</code>, <code>teeing</code></td><td>See <a href="#m5-collectors-grouping">the next article</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Lists and sets</h4>
+  <pre data-title="toSet and toCollection"><code class="language-java">Set&lt;String&gt; depts = emps.stream().map(Employee::dept).collect(Collectors.toSet());
+
+TreeSet&lt;String&gt; sortedDepts = emps.stream()
+        .map(Employee::dept)
+        .collect(Collectors.toCollection(TreeSet::new));
+System.out.println(depts.size() + " " + sortedDepts);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">3 [Finance, HR, IT]</code></pre>
+  <p><code>toSet()</code> gives a <code>HashSet</code> in practice, with no order and no promises. When you need a particular type — a sorted <code>TreeSet</code>, an insertion-ordered <code>LinkedHashSet</code>, an <code>ArrayDeque</code> — pass its constructor to <code>toCollection</code>. For lists, prefer <code>stream.toList()</code>, as explained in <a href="#m5-stream-terminal-ops">the previous article</a>.</p>
+
+  <h4>toMap: turning elements into key–value pairs</h4>
+  <p><code>toMap</code> needs two functions: one that computes the <strong>key</strong> from an element and one that computes the <strong>value</strong>. <code>Function.identity()</code> means "the element itself".</p>
+  <pre data-title="toMap basics"><code class="language-java">Map&lt;String, Integer&gt; salaryByName = emps.stream()
+        .collect(Collectors.toMap(Employee::name, Employee::salary));
+Map&lt;String, Employee&gt; byName = emps.stream()
+        .collect(Collectors.toMap(Employee::name, Function.identity()));
+System.out.println(salaryByName.get("Meera") + " " + byName.get("Asha").dept());</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">120000 HR</code></pre>
+  <p>This works only because every name is unique. Use a key that repeats and <code>toMap</code> fails:</p>
+  <pre data-title="Duplicate keys"><code class="language-java">Map&lt;String, String&gt; bad = emps.stream()
+        .collect(Collectors.toMap(Employee::dept, Employee::name));   // dept repeats</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Exception in thread "main" java.lang.IllegalStateException:
+    Duplicate key IT (attempted merging values Ravi and Kiran)</code></pre>
+  <p>The fix is the three-argument form: a <strong>merge function</strong> that says what to do when two elements produce the same key. The four-argument form adds a <strong>map supplier</strong> so you choose the map type (<code>TreeMap</code> for sorted keys, <code>LinkedHashMap</code> for first-seen order).</p>
+  <pre data-title="Merge function and map supplier"><code class="language-java">// Total salary per department, keys sorted
+Map&lt;String, Integer&gt; totalByDept = emps.stream()
+        .collect(Collectors.toMap(Employee::dept, Employee::salary,
+                Integer::sum, TreeMap::new));
+System.out.println(totalByDept);
+
+// Names per department as one string, in first-seen order
+Map&lt;String, String&gt; namesByDept = emps.stream()
+        .collect(Collectors.toMap(Employee::dept, Employee::name,
+                (first, second) -&gt; first + "," + second, LinkedHashMap::new));
+System.out.println(namesByDept);
+
+// Highest-paid employee per department
+Map&lt;String, Employee&gt; topByDept = emps.stream()
+        .collect(Collectors.toMap(Employee::dept, Function.identity(),
+                BinaryOperator.maxBy(Comparator.comparingInt(Employee::salary)),
+                TreeMap::new));
+topByDept.forEach((dept, e) -&gt; System.out.println(dept + " -&gt; " + e.name()));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{Finance=177000, HR=135000, IT=370000}
+{IT=Ravi,Kiran,Meera,Anita, HR=Asha,John, Finance=Kavya,Sanjay}
+Finance -&gt; Sanjay
+HR -&gt; John
+IT -&gt; Meera</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for toMap</p>
+    <ul>
+      <li>Two elements with the same key throw <code>IllegalStateException</code> unless you pass a merge function.</li>
+      <li>A <code>null</code> value throws <code>NullPointerException</code>, even though a plain <code>HashMap</code> allows null values. Replace nulls first or use <code>Optional</code>.</li>
+      <li>The two-argument and three-argument forms return a <code>HashMap</code> in practice, with no ordering. Use the four-argument form for <code>TreeMap</code> or <code>LinkedHashMap</code>.</li>
+      <li>The merge function receives (value already in the map, new value) and returns the value to keep.</li>
+    </ul>
+  </div>
+
+  <h4>joining: many strings into one</h4>
+  <pre data-title="joining"><code class="language-java">String all = emps.stream().map(Employee::name).collect(Collectors.joining(", "));
+String firstThree = emps.stream().limit(3).map(Employee::name)
+        .collect(Collectors.joining(" | ", "[", "]"));
+String digits = Stream.of(3, 1, 4).map(String::valueOf).collect(Collectors.joining());
+System.out.println(all);
+System.out.println(firstThree);
+System.out.println(digits);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Ravi, Asha, Kiran, Meera, John, Kavya, Sanjay, Anita
+[Ravi | Asha | Kiran]
+314</code></pre>
+  <p><code>joining</code> works only on a stream of <code>CharSequence</code> (usually <code>String</code>). If you have numbers or objects, convert with <code>map(String::valueOf)</code> first. The three-argument form adds a prefix and a suffix, which is handy for building SQL <code>IN (...)</code> lists in tests or log lines.</p>
+
+  <h4>Counting, totals, averages and statistics</h4>
+  <pre data-title="Numeric collectors"><code class="language-java">long count = emps.stream().collect(Collectors.counting());
+int total = emps.stream().collect(Collectors.summingInt(Employee::salary));
+double average = emps.stream().collect(Collectors.averagingInt(Employee::salary));
+Optional&lt;Employee&gt; oldest = emps.stream()
+        .collect(Collectors.maxBy(Comparator.comparingInt(Employee::age)));
+IntSummaryStatistics stats = emps.stream()
+        .collect(Collectors.summarizingInt(Employee::salary));
+
+System.out.println(count + " " + total + " " + average + " " + oldest.get().name());
+System.out.println(stats);
+System.out.println(stats.getMin() + " " + stats.getMax() + " " + stats.getAverage());</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">8 682000 85250.0 Sanjay
+IntSummaryStatistics{count=8, sum=682000, min=60000, average=85250.000000, max=120000}
+60000 120000 85250.0</code></pre>
+  <p>Most of these also exist directly on the stream, and for a single number the direct form is shorter. Collectors earn their place <em>inside</em> <code>groupingBy</code> (next article) and when you want several results from one pass.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>You want</th><th>Directly on the stream</th><th>As a collector</th></tr></thead>
+    <tbody>
+      <tr><td>Count</td><td><code>count()</code></td><td><code>Collectors.counting()</code></td></tr>
+      <tr><td>Total</td><td><code>mapToInt(f).sum()</code></td><td><code>Collectors.summingInt(f)</code></td></tr>
+      <tr><td>Average</td><td><code>mapToInt(f).average()</code> — an <code>OptionalDouble</code></td><td><code>Collectors.averagingInt(f)</code> — a plain <code>Double</code>, 0.0 when empty</td></tr>
+      <tr><td>Largest</td><td><code>max(cmp)</code></td><td><code>Collectors.maxBy(cmp)</code></td></tr>
+      <tr><td>All statistics</td><td><code>mapToInt(f).summaryStatistics()</code></td><td><code>Collectors.summarizingInt(f)</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>Collectors.toList()</code>, <code>toSet()</code> and <code>toMap()</code> give <em>no guarantee</em> about the exact type, mutability or thread-safety of what they return. Never cast the result to <code>ArrayList</code> or <code>HashMap</code>; ask for the type you need with <code>toCollection</code> or the map supplier.</li>
+      <li><code>counting()</code> returns a <code>Long</code>, not an <code>int</code>. Compare it with <code>&gt;</code> or <code>==</code> against a number literal (it unboxes), but never use <code>==</code> between two <code>Long</code> objects.</li>
+      <li><code>averagingInt</code> on an empty stream returns <code>0.0</code>, while <code>IntStream.average()</code> returns <code>OptionalDouble.empty()</code>. Pick the one that matches how you want to treat "no data".</li>
+      <li><code>toUnmodifiableList()</code>, <code>toUnmodifiableSet()</code> and <code>toUnmodifiableMap()</code> (Java 10) throw <code>NullPointerException</code> for null elements.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: toMap on a key that can repeat</p>
+    <p>It works in a quick test with unique data and fails in production the day two rows share a key. Ask yourself "can two elements produce the same key?" Whenever the answer is yes or maybe, supply a merge function — or use <code>groupingBy</code>, which is built for repeating keys.</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: fails on the second IT employee</p><pre><code class="language-java">Map&lt;String, Integer&gt; m = emps.stream()
+        .collect(Collectors.toMap(
+                Employee::dept, Employee::salary));</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: merge duplicates explicitly</p><pre><code class="language-java">Map&lt;String, Integer&gt; m = emps.stream()
+        .collect(Collectors.toMap(
+                Employee::dept, Employee::salary, Integer::sum));</code></pre></div>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>For a list use <code>.toList()</code>; for everything else use <code>collect(...)</code>.</li>
+      <li>When the order of a map or set matters (output, tests, JSON), pass <code>TreeMap::new</code>, <code>LinkedHashMap::new</code> or <code>TreeSet::new</code> explicitly.</li>
+      <li>Use method references and <code>Function.identity()</code> instead of <code>e -&gt; e</code>.</li>
+      <li>Do not build maps by hand with <code>forEach</code> and <code>map.put</code> inside a pipeline; that is a side effect.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: a static import shortens long pipelines</p>
+    <p>Many teams write <code>import static java.util.stream.Collectors.*;</code> so the code reads <code>groupingBy(Employee::dept, counting())</code>. It is fine in a file that uses collectors heavily. These notes keep the <code>Collectors.</code> prefix so you can see where each method comes from.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you turn a list into a map? What if keys repeat?"</p>
+    <ul>
+      <li><code>collect(Collectors.toMap(keyFn, valueFn))</code>; duplicates throw <code>IllegalStateException: Duplicate key ...</code>.</li>
+      <li>Fix with a merge function as the third argument; pick the map type with the fourth (<code>LinkedHashMap::new</code> keeps order, <code>TreeMap::new</code> sorts).</li>
+      <li>Null values throw <code>NullPointerException</code>.</li>
+      <li>"Join names with commas": <code>map(...).collect(Collectors.joining(", "))</code>.</li>
+      <li>"Get a sorted set": <code>collect(Collectors.toCollection(TreeSet::new))</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-collectors-grouping">
+  <h3>groupingBy, partitioningBy and downstream collectors</h3>
+  <p class="tldr">groupingBy splits a stream into groups by a key (like SQL GROUP BY), partitioningBy splits it into exactly two groups (true and false), and a downstream collector decides what each group turns into: a list, a count, a sum, an average, a set of names.</p>
+
+  <p>Grouping is the stream version of SQL's <code>GROUP BY</code>. You give <code>groupingBy</code> a <strong>classifier</strong> — a function that returns the group key for each element — and it returns a <code>Map</code> from key to group. By default each group is a <code>List</code>. A <strong>downstream collector</strong> changes that: it receives all the elements of one group and turns them into the map's value.</p>
+  <figure class="fig">
+<pre class="diagram">
+ 8 employees
+     │  classifier: Employee::dept   (gives each element a key)
+     ▼
+ key        group made by groupingBy         after downstream counting()
+ ─────────  ───────────────────────────────  ───────────────────────────
+ IT         Ravi, Kiran, Meera, Anita        4
+ HR         Asha, John                       2
+ Finance    Kavya, Sanjay                    2
+</pre>
+    <figcaption>groupingBy makes the groups; the downstream collector summarises each group</figcaption>
+  </figure>
+  <p>This article uses the same eight employees as <a href="#m5-stream-terminal-ops">the terminal operations article</a>: Ravi, Kiran, Meera and Anita in IT; Asha and John in HR; Kavya and Sanjay in Finance.</p>
+
+  <h4>groupingBy: the three forms</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Form</th><th>Result</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>groupingBy(classifier)</code></td><td><code>Map&lt;K, List&lt;T&gt;&gt;</code></td><td>Each group is a list of the elements</td></tr>
+      <tr><td><code>groupingBy(classifier, downstream)</code></td><td><code>Map&lt;K, D&gt;</code></td><td>Each group is turned into <code>D</code> by the downstream collector</td></tr>
+      <tr><td><code>groupingBy(classifier, mapFactory, downstream)</code></td><td><code>M extends Map&lt;K, D&gt;</code></td><td>Also chooses the map type (<code>TreeMap::new</code>, <code>LinkedHashMap::new</code>)</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Names per department"><code class="language-java">Map&lt;String, List&lt;String&gt;&gt; namesByDept = emps.stream()
+        .collect(Collectors.groupingBy(Employee::dept,
+                Collectors.mapping(Employee::name, Collectors.toList())));
+System.out.println(namesByDept);</code></pre>
+  <pre class="out" data-title="Output (HashMap order is not guaranteed)"><code class="language-plaintext">{Finance=[Kavya, Sanjay], HR=[Asha, John], IT=[Ravi, Kiran, Meera, Anita]}</code></pre>
+  <p>The elements inside each group keep their encounter order. The order of the <em>keys</em> comes from the map, and the default is a <code>HashMap</code>. From here on the examples use the three-argument form with <code>TreeMap::new</code>, so output is sorted and predictable.</p>
+
+  <h4>Common downstream collectors</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Downstream</th><th>Each group becomes</th><th>Example question</th></tr></thead>
+    <tbody>
+      <tr><td><code>counting()</code></td><td><code>Long</code></td><td>How many employees per department?</td></tr>
+      <tr><td><code>summingInt(f)</code></td><td><code>Integer</code></td><td>Total salary per department?</td></tr>
+      <tr><td><code>averagingInt(f)</code>, <code>averagingDouble(f)</code></td><td><code>Double</code></td><td>Average salary per department?</td></tr>
+      <tr><td><code>mapping(f, downstream)</code></td><td>Whatever the inner collector builds</td><td>Only the names, as a set or list?</td></tr>
+      <tr><td><code>filtering(p, downstream)</code> (Java 9)</td><td>Same, after dropping elements</td><td>Names of high earners, keeping empty groups?</td></tr>
+      <tr><td><code>flatMapping(f, downstream)</code> (Java 9)</td><td>Same, after flattening</td><td>All items bought per customer?</td></tr>
+      <tr><td><code>maxBy(cmp)</code>, <code>minBy(cmp)</code></td><td><code>Optional&lt;T&gt;</code></td><td>Highest-paid employee per department?</td></tr>
+      <tr><td><code>summarizingInt(f)</code></td><td><code>IntSummaryStatistics</code></td><td>Min, max, average and count in one go?</td></tr>
+      <tr><td><code>collectingAndThen(down, fn)</code></td><td>The result of <code>fn</code></td><td>Unwrap the Optional, make the list unmodifiable</td></tr>
+      <tr><td><code>groupingBy(...)</code> again</td><td>A nested map</td><td>Group by department, then by age band</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Counting, summing, averaging"><code class="language-java">Map&lt;String, Long&gt; headcount = emps.stream()
+        .collect(Collectors.groupingBy(Employee::dept, TreeMap::new,
+                Collectors.counting()));
+Map&lt;String, Integer&gt; payroll = emps.stream()
+        .collect(Collectors.groupingBy(Employee::dept, TreeMap::new,
+                Collectors.summingInt(Employee::salary)));
+Map&lt;String, Double&gt; avgSalary = emps.stream()
+        .collect(Collectors.groupingBy(Employee::dept, TreeMap::new,
+                Collectors.averagingInt(Employee::salary)));
+System.out.println(headcount);
+System.out.println(payroll);
+System.out.println(avgSalary);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{Finance=2, HR=2, IT=4}
+{Finance=177000, HR=135000, IT=370000}
+{Finance=88500.0, HR=67500.0, IT=92500.0}</code></pre>
+  <pre data-title="Names, top earner, statistics"><code class="language-java">Map&lt;String, Set&lt;String&gt;&gt; nameSets = emps.stream()
+        .collect(Collectors.groupingBy(Employee::dept, TreeMap::new,
+                Collectors.mapping(Employee::name,
+                        Collectors.toCollection(TreeSet::new))));
+
+Map&lt;String, String&gt; topEarner = emps.stream()
+        .collect(Collectors.groupingBy(Employee::dept, TreeMap::new,
+                Collectors.collectingAndThen(
+                        Collectors.maxBy(Comparator.comparingInt(Employee::salary)),
+                        best -&gt; best.get().name())));
+
+Map&lt;String, IntSummaryStatistics&gt; stats = emps.stream()
+        .collect(Collectors.groupingBy(Employee::dept, TreeMap::new,
+                Collectors.summarizingInt(Employee::salary)));
+
+System.out.println(nameSets);
+System.out.println(topEarner);
+System.out.println(stats.get("IT"));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{Finance=[Kavya, Sanjay], HR=[Asha, John], IT=[Anita, Kiran, Meera, Ravi]}
+{Finance=Sanjay, HR=John, IT=Meera}
+IntSummaryStatistics{count=4, sum=370000, min=70000, average=92500.000000, max=120000}</code></pre>
+  <p>In the second example, <code>maxBy</code> returns an <code>Optional</code>. Inside a group it is never empty (a group exists only because it has elements), so <code>collectingAndThen</code> unwraps it safely with <code>best.get()</code>. This is one of the few places where calling <code>get()</code> is fine.</p>
+
+  <h4>Nested grouping</h4>
+  <p>Use another <code>groupingBy</code> as the downstream collector to group twice: first by department, then by an age band.</p>
+  <pre data-title="Department, then age band"><code class="language-java">Map&lt;String, Map&lt;String, List&lt;String&gt;&gt;&gt; nested = emps.stream()
+        .collect(Collectors.groupingBy(Employee::dept, TreeMap::new,
+                Collectors.groupingBy(e -&gt; e.age() &gt;= 30 ? "30+" : "under 30",
+                        TreeMap::new,
+                        Collectors.mapping(Employee::name, Collectors.toList()))));
+nested.forEach((dept, byAge) -&gt; System.out.println(dept + " " + byAge));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Finance {30+=[Sanjay], under 30=[Kavya]}
+HR {30+=[John], under 30=[Asha]}
+IT {30+=[Ravi, Meera], under 30=[Kiran, Anita]}</code></pre>
+
+  <h4>partitioningBy: exactly two groups</h4>
+  <p><code>partitioningBy(predicate)</code> splits the stream into <code>true</code> and <code>false</code>. The map always has both keys, even if one group is empty — something <code>groupingBy</code> with a boolean classifier does not promise. It also accepts a downstream collector.</p>
+  <pre data-title="partitioningBy"><code class="language-java">Map&lt;Boolean, List&lt;String&gt;&gt; split = emps.stream()
+        .collect(Collectors.partitioningBy(e -&gt; e.salary() &gt;= 90000,
+                Collectors.mapping(Employee::name, Collectors.toList())));
+Map&lt;Boolean, Long&gt; counts = emps.stream()
+        .collect(Collectors.partitioningBy(e -&gt; e.salary() &gt; 500000,
+                Collectors.counting()));
+System.out.println(split);
+System.out.println(counts);
+System.out.println(split.get(true).size());</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{false=[Asha, John, Kavya, Anita], true=[Ravi, Kiran, Meera, Sanjay]}
+{false=8, true=0}
+4</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>groupingBy</code></th><th><code>partitioningBy</code></th></tr></thead>
+    <tbody>
+      <tr><td>Number of groups</td><td>Any number</td><td>Exactly two</td></tr>
+      <tr><td>Key type</td><td>Anything (not <code>null</code>)</td><td><code>Boolean</code></td></tr>
+      <tr><td>Takes</td><td>A classifier function</td><td>A <code>Predicate</code></td></tr>
+      <tr><td>Empty group</td><td>Key is absent</td><td>Key is present with an empty result</td></tr>
+      <tr><td>Map type</td><td>Your choice (3-argument form)</td><td>Fixed</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>filtering vs filter</h4>
+  <p>Filtering <em>before</em> grouping removes elements, and a group with no survivors disappears. <code>Collectors.filtering</code> filters <em>inside</em> each group, so the group stays, with an empty result. Choose based on whether you want to see the empty groups.</p>
+  <pre data-title="filter before vs filtering inside"><code class="language-java">Map&lt;String, List&lt;String&gt;&gt; before = emps.stream()
+        .filter(e -&gt; e.salary() &gt; 85000)
+        .collect(Collectors.groupingBy(Employee::dept, TreeMap::new,
+                Collectors.mapping(Employee::name, Collectors.toList())));
+
+Map&lt;String, List&lt;String&gt;&gt; inside = emps.stream()
+        .collect(Collectors.groupingBy(Employee::dept, TreeMap::new,
+                Collectors.filtering(e -&gt; e.salary() &gt; 85000,
+                        Collectors.mapping(Employee::name, Collectors.toList()))));
+System.out.println(before);
+System.out.println(inside);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{Finance=[Sanjay], IT=[Ravi, Kiran, Meera]}
+{Finance=[Sanjay], HR=[], IT=[Ravi, Kiran, Meera]}</code></pre>
+  <p><code>flatMapping</code> is the same idea for <code>flatMap</code>: each element contributes several values to its group. With orders that each contain items, <code>groupingBy(Order::customer, flatMapping(o -&gt; o.items().stream(), toSet()))</code> gives every distinct item each customer ever bought.</p>
+
+  <h4>collectingAndThen and teeing</h4>
+  <p><code>collectingAndThen(downstream, finisher)</code> runs a collector and then transforms its result — unwrap an <code>Optional</code>, or wrap a list as unmodifiable: <code>collectingAndThen(Collectors.toList(), Collections::unmodifiableList)</code>.</p>
+  <p><code>teeing</code> (Java 12) sends every element to <em>two</em> collectors in a single pass and then merges their two results. Use it when you need two answers from one stream.</p>
+  <pre data-title="teeing: two results, one pass"><code class="language-java">double average = emps.stream().collect(Collectors.teeing(
+        Collectors.summingInt(Employee::salary),
+        Collectors.counting(),
+        (sum, n) -&gt; (double) sum / n));
+
+record Range(int min, int max) {}
+Range range = emps.stream().collect(Collectors.teeing(
+        Collectors.minBy(Comparator.comparingInt(Employee::salary)),
+        Collectors.maxBy(Comparator.comparingInt(Employee::salary)),
+        (lo, hi) -&gt; new Range(lo.get().salary(), hi.get().salary())));
+System.out.println(average);
+System.out.println(range);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">85250.0
+Range[min=60000, max=120000]</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>The classifier must never return <code>null</code>. It throws <code>NullPointerException: element cannot be mapped to a null key</code>. Return a placeholder such as <code>"UNKNOWN"</code> for missing values.</li>
+      <li>A group exists only if at least one element has that key; there are no empty groups (except with <code>partitioningBy</code> and <code>filtering</code>).</li>
+      <li>Inside one group the elements keep their encounter order.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge case: println and TreeMap::new do not mix</p>
+    <p>If you pass a whole <code>collect(groupingBy(..., TreeMap::new, ...))</code> expression directly to <code>System.out.println(...)</code>, javac can fail with <code>error: method println in class PrintStream cannot be applied to given types ... inference variable R has incompatible bounds</code>. <code>println</code> has many overloads, and the constructor reference leaves the compiler without enough type information to choose one. Assign the result to a typed variable first, as the examples here do.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: sorting a map you got from groupingBy</p>
+    <p>A <code>HashMap</code> has no order, so you cannot sort it in place. Choose the order when you build it (<code>TreeMap::new</code> sorts by key, <code>LinkedHashMap::new</code> keeps insertion order). To sort by value, stream the entries and sort them (see the interview recipes).</p>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Reports and dashboards: orders per status, revenue per day, errors per service, top product per category. When the data lives in a database, group in SQL (<code>GROUP BY</code>) — it is faster and uses less memory. Use stream grouping for data that is already in memory: results of several service calls, a CSV file, a cache.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "groupingBy vs partitioningBy?" and "What is a downstream collector?"</p>
+    <ul>
+      <li><code>groupingBy</code>: any number of groups by a key function; <code>partitioningBy</code>: exactly two groups by a predicate, both keys always present.</li>
+      <li>A downstream collector processes the elements of each group: <code>counting()</code>, <code>summingInt</code>, <code>averagingInt</code>, <code>mapping</code>, <code>maxBy</code>, another <code>groupingBy</code>.</li>
+      <li>Classic questions: "count per department" (<code>counting</code>), "average salary per department" (<code>averagingInt</code>), "names per department" (<code>mapping</code>), "highest paid per department" (<code>maxBy</code> + <code>collectingAndThen</code>, or <code>toMap</code> with <code>BinaryOperator.maxBy</code>).</li>
+      <li>Pass <code>TreeMap::new</code> as the map factory for sorted keys.</li>
+      <li><code>filtering</code> inside a group keeps empty groups; <code>filter</code> before grouping drops them.</li>
+      <li><code>teeing</code> (Java 12) gives two results from one pass.</li>
+    </ul>
+  </div>
+</article>

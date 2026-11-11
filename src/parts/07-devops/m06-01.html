@@ -1,0 +1,419 @@
+<div class="mintro">
+  <p>Deploying is only half the job. Once real users arrive, you need to know when the app is down, why it
+  crashed, how slow it is, and how much room is left. This module covers the everyday skills first: reading logs
+  on a server, finding out why an app died, health checks and uptime alerts. These are the <span class="chip pri-must">Must</span>
+  skills for a backend developer.</p>
+  <p>The second half is <span class="chip pri-later">Later</span> material that you do not need for your first
+  job but will meet soon after: Prometheus and Grafana for metrics, Kubernetes for running many containers, and
+  Terraform for creating infrastructure from code. Learn the first half now and read the second half to know
+  what exists and how to talk about it. It builds on <a href="#m3">Docker</a>, <a href="#m4">CI/CD</a> and
+  <a href="#m5">Cloud and deployment</a>, and on Actuator from
+  <a href="04-spring-boot.html#m6">Spring Boot · Module 6</a>.</p>
+  <ul>
+    <li>Read and search logs from Docker, systemd and files, and keep them from filling the disk.</li>
+    <li>Diagnose the usual crashes: out of memory, port in use, database refused, missing configuration.</li>
+    <li>Explain logs, metrics and traces, and the four golden signals.</li>
+    <li>Set up health checks, uptime monitoring and alerts to your phone.</li>
+    <li>Run Prometheus and Grafana with Spring Boot and write basic PromQL.</li>
+    <li>Explain Kubernetes objects, read a Deployment and Service YAML, and describe what Terraform does.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m6-logs-server">
+  <h3>Reading your app's logs on a server</h3>
+  <p class="tldr">Run <code>docker compose logs -f --tail 100 api</code> (or <code>journalctl -u shop -f</code>
+  for a systemd service) to follow the application log, search it with <code>grep</code> and <code>less</code>,
+  and rotate logs so they cannot fill the disk.</p>
+
+  <h4>Where logs live</h4>
+  <p>A <strong>log</strong> is a time-ordered text record of what the application did and what went wrong. Where
+  you find it depends on how the app runs:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>How it runs</th><th>Where the log is</th><th>Command</th></tr></thead>
+    <tbody>
+      <tr><td>Docker container</td><td>Captured from stdout/stderr by Docker</td><td><code>docker logs</code></td></tr>
+      <tr><td>Docker Compose</td><td>Same, grouped by service</td><td><code>docker compose logs</code></td></tr>
+      <tr><td>systemd service (a JAR)</td><td>The journal</td><td><code>journalctl -u shop</code></td></tr>
+      <tr><td>Plain process with file logging</td><td>A file such as <code>/var/log/shop/app.log</code></td><td><code>tail</code>, <code>less</code></td></tr>
+      <tr><td>Nginx</td><td><code>/var/log/nginx/access.log</code> and <code>error.log</code></td><td><code>tail</code>, <code>grep</code></td></tr>
+      <tr><td>PaaS (Render, Railway)</td><td>The platform's log viewer</td><td>Dashboard or CLI</td></tr>
+    </tbody>
+  </table></div>
+  <p>Spring Boot writes to the console (stdout) by default. In containers that is exactly right: the platform
+  collects stdout, and the app does not manage files. This is one of the twelve-factor ideas: treat logs as an
+  event stream.</p>
+
+  <h4>Docker and Compose</h4>
+  <pre data-title="Docker logs"><code class="language-shell">$ docker logs shop-api                      # everything since the container started
+$ docker logs --tail 100 shop-api           # the last 100 lines
+$ docker logs -f --tail 100 shop-api        # follow new lines (Ctrl+C to stop)
+$ docker logs --since 10m shop-api          # the last 10 minutes
+$ docker logs -t shop-api | tail            # add Docker's timestamps
+
+$ cd /opt/shop
+$ docker compose logs -f --tail 100 api     # one service
+$ docker compose logs -f                    # all services, interleaved
+$ docker compose logs --no-color --since 1h api &gt; api.log   # save for sharing</code></pre>
+  <p>Note that <code>docker logs</code> shows logs of a container that still exists, even if stopped. When a
+  container is <em>removed</em> (for example by <code>docker compose down</code> or a recreate), its json log
+  file is removed with it. After a crash, look first, then restart.</p>
+
+  <h4>systemd and the journal</h4>
+  <pre data-title="journalctl"><code class="language-shell">$ journalctl -u shop -f                         # follow
+$ journalctl -u shop -n 200 --no-pager          # last 200 lines
+$ journalctl -u shop --since "1 hour ago"
+$ journalctl -u shop --since "2026-11-11 09:00" --until "2026-11-11 09:30"
+$ journalctl -u shop -p err                     # only errors and worse
+$ journalctl -b -1                              # the previous boot, useful after a crash/reboot
+$ journalctl -u docker --since today            # logs of the Docker service itself</code></pre>
+  <p>Add <code>sudo</code> if your user is not in the <code>systemd-journal</code> group. The journal's size
+  can be capped with <code>SystemMaxUse=500M</code> in <code>/etc/systemd/journald.conf</code>.</p>
+
+  <h4>Searching logs: grep, less, awk</h4>
+  <pre data-title="Searching"><code class="language-shell">$ docker compose logs api | grep -i error                  # case-insensitive
+$ docker compose logs api | grep -C 5 "NullPointerException"  # 5 lines around each match
+$ docker compose logs api | grep -c "WARN"                 # count matches
+$ grep -r "OrderService" /var/log/shop/ | tail             # search several files
+$ zgrep "ERROR" /var/log/shop/app.log.*.gz                 # search rotated, compressed logs
+$ less +F /var/log/shop/app.log                            # follow inside less; Ctrl+C to stop following
+
+# Nginx access log: count responses per status code
+$ awk '{print $9}' /var/log/nginx/access.log | sort | uniq -c | sort -rn
+# the busiest client IPs
+$ awk '{print $1}' /var/log/nginx/access.log | sort | uniq -c | sort -rn | head</code></pre>
+  <p>Inside <code>less</code>: <kbd>/</kbd> then a word searches forward, <kbd>n</kbd> jumps to the next match,
+  <kbd>G</kbd> goes to the end, <kbd>g</kbd> to the start, <kbd>q</kbd> quits. In the default Nginx log format
+  the status code is the 9th space-separated field, which is why the <code>awk</code> line works; if you change
+  the log format, adjust it.</p>
+
+  <h4>Log levels and Spring Boot settings</h4>
+  <p>Levels from quiet to loud are ERROR, WARN, INFO, DEBUG, TRACE. Production usually runs at INFO for your
+  code and WARN for libraries. Set levels in properties or environment variables:</p>
+  <pre data-title="application-prod.properties"><code class="language-properties">logging.level.root=WARN
+logging.level.com.shop=INFO
+# only if you must log to a file (not needed in containers):
+logging.file.name=/var/log/shop/app.log
+logging.logback.rollingpolicy.max-file-size=20MB
+logging.logback.rollingpolicy.max-history=14</code></pre>
+  <p>With Actuator's <code>loggers</code> endpoint exposed (and protected!), you can change a level on a running
+  app without restarting, which is handy for a short debugging session:</p>
+  <pre data-title="Raise one package to DEBUG, then back"><code class="language-shell">$ curl -X POST -H "Content-Type: application/json" \
+    -d '{"configuredLevel":"DEBUG"}' http://127.0.0.1:8080/actuator/loggers/com.shop.orders
+$ curl -X POST -H "Content-Type: application/json" \
+    -d '{"configuredLevel":null}' http://127.0.0.1:8080/actuator/loggers/com.shop.orders</code></pre>
+  <div class="co co-version">
+    <p class="co-t">Version note: structured logging</p>
+    <p>Spring Boot 3.4 and later (including 4.x) can write logs as JSON for log tools using properties such as
+    <code>logging.structured.format.console=ecs</code> (other formats include logstash). On older 3.x versions use
+    a Logback encoder library. JSON logs are far easier to search in a central system.</p>
+  </div>
+
+  <h4>Stop logs from filling the disk</h4>
+  <p>A full disk kills a server: the database cannot write, the app crashes, even SSH can misbehave. Docker's
+  default <code>json-file</code> driver keeps logs forever unless you limit them. Set limits per service in
+  Compose (as in the <a href="#m5-deploy-runbook">runbook</a>), or for all containers in
+  <code>/etc/docker/daemon.json</code>:</p>
+  <pre data-title="/etc/docker/daemon.json"><code class="language-json">{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}</code></pre>
+  <p>Restart Docker after editing (<code>sudo systemctl restart docker</code>); the new default applies only to
+  containers created afterwards. For plain log files, <strong>logrotate</strong> renames, compresses and deletes
+  old files on a schedule:</p>
+  <pre data-title="/etc/logrotate.d/shop"><code class="language-plaintext">/var/log/shop/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+}</code></pre>
+  <p><code>copytruncate</code> copies the file and empties the original, so a running app that keeps the file
+  open continues to write without a restart. Check space regularly with <code>df -h</code>,
+  <code>du -sh /var/log/*</code> and <code>docker system df</code>.</p>
+
+  <h4>Centralised logging, in one paragraph</h4>
+  <p>With one server, SSH and <code>grep</code> are enough. With many servers or containers, logs vanish when a
+  container is replaced and searching ten machines by hand is painful. A <strong>centralised logging</strong>
+  system ships every log line to one searchable place. Two popular stacks are <strong>ELK</strong>
+  (Elasticsearch stores and indexes, Logstash or Beats ship, Kibana searches and charts) and
+  <strong>Loki with Grafana</strong> (an agent such as Promtail or Grafana Alloy ships logs; Loki indexes only
+  labels, so it is lighter; you search in Grafana). On AWS, CloudWatch Logs does this for you. Use
+  structured JSON logs and a correlation (request) ID in every line so one request can be followed across
+  services.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: never log secrets or personal data</p>
+    <p>Do not log passwords, JWTs, API keys, full card numbers or whole request bodies. Logs are copied, shared
+    and kept for months, and many people can read them.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Running at DEBUG in production: huge logs, slower app, leaked data.</li>
+      <li>Restarting or recreating the container before reading the log of the crash.</li>
+      <li>Using <code>System.out.println</code> or <code>e.printStackTrace()</code> instead of a logger with
+      levels and timestamps.</li>
+      <li>No limit on Docker log size, then "No space left on device" months later.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you debug a production problem using logs?"</p>
+    <ul>
+      <li>Find the time window, follow or filter the logs (<code>--since</code>, <code>grep -C</code>), find the
+      first error (not the last), use a request ID to follow one request, check the stack trace's "Caused by".</li>
+      <li>Mention log levels, rotation, structured logs and centralised logging for many servers.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-crash-walkthrough">
+  <h3>Why did my app crash? A step-by-step walkthrough</h3>
+  <p class="tldr">Check whether the container or service is running and how it exited, read the lines just before
+  the death, then match the symptom to one of the usual causes: killed for memory (exit 137), port already in
+  use, database refused, missing environment variable, or a full disk.</p>
+
+  <h4>The method</h4>
+  <p>Do not guess and do not restart blindly. Follow the same order every time:</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A["App is down or restarting"] --> B["Is it running? docker compose ps"]
+  B --> C["How did it exit? exit code, OOMKilled"]
+  C --> D["Read the last log lines before the end"]
+  D --> E{"Stack trace or failure analysis?"}
+  E -->|"yes"| F["Fix the named cause"]
+  E -->|"no log at all"| G["Killed from outside: dmesg, memory, disk"]
+  F --> H["Redeploy and watch health"]
+  G --> H
+</pre>
+    <figcaption>A repeatable order for investigating a crash</figcaption>
+  </figure>
+  <pre data-title="The first four commands"><code class="language-shell">$ docker compose ps -a                        # status and exit code (Exited (137) ...)
+$ docker inspect -f '{{.State.ExitCode}} oom={{.State.OOMKilled}}' shop-api-1
+137 oom=true
+$ docker compose logs --tail 200 api          # the end of the log
+$ df -h / ; free -h                           # disk and memory right now</code></pre>
+  <p><strong>Exit codes</strong> tell a lot. <code>0</code> means a clean exit. <code>1</code> means the
+  application failed (an exception during startup). <code>137</code> means the process received SIGKILL (128 + 9),
+  most often from the out-of-memory killer. <code>143</code> means SIGTERM (128 + 15): a normal stop request
+  from <code>docker stop</code> or a deploy.</p>
+
+  <h4>Cause 1: the process was killed for memory (exit 137)</h4>
+  <p><strong>Symptom:</strong> the container restarts at random times, exit code 137, <code>OOMKilled</code> is
+  true, and the app log simply stops with <em>no stack trace</em>, because the kernel killed the process
+  instantly.</p>
+  <pre data-title="Confirm in the kernel log"><code class="language-shell">$ sudo dmesg -T | grep -i -E "out of memory|killed process"
+[Tue Nov 11 09:14:02 2026] Out of memory: Killed process 4218 (java) total-vm:3482112kB ...</code></pre>
+  <p><strong>Why:</strong> the JVM uses more than heap (metaspace, thread stacks, buffers), and the machine or
+  container limit is smaller than the total. <strong>Fix:</strong> give the JVM less than the limit with
+  <code>-XX:MaxRAMPercentage=75</code> (in <code>JAVA_TOOL_OPTIONS</code>), move to a bigger instance, add swap
+  as a safety net, stop other memory eaters, and look for a leak.</p>
+  <p>Do not confuse this with a Java-level <code>java.lang.OutOfMemoryError: Java heap space</code>, which
+  <em>is</em> in the log with a stack trace: the heap itself was too small or leaking. To study it, run with
+  <code>-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp</code> and open the dump in a tool such as
+  Eclipse MAT or VisualVM (see <a href="02-core-java.html#m7">Core Java · Module 7</a>).</p>
+
+  <h4>Cause 2: the port is already in use</h4>
+  <pre class="out" data-title="Log"><code class="language-plaintext">***************************
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+Web server failed to start. Port 8080 was already in use.
+
+Action:
+
+Identify and stop the process that's listening on port 8080 or configure
+this application to listen on another port.</code></pre>
+  <p><strong>Find the owner:</strong></p>
+  <pre data-title="Who is using port 8080?"><code class="language-shell">$ sudo ss -ltnp | grep ':8080'
+LISTEN 0 100 *:8080 *:* users:(("java",pid=2311,fd=9))
+$ docker ps --format '{{.Names}} {{.Ports}}' | grep 8080</code></pre>
+  <p>Typical reasons: an old copy of the app (a forgotten manual <code>java -jar</code>), two containers
+  publishing the same host port, or a new container started before the old one released the port. Stop the
+  other process, or map a different host port.</p>
+
+  <h4>Cause 3: the database refuses the connection</h4>
+  <pre class="out" data-title="Log"><code class="language-plaintext">HikariPool-1 - Exception during pool initialization.
+org.postgresql.util.PSQLException: Connection to localhost:5432 refused.
+Check that the hostname and port are correct and that the postmaster is accepting TCP/IP connections.
+Caused by: java.net.ConnectException: Connection refused</code></pre>
+  <p>Read the host in the message. Check, in this order:</p>
+  <ol class="steps">
+    <li><strong>Wrong host.</strong> <code>localhost</code> inside a container means the container itself. Use
+    the Compose service name (<code>postgres</code>) or the RDS endpoint (see
+    <a href="#m3-networks">Docker networks</a>).</li>
+    <li><strong>Database not ready or not running.</strong> <code>docker compose ps</code>; use a healthcheck
+    and <code>depends_on: condition: service_healthy</code>.</li>
+    <li><strong>Network rule.</strong> For RDS, a <em>timeout</em> (not "refused") usually means the security
+    group does not allow the app's group on 5432.</li>
+    <li><strong>Credentials.</strong> <em>password authentication failed for user</em> means the host is
+    reachable but the user or password is wrong. <em>database "shop" does not exist</em> means a wrong name.</li>
+    <li><strong>Too many connections.</strong> Pool size times instances is above the server limit.</li>
+  </ol>
+  <pre data-title="Test the connection from the same place the app runs"><code class="language-shell">$ docker compose exec api sh -c 'getent hosts postgres'
+$ docker run --rm --network shop_default postgres:16 \
+    psql -h postgres -U shop_app -d shop -c 'select 1'</code></pre>
+
+  <h4>Cause 4: a missing or wrong environment variable</h4>
+  <pre class="out" data-title="Log"><code class="language-plaintext">Caused by: java.lang.IllegalArgumentException:
+Could not resolve placeholder 'JWT_SECRET' in value "${JWT_SECRET}"</code></pre>
+  <p>The code expects a variable that the container does not have. See what the container actually got, and what
+  Compose resolved:</p>
+  <pre data-title="Check the environment"><code class="language-shell">$ docker compose config | grep -A 12 environment     # after variable substitution
+$ docker compose exec api env | grep -E "SPRING|JWT|DB_"</code></pre>
+  <p>Common reasons: the variable is missing from <code>.env</code>, a typo in the name, a value with a space or
+  special character that needs quotes, an <code>env_file</code> path that is wrong, or the container was not
+  recreated after the file changed (<code>docker compose up -d</code> recreates only when the configuration
+  differs, so run it again after editing, and check).</p>
+
+  <h4>Cause 5: the disk is full</h4>
+  <pre class="out" data-title="Symptoms"><code class="language-plaintext">java.io.IOException: No space left on device
+ERROR: could not write to file "pg_wal/xlogtemp.123": No space left on device</code></pre>
+  <pre data-title="Find the space hog"><code class="language-shell">$ df -h
+$ sudo du -xh / --max-depth=2 2&gt;/dev/null | sort -rh | head -15
+$ docker system df
+$ docker system prune -f              # removes stopped containers, dangling images, unused networks
+$ sudo journalctl --vacuum-size=200M  # shrink the journal</code></pre>
+  <p>Typical culprits: unlimited container logs, old images, a growing upload folder, a database dump left in
+  place. Fix by cleaning, then add log rotation and a disk alert so it does not return.</p>
+
+  <h4>More causes worth a quick check</h4>
+  <ul>
+    <li><strong>Wrong Java version:</strong> <code>UnsupportedClassVersionError</code> means the JAR was compiled for a
+    newer Java than the runtime image provides.</li>
+    <li><strong>Migration failed:</strong> Flyway reports a checksum mismatch or a failed script; the app refuses
+    to start. Read the migration name in the log.</li>
+    <li><strong>The health check kills a slow starter:</strong> an orchestrator restarts the app before it
+    finished starting; add a startup probe or a longer initial delay.</li>
+    <li><strong>Permissions:</strong> the app cannot write to a mounted folder owned by root.</li>
+    <li><strong>Certificates or DNS:</strong> <code>UnknownHostException</code> for an external API, or SSL
+    handshake errors, point to network or trust problems.</li>
+  </ul>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: write a post-mortem note</p>
+    <p>After fixing, write three lines: what happened, the cause, what you changed so it will not repeat (a
+    memory limit, an alert, a test). This habit is what turns incidents into experience, and interviewers like
+    to hear one real story.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>With <code>restart: unless-stopped</code>, a crash loop can restart the app every few seconds and
+      fill the log. Use <code>docker compose ps</code> to see the restart count, and stop the loop to investigate.</li>
+      <li>The first error in a log is usually the real cause. Later errors are often side effects.</li>
+      <li>A Java <code>OutOfMemoryError</code> for "unable to create native thread" is about the OS thread or
+      memory limit, not the heap.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "The app keeps restarting in production. What do you do?"</p>
+    <ul>
+      <li>Check status and exit code, read the log before the exit, check memory and disk, then match the cause
+      (137 OOM, port conflict, DB connection, missing config). Fix, redeploy, verify the health endpoint, and add
+      monitoring so you hear about it first next time.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-observability">
+  <h3>Observability: logs, metrics, traces and the golden signals</h3>
+  <p class="tldr">Observability means you can understand what a running system is doing from its outputs: logs
+  say what happened, metrics say how much and how fast, traces show the path of one request; watch the four golden
+  signals (latency, traffic, errors, saturation) to know whether users are happy.</p>
+
+  <h4>Monitoring vs observability</h4>
+  <p><strong>Monitoring</strong> watches known things: "is the site up, is CPU above 90%?". It answers the
+  questions you thought of in advance. <strong>Observability</strong> is the ability to ask new questions about a
+  live system ("why are orders from one city slow since 3 pm?") using the data it emits, without shipping new
+  code first. You need both: monitoring tells you something is wrong, observability helps you find out why.</p>
+
+  <h4>The three pillars</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pillar</th><th>What it is</th><th>Good for</th><th>Typical tools</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Logs</strong></td><td>Timestamped events with details</td><td>"What exactly happened in this request?"</td><td>Docker logs, ELK, Loki, CloudWatch</td></tr>
+      <tr><td><strong>Metrics</strong></td><td>Numbers sampled over time (counters, gauges, histograms)</td><td>Trends, dashboards, alerts</td><td>Prometheus, Grafana, CloudWatch</td></tr>
+      <tr><td><strong>Traces</strong></td><td>The timeline of one request across services, as nested spans</td><td>"Which service made this slow?"</td><td>OpenTelemetry, Zipkin, Jaeger, Tempo</td></tr>
+    </tbody>
+  </table></div>
+  <p>Metrics are cheap and compact, so they power alerts. Logs are rich but heavy. Traces matter most in
+  microservices, where one user click touches many services; see
+  <a href="04-spring-boot.html#m7">Spring Boot · Module 7</a> for Micrometer Tracing and distributed tracing.
+  The three connect through shared identifiers: a trace ID printed in each log line lets you jump from a slow
+  trace to its logs.</p>
+
+  <h4>The four golden signals</h4>
+  <p>Google's Site Reliability Engineering book names four signals that describe the health of almost any
+  service. If you can watch only four things, watch these.</p>
+  <dl class="terms">
+    <dt>Latency</dt><dd>How long requests take. Look at percentiles (p50, p95, p99), not the average, because the
+    slowest 1% of users matter. Separate the latency of failed requests from successful ones.</dd>
+    <dt>Traffic</dt><dd>How much demand: requests per second, messages per minute.</dd>
+    <dt>Errors</dt><dd>The rate of failing requests: HTTP 5xx, exceptions, timeouts, and wrong results.</dd>
+    <dt>Saturation</dt><dd>How full the system is: CPU, memory, disk, thread pool, database connection pool,
+    queue length. Latency rises sharply as saturation nears 100%.</dd>
+  </dl>
+  <p>Two shortcuts help you choose metrics: the <strong>RED method</strong> for request-driven services
+  (<strong>R</strong>ate, <strong>E</strong>rrors, <strong>D</strong>uration), and the <strong>USE
+  method</strong> for resources like CPU, disk and network (<strong>U</strong>tilisation,
+  <strong>S</strong>aturation, <strong>E</strong>rrors). RED tells you how users feel; USE tells you which
+  machine part is the bottleneck.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Golden signal</th><th>Spring Boot / JVM example</th></tr></thead>
+    <tbody>
+      <tr><td>Latency</td><td><code>http.server.requests</code> timer (p95), database query time</td></tr>
+      <tr><td>Traffic</td><td>Request count per second per endpoint</td></tr>
+      <tr><td>Errors</td><td>Count of responses with status 5xx; exceptions per minute</td></tr>
+      <tr><td>Saturation</td><td>JVM heap used vs max, GC pause time, Hikari active connections vs max, Tomcat threads busy, CPU, disk</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>What to alert on</h4>
+  <p>Alert on symptoms users feel, not on every cause. "Error rate above 5% for 5 minutes" and "p95 latency above
+  one second for 10 minutes" are good alerts. "CPU above 80% for a minute" often is not: it may be fine, and it wakes
+  you for nothing. Too many alerts cause <strong>alert fatigue</strong>, and people begin to ignore them. Every
+  alert should be actionable, and link to a runbook that says what to check first. Terms you will hear:
+  <strong>SLI</strong> (service level indicator: a measured number such as the percentage of successful
+  requests), <strong>SLO</strong> (the target for it, such as 99.9% over 30 days) and the <strong>error
+  budget</strong> (how much failure the SLO still allows, used to decide between shipping features and fixing
+  reliability).</p>
+
+  <h4>The path you will take in this module</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A["Spring Boot + Actuator + Micrometer"] -->|"/actuator/health"| B["Uptime monitor"]
+  A -->|"/actuator/prometheus"| C[Prometheus]
+  C --> D[Grafana dashboards]
+  C --> E[Alert rules]
+  B --> F["Email, Slack, Telegram"]
+  E --> F
+  A -->|"stdout"| G["Logs (Docker, Loki, CloudWatch)"]
+</pre>
+    <figcaption>Health checks, metrics and logs flowing from one Spring Boot app</figcaption>
+  </figure>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Looking at average latency only; a few very slow requests hide inside it.</li>
+      <li>Metrics with unbounded labels (a user ID or full URL as a label): the number of time series explodes
+      and memory runs out (<strong>high cardinality</strong>). Use the URI template
+      <code>/orders/{id}</code>, not <code>/orders/42</code>.</li>
+      <li>Dashboards nobody looks at, and alerts nobody acts on.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is observability? What are the golden signals?"</p>
+    <ul>
+      <li>Logs, metrics and traces help you explain system behaviour from outside. The golden signals are
+      latency, traffic, errors and saturation. Use percentiles; alert on user-visible symptoms; link alerts to
+      runbooks.</li>
+      <li>Mention RED for services, USE for resources, and OpenTelemetry as the vendor-neutral standard.</li>
+    </ul>
+  </div>
+</article>

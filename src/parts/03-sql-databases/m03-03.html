@@ -1,0 +1,375 @@
+<article class="topic" id="m3-views">
+  <h3>Views, updatable views and materialized views</h3>
+  <p class="tldr">A <strong>view</strong> is a saved query with a name that you use like a table. It stores no
+  data, so it is always current. A <strong>materialized view</strong> (PostgreSQL) does store the result and must
+  be refreshed. Views hide complexity and sensitive columns.</p>
+
+  <h4>What and why</h4>
+  <p>Some queries are used again and again: the join of orders, items and products, or the department summary
+  every dashboard needs. Instead of pasting that SQL into ten places, save it once as a view. Callers write
+  <code>SELECT * FROM department_summary</code> and the database substitutes the saved query. Reasons to use
+  views:</p>
+  <ul>
+    <li><strong>Reuse:</strong> one definition of a business rule ("what counts as revenue").</li>
+    <li><strong>Simplicity:</strong> hide joins and calculations from report writers and from the application.</li>
+    <li><strong>Security:</strong> expose some columns or rows and not others.</li>
+    <li><strong>Stable interface:</strong> change the tables underneath and keep the view's shape.</li>
+  </ul>
+
+  <h4>Creating a view</h4>
+  <pre data-title="A summary view"><code class="language-sql">CREATE OR REPLACE VIEW department_summary AS
+SELECT d.dept_id,
+       d.name,
+       COUNT(e.emp_id)              AS headcount,
+       COALESCE(SUM(e.salary), 0)   AS payroll
+FROM departments AS d
+LEFT JOIN employees AS e ON e.dept_id = d.dept_id
+GROUP BY d.dept_id, d.name;
+
+SELECT * FROM department_summary ORDER BY dept_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id |    name     | headcount |  payroll
+---------+-------------+-----------+-----------
+       1 | Engineering |         5 | 720000.00
+       2 | Sales       |         3 | 385000.00
+       3 | HR          |         3 | 240000.00
+       4 | Marketing   |         0 |         0
+(4 rows)</code></pre>
+  <p>The view stores only the <code>SELECT</code>. When you query it, the database expands the definition into
+  your query and optimizes the whole thing together, so a filter you add on the view can still use the base
+  tables' indexes. Querying a view is exactly as fast as running its query. Remove it with
+  <code>DROP VIEW department_summary</code>. <code>CREATE OR REPLACE VIEW</code> can change the query, but in
+  PostgreSQL it can only <em>add</em> columns at the end; renaming, removing or retyping columns needs
+  <code>DROP</code> and <code>CREATE</code>. Avoid <code>SELECT *</code> inside a view: the column list is fixed
+  when the view is created, and later table changes do not flow in.</p>
+
+  <h4>Views for security</h4>
+  <p>Give a role access to the view, not the table. The payroll team sees salaries, everybody else gets the
+  directory without them:</p>
+  <pre data-title="Hiding columns"><code class="language-sql">CREATE VIEW employee_directory AS
+SELECT emp_id, first_name, last_name, email, dept_id     -- no salary, no manager
+FROM employees;
+
+REVOKE ALL ON employees FROM reporting_role;
+GRANT SELECT ON employee_directory TO reporting_role;</code></pre>
+  <p>A PostgreSQL view runs with the privileges of its <em>owner</em> by default, which is what makes this
+  work. Since PostgreSQL 15 you can create it <code>WITH (security_invoker = true)</code> to check the caller's
+  rights instead. Row-level restrictions are also possible with a <code>WHERE</code> in the view, or with row
+  level security policies (<a href="#m5">Module 5</a>).</p>
+
+  <h4>Updatable views</h4>
+  <p>A <em>simple</em> view (one table, no <code>GROUP BY</code>, <code>DISTINCT</code>, aggregates, window
+  functions or set operations) is <strong>automatically updatable</strong> in PostgreSQL (since 9.3) and MySQL:
+  <code>INSERT</code>, <code>UPDATE</code> and <code>DELETE</code> on the view change the base table. A view with
+  a join, an aggregate or <code>DISTINCT</code> is read-only unless you add <code>INSTEAD OF</code> triggers.</p>
+  <pre data-title="WITH CHECK OPTION"><code class="language-sql">CREATE VIEW engineering_staff AS
+SELECT emp_id, first_name, last_name, email, dept_id, salary
+FROM employees
+WHERE dept_id = 1
+WITH CHECK OPTION;
+
+UPDATE engineering_staff SET salary = 95000 WHERE emp_id = 8;     -- fine: Divya stays visible
+UPDATE engineering_staff SET dept_id = 2 WHERE emp_id = 8;
+-- ERROR:  new row violates check option for view "engineering_staff"</code></pre>
+  <p><code>WITH CHECK OPTION</code> forbids changes through the view that would make the row disappear from the
+  view (moving Divya to Sales). Without it, the update would succeed and she would vanish from
+  <code>engineering_staff</code>.</p>
+
+  <h4>Materialized views</h4>
+  <p>A <strong>materialized view</strong> runs the query once and <strong>stores the result</strong> like a
+  table. Reads are fast (and the result can be indexed), but the data is only as fresh as the last refresh.
+  Perfect for expensive aggregations: a dashboard that reads yesterday's totals.</p>
+  <pre data-title="Monthly revenue, stored"><code class="language-sql">CREATE MATERIALIZED VIEW monthly_revenue AS
+SELECT DATE_TRUNC('month', o.order_date)::DATE AS month,
+       SUM(oi.quantity * oi.unit_price)         AS revenue
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.order_id
+WHERE o.status &lt;&gt; 'CANCELLED'
+GROUP BY DATE_TRUNC('month', o.order_date);
+
+CREATE UNIQUE INDEX uq_monthly_revenue_month ON monthly_revenue (month);
+
+SELECT * FROM monthly_revenue ORDER BY month;
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY monthly_revenue;   -- rebuild without blocking readers</code></pre>
+  <pre class="out" data-title="Output of the SELECT"><code class="language-plaintext">   month    | revenue
+------------+---------
+ 2026-01-01 | 5256.00
+ 2026-02-01 | 2797.00
+ 2026-03-01 | 7594.00
+ 2026-04-01 | 2778.00
+(4 rows)</code></pre>
+  <p><code>REFRESH MATERIALIZED VIEW</code> recomputes everything and locks readers while it works.
+  <code>CONCURRENTLY</code> keeps the old data readable, but needs a unique index on the view. Schedule refreshes
+  with <code>pg_cron</code>, an operating-system cron job, or a Spring <code>@Scheduled</code> task. MySQL has
+  <strong>no materialized views</strong>: build a summary table and refresh it with a scheduled job or event.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>View</th><th>Materialized view</th><th>Summary table you maintain</th></tr></thead>
+    <tbody>
+      <tr><td>Stores data</td><td>no</td><td>yes</td><td>yes</td></tr>
+      <tr><td>Always current</td><td>yes</td><td>no, until refreshed</td><td>no, until your job runs</td></tr>
+      <tr><td>Speed</td><td>same as the underlying query</td><td>fast reads, can be indexed</td><td>fast reads</td></tr>
+      <tr><td>Maintenance</td><td>none</td><td>a refresh schedule</td><td>your own code</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Views and Spring</h4>
+  <p>From Java a view looks like a table. You can map a read-only JPA entity to a view
+  (<code>@Entity @Immutable</code> on a class with <code>@Table(name = "department_summary")</code>), or select
+  from it with a native query or a Spring Data projection. Flyway or Liquibase migrations create the view like any
+  other object, in the right order after its tables.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: a view depends on its tables</p>
+    <p>You cannot drop or retype a column used by a view (<code>ERROR:  cannot drop column salary of table
+    employees because other objects depend on it</code>). Drop the view first, or drop with <code>CASCADE</code>
+    and recreate it. Keep view definitions in version-controlled migrations.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: building views on views on views</p>
+    <p>Each layer hides the real cost, and the optimizer may not flatten them well. Nested views are hard to
+    debug and easy to slow down. Prefer a few well-named views over a tower of them.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>An <code>ORDER BY</code> inside a view definition is not a promise about the order of the final
+      result; sort in the outer query.</li>
+      <li>A materialized view is not updated by changes to its base tables, not even in the same transaction.</li>
+      <li>Views cannot take parameters. For that use a function that returns a table
+      (<a href="#m3-procedures-triggers">Functions, procedures and triggers</a>).</li>
+      <li>MySQL view algorithms: <code>MERGE</code> (inlined) or <code>TEMPTABLE</code> (materialized
+      temporarily, slower); MySQL picks by itself.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is a view? Does it store data?" (no, a stored query), "view vs materialized view" (freshness vs
+    speed), "can you update through a view" (simple views yes, with <code>WITH CHECK OPTION</code> to protect
+    the filter), "why use views" (reuse, security, abstraction).</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-procedures-triggers">
+  <h3>Functions, stored procedures and triggers</h3>
+  <p class="tldr">A <strong>function</strong> is reusable code stored in the database that returns a value, a
+  <strong>procedure</strong> is called with <code>CALL</code> and can control transactions, and a
+  <strong>trigger</strong> runs code automatically when rows change. They are powerful, and many teams use them
+  sparingly.</p>
+
+  <h4>Why code lives in the database at all</h4>
+  <p>SQL alone has no variables, loops or if-statements. Databases add a procedural language to the server:
+  <strong>PL/pgSQL</strong> in PostgreSQL, a SQL/PSM dialect in MySQL. Code stored there runs next to the data, so
+  it avoids network round trips, can be shared by every application that connects, and can enforce rules nobody
+  can bypass. The price is discussed at the end of this article.</p>
+
+  <h4>Functions</h4>
+  <p>A function takes arguments and returns a value (or a table). Simple ones can be written in plain SQL:</p>
+  <pre data-title="A SQL function"><code class="language-sql">CREATE OR REPLACE FUNCTION dept_headcount(p_dept INT)
+RETURNS INT
+LANGUAGE sql STABLE
+AS $$
+    SELECT COUNT(*)::INT FROM employees WHERE dept_id = p_dept;
+$$;
+
+SELECT dept_headcount(1) AS engineering, dept_headcount(4) AS marketing;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> engineering | marketing
+-------------+-----------
+           5 |         0
+(1 row)</code></pre>
+  <p>The body sits between <code>$$ … $$</code> (dollar quoting, so you need no escaping for single quotes).
+  <code>STABLE</code> tells the planner that the function does not change data and gives the same answer inside
+  one statement; the options are <code>IMMUTABLE</code> (same inputs always give the same output, can be used in
+  an index), <code>STABLE</code> and <code>VOLATILE</code> (the default; may change anything). A function can
+  also return a table, which acts like a parameterised view:
+  <code>RETURNS TABLE (name TEXT, salary NUMERIC) AS $$ SELECT … $$</code>, called with
+  <code>SELECT * FROM top_earners(3)</code>.</p>
+  <p>With <strong>PL/pgSQL</strong> you get variables, conditions and loops, and errors:</p>
+  <pre data-title="A PL/pgSQL function with logic"><code class="language-sql">CREATE OR REPLACE FUNCTION salary_grade(p_salary NUMERIC)
+RETURNS TEXT
+LANGUAGE plpgsql IMMUTABLE
+AS $$
+BEGIN
+    IF p_salary IS NULL THEN
+        RETURN NULL;
+    ELSIF p_salary &gt;= 200000 THEN
+        RETURN 'Senior';
+    ELSIF p_salary &gt;= 100000 THEN
+        RETURN 'Mid';
+    END IF;
+    RETURN 'Junior';
+END;
+$$;
+
+SELECT first_name, salary_grade(salary) AS grade FROM employees WHERE emp_id IN (1, 8);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> first_name | grade
+------------+--------
+ Meera      | Senior
+ Divya      | Junior
+(2 rows)</code></pre>
+
+  <h4>Stored procedures</h4>
+  <p>A <strong>procedure</strong> (<code>CREATE PROCEDURE</code>, PostgreSQL 11 and later; MySQL has them too)
+  is invoked with <code>CALL</code>, does not return a value in a <code>SELECT</code>, and, unlike a function, can
+  <code>COMMIT</code> or <code>ROLLBACK</code> inside it. It fits batch work and multi-step operations.</p>
+  <pre data-title="A procedure that raises a salary and checks the result"><code class="language-sql">CREATE OR REPLACE PROCEDURE raise_salary(p_emp INT, p_percent NUMERIC)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF p_percent &lt;= 0 OR p_percent &gt; 50 THEN
+        RAISE EXCEPTION 'Percent must be between 0 and 50, got %', p_percent;
+    END IF;
+
+    UPDATE employees
+    SET salary = ROUND(salary * (1 + p_percent / 100), 2)
+    WHERE emp_id = p_emp;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Employee % does not exist', p_emp;
+    END IF;
+END;
+$$;
+
+CALL raise_salary(8, 10);      -- Divya: 90000 becomes 99000
+CALL raise_salary(99, 10);     -- ERROR:  Employee 99 does not exist</code></pre>
+  <p>Spring calls them with <code>JdbcTemplate</code> / <code>SimpleJdbcCall</code>, or in JPA with
+  <code>@Procedure</code> and <code>@NamedStoredProcedureQuery</code>. In MySQL the syntax needs a changed
+  statement delimiter, because the body contains semicolons:</p>
+  <pre data-title="MySQL syntax"><code class="language-sql">DELIMITER $$
+CREATE PROCEDURE raise_salary(IN p_emp INT, IN p_percent DECIMAL(5,2))
+BEGIN
+    UPDATE employees SET salary = ROUND(salary * (1 + p_percent / 100), 2) WHERE emp_id = p_emp;
+END$$
+DELIMITER ;
+CALL raise_salary(8, 10);</code></pre>
+
+  <h4>Triggers</h4>
+  <p>A <strong>trigger</strong> runs a function automatically <code>BEFORE</code> or <code>AFTER</code> an
+  <code>INSERT</code>, <code>UPDATE</code> or <code>DELETE</code>, once <code>FOR EACH ROW</code> (or once per
+  statement). Inside, <code>NEW</code> is the new row and <code>OLD</code> the old one. In PostgreSQL a trigger is
+  two objects: a trigger function that <code>RETURNS TRIGGER</code>, and the <code>CREATE TRIGGER</code> that
+  attaches it.</p>
+  <p><strong>Example 1: keep an <code>updated_at</code> column current.</strong></p>
+  <pre data-title="updated_at trigger"><code class="language-sql">ALTER TABLE products ADD COLUMN updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    NEW.updated_at := now();      -- change the row before it is written
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_products_updated_at
+BEFORE UPDATE ON products
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();</code></pre>
+  <p>Now every <code>UPDATE products …</code> refreshes <code>updated_at</code> even if the application forgot.
+  (<code>EXECUTE FUNCTION</code> is PostgreSQL 11+ syntax; older versions say <code>EXECUTE PROCEDURE</code>.)
+  MySQL does this without a trigger:
+  <code>updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP</code>.</p>
+  <p><strong>Example 2: an audit log of salary changes.</strong></p>
+  <pre data-title="Audit trigger"><code class="language-sql">CREATE TABLE salary_audit (
+    audit_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    emp_id      INT           NOT NULL,
+    old_salary  NUMERIC(10,2) NOT NULL,
+    new_salary  NUMERIC(10,2) NOT NULL,
+    changed_at  TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    changed_by  TEXT          NOT NULL DEFAULT current_user
+);
+
+CREATE OR REPLACE FUNCTION log_salary_change()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    INSERT INTO salary_audit (emp_id, old_salary, new_salary)
+    VALUES (OLD.emp_id, OLD.salary, NEW.salary);
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_employees_salary_audit
+AFTER UPDATE OF salary ON employees
+FOR EACH ROW
+WHEN (OLD.salary IS DISTINCT FROM NEW.salary)
+EXECUTE FUNCTION log_salary_change();
+
+UPDATE employees SET salary = 95000 WHERE emp_id = 8;
+SELECT audit_id, emp_id, old_salary, new_salary, changed_by FROM salary_audit;</code></pre>
+  <pre class="out" data-title="Output (changed_by is whoever you connected as)"><code class="language-plaintext"> audit_id | emp_id | old_salary | new_salary | changed_by
+----------+--------+------------+------------+------------
+        1 |      8 |   90000.00 |   95000.00 | app_user
+(1 row)</code></pre>
+  <p>The trigger fires only when the <code>salary</code> column changes and the value really differs (the
+  <code>WHEN</code> clause), and writes to the audit table in the same transaction: if the update rolls back, so
+  does the audit row. That is why audit logs are the best use of triggers: nobody can forget them, whatever
+  application or script changes the data.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Timing</th><th>Use for</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>BEFORE</code> row trigger</td><td>change or validate <code>NEW</code> (timestamps, defaults, custom checks)</td><td>return <code>NEW</code> to continue, <code>NULL</code> to skip the row</td></tr>
+      <tr><td><code>AFTER</code> row trigger</td><td>audit log, update a summary table, notify</td><td>return value ignored</td></tr>
+      <tr><td><code>INSTEAD OF</code></td><td>make a complex view updatable</td><td>views only</td></tr>
+      <tr><td>Statement-level</td><td>once per statement, regardless of the number of rows</td><td>use transition tables for bulk logic</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Pros and cons</h4>
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Runs next to the data: fewer round trips for bulk work.</li>
+      <li>One implementation shared by every application and script.</li>
+      <li>Cannot be bypassed; ideal for audit trails and integrity rules.</li>
+      <li>Permissions can allow a procedure without allowing direct table access.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>Hidden behaviour: an <code>UPDATE</code> that "also does something else" surprises developers.</li>
+      <li>Harder to test, debug, version and review than Java; weaker tooling.</li>
+      <li>Ties you to one database's dialect; scaling logic means scaling the database, the hardest tier to scale.</li>
+      <li>Deployment is split: the code and its database objects must be released together.</li>
+    </ul></div>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects: why many teams keep business logic in the application</p>
+    <p>A Spring Boot team usually keeps business rules in Java services, where they are unit-tested, versioned
+    with the code and portable. They use the database for what it is best at: constraints, indexes, transactions,
+    sometimes audit triggers and the <code>updated_at</code> trigger, and stored procedures for heavy batch jobs
+    or legacy systems (banks and ERPs often have thousands). In Spring, <code>@CreatedDate</code> and
+    <code>@LastModifiedDate</code> (Spring Data auditing) or Hibernate's <code>@UpdateTimestamp</code> replace the
+    <code>updated_at</code> trigger when only the application writes to the table. Triggers are the right tool
+    when other writers exist.</p>
+  </div>
+  <div class="co co-rule">
+    <p class="co-t">Rule: triggers must be fast, small and idempotent-safe</p>
+    <p>A trigger runs inside the triggering statement's transaction, for every affected row. A slow trigger
+    slows every write; a trigger that updates the same table can fire itself again (recursion). Keep them short,
+    and document each one where developers will find it.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: business workflow in triggers</p>
+    <p>"When an order is inserted, a trigger reduces stock, sends an email row, updates the customer's total…"
+    becomes a chain no one can follow, and a bulk load of 100,000 orders runs 100,000 extra statements. Put
+    workflows in a service and use triggers only for simple, local rules.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Row triggers do not fire for <code>TRUNCATE</code>; statement-level truncate triggers do.</li>
+      <li>A <code>BEFORE</code> trigger returning <code>NULL</code> silently cancels the operation for that row.
+      <code>RAISE EXCEPTION</code> cancels the whole statement.</li>
+      <li>Bulk loads such as <code>COPY</code> still fire triggers (unless disabled with <code>ALTER TABLE …
+      DISABLE TRIGGER</code>).</li>
+      <li>In MySQL, triggers are not fired by cascading foreign-key actions.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Function vs procedure" (function returns a value and is used inside queries; procedure is called with
+    <code>CALL</code> and can manage transactions), "what is a trigger and when would you use one" (audit,
+    timestamps), and the architecture question "would you put business logic in stored procedures?" A balanced
+    answer lists the pros and cons above and says you prefer the application layer for business rules.</p>
+  </div>
+</article>

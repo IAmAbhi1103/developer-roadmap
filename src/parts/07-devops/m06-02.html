@@ -1,0 +1,548 @@
+<article class="topic" id="m6-health-checks">
+  <h3>Health checks: Actuator, liveness vs readiness, Docker and load balancers</h3>
+  <p class="tldr">Spring Boot Actuator exposes <code>/actuator/health</code> (UP returns 200, DOWN returns 503);
+  use it for Docker <code>HEALTHCHECK</code>, load-balancer target checks and uptime monitors, and split it into
+  liveness ("restart me?") and readiness ("send me traffic?") for orchestrators.</p>
+
+  <h4>Why health checks</h4>
+  <p>A running process is not always a working application. The JVM can be alive while the database pool is
+  exhausted or startup is not finished. A <strong>health check</strong> is a cheap URL or command that answers
+  "is this instance OK?". Docker, load balancers, Kubernetes and monitoring tools call it on a schedule and act:
+  stop sending traffic, restart the container, or alert you.</p>
+
+  <h4>Actuator basics</h4>
+  <p>Add <code>spring-boot-starter-actuator</code> to the project. The health endpoint combines many
+  <strong>health indicators</strong> (database connectivity, disk space, Redis and so on) into one status.</p>
+  <pre data-title="pom.xml (fragment)"><code class="language-xml">&lt;dependency&gt;
+  &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-boot-starter-actuator&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <pre data-title="application.properties"><code class="language-properties">management.endpoints.web.exposure.include=health,info
+management.endpoint.health.show-details=when-authorized
+management.endpoint.health.probes.enabled=true</code></pre>
+  <pre data-title="Healthy and unhealthy responses" class="out"><code class="language-http">GET /actuator/health HTTP/1.1
+
+HTTP/1.1 200 OK
+Content-Type: application/vnd.spring-boot.actuator.v3+json
+
+{"status":"UP"}
+
+HTTP/1.1 503 Service Unavailable
+
+{"status":"DOWN"}</code></pre>
+  <p>Without extra properties only the overall status is shown, which is what you want on the public internet.
+  <code>show-details=when-authorized</code> shows which component failed only to authenticated users; never expose
+  details publicly because they reveal your internals. Only the endpoints listed in
+  <code>exposure.include</code> are reachable over the web, so list the minimum.</p>
+
+  <h4>A custom health indicator</h4>
+  <p>Add checks for things your app really depends on, such as a payment gateway. Keep them fast and
+  time-limited: a slow health check can itself cause outages.</p>
+  <pre data-title="PaymentGatewayHealthIndicator.java"><code class="language-java">@Component
+public class PaymentGatewayHealthIndicator implements HealthIndicator {
+
+    private final PaymentClient client;
+
+    public PaymentGatewayHealthIndicator(PaymentClient client) {
+        this.client = client;
+    }
+
+    @Override
+    public Health health() {
+        try {
+            client.ping();                      // must be quick, with a short timeout
+            return Health.up().withDetail("gateway", "reachable").build();
+        } catch (Exception e) {
+            return Health.down(e).build();
+        }
+    }
+}</code></pre>
+  <div class="co co-version">
+    <p class="co-t">Version note: Actuator packages in Spring Boot 4</p>
+    <p>Spring Boot 4 split Actuator into smaller modules, and some health classes moved to new packages. The
+    idea (implement <code>HealthIndicator</code>, return <code>Health</code>) is the same, but check the Boot 4
+    migration notes for the exact imports if you upgrade.</p>
+  </div>
+
+  <h4>Liveness vs readiness</h4>
+  <p>Two different questions, and mixing them causes outages.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Liveness</th><th>Readiness</th></tr></thead>
+    <tbody>
+      <tr><td>Question</td><td>Is the process stuck or broken beyond repair?</td><td>Can it serve requests right now?</td></tr>
+      <tr><td>If it fails</td><td>The orchestrator restarts the container</td><td>The instance is removed from the load balancer; no restart</td></tr>
+      <tr><td>Should include</td><td>Only the app's own state (not external services)</td><td>Dependencies the app needs to work, such as the database</td></tr>
+      <tr><td>Spring URL</td><td><code>/actuator/health/liveness</code></td><td><code>/actuator/health/readiness</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>If liveness included the database and the database had a short outage, an orchestrator would restart every
+  app instance in a loop and make the incident worse. Readiness is the right place for the database: the instance
+  stops receiving traffic until the database returns, then rejoins. Spring Boot enables these two groups
+  automatically when it detects Kubernetes; elsewhere turn them on with
+  <code>management.endpoint.health.probes.enabled=true</code>. Choose what the readiness group contains:</p>
+  <pre data-title="application.properties"><code class="language-properties">management.endpoint.health.group.readiness.include=readinessState,db
+management.endpoint.health.group.liveness.include=livenessState</code></pre>
+  <p>Spring also publishes the state during shutdown: when the app is stopping, readiness turns
+  <code>REFUSING_TRAFFIC</code> first, so a load balancer stops sending new requests (pair this with
+  <code>server.shutdown=graceful</code>).</p>
+
+  <h4>Docker HEALTHCHECK and Compose</h4>
+  <p>Docker can run a command inside the container and mark it <code>healthy</code> or <code>unhealthy</code>.
+  The image needs the tool you call; slim images may lack <code>curl</code>, so install it or use another tool
+  that exists there.</p>
+  <pre data-title="Dockerfile (fragment)"><code class="language-dockerfile">HEALTHCHECK --interval=30s --timeout=3s --start-period=60s --retries=3 \
+  CMD curl -fsS http://localhost:8080/actuator/health || exit 1</code></pre>
+  <pre data-title="compose.yaml (alternative: define it in Compose)"><code class="language-yaml">services:
+  api:
+    image: ghcr.io/asha/shop-api:${IMAGE_TAG}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 60s        # failures during startup do not count
+  worker:
+    image: ghcr.io/asha/shop-worker:${IMAGE_TAG}
+    depends_on:
+      api:
+        condition: service_healthy   # start only after api is healthy</code></pre>
+  <p>Plain Docker marks a container unhealthy but does not restart it by itself (Docker Swarm and orchestrators
+  do). Use <code>docker ps</code> to see <code>(healthy)</code>, and combine with an uptime monitor.</p>
+
+  <h4>Load balancers and platforms</h4>
+  <ul>
+    <li><strong>AWS ALB:</strong> each target group has a health check path (<code>/actuator/health</code> or
+    the readiness URL), an interval, and thresholds. Instances failing the check are taken out of rotation.</li>
+    <li><strong>Render, Railway and others:</strong> set the health check path in service settings; a new
+    deployment receives traffic only after it passes, which gives zero-downtime deploys.</li>
+    <li><strong>Kubernetes:</strong> liveness, readiness and startup probes (next articles).</li>
+  </ul>
+
+  <h4>Security of health endpoints</h4>
+  <ul>
+    <li>If you use Spring Security, permit <code>/actuator/health/**</code> without login, and protect other
+    Actuator endpoints with a role. See <a href="04-spring-boot.html#m4">Spring Boot · Module 4</a>.</li>
+    <li>Better still, put Actuator on a separate port that is never published:
+    <code>management.server.port=8081</code>. Then probes and Prometheus use the internal network, and nothing
+    sensitive is reachable through Nginx. (If you move the port, point your Docker or Kubernetes checks to it.)</li>
+    <li>For the uptime monitor, expose only a simple public health URL, or a separate small endpoint.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Health checks that call slow external services, so one slow partner marks every instance DOWN.</li>
+      <li>Putting the database in liveness (restart storms).</li>
+      <li>Exposing <code>*</code> endpoints or full health details publicly.</li>
+      <li>A start period that is shorter than your app's startup time, so it gets killed while starting.</li>
+      <li>Health only checks "process is up" (a static <code>200</code>) and hides a broken database.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Liveness vs readiness probe?"</p>
+    <ul>
+      <li>Liveness decides if the container should be restarted; readiness decides if it receives traffic.
+      Keep external dependencies out of liveness. Spring Boot provides both through Actuator health groups.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-uptime-monitoring">
+  <h3>Uptime monitoring and alerts to email, Slack and Telegram</h3>
+  <p class="tldr">An external service calls your public health URL every few minutes from outside your
+  infrastructure and alerts you by email, Slack or Telegram when it fails, so you hear about an outage before your
+  users tell you.</p>
+
+  <h4>Why monitor from outside</h4>
+  <p>If your monitoring runs on the same server as the app, it dies with it. An <strong>uptime monitor</strong>
+  is a service on someone else's infrastructure that requests your URL from outside, through the same path as a
+  real user: DNS, the internet, TLS, Nginx, and the app. If any link breaks, it notices. Popular services are
+  <strong>UptimeRobot</strong> and <strong>Better Stack</strong> (formerly Better Uptime); both have free plans
+  at the time of writing, with limits on check interval and number of monitors that change, so check the current
+  terms. <strong>Healthchecks.io</strong> works the other way round for scheduled jobs: your cron job pings it
+  after each run, and it alerts if a ping is missing (a "dead man's switch", good for nightly backups).</p>
+
+  <h4>Set up a monitor, step by step</h4>
+  <ol class="steps">
+    <li>Choose the URL: <code>https://api.example.com/actuator/health</code> through your real domain, over
+    HTTPS. Add a second monitor for the frontend URL.</li>
+    <li>Choose type "HTTP(s)". Better still, use a keyword check that expects <code>"status":"UP"</code> in the
+    body: a custom error page with status 200 would otherwise look healthy.</li>
+    <li>Set the interval as short as your plan allows (often one to five minutes).</li>
+    <li>Add alert contacts: email first, then a chat tool. Test them with the service's test button.</li>
+    <li>Require two failed checks in a row before alerting, so one network blip does not wake you.</li>
+    <li>Add monitors for the <strong>TLS certificate expiry</strong> and, if available, the domain expiry.</li>
+    <li>Optionally publish a public status page.</li>
+  </ol>
+
+  <h4>Alert channels</h4>
+  <ul>
+    <li><strong>Email:</strong> the baseline. Put the address on your phone with push notifications.</li>
+    <li><strong>Slack or Discord:</strong> create an incoming webhook for a channel; most monitoring tools
+    already have a ready integration.</li>
+    <li><strong>Telegram:</strong> create a bot with BotFather (it gives you a token), start a chat with the
+    bot, find your chat ID, and paste both into the tool's Telegram integration. It is free and reaches your phone
+    quickly, which suits solo developers.</li>
+  </ul>
+  <p>You can also send your own alerts from scripts, for example at the end of a failed deployment. Treat the
+  webhook URL and the bot token as secrets: keep them in environment variables or CI secrets.</p>
+  <pre data-title="Send a message from a script"><code class="language-shell"># Slack incoming webhook
+$ curl -fsS -X POST -H 'Content-type: application/json' \
+    --data '{"text":"Deploy of sha-9b1d4e7 failed on production"}' "$SLACK_WEBHOOK_URL"
+
+# Telegram bot
+$ curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+    -d chat_id="${CHAT_ID}" -d text="Deploy of sha-9b1d4e7 failed on production"</code></pre>
+  <p>Add this to the failure branch of your deploy workflow (<a href="#m4-cd">Module 4</a>), so the pipeline
+  tells you when it breaks.</p>
+
+  <h4>What to monitor</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Target</th><th>Check</th><th>Catches</th></tr></thead>
+    <tbody>
+      <tr><td>Public health URL</td><td>HTTPS + keyword <code>UP</code></td><td>App down, DNS or TLS problems, Nginx down</td></tr>
+      <tr><td>Frontend URL</td><td>HTTPS 200</td><td>Failed deploy on Vercel/Netlify, DNS errors</td></tr>
+      <tr><td>Certificate expiry</td><td>Days left</td><td>Failed certbot renewal</td></tr>
+      <tr><td>Nightly job</td><td>Heartbeat ping</td><td>Backups that silently stopped</td></tr>
+      <tr><td>Server resources</td><td>Disk, memory (via Prometheus/CloudWatch)</td><td>Problems before they become outages</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Good alerting habits</h4>
+  <ul>
+    <li>Alert on user-visible failure, not on every internal blip.</li>
+    <li>Make each alert say what failed, since when, and where to look first (link to the runbook).</li>
+    <li>Do not alert your whole team on a learning project, and do not mute alerts permanently because they are
+    noisy; fix the noise.</li>
+    <li>Test the whole path by stopping the app once and checking that your phone receives the alert.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Monitoring only the home page of the frontend and never the API.</li>
+      <li>Alerts going to an email address nobody reads (compare the billing alert advice in
+      <a href="#m5-billing-alerts">Module 5</a>).</li>
+      <li>Pinging a free, sleeping service every few minutes to keep it awake: it can break the platform's
+      rules or use up its allowance. Read the platform terms.</li>
+      <li>Checking the root URL <code>/</code> that serves a cached or static page and stays 200 when the API
+      is dead.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you know your service is down before customers do?"</p>
+    <ul>
+      <li>External uptime checks on a real health URL with keyword assertion, alert routing to chat or phone,
+      metrics-based alerts on error rate and latency, and an on-call or at least a runbook.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-prometheus-grafana">
+  <h3>Prometheus and Grafana: metrics from Spring Boot with Docker Compose</h3>
+  <p class="tldr">Spring Boot (Actuator plus Micrometer) exposes metrics at <code>/actuator/prometheus</code>;
+  Prometheus pulls and stores them on a schedule defined in <code>prometheus.yml</code>, and Grafana draws
+  dashboards from Prometheus.</p>
+
+  <h4>The pull model</h4>
+  <p><strong>Prometheus</strong> is a time-series database and monitoring system. It uses a <strong>pull
+  model</strong>: instead of your app sending data, Prometheus visits each target's metrics URL every few
+  seconds ("scrapes" it) and stores the numbers with timestamps. The advantages are simple targets (they only
+  expose text), and Prometheus itself notices a dead target, because the scrape fails (the metric
+  <code>up</code> becomes 0). <strong>Grafana</strong> is the dashboard tool; it reads from Prometheus (and from
+  Loki, PostgreSQL, CloudWatch and others) and draws graphs.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A["Spring Boot: /actuator/prometheus"] -->|"scraped every 15s"| P[Prometheus]
+  N["node_exporter: host CPU, disk"] -->|scraped| P
+  P --> G[Grafana dashboards]
+  P --> R["Alert rules"]
+  R --> M[Alertmanager]
+  M --> T["Email, Slack, Telegram"]
+</pre>
+    <figcaption>Prometheus pulls metrics from targets; Grafana and alert rules read from it</figcaption>
+  </figure>
+
+  <h4>Expose metrics from Spring Boot</h4>
+  <p><strong>Micrometer</strong> is the metrics facade inside Spring Boot (like SLF4J for logging). The Prometheus
+  registry turns its metrics into Prometheus text format. Add the dependency (the version is managed by Boot):</p>
+  <pre data-title="pom.xml (fragment)"><code class="language-xml">&lt;dependency&gt;
+  &lt;groupId&gt;io.micrometer&lt;/groupId&gt;
+  &lt;artifactId&gt;micrometer-registry-prometheus&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <pre data-title="application.properties"><code class="language-properties">management.endpoints.web.exposure.include=health,info,prometheus
+management.metrics.tags.application=shop-api
+management.metrics.distribution.percentiles-histogram.http.server.requests=true
+# optional: serve Actuator on a private port that is never published
+management.server.port=8081</code></pre>
+  <ul>
+    <li><code>management.metrics.tags.application</code> adds a label to every metric so you can tell apps apart
+    in one Prometheus.</li>
+    <li><code>percentiles-histogram…http.server.requests=true</code> publishes histogram buckets for request
+    time. Without them you cannot calculate p95 with <code>histogram_quantile</code> (see the PromQL article).</li>
+    <li><code>management.server.port</code> keeps metrics off the public port. Prometheus reaches
+    <code>api:8081</code> inside the Docker network; Nginx does not proxy to it.</li>
+  </ul>
+  <p>Open the endpoint to see the format: lines of <code>name{labels} value</code>.</p>
+  <pre class="out" data-title="curl localhost:8081/actuator/prometheus (shortened)"><code class="language-plaintext"># HELP http_server_requests_seconds Duration of HTTP server request handling
+# TYPE http_server_requests_seconds histogram
+http_server_requests_seconds_count{method="GET",status="200",uri="/api/products"} 1542
+http_server_requests_seconds_sum{method="GET",status="200",uri="/api/products"} 61.4
+http_server_requests_seconds_bucket{le="0.1",method="GET",status="200",uri="/api/products"} 1390
+jvm_memory_used_bytes{area="heap",id="G1 Eden Space"} 5.2428800E7
+process_cpu_usage 0.031
+hikaricp_connections_active{pool="HikariPool-1"} 2.0</code></pre>
+
+  <h4>Metric types</h4>
+  <dl class="terms">
+    <dt>Counter</dt><dd>A number that only goes up (requests served). You almost always look at its rate of
+    change, with <code>rate()</code>.</dd>
+    <dt>Gauge</dt><dd>A value that goes up and down (heap used, active connections).</dd>
+    <dt>Histogram / timer</dt><dd>Counts observations in buckets (<code>_bucket</code>), plus a total
+    (<code>_sum</code>) and a count (<code>_count</code>). Used for latency.</dd>
+  </dl>
+
+  <h4>The scrape configuration</h4>
+  <pre data-title="prometheus/prometheus.yml"><code class="language-yaml">global:
+  scrape_interval: 15s            # how often to scrape
+  evaluation_interval: 15s        # how often to evaluate alert rules
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: shop-api
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["api:8081"]     # service name and management port on the Compose network
+
+  - job_name: prometheus          # Prometheus monitors itself too
+    static_configs:
+      - targets: ["localhost:9090"]</code></pre>
+  <p>A <strong>job</strong> is a group of targets with the same purpose; every sample gets the labels
+  <code>job</code> and <code>instance</code> (the address). Spring Boot's default path is not Prometheus's default
+  path, so <code>metrics_path</code> is essential. Use <code>static_configs</code> for fixed hosts; on
+  Kubernetes or AWS Prometheus finds targets through service discovery.</p>
+
+  <h4>Run Prometheus and Grafana with Docker Compose</h4>
+  <pre data-title="compose.monitoring.yaml (next to compose.yaml)"><code class="language-yaml">services:
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"       # only reachable from the server itself
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:</code></pre>
+  <pre data-title="Start together with the app and look from your laptop"><code class="language-shell">$ docker compose -f compose.yaml -f compose.monitoring.yaml up -d
+$ ssh -i shop-key.pem -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 ubuntu@203.0.113.25
+# then open http://localhost:3000 (Grafana) and http://localhost:9090 (Prometheus)</code></pre>
+  <p>Use the pinned image versions you have tested rather than the default latest tag in real setups. Both ports
+  are bound to the loopback address and reached through an SSH tunnel, so no extra security-group rules are
+  needed. If you want Grafana on a public domain later, put it behind Nginx with HTTPS and a strong admin
+  password.</p>
+  <ol class="steps">
+    <li>In Prometheus open Status → Targets: the <code>shop-api</code> target should be <strong>UP</strong>. If it
+    is DOWN, read the error message (wrong port, wrong path, network name).</li>
+    <li>In Grafana log in as <code>admin</code> with the password you set (Grafana asks you to change a default
+    password if you never set one).</li>
+    <li>Connections → Data sources → Add data source → Prometheus, URL <code>http://prometheus:9090</code>
+    (the Compose service name, not localhost). Save and test.</li>
+    <li>Dashboards → New → <strong>Import</strong>. Search grafana.com/grafana/dashboards for a "JVM
+    (Micrometer)" or "Spring Boot" dashboard, enter its ID or JSON, pick the Prometheus data source and import.
+    Community dashboards expect specific label names, such as the <code>application</code> tag set above, so adjust
+    the dashboard variables if panels are empty.</li>
+    <li>Build your own panel for the golden signals using the queries in the next article.</li>
+  </ol>
+  <p>For machine-level metrics (CPU, memory, disk of the server) add <strong>node_exporter</strong> as another
+  scrape target; for per-container metrics, <strong>cAdvisor</strong>. Together with application metrics, they
+  cover saturation.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: metrics endpoints are not public</p>
+    <p>Metrics reveal your endpoints, versions and load. Expose <code>/actuator/prometheus</code> only on an
+    internal port or protect it. Never publish Prometheus or Grafana with default passwords.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Target DOWN because Prometheus uses <code>localhost:8081</code> inside its own container; use the
+      service name.</li>
+      <li>Forgetting <code>metrics_path</code> and getting 404.</li>
+      <li>Not persisting data (<code>prometheus-data</code> volume), so history disappears on recreate.</li>
+      <li>Labels with unbounded values (user IDs), which explode memory.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Prometheus stores data locally for a limited time (the retention setting); it is not a long-term archive.
+      Long-term storage needs remote write to another system.</li>
+      <li>Short-lived jobs may finish between scrapes; for those a Pushgateway exists.</li>
+      <li>A scrape interval of 15s with <code>rate(...[5m])</code> works well; the range should hold several
+      samples.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you monitor a Spring Boot app with Prometheus and Grafana?"</p>
+    <ul>
+      <li>Actuator plus the Micrometer Prometheus registry expose <code>/actuator/prometheus</code>; Prometheus
+      scrapes it (pull model) per <code>prometheus.yml</code>; Grafana queries Prometheus; alert rules go through
+      Alertmanager.</li>
+      <li>Mention metric types, the <code>application</code> tag, and keeping the endpoint private.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-promql">
+  <h3>PromQL basics: rate, error rate, p95 latency and alert rules</h3>
+  <p class="tldr">PromQL selects time series by name and labels; use <code>rate(counter[5m])</code> for
+  per-second speed, divide two sums for an error ratio, and
+  <code>histogram_quantile(0.95, …)</code> over buckets for p95 latency; alert rules turn a query into a
+  notification.</p>
+
+  <h4>Selectors and ranges</h4>
+  <p><strong>PromQL</strong> is Prometheus's query language. A name alone returns the latest value of every series
+  with that name; braces filter by labels.</p>
+  <pre data-title="Selectors"><code class="language-plaintext">http_server_requests_seconds_count
+http_server_requests_seconds_count{uri="/api/products"}
+http_server_requests_seconds_count{status=~"5.."}        # regex match: any 5xx
+http_server_requests_seconds_count{status!="200"}        # not equal
+http_server_requests_seconds_count[5m]                   # a range: the last 5 minutes of samples</code></pre>
+  <p>The operators are <code>=</code>, <code>!=</code>, <code>=~</code> (regex) and <code>!~</code>. A selector
+  with <code>[5m]</code> is a <strong>range vector</strong> and can only be passed to functions such as
+  <code>rate</code>; one without a range is an <strong>instant vector</strong>.</p>
+
+  <h4>The golden signals as queries</h4>
+  <dl class="terms">
+    <dt>Rate (traffic)</dt><dd><code>rate(x[5m])</code> gives the per-second increase of a counter averaged over
+    5 minutes. It handles counter resets after restarts. Never graph a raw counter; it only climbs.</dd>
+    <dt>sum / sum by</dt><dd>Adds series together, optionally keeping some labels:
+    <code>sum by (uri) (...)</code>.</dd>
+    <dt>increase</dt><dd><code>increase(x[1h])</code> gives the total increase over the range (requests in the
+    last hour).</dd>
+    <dt>histogram_quantile</dt><dd>Estimates a percentile from histogram buckets.</dd>
+  </dl>
+  <pre data-title="Traffic: requests per second"><code class="language-plaintext">sum(rate(http_server_requests_seconds_count[5m]))
+
+# per endpoint, busiest first
+topk(5, sum by (uri) (rate(http_server_requests_seconds_count[5m])))</code></pre>
+  <pre data-title="Errors: the share of requests that fail (0 to 1)"><code class="language-plaintext">sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m]))
+/
+sum(rate(http_server_requests_seconds_count[5m]))</code></pre>
+  <pre data-title="Latency: average and p95"><code class="language-plaintext"># average response time
+sum(rate(http_server_requests_seconds_sum[5m]))
+/
+sum(rate(http_server_requests_seconds_count[5m]))
+
+# 95th percentile (needs the histogram buckets enabled in Spring Boot)
+histogram_quantile(0.95,
+  sum by (le) (rate(http_server_requests_seconds_bucket[5m])))</code></pre>
+  <p>For p95, you must keep the <code>le</code> label ("less or equal", the bucket bound) while summing; that is
+  what <code>sum by (le)</code> does. If you group also by <code>uri</code>, add it:
+  <code>sum by (le, uri)</code>. The result is an estimate based on bucket sizes, not an exact number.</p>
+  <pre data-title="Saturation: JVM, pool, CPU"><code class="language-plaintext"># heap usage as a fraction
+sum(jvm_memory_used_bytes{area="heap"}) / sum(jvm_memory_max_bytes{area="heap"})
+
+# database connection pool: busy connections vs the maximum
+hikaricp_connections_active / hikaricp_connections_max
+
+# process CPU usage (0 to 1 of the CPU available to the process)
+process_cpu_usage
+
+# is every target up? (1 = scrape succeeded)
+up{job="shop-api"}</code></pre>
+
+  <h4>Alert rules</h4>
+  <p>An alert rule is a query plus a condition and a duration. When the condition holds for the whole
+  <code>for</code> period, the alert fires. Prometheus then sends it to <strong>Alertmanager</strong>, which
+  groups, de-duplicates and routes alerts to email, Slack, Telegram (via a webhook receiver) or paging tools.
+  Grafana also has its own alerting if you prefer to manage everything there.</p>
+  <pre data-title="prometheus/alerts.yml"><code class="language-yaml">groups:
+  - name: shop-api
+    rules:
+      - alert: ApiDown
+        expr: up{job="shop-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "shop-api is not reachable by Prometheus"
+
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m]))
+          / sum(rate(http_server_requests_seconds_count[5m])) &gt; 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of requests fail"
+
+      - alert: SlowRequests
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_server_requests_seconds_bucket[5m]))) &gt; 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency is above one second"</code></pre>
+  <p>The file is loaded through <code>rule_files</code> in <code>prometheus.yml</code>. Check rule syntax with
+  <code>promtool check rules alerts.yml</code> (the tool ships with Prometheus) before you restart. In the
+  Prometheus UI, the Alerts page shows pending and firing alerts. Remember a catch: an alert that depends on the
+  app's own metrics cannot fire if the whole server is down, which is why the external uptime monitor from the
+  previous article remains necessary.</p>
+
+  <h4>Reading and building a dashboard</h4>
+  <ul>
+    <li>Make one row per golden signal: traffic (requests per second), errors (percentage), latency (p50 and
+    p95 lines), saturation (heap, CPU, pool usage).</li>
+    <li>Show the same time range for all panels and annotate deployments, so a spike can be linked to a
+    release.</li>
+    <li>Use the panel's unit settings (seconds, percent 0.0–1.0, bytes) to make numbers readable.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Graphing a counter without <code>rate()</code>: a line that only goes up.</li>
+      <li>Using <code>rate()</code> on a gauge, or a range shorter than twice the scrape interval (no data).</li>
+      <li>Dividing two queries without <code>sum</code>, so the labels do not match and the result is empty.</li>
+      <li>Averaging percentiles across instances. Sum the buckets first and then use
+      <code>histogram_quantile</code>.</li>
+      <li>p95 returns "no data": the histogram buckets were never enabled in Spring Boot.</li>
+    </ul>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: build queries step by step in the Prometheus UI</p>
+    <p>Start with the plain metric name, add a label filter, wrap it in <code>rate</code>, then in
+    <code>sum</code>. Open the Graph tab at each step and check that the result makes sense.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Write a query for the error rate and p95 latency."</p>
+    <ul>
+      <li>Error rate: sum of 5xx request rate divided by the sum of all request rate. p95:
+      <code>histogram_quantile(0.95, sum by (le) (rate(..._bucket[5m])))</code>.</li>
+      <li>Explain counters vs gauges, why <code>rate</code>, and why alerts need a <code>for</code> duration.</li>
+    </ul>
+  </div>
+</article>

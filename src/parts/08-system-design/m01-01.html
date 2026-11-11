@@ -1,0 +1,460 @@
+<div class="mintro">
+  <p>Design principles are the habits that keep code easy to change. A program that works today but breaks in three places whenever a requirement moves is a badly designed program, even if every test passes. This module gives you the vocabulary (cohesion, coupling, SOLID, DRY, KISS, YAGNI) and the practical skills (clean code, spotting code smells, drawing UML) that every design discussion and every code review uses.</p>
+  <p>It builds on <a href="02-core-java.html#m2">Core Java · Module 2 (OOP)</a>, which explains how classes, interfaces and polymorphism work. Here the question changes from "how does it work?" to "how should I arrange it so it survives change?". The next module, <a href="#m2">Design patterns</a>, shows ready-made solutions that apply these principles, and <a href="#m3">LLD interview problems</a> asks you to use both.</p>
+  <ul>
+    <li>Judge a design with two ideas: high cohesion and low coupling.</li>
+    <li>Explain each SOLID principle in 30 seconds and show a violating and a fixed version in Java.</li>
+    <li>Tell DRY from accidental duplication, and use KISS and YAGNI to stop over-engineering.</li>
+    <li>Refactor messy code using clean-code rules and name the code smell you are fixing.</li>
+    <li>Draw class diagrams and sequence diagrams and map each arrow to Java code.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m1-good-design">
+  <h3>What good design means: cohesion, coupling and designing for change</h3>
+  <p class="tldr">Good design means code that is cheap to change: each class does one focused job (high cohesion), classes know as little as possible about each other (low coupling), and details are hidden behind interfaces (encapsulation).</p>
+
+  <p>Nobody can predict every future requirement. Tomorrow the business adds a new payment method, a new tax rule, or moves from MySQL to PostgreSQL. A design is <strong>good</strong> when such a change touches few places and breaks nothing else. A design is <strong>bad</strong> when one small change forces edits in ten files. Almost every principle in this module is a way to measure or improve this one property: <strong>cost of change</strong>.</p>
+
+  <h4>Cohesion: things that belong together</h4>
+  <p><strong>Cohesion</strong> measures how strongly the parts inside one module (a method, a class, a package) belong together. In a highly cohesive class, every field and method serves one clear purpose. You can describe the class in one sentence without using "and".</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Low cohesion: a grab-bag</p><pre><code class="language-java">public class Utils {
+    public static String formatRupees(long paise) { /* ... */ return ""; }
+    public static boolean isValidPan(String pan) { /* ... */ return true; }
+    public static void sendSms(String phone, String text) { /* ... */ }
+    public static byte[] zip(byte[] data) { /* ... */ return data; }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">High cohesion: one purpose each</p><pre><code class="language-java">public final class MoneyFormatter {
+    public String rupees(long paise) { /* ... */ return ""; }
+}
+public final class PanValidator {
+    public boolean isValid(String pan) { /* ... */ return true; }
+}
+public interface SmsGateway {
+    void send(String phone, String text);
+}</code></pre></div>
+  </div>
+  <p>Names like <code>Utils</code>, <code>Helper</code>, <code>Manager</code> and <code>Common</code> are warning signs: they attract unrelated code because nobody knows where else it should go. Cohesion also applies to methods: a method <code>validateAndSaveAndEmail()</code> has three purposes.</p>
+
+  <h4>Coupling: how much one part knows about another</h4>
+  <p><strong>Coupling</strong> measures how much one module depends on another. When class A is tightly coupled to class B, a change in B forces a change in A, and you cannot test or reuse A without B. Some coupling is unavoidable (parts must talk), so the goal is <em>loose</em> coupling: depend on a small, stable contract rather than on details.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Kind of coupling</th><th>What A depends on</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Tight (bad)</td><td>The concrete class</td><td><code>new MySqlOrderRepository()</code> inside a service</td></tr>
+      <tr><td>Tight (bad)</td><td>Another class's internals</td><td><code>order.getCustomer().getAddress().getCity()</code></td></tr>
+      <tr><td>Tight (bad)</td><td>Shared mutable state</td><td>A public static <code>Map</code> that many classes edit</td></tr>
+      <tr><td>Loose (good)</td><td>An interface</td><td><code>OrderRepository</code> passed to the constructor</td></tr>
+      <tr><td>Loose (good)</td><td>A message or event</td><td>Publishing <code>OrderPlaced</code> instead of calling five services</td></tr>
+    </tbody>
+  </table></div>
+  <p>Here is a tightly coupled class and a loosely coupled one:</p>
+  <pre data-title="Coupling.java"><code class="language-java">// Tight: the service creates its own dependency, so you cannot swap or fake it
+class ReportService {
+    private final PdfWriter writer = new PdfWriter();       // hard-wired
+    void publish(String text) { writer.write(text); }
+}
+
+// Loose: the service only knows the small interface it needs
+interface DocumentWriter {
+    void write(String text);
+}
+
+class LooseReportService {
+    private final DocumentWriter writer;                    // any implementation
+    LooseReportService(DocumentWriter writer) { this.writer = writer; }
+    void publish(String text) { writer.write(text); }
+}
+
+class PdfWriter implements DocumentWriter {
+    public void write(String text) { System.out.println("PDF: " + text); }
+}</code></pre>
+  <div class="co co-rule">
+    <p class="co-t">The goal: high cohesion, low coupling</p>
+    <p>These two travel together. When each class has one focused job, it needs fewer collaborators and talks to them through small interfaces. When responsibilities are mixed, classes reach into each other and coupling rises. If you remember only one sentence from this module, remember this one.</p>
+  </div>
+
+  <h4>Encapsulation: the root of good design</h4>
+  <p><strong>Encapsulation</strong> means hiding data and implementation behind a small public interface (<a href="02-core-java.html#m2">see Core Java</a>). From a design view, it is what makes low coupling possible. If other classes cannot see your fields, they cannot depend on them, so you are free to change them later.</p>
+  <pre data-title="Encapsulation.java"><code class="language-java">// Exposed: every caller can break the rule and depends on the representation
+class WalletBad {
+    public long balance;
+}
+// caller: wallet.balance -= 500;   // overdraft possible, rules scattered in callers
+
+// Encapsulated: the rule lives in one place, the field can change type later
+class Wallet {
+    private long balanceInPaise;
+
+    void debit(long paise) {
+        if (paise &lt;= 0) throw new IllegalArgumentException("Amount must be positive");
+        if (paise &gt; balanceInPaise) throw new IllegalStateException("Insufficient funds");
+        balanceInPaise -= paise;
+    }
+    long balance() { return balanceInPaise; }
+}</code></pre>
+  <p>Rule of thumb: expose behaviour (<code>debit</code>), not data (<code>setBalance</code>). Every public getter and setter is a small leak of your design.</p>
+
+  <h4>Program to an interface, not an implementation</h4>
+  <p>Declare variables, parameters and return types with the most general type that gives you the methods you need. Write <code>List&lt;Order&gt; orders = new ArrayList&lt;&gt;();</code>, not <code>ArrayList&lt;Order&gt; orders = ...</code>. Write a method that accepts <code>Collection&lt;Order&gt;</code> when it only loops. On the larger scale, a service depends on a <code>PaymentGateway</code> interface, and the Razorpay or Stripe class is a detail chosen at the edge of the program. The caller then survives any change of implementation, because it never named one.</p>
+
+  <h4>Designing for change</h4>
+  <ol class="steps">
+    <li><strong>Find what varies.</strong> Payment methods, tax rules, notification channels, report formats: these change often. Business names and core flows change rarely.</li>
+    <li><strong>Hide what varies behind an interface.</strong> Callers depend on the interface and never know which version runs.</li>
+    <li><strong>Keep the stable part stable.</strong> The flow "validate, price, pay, notify" should not be edited when a new payment method arrives.</li>
+    <li><strong>Do not predict, prepare.</strong> You cannot guess every change. Keep code simple and decoupled, then refactor when a real change arrives (see <a href="#m1-dry-kiss-yagni">YAGNI</a>).</li>
+  </ol>
+  <p>A quick test for any design: "If requirement X changes, how many files do I edit?" If the answer is one or two, the design is doing its job.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Coupling cannot be zero</p>
+    <ul>
+      <li>A system with no coupling does nothing. The aim is to couple to <em>stable abstractions</em>, such as <code>List</code>, <code>PaymentGateway</code>, or a domain event, and not to volatile details.</li>
+      <li>Too many tiny classes can raise coupling too, because readers must hop between files. Balance both goals.</li>
+      <li>Coupling across a network (microservices) is costlier than inside a JVM; see <a href="#m6">distributed system patterns</a>.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes to avoid</p>
+    <ul>
+      <li>Calling a class "cohesive" because it is in one file. Cohesion is about <em>purpose</em>, not location.</li>
+      <li>Making every field public "for convenience" and every class depend on <code>new ConcreteClass()</code>.</li>
+      <li>Creating an interface for every class by habit. Add an interface when there are, or will really be, several implementations or when you need a seam for tests.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: good design</p>
+    <ul>
+      <li><b>What is cohesion and coupling?</b> Cohesion: how well the inside of a module belongs together. Coupling: how much modules depend on each other. Aim for high cohesion and low coupling.</li>
+      <li><b>How do you reduce coupling?</b> Depend on interfaces, inject dependencies, hide data, communicate with events, and follow the <a href="#m1-demeter-tell-soc">Law of Demeter</a>.</li>
+      <li><b>How does encapsulation help design?</b> It lets you change internals without touching callers.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-oop-revisited">
+  <h3>The OOP pillars revisited with design in mind</h3>
+  <p class="tldr">Encapsulation hides change, abstraction names what matters, inheritance reuses a true is-a contract, and polymorphism lets you replace if/else on type with objects that each know their own behaviour: together they are the tools every design principle uses.</p>
+
+  <p>Core Java explains <em>how</em> the four pillars work: <a href="02-core-java.html#m2">Core Java · Module 2</a> has the syntax, rules and examples. This article asks a different question: <em>what does each pillar buy you in a design?</em> Think of them as tools, and of the principles in this module as the instructions for using them.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pillar</th><th>Design question it answers</th><th>Principle that depends on it</th></tr></thead>
+    <tbody>
+      <tr><td>Encapsulation</td><td>How do I stop callers depending on my internals?</td><td>Low coupling, <a href="#m1-demeter-tell-soc">Tell, Don't Ask</a></td></tr>
+      <tr><td>Abstraction</td><td>What is the smallest contract callers need?</td><td><a href="#m1-isp">ISP</a>, <a href="#m1-dip">DIP</a></td></tr>
+      <tr><td>Inheritance</td><td>Which types are truly substitutable?</td><td><a href="#m1-lsp">LSP</a>, <a href="#m1-composition-inheritance">composition over inheritance</a></td></tr>
+      <tr><td>Polymorphism</td><td>How do I add behaviour without editing old code?</td><td><a href="#m1-ocp">OCP</a>, Strategy</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Encapsulation: hide what may change</h4>
+  <p>Every private field is a decision you may change later without telling anyone. Design for it: make fields private, make objects immutable when possible (records, <code>final</code> fields), return unmodifiable views or copies of collections, and put the rules next to the data they protect. An <code>Order</code> should expose <code>addItem()</code> and <code>cancel()</code>, not <code>getItems().add(...)</code> and <code>setStatus(...)</code>.</p>
+
+  <h4>Abstraction: name the idea, hide the how</h4>
+  <p>An abstraction is a promise: "give me an <code>Order</code> and I will return a <code>Receipt</code>". The caller does not care about databases or HTTP. A good abstraction is <em>small</em> (few methods), <em>stable</em> (does not change when internals change) and <em>honest</em> (it does not leak details such as <code>SQLException</code> in a method that has nothing to do with SQL). In Java you express abstractions with interfaces and abstract classes; <a href="02-core-java.html#m2">Core Java</a> compares the two.</p>
+
+  <h4>Inheritance: use sparingly, and only for real is-a</h4>
+  <p>Inheritance is the strongest coupling Java offers. A child sees and depends on its parent's behaviour. Use it when the child truly <em>is</em> a parent in every situation the parent is used (the Liskov test, see <a href="#m1-lsp">LSP</a>) and when the parent was designed to be extended. For code reuse alone, prefer <a href="#m1-composition-inheritance">composition</a>.</p>
+
+  <h4>Polymorphism: replace conditionals with objects</h4>
+  <p>Polymorphism is the engine of design for change. Instead of one method with an <code>if</code> or <code>switch</code> on a type code, you define an interface and let each type implement its own behaviour. Adding a new type then means adding a class, not editing a switch in five places.</p>
+  <pre data-title="PolymorphismDesign.java"><code class="language-java">// Before: every new shape means editing this method (and every other switch like it)
+static double area(String type, double a, double b) {
+    switch (type) {
+        case "CIRCLE":    return Math.PI * a * a;
+        case "RECTANGLE": return a * b;
+        default: throw new IllegalArgumentException(type);
+    }
+}
+
+// After: each shape knows its own area; adding Triangle edits nothing existing
+interface Shape { double area(); }
+record Circle(double r) implements Shape {
+    public double area() { return Math.PI * r * r; }
+}
+record Rectangle(double w, double h) implements Shape {
+    public double area() { return w * h; }
+}</code></pre>
+  <p>Java 21 adds sealed interfaces with pattern-matching <code>switch</code> as a second tool: when the set of types is closed and fixed, a sealed hierarchy with an exhaustive <code>switch</code> is also good design, because the compiler tells you every place to update when you add a type. Choose polymorphic methods when new <em>types</em> are likely; choose sealed types plus <code>switch</code> when new <em>operations</em> are likely.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Design habits from the pillars</p>
+    <ul>
+      <li>Private fields, behaviour-rich classes, few setters.</li>
+      <li>Small interfaces named after the role (<code>PaymentGateway</code>), not the technology (<code>RazorpayService</code>).</li>
+      <li>Default to <code>final</code> classes; open a class for extension on purpose.</li>
+      <li>Any <code>switch</code> or <code>instanceof</code> chain on a type is a hint to ask whether polymorphism fits (see <a href="#m1-code-smells">code smells</a>).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: OOP pillars from a design view</p>
+    <ul>
+      <li>Do not recite definitions only. Say what each pillar protects: encapsulation protects against change in data, abstraction against change in implementation, polymorphism against change in behaviour.</li>
+      <li>Mention that inheritance is the one to be careful with, and say why (fragile base class; see <a href="#m1-composition-inheritance">composition over inheritance</a>).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-srp">
+  <h3>S: Single Responsibility Principle</h3>
+  <p class="tldr">A class should have only one reason to change: it should serve one actor or one concern, so that a change in business rules, storage or notifications touches only the class that owns that concern.</p>
+
+  <p><strong>SOLID</strong> is a set of five principles popularised by Robert C. Martin ("Uncle Bob"): Single responsibility, Open/closed, Liskov substitution, Interface segregation, Dependency inversion. They are guidelines, not laws, but they appear in almost every design interview and code review. We take them one at a time, each with a violating version and a fix.</p>
+  <p>The <strong>Single Responsibility Principle (SRP)</strong> says: <em>a class should have one, and only one, reason to change</em>. Martin later restated it as: a module should answer to one actor, meaning one group of people who ask for changes. If the finance team and the marketing team both ask for changes to the same class, that class has two responsibilities, and their edits will collide.</p>
+
+  <h4>The violation: a class that does everything</h4>
+  <p>Look at a typical first draft of order placement. It validates, calculates the price, writes to the database and sends an email, all in one place.</p>
+  <pre data-title="OrderService.java (violating SRP)"><code class="language-java">import java.sql.*;
+import java.util.List;
+
+record OrderItem(String sku, long unitPaise, int qty) { }
+record Order(String id, String customerEmail, List&lt;OrderItem&gt; items) { }
+
+public class OrderService {
+    public void placeOrder(Order order) throws SQLException {
+        // 1. validation rules (changes when the business rules change)
+        if (order.items().isEmpty()) {
+            throw new IllegalArgumentException("Order has no items");
+        }
+        if (!order.customerEmail().contains("@")) {
+            throw new IllegalArgumentException("Bad email");
+        }
+        // 2. pricing (changes when the finance team changes discounts or GST)
+        long total = 0;
+        for (OrderItem i : order.items()) total += i.unitPaise() * i.qty();
+        if (total &gt; 500_000) total = total * 95 / 100;
+        // 3. persistence (changes when the database or schema changes)
+        try (Connection c = DriverManager.getConnection("jdbc:postgresql://db/shop");
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO orders(id, email, total) VALUES (?, ?, ?)")) {
+            ps.setString(1, order.id());
+            ps.setString(2, order.customerEmail());
+            ps.setLong(3, total);
+            ps.executeUpdate();
+        }
+        // 4. notification (changes when marketing wants SMS or a new template)
+        System.out.println("Mail to " + order.customerEmail() + ": order " + order.id());
+    }
+}</code></pre>
+  <p>There are four reasons to change this class: validation rules, pricing, the database, and the message. Each belongs to a different person or team. The problems are practical:</p>
+  <ul>
+    <li><strong>Merge conflicts and regressions.</strong> A discount change can accidentally break the SQL.</li>
+    <li><strong>Hard to test.</strong> To test the discount you need a live database.</li>
+    <li><strong>No reuse.</strong> The pricing logic cannot be used by the "show cart" page.</li>
+    <li><strong>Hard to read.</strong> Four concerns are mixed in one method.</li>
+  </ul>
+
+  <h4>The refactoring: one class per reason to change</h4>
+  <pre data-title="OrderServiceRefactored.java"><code class="language-java">import java.util.List;
+
+class OrderValidator {
+    void validate(Order order) {
+        if (order.items().isEmpty()) {
+            throw new IllegalArgumentException("Order has no items");
+        }
+        if (!order.customerEmail().contains("@")) {
+            throw new IllegalArgumentException("Bad email");
+        }
+    }
+}
+
+class PriceCalculator {
+    long totalInPaise(List&lt;OrderItem&gt; items) {
+        long total = 0;
+        for (OrderItem i : items) total += i.unitPaise() * i.qty();
+        return total &gt; 500_000 ? total * 95 / 100 : total;
+    }
+}
+
+interface OrderRepository {
+    void save(Order order, long totalInPaise);
+}
+
+interface OrderNotifier {
+    void orderPlaced(Order order);
+}
+
+public class OrderService {
+    private final OrderValidator validator;
+    private final PriceCalculator pricing;
+    private final OrderRepository repository;
+    private final OrderNotifier notifier;
+
+    public OrderService(OrderValidator validator, PriceCalculator pricing,
+                        OrderRepository repository, OrderNotifier notifier) {
+        this.validator = validator;
+        this.pricing = pricing;
+        this.repository = repository;
+        this.notifier = notifier;
+    }
+
+    public void placeOrder(Order order) {                 // the workflow, nothing else
+        validator.validate(order);
+        long total = pricing.totalInPaise(order.items());
+        repository.save(order, total);
+        notifier.orderPlaced(order);
+    }
+}</code></pre>
+  <p><code>OrderService</code> now has one job: <em>coordinate</em> the steps. Its reason to change is "the order workflow changes". The JDBC code lives in a <code>JdbcOrderRepository</code>, the email in an <code>EmailOrderNotifier</code>. You can test <code>PriceCalculator</code> with plain JUnit and no mocks, and replace the notifier with a fake in a test of the service.</p>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class OrderService {
+    +placeOrder(Order)
+  }
+  class OrderValidator
+  class PriceCalculator
+  class OrderRepository {
+    &lt;&lt;interface&gt;&gt;
+    +save(Order, long)
+  }
+  class OrderNotifier {
+    &lt;&lt;interface&gt;&gt;
+    +orderPlaced(Order)
+  }
+  OrderService --> OrderValidator
+  OrderService --> PriceCalculator
+  OrderService --> OrderRepository
+  OrderService --> OrderNotifier
+  OrderRepository &lt;|.. JdbcOrderRepository
+  OrderNotifier &lt;|.. EmailOrderNotifier
+</pre>
+    <figcaption>After applying SRP, the service orchestrates and each concern lives in its own class</figcaption>
+  </figure>
+
+  <h4>How Spring helps</h4>
+  <p>In Spring Boot, the layered structure is SRP at work: <code>@RestController</code> handles HTTP, <code>@Service</code> holds business rules, <code>@Repository</code> talks to the database. Spring's dependency injection then wires the small classes together, so splitting a class into four costs you almost nothing: you declare the collaborators as constructor parameters and the container supplies them.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Common misunderstandings</p>
+    <ul>
+      <li><strong>"One class = one method."</strong> Wrong. A class may have many methods if they all serve the same responsibility. <code>BigDecimal</code> has dozens of methods and one purpose: decimal arithmetic.</li>
+      <li><strong>"Split everything."</strong> Splitting too far creates dozens of tiny classes that each do nothing and are hard to follow. Split along <em>reasons to change</em>, not along lines of code.</li>
+      <li><strong>It is about change, not size.</strong> A 400-line class with one reason to change can be fine; a 60-line class that mixes SQL and email is not.</li>
+      <li>Entities and DTOs: a JPA entity that is also the JSON response and also the form object has three reasons to change. Use separate DTOs at the API boundary.</li>
+    </ul>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: how to find responsibilities</p>
+    <p>Describe the class in one sentence. If you need "and" or "or", split it. Ask: "Who would ask me to change this?" If the answer lists several roles (finance, ops, security), you have several responsibilities. Another signal: the class imports packages from unrelated areas (<code>java.sql</code> and <code>javax.mail</code> in one file).</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: explain SRP in 30 seconds</p>
+    <p>"SRP says a class should have only one reason to change. If validation, pricing, database access and email are in one class, any of four teams can break it. I split them so that each class serves one concern, and a coordinator class calls them. It makes code easier to test and to change. It does not mean one method per class; it is about reasons to change." Follow-up: "How do you know when to split?" Answer: when you see unrelated imports, a hard-to-name class, or tests that need heavy setup.</p>
+  </div>
+</article>
+
+<article class="topic" id="m1-ocp">
+  <h3>O: Open/Closed Principle</h3>
+  <p class="tldr">Software entities should be open for extension but closed for modification: you add new behaviour by writing new classes that plug into an existing abstraction, without editing the tested code that already works.</p>
+
+  <p>Every time you edit a working class, you risk breaking it. The <strong>Open/Closed Principle (OCP)</strong>, from Bertrand Meyer and popularised by Uncle Bob, says design the code so that new behaviour arrives as <em>new code</em>, not as edits to old code. "Open for extension" means you can add behaviour. "Closed for modification" means the existing, tested source stays untouched.</p>
+  <p>It is not magic. It works only along the lines of change you anticipated (or have already seen once). You build the abstraction around something that varies, such as a discount rule, and then new variations are new classes.</p>
+
+  <h4>The violation: a switch that grows forever</h4>
+  <pre data-title="DiscountCalculator.java (violating OCP)"><code class="language-java">enum CustomerType { REGULAR, PREMIUM, STUDENT }
+
+public class DiscountCalculator {
+    public long discountInPaise(CustomerType type, long amountInPaise) {
+        switch (type) {
+            case REGULAR:
+                return 0;
+            case PREMIUM:
+                return amountInPaise * 10 / 100;
+            case STUDENT:
+                return amountInPaise * 5 / 100;
+            default:
+                throw new IllegalArgumentException("Unknown type " + type);
+        }
+    }
+}</code></pre>
+  <p>Marketing now wants a <code>FESTIVE</code> discount, then <code>EMPLOYEE</code>, then <code>FIRST_ORDER</code>. Each one means editing this method, recompiling and retesting every existing branch, and probably editing similar <code>switch</code> blocks elsewhere (the invoice printer, the report). This is a sign that OCP is violated: every new variant edits old code.</p>
+
+  <h4>The fix: an abstraction and one class per rule</h4>
+  <pre data-title="DiscountPolicy.java"><code class="language-java">public interface DiscountPolicy {
+    boolean appliesTo(CustomerType type);
+    long discountInPaise(long amountInPaise);
+}
+
+class RegularDiscount implements DiscountPolicy {
+    public boolean appliesTo(CustomerType type) { return type == CustomerType.REGULAR; }
+    public long discountInPaise(long amount) { return 0; }
+}
+
+class PremiumDiscount implements DiscountPolicy {
+    public boolean appliesTo(CustomerType type) { return type == CustomerType.PREMIUM; }
+    public long discountInPaise(long amount) { return amount * 10 / 100; }
+}
+
+class StudentDiscount implements DiscountPolicy {
+    public boolean appliesTo(CustomerType type) { return type == CustomerType.STUDENT; }
+    public long discountInPaise(long amount) { return amount * 5 / 100; }
+}
+
+public class DiscountCalculator {
+    private final java.util.List&lt;DiscountPolicy&gt; policies;
+
+    public DiscountCalculator(java.util.List&lt;DiscountPolicy&gt; policies) {
+        this.policies = policies;
+    }
+
+    public long discountInPaise(CustomerType type, long amountInPaise) {
+        return policies.stream()
+                .filter(p -&gt; p.appliesTo(type))
+                .findFirst()
+                .orElseThrow(() -&gt; new IllegalArgumentException("No policy for " + type))
+                .discountInPaise(amountInPaise);
+    }
+}</code></pre>
+  <p>To add a festive discount you write <code>FestiveDiscount implements DiscountPolicy</code> and add it to the list. <code>DiscountCalculator</code> is closed: it never changes. The set of rules is open: it grows by adding classes. This is the <strong>Strategy pattern</strong> (<a href="#m2-strategy">Strategy</a>).</p>
+
+  <h4>How Spring makes OCP easy</h4>
+  <p>Spring can inject <em>all</em> beans of an interface as a <code>List</code>, or as a <code>Map</code> keyed by bean name. You write a new <code>@Component</code> and the calculator finds it, with no registration code:</p>
+  <pre data-title="SpringDiscounts.java"><code class="language-java">import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
+import java.util.List;
+
+@Component
+class FestiveDiscount implements DiscountPolicy {          // new class only
+    public boolean appliesTo(CustomerType type) { return type == CustomerType.FESTIVE; }
+    public long discountInPaise(long amount) { return amount * 15 / 100; }
+}
+
+@Service
+class DiscountService {
+    private final List&lt;DiscountPolicy&gt; policies;           // Spring injects every bean
+
+    DiscountService(List&lt;DiscountPolicy&gt; policies) { this.policies = policies; }
+    // same logic as above
+}</code></pre>
+  <p>(The example assumes <code>CustomerType</code> has a <code>FESTIVE</code> constant, added as part of the new feature; adding an enum constant is not editing the calculator.)</p>
+
+  <h4>Other ways to get OCP</h4>
+  <ul>
+    <li><strong>Inheritance and the Template Method</strong>: a base class fixes the algorithm; subclasses fill in steps (<a href="#m2-template-method">Template Method</a>).</li>
+    <li><strong>Decorator</strong>: wrap an object to add behaviour without changing it (<a href="#m2-decorator">Decorator</a>).</li>
+    <li><strong>Plugins and <code>ServiceLoader</code></strong>: new JARs on the classpath add implementations of an interface.</li>
+    <li><strong>Lambdas</strong>: pass a <code>Predicate</code> or <code>Comparator</code> instead of hard-coding a rule.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Common misunderstandings and limits</p>
+    <ul>
+      <li><strong>You cannot close code against every change.</strong> Pick the likely axis of change. If you guess wrong, the abstraction does not help, so wait for the second or third variant before building it (see <a href="#m1-dry-kiss-yagni">YAGNI</a>).</li>
+      <li>"Never modify a class" is not the rule. Fixing a bug in <code>PremiumDiscount</code> is a normal edit. The rule is about adding <em>features</em>.</li>
+      <li>A <code>switch</code> over a closed, stable set (days of the week) is fine. The smell is a <code>switch</code> that you keep editing and that is copied in several places.</li>
+      <li>A good test: does adding a feature require editing existing <code>if/else</code> or <code>switch</code> blocks? If yes, OCP is violated.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: building the framework first</p>
+    <p>Writing a <code>PolicyFactoryProvider</code> with a plugin system for a rule that has one variant is over-engineering. Write the simple <code>if</code> first. When the second variant arrives, refactor to an interface. When the third arrives, you will thank yourself.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: explain OCP in 30 seconds</p>
+    <p>"OCP says classes should be open for extension and closed for modification. If I have a <code>switch</code> on customer type for discounts, every new type edits that method. I introduce a <code>DiscountPolicy</code> interface, one class per rule, and the calculator loops over the policies. A new rule is a new class; old code stays untouched. In Spring I inject <code>List&lt;DiscountPolicy&gt;</code> so a new <code>@Component</code> is picked up automatically." Common follow-up: "Is it always possible?" Answer: only along anticipated axes of change; do not abstract early.</p>
+  </div>
+</article>

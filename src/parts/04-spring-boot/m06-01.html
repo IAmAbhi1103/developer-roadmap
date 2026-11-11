@@ -1,0 +1,553 @@
+<div class="mintro">
+  <p>A project that "works on my laptop" is not yet a project that runs well in production. This module is about everything around your business code that makes an application <strong>operable</strong>: you can see what it is doing (logs, health, metrics), it is fast enough (caching), it does work in the background (scheduling, async), it handles files and email, it calls other APIs safely, and it protects itself from abuse (rate limiting).</p>
+  <p>Most of these features are a starter dependency plus a few properties, and most are built on the proxy mechanism from <a href="#m1">module 1</a>, so the same traps repeat (self-invocation, wrong thread, wrong transaction). We use the Project 2 job portal (User, Company, Job, Application) for examples: a resume upload, an email to the recruiter when someone applies, a cached job list and a health endpoint for Docker.</p>
+  <p>The next module, <a href="#m7">Microservices and messaging</a>, builds on these: Actuator and Micrometer feed tracing, and RestClient meets Resilience4j.</p>
+  <ul>
+    <li>Configure logging with levels, files, JSON output and a correlation id, and know what never to log.</li>
+    <li>Expose health, info and metrics with Actuator, secure it, and write a custom health check and custom metrics.</li>
+    <li>Cache with <code>@Cacheable</code> using Caffeine or Redis, and invalidate correctly.</li>
+    <li>Run scheduled and asynchronous jobs safely, with virtual threads where they help.</li>
+    <li>Upload and download files and send email (HTML, attachments) without security holes.</li>
+    <li>Call other services with <code>RestClient</code> and declarative HTTP clients, with timeouts.</li>
+    <li>Add rate limiting and walk through a production-readiness checklist.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m6-logging">
+  <h3>Logging with SLF4J and Logback: levels, files, JSON and MDC</h3>
+  <p class="tldr">Log through the SLF4J API, let Spring Boot's default Logback do the work, control it with logging.level.* and a few properties, switch to JSON in production, tag every line with a request id using MDC, and never log secrets.</p>
+
+  <h4>What and why</h4>
+  <p><code>System.out.println</code> is not logging. A <strong>log</strong> is a stream of timestamped, levelled events that you can filter, search, ship to a central system and turn up or down without redeploying. When a user says "my application did not go through at 3 pm", the log is often your only evidence.</p>
+  <p>Java has many logging libraries, so Spring Boot uses a <strong>facade</strong>. <strong>SLF4J</strong> is the API you write against (<code>Logger</code>, <code>LoggerFactory</code>); <strong>Logback</strong> is the implementation that actually writes lines. <code>spring-boot-starter-logging</code> is included by every starter, so logging works with zero setup. Basic Java logging ideas are in <a href="02-core-java.html#m8">Core Java · Module 8</a>.</p>
+
+  <h4>Writing log statements</h4>
+  <pre data-title="ApplicationService.java"><code class="language-java">import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+@Service
+public class ApplicationService {
+
+    private static final Logger log = LoggerFactory.getLogger(ApplicationService.class);
+
+    public ApplicationResponse apply(Long jobId, Long userId) {
+        log.info("User {} applying to job {}", userId, jobId);   // placeholders, no concatenation
+        try {
+            // ... save the application
+            log.debug("Application saved, id={}", saved.getId());
+            return mapper.toResponse(saved);
+        } catch (DuplicateResourceException ex) {
+            log.warn("Duplicate application: user={}, job={}", userId, jobId);
+            throw ex;
+        } catch (RuntimeException ex) {
+            log.error("Could not save application for user {} job {}", userId, jobId, ex);
+            throw ex;                    // the last argument, an exception, prints the stack trace
+        }
+    }
+}</code></pre>
+  <p>With Lombok you can write <code>@Slf4j</code> on the class and use <code>log</code> directly. Rules for the statements themselves:</p>
+  <ul>
+    <li>Use <code>{}</code> placeholders. The message is built only if the level is enabled, so <code>log.debug("x " + big)</code> (which builds the string always) is a small performance bug.</li>
+    <li>Pass the exception as the <strong>last argument</strong>, without a placeholder, to get the stack trace. <code>log.error("failed: " + ex.getMessage())</code> throws the stack trace away.</li>
+    <li>Do not log and rethrow the same exception at every layer; you get the same stack trace five times. Log it once, where you handle it (usually the <code>@RestControllerAdvice</code> from <a href="#m2">module 2</a>).</li>
+  </ul>
+
+  <h4>Log levels</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Level</th><th>Use it for</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>ERROR</code></td><td>The operation failed and someone should look</td><td>Database down, unexpected exception</td></tr>
+      <tr><td><code>WARN</code></td><td>Something odd, but the app handled it</td><td>Retry succeeded, deprecated API used, rate limit hit</td></tr>
+      <tr><td><code>INFO</code></td><td>Important business events, few per request</td><td>"Application submitted", startup, job finished</td></tr>
+      <tr><td><code>DEBUG</code></td><td>Details for developers, off in production</td><td>Method arguments, decisions taken</td></tr>
+      <tr><td><code>TRACE</code></td><td>Very fine detail</td><td>Every loop iteration, raw payloads</td></tr>
+    </tbody>
+  </table></div>
+  <p>Levels are ordered: setting a logger to <code>INFO</code> prints INFO, WARN and ERROR. Spring Boot's default is <code>INFO</code> for everything. A bad request from a client (validation failure, 404) is <strong>not</strong> an ERROR in your system; log it at INFO or DEBUG, or not at all. Reserve ERROR for things you would wake up for.</p>
+
+  <h4>Configuring Logback through properties</h4>
+  <p>Boot's defaults need no XML. Everything below goes in <code>application.yml</code> (or <code>.properties</code>):</p>
+  <pre data-title="application.yml"><code class="language-yaml">logging:
+  level:
+    root: INFO
+    com.example.jobs: DEBUG              # your packages
+    org.springframework.web: WARN
+    org.hibernate.SQL: DEBUG             # print SQL (see the JPA module)
+  file:
+    name: logs/jobs-api.log              # also write to a file (path relative to working dir)
+  logback:
+    rollingpolicy:
+      max-file-size: 10MB                # roll over when the file reaches this size
+      max-history: 14                    # keep 14 days of archives
+      total-size-cap: 1GB
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{requestId:-}] %logger{36} - %msg%n"
+  group:
+    persistence: org.hibernate.SQL, org.springframework.orm.jpa   # one name for many loggers</code></pre>
+  <ul>
+    <li><code>logging.level.&lt;logger&gt;</code> sets the level for a package or class. Loggers form a tree: <code>com.example.jobs</code> also controls <code>com.example.jobs.job.JobService</code> unless that has its own level.</li>
+    <li><code>logging.file.name</code> (or <code>logging.file.path</code>, which writes <code>spring.log</code> inside that folder) adds a file. Boot rolls files by size and date once you set the <code>logging.logback.rollingpolicy.*</code> properties.</li>
+    <li><code>logging.pattern.console</code> and <code>logging.pattern.file</code> change the line format. <code>%X{requestId:-}</code> prints a value from the MDC (below), or nothing.</li>
+    <li><code>logging.group.&lt;name&gt;</code> lets you write <code>logging.level.persistence: DEBUG</code> for several loggers at once.</li>
+    <li>Quick debugging: start with <code>--debug</code> (or <code>debug=true</code>) to see Boot's auto-configuration report. This is not the same as DEBUG for your own code.</li>
+  </ul>
+  <p>You can also change a level of a running application without a restart through the Actuator <code>loggers</code> endpoint (see <a href="#m6-actuator">Actuator</a>).</p>
+
+  <h4>logback-spring.xml: profiles and rolling files</h4>
+  <p>When properties are not enough, add <code>src/main/resources/logback-spring.xml</code>. Use the name <code>logback-spring.xml</code>, not <code>logback.xml</code>: the "-spring" version is loaded by Spring Boot, so you can use <code>&lt;springProfile&gt;</code> and <code>&lt;springProperty&gt;</code>.</p>
+  <pre data-title="logback-spring.xml"><code class="language-xml">&lt;configuration&gt;
+  &lt;include resource="org/springframework/boot/logging/logback/defaults.xml"/&gt;
+  &lt;include resource="org/springframework/boot/logging/logback/console-appender.xml"/&gt;
+
+  &lt;springProperty scope="context" name="APP" source="spring.application.name"
+                  defaultValue="jobs-api"/&gt;
+
+  &lt;appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender"&gt;
+    &lt;file&gt;logs/${APP}.log&lt;/file&gt;
+    &lt;rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy"&gt;
+      &lt;fileNamePattern&gt;logs/${APP}-%d{yyyy-MM-dd}.%i.log.gz&lt;/fileNamePattern&gt;
+      &lt;maxFileSize&gt;10MB&lt;/maxFileSize&gt;
+      &lt;maxHistory&gt;14&lt;/maxHistory&gt;
+      &lt;totalSizeCap&gt;1GB&lt;/totalSizeCap&gt;
+    &lt;/rollingPolicy&gt;
+    &lt;encoder&gt;
+      &lt;pattern&gt;%d %-5level [%thread] [%X{requestId:-}] %logger{36} - %msg%n&lt;/pattern&gt;
+    &lt;/encoder&gt;
+  &lt;/appender&gt;
+
+  &lt;springProfile name="dev"&gt;
+    &lt;root level="INFO"&gt;&lt;appender-ref ref="CONSOLE"/&gt;&lt;/root&gt;
+    &lt;logger name="com.example.jobs" level="DEBUG"/&gt;
+  &lt;/springProfile&gt;
+
+  &lt;springProfile name="prod"&gt;
+    &lt;root level="INFO"&gt;
+      &lt;appender-ref ref="CONSOLE"/&gt;
+      &lt;appender-ref ref="FILE"/&gt;
+    &lt;/root&gt;
+  &lt;/springProfile&gt;
+&lt;/configuration&gt;</code></pre>
+  <p>Think about whether you need files at all. In Docker and Kubernetes the standard is: <strong>write to the console (stdout)</strong> and let the platform collect it. Files and rotation are for plain VM deployments (<a href="07-devops.html#m6">DevOps · Module 6</a>).</p>
+
+  <h4>Structured (JSON) logging</h4>
+  <p>Plain text lines are easy for humans but hard for log tools: to search "all errors for user 42" you must parse text. <strong>Structured logging</strong> writes each event as one JSON object with fields (<code>@timestamp</code>, <code>level</code>, <code>message</code>, <code>traceId</code>, your MDC values), so tools like Loki, Elasticsearch or CloudWatch can filter by field.</p>
+  <pre data-title="application-prod.yml"><code class="language-yaml">logging:
+  structured:
+    format:
+      console: ecs          # also: logstash, gelf
+      # file: ecs           # same for the log file</code></pre>
+  <pre class="out" data-title="One log event (pretty-printed here; really one line)"><code class="language-json">{
+  "@timestamp": "2026-11-10T09:15:03.412Z",
+  "log.level": "INFO",
+  "message": "User 42 applying to job 7",
+  "service.name": "jobs-api",
+  "log.logger": "com.example.jobs.application.ApplicationService"
+}</code></pre>
+  <div class="co co-version">
+    <p class="co-t">Version note</p>
+    <p>Built-in structured logging (<code>logging.structured.format.console</code>) arrived in Spring Boot 3.4 and works the same in 4.x. On older versions you would add a JSON encoder library such as <code>logstash-logback-encoder</code> in <code>logback-spring.xml</code>. The exact field names depend on the format you pick (ECS, Logstash, GELF).</p>
+  </div>
+
+  <h4>MDC: a request id on every line</h4>
+  <p>The <strong>MDC</strong> (Mapped Diagnostic Context) is a per-thread map that Logback can print on every line. Put a <strong>correlation id</strong> (request id) in it at the start of each request, and every log line from that request, from any class, carries the same id. When a user reports a problem, you search for one id and see the whole story.</p>
+  <pre data-title="RequestIdFilter.java"><code class="language-java">import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.util.UUID;
+import org.slf4j.MDC;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class RequestIdFilter extends OncePerRequestFilter {
+
+    private static final String HEADER = "X-Request-Id";
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+                                    FilterChain chain) throws ServletException, IOException {
+        String id = request.getHeader(HEADER);
+        if (id == null || id.isBlank() || id.length() &gt; 64) {
+            id = UUID.randomUUID().toString();
+        }
+        MDC.put("requestId", id);
+        response.setHeader(HEADER, id);          // the client can quote it in a bug report
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            MDC.remove("requestId");             // threads are reused: always clean up
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Console with the pattern above"><code class="language-plaintext">09:15:03.412 INFO  [a1b2c3d4-...] c.e.jobs.application.ApplicationService - User 42 applying to job 7
+09:15:03.430 WARN  [a1b2c3d4-...] c.e.jobs.application.ApplicationService - Duplicate application</code></pre>
+  <p>Two details matter. First, the MDC is bound to the <strong>thread</strong>; a new thread (<code>@Async</code>, an executor, a Kafka listener) starts with an empty MDC. Copy it with a <code>TaskDecorator</code> (see <a href="#m6-async">Async</a>). Second, if you add Micrometer Tracing later (<a href="#m7-tracing">tracing</a>), it puts <code>traceId</code> and <code>spanId</code> in the MDC for you, and the request id becomes less necessary.</p>
+
+  <h4>What to log, and what never to log</h4>
+  <ul>
+    <li><strong>Log:</strong> business events with ids (application submitted, job closed), calls to other systems with duration and status, scheduled job start/end with counts, security events (login failed, access denied), and the exception at the place you handle it.</li>
+    <li><strong>Never log:</strong> passwords, JWTs, API keys, OTPs, card numbers, Aadhaar/PAN, full email bodies, full request bodies of sensitive endpoints. This is both a security and a legal problem (privacy laws, PCI rules). Log ids, not personal data: <code>userId=42</code>, not the user's phone number.</li>
+    <li><strong>Watch out for:</strong> <code>toString()</code> of entities (lazy loading and sensitive fields), Lombok <code>@Data</code> printing a password field, and <code>logging.level.org.springframework.web=DEBUG</code> in production, which can print request details.</li>
+  </ul>
+
+  <h4>Logging in tests</h4>
+  <p>Keep a <code>src/test/resources/application-test.yml</code> with quieter levels so test output is readable. To assert on log output, use the <code>OutputCaptureExtension</code> from Spring Boot (<code>@ExtendWith(OutputCaptureExtension.class)</code>, then take a <code>CapturedOutput</code> parameter and check <code>output.getOut()</code>). Prefer asserting on behaviour, and only check logs for things like "secret is not printed". See <a href="#m5">module 5</a> for test setup.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>String concatenation in log calls, or <code>ex.printStackTrace()</code> (goes to stderr, outside the log).</li>
+      <li>Logging a whole request DTO that contains a password.</li>
+      <li>DEBUG left on in production: slow, huge disk use, and leaks data.</li>
+      <li>Forgetting <code>MDC.remove</code> in <code>finally</code>, so the next request on that thread shows the old id.</li>
+      <li>Logging inside a tight loop (a million lines for one batch). Log a summary.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Both <code>logging.file.name</code> and <code>logging.file.path</code> set: <code>name</code> wins.</li>
+      <li>If a second logging library is on the classpath (log4j-slf4j and Logback together), SLF4J prints "multiple bindings" and may pick the wrong one. Exclude one in the build.</li>
+      <li>A <code>logback.xml</code> (without "-spring") is read before Boot starts, so <code>&lt;springProfile&gt;</code> will not work there.</li>
+      <li>Logging cannot fail the request: Logback swallows its own I/O errors (a full disk loses logs, but requests continue).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"SLF4J vs Logback?" Facade vs implementation. "Why placeholders?" No string building when disabled. "How do you trace one request across many log lines?" MDC correlation id in a filter, or tracing ids. "How do you change the log level without restart?" Actuator <code>loggers</code>. "What do you never log?" Secrets and personal data. Mention JSON logs for log platforms.</p>
+  </div>
+</article>
+
+<article class="topic" id="m6-actuator">
+  <h3>Spring Boot Actuator: health, info, endpoints and securing them</h3>
+  <p class="tldr">Add spring-boot-starter-actuator to get ready-made endpoints (health, info, metrics, loggers and more); expose only what you need, secure the rest, and use the liveness and readiness probes for Docker and Kubernetes.</p>
+
+  <h4>What and why</h4>
+  <p><strong>Actuator</strong> adds production endpoints to your application with no code: "is it up?", "what is its version?", "how many requests failed?", "what is the log level?". Load balancers, Docker, Kubernetes and monitoring tools call these endpoints. Without a health endpoint, your platform can only guess whether the application works.</p>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-actuator&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <p>With the starter alone, only <code>/actuator/health</code> is exposed over HTTP (and it shows just <code>{"status":"UP"}</code>). The other endpoints exist but are hidden for safety, because some of them (<code>env</code>, <code>heapdump</code>) reveal sensitive data.</p>
+
+  <h4>The main endpoints</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Endpoint</th><th>What it shows or does</th><th>Risk</th></tr></thead>
+    <tbody>
+      <tr><td><code>health</code></td><td>UP/DOWN of the app and its parts (database, disk, Redis...)</td><td>Low (details can leak)</td></tr>
+      <tr><td><code>info</code></td><td>App name, version, git commit, build time</td><td>Low</td></tr>
+      <tr><td><code>metrics</code></td><td>Micrometer metric names and values (JVM, HTTP, pool)</td><td>Medium</td></tr>
+      <tr><td><code>prometheus</code></td><td>All metrics in Prometheus text format (needs the Prometheus registry)</td><td>Medium</td></tr>
+      <tr><td><code>loggers</code></td><td>List and <strong>change</strong> log levels at runtime</td><td>Medium (writeable)</td></tr>
+      <tr><td><code>env</code></td><td>Properties and environment (values of secrets are masked by default, not always)</td><td>High</td></tr>
+      <tr><td><code>mappings</code></td><td>All URL mappings</td><td>Medium</td></tr>
+      <tr><td><code>beans</code></td><td>All Spring beans</td><td>Medium</td></tr>
+      <tr><td><code>conditions</code></td><td>Why each auto-configuration did or did not apply</td><td>Low</td></tr>
+      <tr><td><code>threaddump</code></td><td>Stack of every thread (find deadlocks and stuck requests)</td><td>High</td></tr>
+      <tr><td><code>heapdump</code></td><td>Downloads a JVM heap dump, which contains everything in memory</td><td><strong>Very high</strong></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Exposure settings</h4>
+  <p>Every endpoint has two switches: <em>enabled</em> and <em>exposed</em> (over HTTP or JMX). You choose what is exposed:</p>
+  <pre data-title="application.yml"><code class="language-yaml">management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus, loggers   # list what you need
+        # exclude: heapdump, env
+        # include: "*"                                         # everything: dev only
+      base-path: /actuator                                     # default
+  endpoint:
+    health:
+      show-details: when-authorized      # never | when-authorized | always
+      probes:
+        enabled: true                    # adds /actuator/health/liveness and /readiness
+  server:
+    port: 9090                           # optional: serve actuator on a separate port</code></pre>
+  <p>A separate management port (<code>management.server.port</code>) is a strong, simple protection: do not publish port 9090 to the internet, only to your monitoring network. Your gateway or Nginx only forwards the API port.</p>
+
+  <h4>Securing Actuator</h4>
+  <p>If <a href="#m4">Spring Security</a> is on the classpath, actuator endpoints are protected by your filter chain like any URL. The rule is: health (and the probes) open or limited to the platform, everything else for an admin role.</p>
+  <pre data-title="SecurityConfig.java (fragment)"><code class="language-java">@Bean
+SecurityFilterChain actuatorChain(HttpSecurity http) throws Exception {
+    http.securityMatcher(EndpointRequest.toAnyEndpoint())          // only actuator URLs
+        .authorizeHttpRequests(auth -&gt; auth
+            .requestMatchers(EndpointRequest.to("health", "info")).permitAll()
+            .anyRequest().hasRole("ADMIN"))
+        .httpBasic(Customizer.withDefaults());
+    return http.build();
+}</code></pre>
+  <p>Put this chain before your main API chain with <code>@Order(1)</code>, or merge the rules into your existing chain. Prometheus scrapers usually use a separate port or a basic-auth user. Rule of thumb: <code>health</code> may be public; <code>env</code>, <code>heapdump</code>, <code>threaddump</code>, <code>loggers</code> must never be.</p>
+
+  <h4>Health in depth</h4>
+  <p>The <code>health</code> endpoint combines many <strong>health indicators</strong>. Boot adds them automatically when the related library is present: <code>db</code> (runs a validation query on your DataSource), <code>diskSpace</code>, <code>redis</code>, <code>mail</code>, <code>rabbit</code>, and so on. The overall status is the worst one: if the database is DOWN, the app is DOWN (HTTP 503).</p>
+  <pre class="out" data-title="GET /actuator/health with show-details=always"><code class="language-json">{
+  "status": "UP",
+  "components": {
+    "db":        { "status": "UP", "details": { "database": "PostgreSQL" } },
+    "diskSpace": { "status": "UP", "details": { "free": 91234816000, "threshold": 10485760 } },
+    "ping":      { "status": "UP" }
+  }
+}</code></pre>
+
+  <h4>Liveness and readiness probes</h4>
+  <p>Orchestrators ask two different questions, and Boot answers both when <code>management.endpoint.health.probes.enabled=true</code> (it is on automatically when Boot detects Kubernetes):</p>
+  <ul>
+    <li><strong>Liveness</strong> (<code>/actuator/health/liveness</code>): "Is the process broken beyond repair?" If it fails, the platform <strong>restarts</strong> the container. Keep it simple: it should not check the database, or a database outage would restart every pod and make things worse.</li>
+    <li><strong>Readiness</strong> (<code>/actuator/health/readiness</code>): "Can it accept traffic now?" If it fails, the platform stops sending requests but does not restart. It goes OUT_OF_SERVICE during startup and during graceful shutdown.</li>
+  </ul>
+  <p>You can define your own <strong>health groups</strong> that pick specific indicators, for example a group the Docker healthcheck uses:</p>
+  <pre data-title="application.yml"><code class="language-yaml">management:
+  endpoint:
+    health:
+      group:
+        readiness:
+          include: readinessState, db, redis       # DB and Redis needed to serve traffic
+        liveness:
+          include: livenessState</code></pre>
+
+  <h4>A custom HealthIndicator</h4>
+  <p>Add your own check by implementing <code>HealthIndicator</code>; the bean name (minus "HealthIndicator") becomes the component name. Example: is the resume storage folder writeable?</p>
+  <pre data-title="StorageHealthIndicator.java"><code class="language-java">import java.nio.file.Files;
+import java.nio.file.Path;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.actuate.health.Health;
+import org.springframework.boot.actuate.health.HealthIndicator;
+import org.springframework.stereotype.Component;
+
+@Component("storage")                         // shows as components.storage
+public class StorageHealthIndicator implements HealthIndicator {
+
+    private final Path root;
+
+    public StorageHealthIndicator(@Value("${app.upload-dir}") Path root) {
+        this.root = root;
+    }
+
+    @Override
+    public Health health() {
+        if (Files.isWritable(root)) {
+            return Health.up().withDetail("path", root.toString()).build();
+        }
+        return Health.down().withDetail("path", root.toString())
+                .withDetail("reason", "not writable").build();
+    }
+}</code></pre>
+  <p>Keep indicators fast (they run on each call, and the platform may call every few seconds). Do not call a slow external API from one; if you must, cache the result.</p>
+
+  <h4>The info endpoint: build and git information</h4>
+  <p>The <code>info</code> endpoint answers "which version is running?" You can feed it from properties, the build, and git:</p>
+  <pre data-title="pom.xml (build-info goal) and application.yml"><code class="language-xml">&lt;plugin&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-maven-plugin&lt;/artifactId&gt;
+    &lt;executions&gt;
+        &lt;execution&gt;
+            &lt;goals&gt;&lt;goal&gt;build-info&lt;/goal&gt;&lt;/goals&gt;   &lt;!-- creates META-INF/build-info.properties --&gt;
+        &lt;/execution&gt;
+    &lt;/executions&gt;
+&lt;/plugin&gt;</code></pre>
+  <pre data-title="application.yml"><code class="language-yaml">management:
+  info:
+    env:
+      enabled: true          # show properties that start with "info."
+    git:
+      mode: simple           # needs git.properties (git-commit-id plugin)
+info:
+  app:
+    name: Jobs API
+    owner: platform-team</code></pre>
+  <p>With the git-commit-id Maven plugin generating <code>git.properties</code>, <code>info</code> shows the commit id and branch, which is gold when you ask "is the fix deployed?".</p>
+
+  <h4>Changing log levels at runtime</h4>
+  <p>The <code>loggers</code> endpoint lets you raise one logger to DEBUG on a live system, find the problem, then put it back, with no restart:</p>
+  <pre data-title="Shell session"><code class="language-shell">$ curl -s localhost:8080/actuator/loggers/com.example.jobs.application
+{"configuredLevel":null,"effectiveLevel":"INFO"}
+
+$ curl -X POST localhost:8080/actuator/loggers/com.example.jobs.application \
+       -H 'Content-Type: application/json' -d '{"configuredLevel":"DEBUG"}'
+
+$ curl -X POST localhost:8080/actuator/loggers/com.example.jobs.application \
+       -H 'Content-Type: application/json' -d '{"configuredLevel":null}'     # reset</code></pre>
+  <p>The change is in memory only; it is lost on restart. This is why <code>loggers</code> must be admin-only.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Expose only the endpoints you use. Never expose <code>env</code>, <code>heapdump</code> or <code>threaddump</code> publicly.</li>
+      <li>Liveness must not depend on external systems; readiness may.</li>
+      <li>Do not put secrets into <code>info</code> or health details.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li><code>include: "*"</code> copied from a tutorial into production.</li>
+      <li>Using <code>/actuator/health</code> (with the DB check) as the liveness probe, so a short database outage restarts all pods.</li>
+      <li>A Docker healthcheck that calls an endpoint behind authentication, so the container is "unhealthy" forever.</li>
+      <li>Forgetting that <code>show-details: always</code> leaks database names and paths on a public URL.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li>A DOWN health returns HTTP <strong>503</strong>, not 200 with a body saying DOWN. Docker or Kubernetes probes use the status code.</li>
+      <li>With a separate management port, Spring Security rules for the main port do not apply to it; protect it by the network.</li>
+      <li>Boot 3 and 4 both read <code>management.endpoints.web.exposure.*</code>; JMX exposure has different defaults (JMX is off unless enabled).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is Actuator?" Production-ready endpoints. "Liveness vs readiness?" Restart vs stop sending traffic. "How do you secure it?" Expose few endpoints, separate port, role-based access. "How do you add a custom check?" Implement <code>HealthIndicator</code>. "How do you find which version is deployed?" The <code>info</code> endpoint with build and git info.</p>
+  </div>
+</article>
+
+<article class="topic" id="m6-micrometer">
+  <h3>Metrics with Micrometer and the Prometheus endpoint</h3>
+  <p class="tldr">Micrometer is the metrics facade inside Spring Boot: it records JVM, HTTP and pool metrics automatically, you add your own counters, timers and gauges through MeterRegistry, and Prometheus scrapes them from /actuator/prometheus.</p>
+
+  <h4>What and why</h4>
+  <p>Logs tell you what happened in one request. <strong>Metrics</strong> are numbers over time: requests per second, error rate, 95th percentile latency, heap used, database connections in use. They answer "is the system healthy right now, and is it getting worse?" and they drive alerts and dashboards.</p>
+  <p><strong>Micrometer</strong> is to metrics what SLF4J is to logging: a facade. You write code against Micrometer, and a <strong>registry</strong> for your monitoring system (Prometheus, Datadog, CloudWatch...) turns it into that system's format. With Actuator you already get many metrics:</p>
+  <ul>
+    <li><code>jvm.memory.used</code>, <code>jvm.gc.pause</code>, <code>jvm.threads.live</code></li>
+    <li><code>http.server.requests</code> (count, total time and max, tagged by method, URI, status, outcome)</li>
+    <li><code>hikaricp.connections.active</code>, <code>hikaricp.connections.pending</code></li>
+    <li><code>system.cpu.usage</code>, <code>process.uptime</code>, <code>logback.events</code>, cache metrics for caches that expose stats</li>
+  </ul>
+  <pre data-title="Shell session"><code class="language-shell">$ curl -s localhost:8080/actuator/metrics | head -c 120
+{"names":["application.ready.time","hikaricp.connections.active", ...
+
+$ curl -s "localhost:8080/actuator/metrics/http.server.requests?tag=status:500"
+{"name":"http.server.requests","baseUnit":"seconds","measurements":[
+ {"statistic":"COUNT","value":3.0},{"statistic":"TOTAL_TIME","value":0.41}, ...</code></pre>
+
+  <h4>Meter types</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Meaning</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Counter</strong></td><td>A value that only goes up</td><td>Applications submitted, emails sent, errors</td></tr>
+      <tr><td><strong>Gauge</strong></td><td>A value that goes up and down; read when scraped</td><td>Queue size, open jobs, cache size</td></tr>
+      <tr><td><strong>Timer</strong></td><td>Count and duration of short events, with percentiles</td><td>Time to send an email, time of a job run</td></tr>
+      <tr><td><strong>DistributionSummary</strong></td><td>Distribution of non-time values</td><td>Uploaded file size</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Custom metrics with MeterRegistry</h4>
+  <p>Inject <code>MeterRegistry</code> (Boot provides it) and create meters. Names use dots (<code>jobs.applications.submitted</code>); each registry converts them to its own style (Prometheus: <code>jobs_applications_submitted_total</code>).</p>
+  <pre data-title="ApplicationMetrics.java"><code class="language-java">import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import org.springframework.stereotype.Component;
+
+@Component
+public class ApplicationMetrics {
+
+    private final Counter submitted;
+    private final Timer emailTimer;
+
+    public ApplicationMetrics(MeterRegistry registry, JobRepository jobRepository) {
+        this.submitted = Counter.builder("jobs.applications.submitted")
+                .description("Applications submitted by candidates")
+                .tag("source", "web")
+                .register(registry);
+
+        this.emailTimer = Timer.builder("jobs.email.send")
+                .description("Time to send one email")
+                .publishPercentileHistogram()          // allows percentiles in Prometheus
+                .register(registry);
+
+        Gauge.builder("jobs.open", jobRepository, repo -&gt; repo.countByStatus(JobStatus.OPEN))
+                .description("Jobs currently open")
+                .register(registry);                   // read on every scrape: keep it cheap
+    }
+
+    public void applicationSubmitted() { submitted.increment(); }
+
+    public &lt;T&gt; T timeEmail(java.util.function.Supplier&lt;T&gt; work) {
+        return emailTimer.record(work);                // records duration, returns the result
+    }
+}</code></pre>
+  <p>Use it from a service: <code>metrics.applicationSubmitted();</code>. A gauge keeps only a weak reference to the object it observes, so keep a reference (a bean, as here) or the gauge may report NaN after garbage collection.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: keep tag values low-cardinality</p>
+    <p>Every unique combination of tag values creates a new time series in memory and in Prometheus. Tags like <code>status</code>, <code>method</code>, <code>outcome</code> are fine. A tag with a user id, an email or a full URL with ids creates millions of series and can bring the monitoring system down. For ids, use logs or traces, not metric tags.</p>
+  </div>
+
+  <h4>@Timed and @Observed (brief)</h4>
+  <p>To time a method without writing the Timer code, use <code>@Timed("jobs.search")</code>. For controllers Boot already times every request, but for ordinary beans you must register the aspect once (it needs <code>spring-boot-starter-aop</code> or the AOP libraries on the classpath):</p>
+  <pre data-title="MetricsConfig.java"><code class="language-java">@Configuration
+public class MetricsConfig {
+    @Bean
+    TimedAspect timedAspect(MeterRegistry registry) {
+        return new TimedAspect(registry);
+    }
+}
+
+@Service
+public class JobSearchService {
+    @Timed(value = "jobs.search", description = "Job search time", histogram = true)
+    public Page&lt;JobResponse&gt; search(JobFilter filter, Pageable pageable) { ... }
+}</code></pre>
+  <p>Like all proxy-based annotations, it does not work on self-invocation (<a href="#m1">module 1</a>). Micrometer's Observation API (<code>@Observed</code>) goes one step further: one annotation produces both a timer and a trace span, which we use in <a href="#m7-tracing">distributed tracing</a>.</p>
+
+  <h4>The Prometheus endpoint</h4>
+  <p><strong>Prometheus</strong> is a monitoring system that <em>pulls</em>: every few seconds it calls <code>/actuator/prometheus</code> on each application, stores the numbers, and Grafana draws graphs from it. To enable it, add the registry and expose the endpoint:</p>
+  <pre data-title="pom.xml and application.yml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;io.micrometer&lt;/groupId&gt;
+    &lt;artifactId&gt;micrometer-registry-prometheus&lt;/artifactId&gt;
+    &lt;scope&gt;runtime&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+  <pre data-title="application.yml"><code class="language-yaml">management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}      # added to every metric: filter by app
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true                 # latency histogram for p95/p99 in Grafana</code></pre>
+  <pre class="out" data-title="GET /actuator/prometheus (excerpt)"><code class="language-plaintext"># HELP jobs_applications_submitted_total Applications submitted by candidates
+# TYPE jobs_applications_submitted_total counter
+jobs_applications_submitted_total{application="jobs-api",source="web"} 17.0
+http_server_requests_seconds_count{method="GET",status="200",uri="/api/jobs"} 412.0
+jvm_memory_used_bytes{area="heap",id="G1 Eden Space"} 5.2428800E7</code></pre>
+  <p>The Prometheus side is one scrape config (job name, <code>metrics_path: /actuator/prometheus</code>, target host:port). Setting up Prometheus, Grafana and alert rules belongs to <a href="07-devops.html#m6">DevOps · Module 6</a>.</p>
+
+  <h4>The four golden signals</h4>
+  <p>A useful first dashboard has four graphs, all available from the metrics above: <strong>latency</strong> (p95 of <code>http.server.requests</code>), <strong>traffic</strong> (requests per second), <strong>errors</strong> (share of status 5xx), and <strong>saturation</strong> (CPU, heap, Hikari connections pending, thread pool queue). Alert on symptoms users feel (errors, latency), not on every internal number.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>High-cardinality tags (user id, raw URL) that explode the number of series.</li>
+      <li>Creating a new <code>Counter</code> on every call without caching it; building meters is cheap but not free. Create once, increment many times (or use <code>registry.counter(name)</code> which looks it up).</li>
+      <li>Exposing <code>/actuator/prometheus</code> publicly. It reveals internals; put it on the management port or behind auth.</li>
+      <li>Heavy database queries inside a gauge supplier; it runs on every scrape.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip</p>
+    <p>Start simple: Actuator + Prometheus + Grafana with a ready-made "Spring Boot / JVM (Micrometer)" dashboard gives 80% of the value in an hour. Add 3 or 4 business counters (applications submitted, emails failed) after that.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is Micrometer?" Vendor-neutral metrics facade, like SLF4J. "Counter vs gauge vs timer?" Up-only, up-and-down snapshot, duration with count. "Push vs pull monitoring?" Prometheus pulls from <code>/actuator/prometheus</code>. "Why is cardinality dangerous?" Each tag combination is a time series. "Logs vs metrics vs traces?" Events, aggregates, request paths (see <a href="#m7-tracing">tracing</a>).</p>
+  </div>
+</article>

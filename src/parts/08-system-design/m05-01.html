@@ -1,0 +1,405 @@
+<div class="mintro">
+  <p>Every large system is assembled from a small set of reusable parts: DNS and a CDN at the edge, load
+  balancers and gateways at the front door, caches next to the app, replicated and sharded databases,
+  queues between services, and object storage and search engines for special kinds of data. This module
+  explains each block the same way: the problem it solves, how it works, the options, the cost, how it
+  fails, and how to talk about it in an interview.</p>
+  <p>Module 4 gave you the numbers and the vocabulary (latency, availability, consistency). Here you use
+  them to choose blocks. Many blocks you have already met from the Spring Boot side: caching with
+  <code>@Cacheable</code>, Kafka listeners, replication in SQL. This module takes the system-design view:
+  why the block exists, what breaks at scale, and which trade-off you accept.</p>
+  <ul>
+    <li>Explain DNS resolution, TTL trade-offs, GeoDNS, and what a CDN caches and how to invalidate it.</li>
+    <li>Pick a load balancer layer (L4 or L7), an algorithm and a health-check strategy.</li>
+    <li>Design an API gateway and choose a rate-limiting algorithm, with a Redis implementation.</li>
+    <li>Choose a caching pattern and eviction policy, and fix stampede, penetration and avalanche.</li>
+    <li>Climb the database scaling ladder: replicas, partitioning, sharding and consistent hashing.</li>
+    <li>Choose between SQL and the NoSQL families, and between Kafka, RabbitMQ and SQS.</li>
+    <li>Design file storage with S3 and presigned URLs, and keep a search index in sync.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m5-dns">
+  <h3>DNS in system design</h3>
+  <p class="tldr">DNS translates names to IP addresses through a cached hierarchy of resolvers; in system
+  design you use it to point users to the nearest or a healthy region (GeoDNS, latency-based routing,
+  failover), and you pick a TTL that balances speed against how fast you can change the answer.</p>
+
+  <h4>What problem it solves</h4>
+  <p>Humans use names (<code>api.shop.example</code>) and machines use IP addresses. The
+  <strong>Domain Name System (DNS)</strong> is the distributed phone book that maps one to the other. It
+  is the very first step of almost every request, and it is also a design tool: because you control the
+  answer, you can decide <em>which</em> IP a user receives.</p>
+
+  <h4>How resolution works</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant B as Browser
+  participant R as Recursive resolver (ISP or 8.8.8.8)
+  participant Root as Root server
+  participant TLD as .com server
+  participant A as Authoritative server
+  B->>R: shop.example.com?
+  R->>Root: who handles .com?
+  Root-->>R: the .com servers
+  R->>TLD: who handles example.com?
+  TLD-->>R: the authoritative servers
+  R->>A: shop.example.com?
+  A-->>R: 203.0.113.10, TTL 300
+  R-->>B: 203.0.113.10 (cached for 300 s)
+</pre>
+    <figcaption>A cold lookup walks the hierarchy; later lookups are answered from caches</figcaption>
+  </figure>
+  <ol class="steps">
+    <li>The browser checks its own cache and the operating system cache (and the hosts file).</li>
+    <li>If missing, it asks a <strong>recursive resolver</strong>, usually run by the ISP or a public
+    service. The resolver does the legwork.</li>
+    <li>The resolver asks a <strong>root server</strong>, then the <strong>TLD server</strong> (for
+    <code>.com</code>, <code>.in</code>), then the domain's <strong>authoritative server</strong>, which
+    holds the real records.</li>
+    <li>The answer comes back with a <strong>TTL</strong> (time to live): how many seconds every cache may
+    reuse it. Each cache along the way stores it.</li>
+  </ol>
+  <p>Because of caching, most lookups never reach your authoritative server, so DNS is fast and cheap, and
+  also slow to change.</p>
+
+  <h4>Record types you should know</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Record</th><th>Maps</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td>A / AAAA</td><td>Name to IPv4 / IPv6 address</td><td>Point a site at a server or load balancer</td></tr>
+      <tr><td>CNAME</td><td>Name to another name</td><td><code>www</code> to a CDN or load-balancer hostname</td></tr>
+      <tr><td>NS</td><td>Domain to its name servers</td><td>Delegation</td></tr>
+      <tr><td>MX</td><td>Domain to mail servers</td><td>Email routing</td></tr>
+      <tr><td>TXT</td><td>Name to text</td><td>Domain verification, SPF/DKIM</td></tr>
+    </tbody>
+  </table></div>
+  <p>A <code>CNAME</code> cannot sit at the bare domain (zone apex) in standard DNS; cloud providers offer
+  "alias" records for that case.</p>
+
+  <h4>TTL: the main trade-off</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Long TTL (hours)</th><th>Short TTL (30–60 s)</th></tr></thead>
+    <tbody>
+      <tr><td>Load on DNS servers</td><td>Low</td><td>High</td></tr>
+      <tr><td>Lookup latency for users</td><td>Mostly cached, fast</td><td>More cold lookups</td></tr>
+      <tr><td>Speed of change or failover</td><td>Slow: stale answers linger</td><td>Fast</td></tr>
+      <tr><td>Good for</td><td>Stable records</td><td>Failover records, planned migrations</td></tr>
+    </tbody>
+  </table></div>
+  <p>Before a migration, lower the TTL a day ahead so the cutover takes minutes. Even then, some resolvers
+  and clients ignore TTL and keep old answers longer, so never rely on DNS for instant failover.</p>
+
+  <h4>DNS as a traffic-steering tool</h4>
+  <ul>
+    <li><strong>Round-robin DNS:</strong> several A records for one name; resolvers rotate them. Crude load
+    spreading with no health awareness.</li>
+    <li><strong>Weighted routing:</strong> send 10% of users to the new version (a canary) and 90% to the old.</li>
+    <li><strong>GeoDNS / geolocation routing:</strong> answer depends on where the resolver is: Indian users
+    get the Mumbai IP, European users the Frankfurt IP. Good for data-residency rules.</li>
+    <li><strong>Latency-based routing:</strong> the provider answers with the region that measured lowest
+    latency to the user.</li>
+    <li><strong>DNS failover:</strong> the DNS service runs health checks against each endpoint and stops
+    returning an unhealthy one. Combined with a short TTL this gives regional failover in a minute or two.</li>
+    <li><strong>Anycast:</strong> many servers around the world announce the same IP and the network routes
+    each user to the nearest. Used by public DNS and CDNs.</li>
+  </ul>
+  <p>Managed services such as Amazon Route 53 and Cloudflare provide these policies. In the multi-region
+  design from earlier, DNS is the first and coarsest load balancer: it picks the region, then a regional
+  <a href="#m5-load-balancers">load balancer</a> picks the server.</p>
+
+  <h4>Failure modes and costs</h4>
+  <ul>
+    <li><strong>DNS is a SPOF</strong> unless you use multiple name servers, ideally from more than one
+    provider. A DNS outage makes a healthy site unreachable.</li>
+    <li><strong>Stale caches</strong> keep sending users to a dead IP until TTL expires.</li>
+    <li><strong>JVM caching:</strong> Java can cache DNS lookups for a long time in some configurations
+    (see the <code>networkaddress.cache.ttl</code> security property). A service that calls a hostname
+    whose IP changes (a load balancer or a managed database endpoint) can keep using an old IP, so set a
+    modest TTL for long-running JVMs.</li>
+    <li><strong>Cache poisoning and spoofing</strong> are attacks on resolvers; DNSSEC adds signatures.</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"DNS is the first hop. I use latency-based or geo routing to send users to the nearest region
+      and health checks for failover, with a short TTL on those records."</li>
+      <li>State the limit: DNS failover is minutes, not seconds, because clients cache; use a load balancer
+      or anycast for fast failover inside a region.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-cdn">
+  <h3>CDN: content delivery networks</h3>
+  <p class="tldr">A CDN keeps copies of your content on edge servers close to users so most requests never
+  reach your origin; it cuts latency, bandwidth cost and origin load, and you control it with cache-control
+  headers and versioned URLs.</p>
+
+  <h4>The problem</h4>
+  <p>Physics sets a floor for latency: a round trip from Bengaluru to a US server is around 200 ms, and a
+  web page needs many round trips. Serving the same 2 MB image from your origin to a million users also
+  burns your bandwidth and CPU. A <strong>Content Delivery Network (CDN)</strong> is a global fleet of
+  <strong>edge servers</strong> (points of presence, PoPs) that cache your files near users. Examples:
+  Cloudflare, Amazon CloudFront, Akamai, Fastly.</p>
+
+  <h4>How it works</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant U as User in Pune
+  participant E as Edge server in Mumbai
+  participant O as Origin server
+  U->>E: GET /img/logo.v7.png
+  Note over E: Cache miss
+  E->>O: GET /img/logo.v7.png
+  O-->>E: 200 OK, Cache-Control: max-age=31536000
+  E-->>U: 200 OK (stored at the edge)
+  U->>E: next user GET /img/logo.v7.png
+  Note over E: Cache hit
+  E-->>U: 200 OK from Mumbai, a few ms
+</pre>
+    <figcaption>The first request fills the edge cache; later ones never reach the origin</figcaption>
+  </figure>
+  <p>DNS or anycast sends the user to a nearby edge. On a <strong>hit</strong> the edge answers at once. On
+  a <strong>miss</strong> it fetches from the origin, stores the response according to the cache headers,
+  and returns it. Many CDNs add a <strong>shield</strong> (a middle cache tier) so that a miss in many
+  edges becomes one request to the origin.</p>
+
+  <h4>Pull vs push CDN</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Pull (origin pull)</th><th>Push</th></tr></thead>
+    <tbody>
+      <tr><td>How</td><td>Edge fetches from origin on the first miss</td><td>You upload files to the CDN storage ahead of time</td></tr>
+      <tr><td>Effort</td><td>Low: just point the CDN at your origin</td><td>Higher: your build or app uploads and removes files</td></tr>
+      <tr><td>First request</td><td>Slow (miss)</td><td>Fast (already there)</td></tr>
+      <tr><td>Storage cost</td><td>Only what is requested</td><td>Everything you push, even if unused</td></tr>
+      <tr><td>Best for</td><td>Most sites, frequently changing content</td><td>Large, rarely changing files (game patches, video)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>What to put on a CDN: static vs dynamic</h4>
+  <p><strong>Static content</strong> (images, CSS, JavaScript bundles, fonts, videos, downloads) is the
+  classic fit: identical for everyone, rarely changing. <strong>Dynamic content</strong> (a user's cart, a
+  personalised feed) usually cannot be cached shared across users. Modern CDNs still help with dynamic
+  traffic: they keep connections to the origin warm, terminate TLS near the user, compress, can cache API
+  responses that are the same for everybody (a product catalogue for 30 seconds) and can run small code at
+  the edge. Never cache per-user responses under a shared key.</p>
+
+  <h4>Controlling the cache: HTTP headers</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Header / directive</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>Cache-Control: max-age=N</code></td><td>Browsers and CDNs may reuse for N seconds</td></tr>
+      <tr><td><code>s-maxage=N</code></td><td>Like max-age but only for shared caches such as CDNs</td></tr>
+      <tr><td><code>public</code> / <code>private</code></td><td>Shared caches may store / only the user's browser may store</td></tr>
+      <tr><td><code>no-store</code></td><td>Never store (bank statements, tokens)</td></tr>
+      <tr><td><code>no-cache</code></td><td>Store, but revalidate with the origin before each reuse</td></tr>
+      <tr><td><code>immutable</code></td><td>Content at this URL never changes; skip revalidation</td></tr>
+      <tr><td><code>stale-while-revalidate=N</code></td><td>Serve stale content while fetching a fresh copy in the background</td></tr>
+      <tr><td><code>ETag</code> / <code>If-None-Match</code></td><td>Validator: the server answers <code>304 Not Modified</code> with no body if unchanged</td></tr>
+      <tr><td><code>Vary: Accept-Encoding</code></td><td>Cache separate variants (for example gzip vs plain)</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Spring Boot: caching headers on a response"><code class="language-java">@GetMapping("/products/{id}")
+public ResponseEntity&lt;Product&gt; get(@PathVariable long id) {
+    Product p = service.find(id);
+    return ResponseEntity.ok()
+        .cacheControl(CacheControl.maxAge(Duration.ofMinutes(5)).cachePublic())
+        .eTag("v" + p.version())
+        .body(p);
+}</code></pre>
+
+  <h4>Invalidation: how to change what is cached</h4>
+  <ol class="steps">
+    <li><strong>Versioned (fingerprinted) URLs:</strong> name files by content, <code>app.3f9c2a.js</code>.
+    A new build means a new URL, so the old cache entry is simply never asked for again. Cache these for a
+    year with <code>immutable</code>. This is the best strategy for static assets (Vite and webpack do it
+    by default).</li>
+    <li><strong>Short TTL</strong> for things that change but can be a little stale (a home page for 60 s).</li>
+    <li><strong>Explicit purge or invalidation:</strong> call the CDN API to remove a path. It works but is
+    slower, may cost money per request, and propagates in seconds to minutes. Keep it for emergencies
+    (a wrong price, a legal takedown).</li>
+    <li><strong>Never cache the HTML shell for long</strong>; it points to the fingerprinted files.</li>
+  </ol>
+
+  <h4>Benefits, costs, failure modes</h4>
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Pros</p><ul>
+      <li>Much lower latency for far-away users.</li>
+      <li>Offloads most bandwidth and requests from the origin.</li>
+      <li>Absorbs traffic spikes and some DDoS attacks.</li>
+      <li>Gives TLS and compression close to the user.</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Cons</p><ul>
+      <li>Stale content if headers are wrong; invalidation is slow.</li>
+      <li>Cost per GB and per request; some CDNs charge for purges.</li>
+      <li>Cache-key mistakes can leak private data between users.</li>
+      <li>An extra dependency: a CDN outage can take down the whole site's assets.</li>
+    </ul></div>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Common mistake: caching a response that varies per user</p>
+    <p>If an API returns data tied to a cookie or <code>Authorization</code> header and the CDN caches it as
+    public, the next user gets someone else's data. Mark such responses <code>private</code> or
+    <code>no-store</code>, and keep cookies out of the cache key for static paths.</p>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>A typical setup: the React build from Vite goes to S3, CloudFront sits in front, assets are
+    fingerprinted with a one-year cache, <code>index.html</code> has a short TTL, user uploads are served
+    from the same CDN through object-storage URLs (<a href="#m5-object-storage">Object storage</a>), and
+    the API is not cached at the edge except for a few public endpoints.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"Static assets and media go through a CDN with long-lived, fingerprinted URLs, so deploys do not
+      need purges."</li>
+      <li>Name the trade-off: stale content and invalidation delay in return for latency and offload.</li>
+      <li>For video streaming, say that the CDN carries almost all bytes; the origin only serves misses.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-load-balancers">
+  <h3>Load balancers: L4 vs L7, algorithms and health checks</h3>
+  <p class="tldr">A load balancer spreads incoming traffic over several healthy servers behind one address;
+  L4 balancers route by IP and port (fast, simple), L7 balancers read HTTP (smart routing, TLS, headers),
+  and you choose an algorithm and health checks to avoid sending traffic to a sick or overloaded node.</p>
+
+  <h4>What problem it solves</h4>
+  <p>One server has a limit and is a single point of failure. A <strong>load balancer (LB)</strong> gives
+  clients one stable address and distributes requests over a pool of servers. It makes horizontal scaling
+  work (<a href="#m4-scaling">Scaling</a>), removes dead servers from rotation, and lets you deploy without
+  downtime by draining one server at a time. For the Nginx basics see
+  <a href="07-devops.html#m2">DevOps · Module 2</a>.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  C[Clients] --> LB1[Load balancer A active]
+  C -.-> LB2[Load balancer B standby]
+  LB1 --> S1[Server 1 healthy]
+  LB1 --> S2[Server 2 healthy]
+  LB1 -. skipped .-> S3[Server 3 failed health check]
+</pre>
+    <figcaption>Traffic goes only to servers that pass the health check; the balancer itself has a standby</figcaption>
+  </figure>
+
+  <h4>L4 vs L7</h4>
+  <p>The layers refer to the OSI model. An <strong>L4 (transport-layer)</strong> balancer sees only IP
+  addresses and TCP/UDP ports; it forwards connections without understanding the content. An
+  <strong>L7 (application-layer)</strong> balancer terminates the connection, reads the HTTP request (path,
+  host, headers, cookies) and makes a routing decision per request.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>L4 load balancer</th><th>L7 load balancer</th></tr></thead>
+    <tbody>
+      <tr><td>Sees</td><td>IP, port, TCP/UDP</td><td>URL, headers, cookies, body</td></tr>
+      <tr><td>Speed</td><td>Very fast, millions of connections, low CPU</td><td>Slower: parses and often decrypts</td></tr>
+      <tr><td>Routing</td><td>By address and port only</td><td>By path (<code>/api</code> vs <code>/img</code>), host, header, cookie</td></tr>
+      <tr><td>TLS</td><td>Passes through or terminates</td><td>Usually terminates; can re-encrypt to backends</td></tr>
+      <tr><td>Extra features</td><td>Few</td><td>Sticky cookies, compression, rate limits, retries, WAF, redirects</td></tr>
+      <tr><td>Protocols</td><td>Any TCP/UDP (databases, gaming, MQTT)</td><td>HTTP, HTTP/2, gRPC, WebSocket</td></tr>
+      <tr><td>Examples</td><td>AWS NLB, HAProxy in TCP mode, LVS</td><td>AWS ALB, Nginx, HAProxy in HTTP mode, Envoy</td></tr>
+    </tbody>
+  </table></div>
+  <p>Common pattern: an L4 balancer or anycast at the very front for raw speed and DDoS absorption, then
+  L7 balancers that route by path to different services.</p>
+
+  <h4>Balancing algorithms</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Algorithm</th><th>How it picks</th><th>Good for / watch out</th></tr></thead>
+    <tbody>
+      <tr><td>Round robin</td><td>1, 2, 3, 1, 2, 3 …</td><td>Equal servers, similar requests. Ignores load.</td></tr>
+      <tr><td>Weighted round robin</td><td>Bigger servers get more turns</td><td>Mixed machine sizes, canary releases</td></tr>
+      <tr><td>Least connections</td><td>Server with the fewest open connections</td><td>Uneven or long requests; better than round robin when durations vary</td></tr>
+      <tr><td>Least response time</td><td>Fastest recent responses, fewest connections</td><td>Adapts to slow nodes. Needs measurement.</td></tr>
+      <tr><td>IP hash</td><td>Hash of client IP chooses the server</td><td>Cheap stickiness. Breaks when pool changes; NAT groups many users on one IP.</td></tr>
+      <tr><td>Consistent hashing</td><td>Hash of a key (user id, URL) onto a ring</td><td>Cache servers and shards: few keys move when nodes change (<a href="#m5-consistent-hashing">details</a>)</td></tr>
+      <tr><td>Random / power of two choices</td><td>Pick two at random, take the less loaded</td><td>Scales well with many balancers; near-optimal</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Health checks</h4>
+  <p>The balancer must know who is alive.</p>
+  <ul>
+    <li><strong>Active checks:</strong> the balancer probes each server every few seconds (a TCP connect or
+    an HTTP GET to <code>/actuator/health</code>). After N failures the server is removed; after M successes
+    it returns.</li>
+    <li><strong>Passive checks:</strong> the balancer watches real traffic; too many errors or timeouts from
+    a server mark it down. No extra probe traffic, but real users hit the failure first.</li>
+  </ul>
+  <p>Design the health endpoint carefully. A <em>liveness</em> check says the process runs. A
+  <em>readiness</em> check says it can take traffic (database connected, warmed up). Do not make the check
+  depend on every downstream service: if the shared database slows down and every health check fails, the
+  balancer pulls all servers out and you cause a total outage. Also use <strong>connection
+  draining</strong> (finish in-flight requests before removing a server) and slow start for new servers.</p>
+  <pre data-title="nginx.conf (L7 balancing with passive checks)"><code class="language-nginx">upstream api_servers {
+    least_conn;
+    server 10.0.1.11:8080 weight=2 max_fails=3 fail_timeout=30s;
+    server 10.0.1.12:8080 max_fails=3 fail_timeout=30s;
+    server 10.0.1.13:8080 backup;
+}
+
+server {
+    listen 443 ssl;
+    server_name api.shop.example;
+    # ssl_certificate and key directives here: TLS ends at the balancer
+
+    location /api/ {
+        proxy_pass http://api_servers;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_next_upstream error timeout http_502 http_503;
+    }
+}</code></pre>
+
+  <h4>Sticky sessions, TLS termination and routing</h4>
+  <ul>
+    <li><strong>Sticky sessions</strong> (session affinity) pin a client to one server using a cookie or IP
+    hash. Downsides: uneven load, lost sessions when the server dies, harder deploys. Prefer stateless apps
+    with a shared session store.</li>
+    <li><strong>TLS termination:</strong> the balancer holds the certificate, decrypts, and talks plain HTTP
+    (or re-encrypts) to backends. This centralises certificates and saves CPU on app servers. Inside a
+    trusted network plain HTTP is common; stricter setups re-encrypt (end-to-end TLS) or use mutual TLS.</li>
+    <li><strong>Path and host routing:</strong> <code>/api/*</code> to the API pool, <code>/ws/*</code> to the
+    WebSocket pool, <code>admin.shop.example</code> to a locked-down pool. Also blue-green and canary rollouts
+    by weights.</li>
+    <li><strong>Client IP:</strong> behind an L7 balancer the app sees the balancer's IP; read
+    <code>X-Forwarded-For</code> (and configure Spring Boot's forwarded-headers support).</li>
+  </ul>
+
+  <h4>Making the load balancer itself highly available</h4>
+  <p>A single balancer is a new single point of failure. Options: run two in active-passive with a floating
+  virtual IP that moves on failure (keepalived and VRRP for self-managed), or active-active behind DNS or
+  anycast. Cloud load balancers (ALB, NLB, Google Cloud Load Balancing) are already distributed across
+  zones and managed for you. In Kubernetes the Service, Ingress and the cloud load balancer play these roles
+  (<a href="07-devops.html#m5">DevOps · Module 5</a>). There is also <strong>client-side load
+  balancing</strong> (the client library such as Spring Cloud LoadBalancer picks an instance from a service
+  registry) and a <strong>service mesh</strong> sidecar, both common between internal services.</p>
+
+  <h4>Failure modes</h4>
+  <ul>
+    <li>All servers fail health checks together (a bad check) and traffic goes nowhere.</li>
+    <li>Retry storms: the balancer retries failed requests on other servers and doubles the load on an
+    already struggling pool. Limit retries and use backoff.</li>
+    <li>Uneven load from sticky sessions or from a few very heavy clients.</li>
+    <li>Thundering herd on a recovering server; slow start helps.</li>
+    <li>Idle timeouts: the balancer closes long-lived connections (WebSockets, long polls) unless timeouts
+    are raised and heartbeats sent.</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"An L7 balancer routes by path and terminates TLS; an L4 balancer is faster and good for raw
+      TCP. I use least connections when request durations vary, and active health checks on a readiness
+      endpoint."</li>
+      <li>"The balancer is redundant: two across zones, or a managed cloud balancer."</li>
+      <li>Mention connection draining for zero-downtime deployments, and that sticky sessions are a smell
+      rather than a design.</li>
+    </ul>
+  </div>
+</article>

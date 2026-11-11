@@ -1,0 +1,582 @@
+<article class="topic" id="m6-async">
+  <h3>@Async, thread pools and virtual threads</h3>
+  <p class="tldr">@Async runs a method on another thread through a proxy so the caller does not wait; configure your own ThreadPoolTaskExecutor, handle exceptions explicitly, remember that transactions, security context and MDC do not follow the new thread, and consider virtual threads for blocking work.</p>
+
+  <h4>What and why</h4>
+  <p>When a candidate applies for a job, the API must save the application and then email the recruiter. Sending email takes 300 ms to 3 seconds and can fail. The candidate should not wait for it. <strong>Asynchronous execution</strong> means: start the work on another thread and return immediately. Spring does this with <code>@Async</code>. (Threads, executors and <code>CompletableFuture</code> themselves are explained in <a href="02-core-java.html#m6">Core Java · Module 6</a>.)</p>
+
+  <h4>Setup and basic use</h4>
+  <pre data-title="AsyncConfig.java and a service"><code class="language-java">@Configuration
+@EnableAsync
+class AsyncConfig { }
+
+@Service
+public class NotificationService {
+
+    private static final Logger log = LoggerFactory.getLogger(NotificationService.class);
+
+    @Async                                          // fire and forget
+    public void sendNewApplicationMail(Long applicationId) {
+        log.info("Sending mail on thread {}", Thread.currentThread().getName());
+        // ... load data, build and send the mail
+    }
+
+    @Async
+    public CompletableFuture&lt;Integer&gt; countInactiveUsers() {     // caller can wait for the result
+        int n = userRepository.countInactive();
+        return CompletableFuture.completedFuture(n);
+    }
+}</code></pre>
+  <ul>
+    <li>A method may return <code>void</code> or <code>Future</code>/<code>CompletableFuture&lt;T&gt;</code> (wrap the value with <code>completedFuture</code>). Any other return type gives <code>null</code> to the caller.</li>
+    <li>With <code>CompletableFuture</code> the caller can combine results: <code>CompletableFuture.allOf(a, b).join()</code>.</li>
+    <li>The call returns at once; the work runs on a pool thread (<code>task-1</code> in the log).</li>
+  </ul>
+
+  <h4>How it works: the same proxy trap</h4>
+  <p><code>@Async</code> is another proxy feature (<a href="#m1">module 1</a>): the proxy does not run your method but submits it as a task to an <code>Executor</code> and returns. Therefore:</p>
+  <ul>
+    <li><strong>Self-invocation does not work.</strong> <code>this.sendMail()</code> from the same class runs synchronously on the caller's thread. Call it from another bean.</li>
+    <li>The method must be <code>public</code> and not <code>final</code>/<code>private</code>.</li>
+    <li>The caller must be another bean holding the proxy.</li>
+  </ul>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant R as Request thread
+  participant P as Async proxy
+  participant E as Executor pool
+  participant W as Worker thread
+  R->>P: sendMail(42)
+  P->>E: submit task
+  P-->>R: returns at once
+  E->>W: run sendMail(42)
+  W-->>W: sends the mail
+</pre>
+  <figcaption>The caller continues while a pool thread does the work</figcaption>
+  </figure>
+
+  <h4>Configuring the executor</h4>
+  <p>Boot auto-configures an <code>applicationTaskExecutor</code> (a <code>ThreadPoolTaskExecutor</code>) that <code>@Async</code> uses. Tune it with properties:</p>
+  <pre data-title="application.yml"><code class="language-yaml">spring:
+  task:
+    execution:
+      thread-name-prefix: app-async-
+      pool:
+        core-size: 4
+        max-size: 16
+        queue-capacity: 200
+        keep-alive: 60s
+      shutdown:
+        await-termination: true
+        await-termination-period: 30s       # finish queued work on shutdown</code></pre>
+  <p>How the pool behaves is a classic interview point: threads up to <code>core-size</code> are created first; further tasks go into the <strong>queue</strong>; only when the queue is full does the pool grow up to <code>max-size</code>; when both are full, the executor rejects the task (<code>TaskRejectedException</code>). A queue of "unbounded" capacity (the old default) means <code>max-size</code> is never used and memory can grow without limit.</p>
+  <p>For different kinds of work, define named executors, so slow email sending cannot starve report generation (the <strong>bulkhead</strong> idea):</p>
+  <pre data-title="Dedicated executors"><code class="language-java">@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+    @Bean("mailExecutor")
+    public ThreadPoolTaskExecutor mailExecutor() {
+        ThreadPoolTaskExecutor ex = new ThreadPoolTaskExecutor();
+        ex.setCorePoolSize(2);
+        ex.setMaxPoolSize(5);
+        ex.setQueueCapacity(100);
+        ex.setThreadNamePrefix("mail-");
+        ex.setTaskDecorator(new MdcTaskDecorator());          // copy request id (below)
+        ex.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        ex.setWaitForTasksToCompleteOnShutdown(true);
+        ex.setAwaitTerminationSeconds(30);
+        return ex;                       // Spring initialises it as a bean
+    }
+}
+
+@Async("mailExecutor")                    // choose the executor by bean name
+public void sendNewApplicationMail(Long applicationId) { ... }</code></pre>
+  <p><code>CallerRunsPolicy</code> makes the caller run the task when the pool is full, which slows the producer down (back-pressure) instead of losing work or throwing.</p>
+
+  <h4>Exception handling</h4>
+  <ul>
+    <li>For methods returning <code>CompletableFuture</code>, the exception is stored in the future: handle it with <code>.exceptionally(...)</code> or <code>.handle(...)</code>, or you get it at <code>get()</code>/<code>join()</code>.</li>
+    <li>For <code>void</code> methods the caller is already gone, so nobody can catch the exception. Spring passes it to an <code>AsyncUncaughtExceptionHandler</code>; the default only logs it.</li>
+  </ul>
+  <pre data-title="A custom handler"><code class="language-java">@Configuration
+@EnableAsync
+public class AsyncErrorConfig implements AsyncConfigurer {
+
+    private static final Logger log = LoggerFactory.getLogger(AsyncErrorConfig.class);
+
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (ex, method, params) -&gt;
+                log.error("Async method {} failed with params {}", method.getName(),
+                        java.util.Arrays.toString(params), ex);
+    }
+}</code></pre>
+  <p>A failed email is lost unless you record it. For important work, catch inside the method, save a "FAILED" status, and let a scheduled job retry (<a href="#m6-scheduling">scheduling</a>), or use a message queue (<a href="#m7-messaging-concepts">messaging</a>) which gives you retries and durability.</p>
+
+  <h4>Transactions, security and MDC do not follow the thread</h4>
+  <p>Transactions, the Spring Security context and the MDC are all stored in <strong>thread-locals</strong> (per-thread storage), so a new thread starts with none of them:</p>
+  <ul>
+    <li><strong>Transaction:</strong> the async method does not run in the caller's transaction. If the caller has not committed yet, the async method may not see the new row (it can fail with "not found"). Pass ids, not entities, and load again in the async method with its own <code>@Transactional</code>. Better, trigger it <em>after</em> commit:</li>
+  </ul>
+  <pre data-title="Send the mail only after the application row is committed"><code class="language-java">public record ApplicationSubmitted(Long applicationId) { }
+
+@Service
+public class ApplicationService {
+    private final ApplicationEventPublisher events;
+    // ...
+    @Transactional
+    public ApplicationResponse apply(Long jobId, Long userId) {
+        Application saved = applicationRepository.save(new Application(jobId, userId));
+        events.publishEvent(new ApplicationSubmitted(saved.getId()));   // nothing sent yet
+        return mapper.toResponse(saved);
+    }
+}
+
+@Component
+public class ApplicationMailListener {
+    private final NotificationService notifications;
+    // ...
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void onSubmitted(ApplicationSubmitted event) {
+        notifications.sendNewApplicationMail(event.applicationId());    // @Async method
+    }
+}</code></pre>
+  <p>If the transaction rolls back, the event is dropped and no email is sent. That is exactly what you want, and it is the in-process cousin of the outbox pattern (<a href="#m7-delivery-outbox">delivery semantics</a>).</p>
+  <ul>
+    <li><strong>Security context:</strong> <code>SecurityContextHolder</code> is empty in the async thread. Wrap the executor with <code>DelegatingSecurityContextAsyncTaskExecutor</code>, or pass the user id explicitly. Passing explicit values is simplest (<a href="#m4">module 4</a>).</li>
+    <li><strong>MDC:</strong> use a <code>TaskDecorator</code> to copy the map:</li>
+  </ul>
+  <pre data-title="MdcTaskDecorator.java"><code class="language-java">import java.util.Map;
+import org.slf4j.MDC;
+import org.springframework.core.task.TaskDecorator;
+
+public class MdcTaskDecorator implements TaskDecorator {
+    @Override
+    public Runnable decorate(Runnable task) {
+        Map&lt;String, String&gt; context = MDC.getCopyOfContextMap();   // captured on the caller
+        return () -&gt; {
+            try {
+                if (context != null) MDC.setContextMap(context);
+                task.run();
+            } finally {
+                MDC.clear();
+            }
+        };
+    }
+}</code></pre>
+
+  <h4>Virtual threads in Spring Boot</h4>
+  <p>A normal (platform) thread maps to an operating-system thread and costs about a megabyte of stack, so pools hold tens or hundreds of them. A <strong>virtual thread</strong> (Java 21+) is a cheap thread managed by the JVM: you can have hundreds of thousands, and a virtual thread that blocks (waiting for a database or HTTP response) frees the underlying carrier thread. Blocking code scales without becoming reactive. Details: <a href="02-core-java.html#m6">Core Java · Module 6</a>.</p>
+  <pre data-title="application.properties"><code class="language-properties">spring.threads.virtual.enabled=true</code></pre>
+  <p>One property (Spring Boot 3.2+, Java 21+) makes Boot use virtual threads for: Tomcat/Jetty request handling (one virtual thread per request), the <code>@Async</code> executor, <code>@Scheduled</code> tasks, and several other places (Kafka and RabbitMQ listeners among them). In effect, <code>core-size</code>/<code>max-size</code> pool settings no longer limit these.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Platform thread pool</th><th>Virtual threads</th></tr></thead>
+    <tbody>
+      <tr><td>Best for</td><td>CPU-heavy work</td><td>Blocking I/O: database, HTTP, files</td></tr>
+      <tr><td>Count</td><td>Small, bounded pool</td><td>One per task, no pool needed</td></tr>
+      <tr><td>Limiting concurrency</td><td>Pool size does it</td><td>You must limit yourself (a <code>Semaphore</code>, a connection pool)</td></tr>
+      <tr><td>Thread-locals</td><td>Reused threads need clean-up</td><td>Work, but are not shared: each task has its own</td></tr>
+    </tbody>
+  </table></div>
+  <div class="co co-exc">
+    <p class="co-t">Things to know about virtual threads</p>
+    <ul>
+      <li>They do not make CPU-bound code faster, and they do not remove the bottleneck of your database: 10,000 concurrent requests still share a Hikari pool of 10 connections. The pool becomes the limit (and requests wait for a connection), so size it consciously.</li>
+      <li><strong>Pinning:</strong> on Java 21 a virtual thread blocked inside a <code>synchronized</code> block holds its carrier thread. Java 24 and later fixed most of this. Prefer <code>ReentrantLock</code> in your own code, and keep your libraries current.</li>
+      <li>Do not pool virtual threads, and do not put unbounded <code>ThreadLocal</code> caches on them.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Forgetting <code>@EnableAsync</code>, or calling the async method from the same class: it runs synchronously and nobody notices.</li>
+      <li>An unbounded queue or pool: memory grows or threads explode.</li>
+      <li>Passing a JPA entity into the async method; its session is closed (<code>LazyInitializationException</code>). Pass an id.</li>
+      <li>Sending the async message inside the transaction, then rolling back: the email says "application received" for an application that does not exist.</li>
+      <li>Blocking on <code>future.get()</code> immediately, which removes all the benefit.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How does <code>@Async</code> work and when does it fail?" Proxy submits to an executor; fails on self-invocation, missing <code>@EnableAsync</code>, private methods. "Which thread runs it?" The <code>applicationTaskExecutor</code> or the named one. "Is the async method in the caller's transaction?" No. "How do you handle exceptions?" Future, or <code>AsyncUncaughtExceptionHandler</code>. "What do virtual threads change?" Cheap blocking, one property to enable; not for CPU-bound work.</p>
+  </div>
+</article>
+
+<article class="topic" id="m6-file-upload">
+  <h3>File upload and download: MultipartFile, storage and safe file names</h3>
+  <p class="tldr">Receive files as MultipartFile, limit their size, check type and content yourself, never trust the original file name, store the file under a generated name (on disk or S3) with metadata in the database, and send it back with ResponseEntity&lt;Resource&gt; and a Content-Disposition header.</p>
+
+  <h4>What and why</h4>
+  <p>In Project 2 a candidate uploads a resume (PDF) when applying. Browsers send files using the <strong>multipart/form-data</strong> encoding: one HTTP request with several parts (text fields and files), each part with its own headers. Spring parses it for you and gives each file as a <code>MultipartFile</code>.</p>
+
+  <h4>Limits first</h4>
+  <pre data-title="application.yml"><code class="language-yaml">spring:
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 5MB          # one file (default is 1MB)
+      max-request-size: 6MB       # whole request: all files + fields (default is 10MB)
+      file-size-threshold: 1MB    # above this size Spring writes to a temp file instead of memory
+app:
+  upload-dir: ${UPLOAD_DIR:./uploads}</code></pre>
+  <p>If a client sends more, Spring throws <code>MaxUploadSizeExceededException</code> before your controller runs. Map it to <strong>413 Payload Too Large</strong> in your <code>@RestControllerAdvice</code> (<a href="#m2">module 2</a>). Also set limits at the proxy (Nginx <code>client_max_body_size</code>) so huge bodies are rejected before they reach Java.</p>
+
+  <h4>The controller</h4>
+  <pre data-title="ResumeController.java"><code class="language-java">@RestController
+@RequestMapping("/api/applications")
+public class ResumeController {
+
+    private final ResumeService resumeService;
+
+    public ResumeController(ResumeService resumeService) { this.resumeService = resumeService; }
+
+    @PostMapping(path = "/{applicationId}/resume", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity&lt;ResumeResponse&gt; upload(@PathVariable Long applicationId,
+                                                 @RequestParam("file") MultipartFile file,
+                                                 @AuthenticationPrincipal UserPrincipal user) {
+        ResumeResponse saved = resumeService.store(applicationId, user.getId(), file);
+        return ResponseEntity.status(HttpStatus.CREATED).body(saved);
+    }
+}</code></pre>
+  <pre data-title="Testing from the shell"><code class="language-shell">$ curl -X POST http://localhost:8080/api/applications/12/resume \
+       -H "Authorization: Bearer $TOKEN" \
+       -F "file=@./asha-resume.pdf;type=application/pdf"
+{"id":5,"originalName":"asha-resume.pdf","size":184320,"contentType":"application/pdf"}</code></pre>
+  <p>Useful <code>MultipartFile</code> methods:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Returns</th><th>Trust it?</th></tr></thead>
+    <tbody>
+      <tr><td><code>getOriginalFilename()</code></td><td>Name chosen by the client</td><td><strong>No</strong> (may contain <code>../</code>)</td></tr>
+      <tr><td><code>getContentType()</code></td><td>Type the client claims</td><td><strong>No</strong> (client controlled)</td></tr>
+      <tr><td><code>getSize()</code></td><td>Size in bytes</td><td>Yes (counted by the server)</td></tr>
+      <tr><td><code>isEmpty()</code></td><td>No file chosen or zero bytes</td><td>Yes</td></tr>
+      <tr><td><code>getInputStream()</code></td><td>Stream of the content</td><td>Yes, read from this</td></tr>
+      <tr><td><code>transferTo(Path)</code></td><td>Moves the content to a destination</td><td>Yes</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Security: validate everything about the file</h4>
+  <ul>
+    <li><strong>Size:</strong> check <code>getSize()</code> again in the service, with a business limit (a resume: 2 MB) even if the global limit is 5 MB.</li>
+    <li><strong>Type by content, not by name:</strong> the extension and <code>Content-Type</code> are written by the client; an attacker uploads <code>shell.jsp</code> labelled <code>image/png</code>. Check the first bytes (a PDF starts with <code>%PDF-</code>) or use a detection library such as Apache Tika. Keep an allow-list (pdf, docx), never a block-list.</li>
+    <li><strong>The file name:</strong> <code>getOriginalFilename()</code> can be <code>../../etc/cron.d/job</code> or contain a null byte. This is a <strong>path traversal</strong> attack: writing outside your upload folder. Defence: do not use the client name for the path at all. Generate your own stored name, and keep the original only as a display name in the database (after cleaning it with <code>StringUtils.cleanPath</code> and taking only the last segment).</li>
+    <li><strong>Where to store:</strong> never inside the web root or a folder served as static files, so an uploaded HTML or script file can never be fetched and run. Serve downloads only through your controller.</li>
+    <li><strong>Authorisation:</strong> check that the logged-in user may upload to / download this application's resume. Using a guessable id (<code>/files/5</code>) without checking ownership is an IDOR bug (<a href="#m4">module 4</a>).</li>
+    <li><strong>Malware and image bombs:</strong> for public uploads, scan with an antivirus service and limit image dimensions.</li>
+  </ul>
+
+  <h4>Storing: generated name, safe path, metadata in the DB</h4>
+  <pre data-title="ResumeService.java"><code class="language-java">@Service
+public class ResumeService {
+
+    private static final long MAX_SIZE = 2L * 1024 * 1024;           // 2 MB
+    private static final byte[] PDF_MAGIC = "%PDF-".getBytes(StandardCharsets.US_ASCII);
+
+    private final Path root;
+    private final ResumeRepository resumeRepository;
+    private final ApplicationRepository applicationRepository;
+
+    public ResumeService(@Value("${app.upload-dir}") Path root,
+                         ResumeRepository resumeRepository,
+                         ApplicationRepository applicationRepository) throws IOException {
+        this.root = root.toAbsolutePath().normalize();
+        this.resumeRepository = resumeRepository;
+        this.applicationRepository = applicationRepository;
+        Files.createDirectories(this.root);
+    }
+
+    @Transactional
+    public ResumeResponse store(Long applicationId, Long userId, MultipartFile file) {
+        Application app = applicationRepository.findById(applicationId)
+                .filter(a -&gt; a.getApplicant().getId().equals(userId))     // ownership
+                .orElseThrow(() -&gt; new ResourceNotFoundException("Application " + applicationId));
+
+        if (file.isEmpty() || file.getSize() &gt; MAX_SIZE) {
+            throw new BadRequestException("File must be between 1 byte and 2 MB");
+        }
+        try (InputStream in = file.getInputStream()) {
+            byte[] head = in.readNBytes(PDF_MAGIC.length);
+            if (!Arrays.equals(head, PDF_MAGIC)) {
+                throw new BadRequestException("Only PDF files are accepted");
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+
+        String storedName = UUID.randomUUID() + ".pdf";                   // our name, our extension
+        Path target = root.resolve(storedName).normalize();
+        if (!target.startsWith(root)) {                                    // belt and braces
+            throw new BadRequestException("Invalid path");
+        }
+        try (InputStream in = file.getInputStream()) {
+            Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Could not store file", e);
+        }
+
+        String display = StringUtils.getFilename(StringUtils.cleanPath(
+                file.getOriginalFilename() == null ? "resume.pdf" : file.getOriginalFilename()));
+        Resume resume = resumeRepository.save(
+                new Resume(app, storedName, display, "application/pdf", file.getSize()));
+        return new ResumeResponse(resume.getId(), display, resume.getSize(), "application/pdf");
+    }
+}</code></pre>
+  <p>The table behind it keeps what the database should know: <code>id, application_id, stored_name, original_name, content_type, size_bytes, uploaded_at</code>. The file system holds only bytes; the database holds meaning and permissions. Add a Flyway migration for the table (<a href="#m3">module 3</a>). If the database save fails after the file was written, delete the file in a catch block (or run a clean-up job for orphan files), because a file system is not part of the transaction.</p>
+
+  <h4>Downloading</h4>
+  <pre data-title="Download endpoint"><code class="language-java">@GetMapping("/{applicationId}/resume")
+public ResponseEntity&lt;Resource&gt; download(@PathVariable Long applicationId,
+                                         @AuthenticationPrincipal UserPrincipal user) {
+    DownloadableFile f = resumeService.load(applicationId, user);   // checks permission
+    Resource resource = new FileSystemResource(f.path());
+
+    ContentDisposition disposition = ContentDisposition.attachment()
+            .filename(f.displayName(), StandardCharsets.UTF_8)      // safe encoding of the name
+            .build();
+
+    return ResponseEntity.ok()
+            .contentType(MediaType.APPLICATION_PDF)
+            .contentLength(f.size())
+            .header(HttpHeaders.CONTENT_DISPOSITION, disposition.toString())
+            .header("X-Content-Type-Options", "nosniff")
+            .body(resource);
+}</code></pre>
+  <ul>
+    <li><code>Content-Disposition: attachment</code> makes the browser download the file; <code>inline</code> shows it in the browser (fine for PDFs and images that you trust).</li>
+    <li>Return <code>Resource</code> (a <code>FileSystemResource</code>, <code>UrlResource</code> or <code>InputStreamResource</code>). Spring streams it to the response in chunks; it does not load the whole file into memory.</li>
+    <li>Set <code>contentType</code> from your stored value, not from a guess, and add <code>nosniff</code> so a browser does not reinterpret it.</li>
+    <li>Return <code>404</code> when the row or the file is missing, and <code>403</code>/<code>404</code> when the user is not allowed.</li>
+  </ul>
+
+  <h4>Streaming large files</h4>
+  <p>For big downloads (exports, videos) use <code>StreamingResponseBody</code>, which lets you write to the output stream from your own code on a separate thread, without buffering. For huge uploads, avoid <code>byte[] getBytes()</code>; use <code>getInputStream()</code> and copy in chunks. For data exports (CSV of 1 million rows), stream from a database cursor and write rows as you read them.</p>
+  <pre data-title="Streaming a CSV export"><code class="language-java">@GetMapping("/export/jobs.csv")
+public ResponseEntity&lt;StreamingResponseBody&gt; export() {
+    StreamingResponseBody body = out -&gt; {
+        var writer = new BufferedWriter(new OutputStreamWriter(out, StandardCharsets.UTF_8));
+        writer.write("id,title,city\n");
+        jobService.streamAll(job -&gt; {                         // iterates, no full list in memory
+            try { writer.write(job.id() + "," + job.title() + "," + job.city() + "\n"); }
+            catch (IOException e) { throw new UncheckedIOException(e); }
+        });
+        writer.flush();
+    };
+    return ResponseEntity.ok()
+            .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"jobs.csv\"")
+            .contentType(MediaType.parseMediaType("text/csv"))
+            .body(body);
+}</code></pre>
+  <p>Escape CSV fields properly in real code (commas and quotes inside titles) or use a CSV library, and beware of CSV injection (cells starting with <code>=</code>).</p>
+
+  <h4>Disk vs object storage</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Local disk</th><th>Object storage (S3 and similar)</th></tr></thead>
+    <tbody>
+      <tr><td>Setup</td><td>None</td><td>Bucket, credentials, SDK</td></tr>
+      <tr><td>Several app instances</td><td>Each has its own disk: file not found on another instance (needs a shared volume)</td><td>All instances see the same bucket</td></tr>
+      <tr><td>Containers</td><td>Lost when the container is replaced unless a volume is mounted</td><td>Independent of the container</td></tr>
+      <tr><td>Durability, backup</td><td>Your job</td><td>Built in (replication, versioning)</td></tr>
+      <tr><td>Large downloads</td><td>Go through your app</td><td>Can use a time-limited <strong>pre-signed URL</strong>: the browser downloads directly from S3</td></tr>
+    </tbody>
+  </table></div>
+  <p>Local disk is fine for development and a single server. In production on several instances or containers, use object storage (see <a href="07-devops.html#m5">DevOps · Module 5</a>). Hide the choice behind an interface (<code>FileStorage</code> with <code>save</code>, <code>load</code>, <code>delete</code>) with a disk implementation and an S3 implementation, selected by a property; the controller and service never know. For large uploads to S3, many systems let the browser upload directly with a pre-signed URL, and the API only records the metadata.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Saving with the client's file name (<code>"uploads/" + file.getOriginalFilename()</code>): path traversal and overwrites.</li>
+      <li>Trusting <code>Content-Type</code> or the extension.</li>
+      <li>Storing uploads inside <code>src/main/resources/static</code> or any served folder.</li>
+      <li>Reading the whole file into memory with <code>getBytes()</code>.</li>
+      <li>No ownership check on download; sequential ids let users read each other's resumes.</li>
+      <li>Not handling <code>MaxUploadSizeExceededException</code>: the client gets a confusing 500 or 413 HTML page.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>MissingServletRequestPartException</code> (400): the part name is not <code>file</code>, or the request is not multipart.</li>
+      <li><code>MultipartException</code> / "Current request is not a multipart request": missing <code>Content-Type: multipart/form-data</code>, often caused by setting the header manually in a client (the boundary is then missing; let the HTTP client set it).</li>
+      <li>Temporary files: Spring writes large parts to a temp folder and deletes them after the request; on small disks watch the temp space.</li>
+      <li>Names with non-ASCII characters (हिंदी.pdf) need the RFC 5987 encoding that <code>ContentDisposition.filename(name, UTF_8)</code> produces.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you handle file upload securely?" Size limits, content-based type check with an allow-list, generated storage names, path normalisation, storage outside the web root, authorisation, metadata in the DB. "What is path traversal?" <code>../</code> in a file name writes outside the folder. "How do you send a file?" <code>ResponseEntity&lt;Resource&gt;</code> with <code>Content-Disposition</code>. "Disk or S3?" S3 for multiple instances and containers.</p>
+  </div>
+</article>
+
+<article class="topic" id="m6-email">
+  <h3>Sending email with JavaMailSender, HTML, attachments and local testing</h3>
+  <p class="tldr">Add spring-boot-starter-mail, set the SMTP properties from environment variables, send plain mail with SimpleMailMessage and HTML or attachments with MimeMessageHelper, render bodies with Thymeleaf, send asynchronously after commit, and test locally with Mailpit.</p>
+
+  <h4>What and why</h4>
+  <p>Email is the oldest notification channel: welcome mails, password reset, "a candidate applied to your job". Mail travels with <strong>SMTP</strong> (Simple Mail Transfer Protocol). Your application is an SMTP <em>client</em>: it connects to a mail server (a provider such as SES, SendGrid, Brevo, or Gmail) with a host, port, username and password, and hands over the message. The server delivers it. Your code never talks to the recipient's server.</p>
+
+  <h4>Setup</h4>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-mail&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <pre data-title="application.yml"><code class="language-yaml">spring:
+  mail:
+    host: ${MAIL_HOST:smtp.gmail.com}
+    port: ${MAIL_PORT:587}
+    username: ${MAIL_USERNAME}
+    password: ${MAIL_PASSWORD}           # never commit this; use an environment variable
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true                 # upgrade the connection to TLS on port 587
+          connectiontimeout: 5000        # ms: do not wait for ever
+          timeout: 5000
+          writetimeout: 5000
+app:
+  mail:
+    from: "Jobs Portal &lt;no-reply@jobs.example.com&gt;"</code></pre>
+  <p>With these properties set, Boot creates a <code>JavaMailSender</code> bean. Provider notes: <strong>Gmail</strong> needs 2-step verification on the account and an <strong>app password</strong> (a 16-character password made for apps; your normal password does not work). It is fine for learning but limited (about 500 mails a day) and unsuitable for production. Real systems use a transactional email provider (SES, SendGrid, Mailgun, Brevo) with their SMTP credentials or HTTP API, and set up <strong>SPF/DKIM/DMARC</strong> DNS records for your sending domain, otherwise your mail lands in spam. Port 587 with STARTTLS is the usual choice; port 465 uses implicit TLS (<code>spring.mail.properties.mail.smtp.ssl.enable=true</code>).</p>
+
+  <h4>Plain text mail</h4>
+  <pre data-title="Simple message"><code class="language-java">@Service
+public class MailService {
+
+    private final JavaMailSender mailSender;
+    private final String from;
+
+    public MailService(JavaMailSender mailSender, @Value("${app.mail.from}") String from) {
+        this.mailSender = mailSender;
+        this.from = from;
+    }
+
+    public void sendPlain(String to, String subject, String text) {
+        SimpleMailMessage msg = new SimpleMailMessage();
+        msg.setFrom(from);
+        msg.setTo(to);
+        msg.setSubject(subject);
+        msg.setText(text);
+        mailSender.send(msg);              // throws MailException (unchecked) on failure
+    }
+}</code></pre>
+
+  <h4>HTML mail and attachments</h4>
+  <p>For HTML, an attachment, an inline image or a non-ASCII text, use a <code>MimeMessage</code> (MIME is the format of structured email) with the helper class:</p>
+  <pre data-title="HTML mail with a resume attached"><code class="language-java">public void sendNewApplication(String to, String subject, String html,
+                               String attachmentName, Path attachment) {
+    try {
+        MimeMessage message = mailSender.createMimeMessage();
+        MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");   // true = multipart
+        helper.setFrom(from);
+        helper.setTo(to);
+        helper.setSubject(subject);
+        helper.setText(html, true);                                   // true = this is HTML
+        helper.addAttachment(attachmentName, new FileSystemResource(attachment));
+        mailSender.send(message);
+    } catch (MessagingException e) {
+        throw new MailPreparationException("Could not build mail", e);
+    }
+}</code></pre>
+  <p>Pass <code>true</code> for multipart whenever you add attachments or inline images. Always send a plain-text alternative for important mail with <code>helper.setText(plain, html)</code>. Attach only when needed: many providers cap messages at 10 to 25 MB, and sending a link is often better.</p>
+
+  <h4>Templates with Thymeleaf (brief)</h4>
+  <p>Do not build HTML with string concatenation. Use a template engine; Thymeleaf is the common choice with Spring (<code>spring-boot-starter-thymeleaf</code>). Put <code>src/main/resources/templates/mail/new-application.html</code> in place:</p>
+  <pre data-title="templates/mail/new-application.html"><code class="language-html">&lt;!DOCTYPE html&gt;
+&lt;html xmlns:th="http://www.thymeleaf.org"&gt;
+  &lt;body&gt;
+    &lt;p&gt;Hello &lt;span th:text="${recruiterName}"&gt;Recruiter&lt;/span&gt;,&lt;/p&gt;
+    &lt;p&gt;&lt;strong th:text="${candidateName}"&gt;Candidate&lt;/strong&gt; applied for
+       &lt;em th:text="${jobTitle}"&gt;Job&lt;/em&gt;.&lt;/p&gt;
+    &lt;p&gt;&lt;a th:href="${link}"&gt;Open the application&lt;/a&gt;&lt;/p&gt;
+  &lt;/body&gt;
+&lt;/html&gt;</code></pre>
+  <pre data-title="Rendering the template"><code class="language-java">@Service
+public class ApplicationMailService {
+
+    private final TemplateEngine templateEngine;      // org.thymeleaf.TemplateEngine
+    private final MailService mailService;
+    // constructor omitted
+
+    public void notifyRecruiter(RecruiterMailData d) {
+        Context ctx = new Context();                  // org.thymeleaf.context.Context
+        ctx.setVariable("recruiterName", d.recruiterName());
+        ctx.setVariable("candidateName", d.candidateName());
+        ctx.setVariable("jobTitle", d.jobTitle());
+        ctx.setVariable("link", d.link());
+        String html = templateEngine.process("mail/new-application", ctx);   // th:text escapes HTML
+        mailService.sendHtml(d.recruiterEmail(), "New application: " + d.jobTitle(), html);
+    }
+}</code></pre>
+  <p><code>th:text</code> escapes HTML, which protects you from a candidate whose name contains a script tag. Never use <code>th:utext</code> with user input.</p>
+
+  <h4>Send asynchronously and after commit</h4>
+  <p>SMTP is slow and flaky. If <code>send()</code> runs inside the request, a slow mail server makes the API slow, and a mail failure can roll back (or fail) the business operation. The standard design for Project 2 combines three pieces from earlier in this module:</p>
+  <ol class="steps">
+    <li>The service saves the application and publishes an <code>ApplicationSubmitted</code> event.</li>
+    <li>A <code>@TransactionalEventListener(phase = AFTER_COMMIT)</code> receives it only if the transaction committed.</li>
+    <li>It calls an <code>@Async("mailExecutor")</code> method that loads the data, renders the template and sends, with a try/catch that logs failures and records them (<a href="#m6-async">Async</a>).</li>
+  </ol>
+  <pre data-title="NotificationService.java"><code class="language-java">@Async("mailExecutor")
+public void sendNewApplicationMail(Long applicationId) {
+    try {
+        RecruiterMailData data = loader.load(applicationId);        // own @Transactional(readOnly)
+        applicationMailService.notifyRecruiter(data);
+        log.info("Recruiter mail sent for application {}", applicationId);
+    } catch (MailException | RuntimeException ex) {
+        log.error("Recruiter mail failed for application {}", applicationId, ex);
+        // optionally: save a FAILED row so a scheduled job can retry
+    }
+}</code></pre>
+  <p>This is "good enough" for a small system. Its weakness: if the app crashes between commit and sending, the mail is lost. A table of pending mails (an <strong>outbox</strong>) plus a scheduler, or a message queue, solves it; see <a href="#m7-delivery-outbox">the outbox idea</a>.</p>
+
+  <h4>Testing email locally</h4>
+  <p>Never test with real recipients. Run a fake SMTP server that catches all mail and shows it in a web page. <strong>Mailpit</strong> (successor of MailHog) is a small Docker image:</p>
+  <pre data-title="compose.yaml (fragment)"><code class="language-yaml">services:
+  mailpit:
+    image: axllent/mailpit
+    ports:
+      - "1025:1025"      # SMTP: the application sends here
+      - "8025:8025"      # web UI: open http://localhost:8025 to read the mails</code></pre>
+  <pre data-title="application-dev.yml"><code class="language-yaml">spring:
+  mail:
+    host: localhost
+    port: 1025
+    properties:
+      mail.smtp.auth: false
+      mail.smtp.starttls.enable: false</code></pre>
+  <p>MailHog (<code>mailhog/mailhog</code>) works the same way with the same ports. In automated tests, either use Testcontainers with Mailpit and call its HTTP API, or mock <code>JavaMailSender</code> and capture the <code>MimeMessage</code> (<a href="#m5">module 5</a>); GreenMail is a popular in-process test SMTP server.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Committing the SMTP password to Git. Use environment variables or a secret manager.</li>
+      <li>Sending email inside the database transaction: a mail goes out for data that is later rolled back.</li>
+      <li>No timeouts: a stuck SMTP server hangs the thread for minutes.</li>
+      <li>Sending to a user-supplied address without limit: your "forgot password" form becomes a spam cannon (rate-limit it, <a href="#m6-rate-limiting">next topics</a>).</li>
+      <li>Putting user-controlled text in the subject or headers without removing line breaks (header injection). <code>MimeMessageHelper</code> checks this for you; do not build headers by hand.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions</p>
+    <ul>
+      <li><code>MailAuthenticationException</code>: wrong username/password (Gmail without an app password).</li>
+      <li><code>MailSendException</code>: delivery to some recipients failed; it contains the failed messages.</li>
+      <li><code>MailParseException</code> / <code>MailPreparationException</code>: bad address or content.</li>
+      <li>All extend the unchecked <code>MailException</code>, so no <code>throws</code> clause; <code>MessagingException</code> (checked) comes from the Jakarta Mail API when you build a <code>MimeMessage</code>.</li>
+      <li>The health indicator <code>mail</code> (Actuator) connects to the SMTP server; it can mark the app DOWN when the mail server is unreachable. Disable it with <code>management.health.mail.enabled=false</code> if mail is not critical.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you send email in Spring Boot?" Starter, SMTP properties, <code>JavaMailSender</code>, <code>SimpleMailMessage</code> vs <code>MimeMessageHelper</code>. "Why asynchronous?" Slow, unreliable external call; do not block the request or the transaction. "How do you make sure it is sent only if the data was saved?" After-commit listener or outbox. "How do you test it?" Mailpit/MailHog or GreenMail.</p>
+  </div>
+</article>

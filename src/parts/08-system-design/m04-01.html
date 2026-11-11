@@ -1,0 +1,415 @@
+<div class="mintro">
+  <p>High-level design (HLD) is the view from far above the code. In the earlier modules you
+  designed classes and objects (low-level design). Here you design a whole system: which services
+  exist, where the data lives, how requests travel, and what happens when a machine, a network link
+  or a whole data centre fails. This module gives you the vocabulary and the arithmetic that every
+  later design is built from.</p>
+  <p>You already build Spring Boot services. HLD asks the next question: what if one million people
+  call your service at the same time, and one of the three servers behind it dies in the middle? The
+  answers use a small set of ideas: estimate the load, scale out, stay available, and choose how
+  consistent your data must be. Module 5 then gives you the building blocks (load balancers,
+  caches, queues, shards) that put these ideas into practice.</p>
+  <ul>
+    <li>Walk through one request from the browser to the database and back, naming every hop.</li>
+    <li>Choose between REST, gRPC, WebSockets, SSE, long polling and webhooks for a given feature.</li>
+    <li>Explain latency, throughput and percentiles, and say why an average hides the pain.</li>
+    <li>Do a back-of-the-envelope estimate of requests per second, storage and bandwidth.</li>
+    <li>Explain stateless services and where session state goes when you scale out.</li>
+    <li>Calculate availability for components in series and in parallel, and read a nines table.</li>
+    <li>Explain CAP with a partition scenario, PACELC, quorums and consistency models, and pick the
+    right consistency for each feature.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m4-hld-overview">
+  <h3>What system design interviews test, and the path of one request</h3>
+  <p class="tldr">A system design interview tests whether you can turn vague requirements into a sensible
+  architecture, justify trade-offs with numbers, and follow one request through every layer: client, DNS,
+  CDN, load balancer, app servers, cache, database, queue and workers.</p>
+
+  <h4>What the interviewer is really checking</h4>
+  <p>There is no single correct answer. The interviewer watches how you think. A good candidate
+  clarifies the problem first, states assumptions, sketches a simple design, estimates the load, and
+  then improves the design where the numbers say it will hurt. Weak candidates jump to "Kafka and
+  microservices" in the first minute without knowing how many users there are.</p>
+  <p>The signals they look for are the same in nearly every interview:</p>
+  <ul>
+    <li><strong>Requirements:</strong> you separate <strong>functional requirements</strong> (what the
+    system does: "shorten a URL", "post a photo") from <strong>non-functional requirements</strong> (how
+    well it does it: latency, availability, consistency, durability, scale).</li>
+    <li><strong>Estimation:</strong> you size the problem before choosing tools.</li>
+    <li><strong>Trade-offs:</strong> every choice costs something. You say what you gain and what you
+    pay. "I use a cache here; the price is stale data for up to 60 seconds, which is fine for a
+    product page."</li>
+    <li><strong>Depth on demand:</strong> when asked "how does that work inside?", you can go one level
+    down (how replication works, what a partition key is).</li>
+    <li><strong>Failure thinking:</strong> you ask "what if this node dies?" before the interviewer does.</li>
+  </ul>
+
+  <h4>How HLD connects to your Spring Boot work</h4>
+  <p>A Spring Boot application is one box in an HLD diagram. The controller, service and repository
+  layers you write live inside that box. Almost every HLD concept has a place where you already touch it:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>HLD idea</th><th>Where you meet it in Spring Boot</th></tr></thead>
+    <tbody>
+      <tr><td>Stateless service</td><td>No data in <code>HttpSession</code>; JWT or a Redis session</td></tr>
+      <tr><td>Cache</td><td><code>@Cacheable</code> with Redis (<a href="04-spring-boot.html#m6">Spring Boot · Module 6</a>)</td></tr>
+      <tr><td>Queue</td><td>Kafka or RabbitMQ listeners (<a href="04-spring-boot.html#m7">Spring Boot · Module 7</a>)</td></tr>
+      <tr><td>Database scaling</td><td>Read replicas, connection pools, indexes (<a href="03-sql-databases.html#m6">SQL · Module 6</a>)</td></tr>
+      <tr><td>Load balancing</td><td>Several instances behind Nginx or an ALB (<a href="07-devops.html#m2">DevOps · Module 2</a>)</td></tr>
+      <tr><td>Health checks</td><td>Actuator <code>/actuator/health</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A repeatable framework for any design question</h4>
+  <ol class="steps">
+    <li><strong>Clarify</strong> the scope and the users. Ask: who uses it, how many, read-heavy or
+    write-heavy, which features are in scope.</li>
+    <li><strong>List requirements</strong>: functional first, then non-functional with numbers
+    (for example "99.9% available, p99 read latency under 200 ms").</li>
+    <li><strong>Estimate</strong> requests per second, storage and bandwidth (the
+    <a href="#m4-estimation">estimation article</a>).</li>
+    <li><strong>Draw the API and the data model</strong> (a few endpoints, a few tables).</li>
+    <li><strong>Draw the high-level design</strong>: client, load balancer, services, database.</li>
+    <li><strong>Deep dive</strong> into one or two hard parts (the hot path, the bottleneck).</li>
+    <li><strong>Handle failures and scale</strong>: replication, caching, sharding, monitoring.</li>
+  </ol>
+
+  <h4>The path of one request</h4>
+  <p>Take a user opening a shopping page on Flipkart-style site. Here is the journey a typical large
+  web system makes. Not every system has every box, and a small one has only a few of them. The skill
+  is knowing when each box earns its place.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  C[Client] --> D[DNS]
+  C --> E[CDN]
+  E --> L[Load balancer]
+  L --> A1[App server 1]
+  L --> A2[App server 2]
+  A1 --> K[(Cache)]
+  A1 --> DB[(Database)]
+  A1 --> Q[[Queue]]
+  Q --> W[Workers]
+  W --> DB
+</pre>
+    <figcaption>One request through a typical web system (DNS is consulted first, then the CDN, then your servers)</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><strong>Client.</strong> The browser or mobile app builds an HTTPS request. It may first check
+    its own cache (the browser cache) and skip the network.</li>
+    <li><strong>DNS.</strong> The client turns <code>shop.example.com</code> into an IP address. The
+    answer is often cached and may point to the nearest region (<a href="#m5-dns">DNS</a>).</li>
+    <li><strong>CDN.</strong> Static files (images, JavaScript, CSS) come from an edge server near the
+    user. A hit ends the journey here (<a href="#m5-cdn">CDN</a>).</li>
+    <li><strong>Load balancer.</strong> Dynamic requests (API calls) arrive at one public address. The
+    load balancer picks a healthy app server and often terminates TLS (<a href="#m5-load-balancers">Load balancers</a>).</li>
+    <li><strong>App server.</strong> Your Spring Boot instance authenticates the request and runs the
+    business logic. It should hold no user state, so any instance can serve any request.</li>
+    <li><strong>Cache.</strong> Before touching the database, the app asks Redis. A hit returns in
+    about a millisecond (<a href="#m5-caching-patterns">Caching</a>).</li>
+    <li><strong>Database.</strong> On a miss, the app queries the database, usually a read replica for
+    reads and the primary for writes (<a href="#m5-replication">Replication</a>).</li>
+    <li><strong>Queue and workers.</strong> Slow or non-urgent work (send email, resize image, update
+    the search index) is put on a queue and the response returns at once. Workers consume the queue
+    later (<a href="#m5-queues">Queues</a>).</li>
+  </ol>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: start with the simplest design that meets the numbers</p>
+    <p>Begin with one app server and one database on the whiteboard. Add a box only when a number or a
+    failure case demands it: "At 5,000 reads per second one database will struggle, so I add a cache."
+    This shows judgement, not buzzwords.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle: what to say in the first five minutes</p>
+    <ul>
+      <li>"Let me clarify scope and non-functional requirements before I draw anything."</li>
+      <li>"Let me estimate the scale so I know which parts need to be distributed."</li>
+      <li>"I will start simple and then evolve the design where the numbers hurt."</li>
+      <li>Always state assumptions aloud; the interviewer can correct them cheaply.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistake: designing for Google scale on day one</p>
+    <p>A system with 10,000 users does not need sharding, Kafka and five microservices. Over-engineering
+    costs money and makes failures harder to find. Say what the design looks like now and how it grows at
+    10x and 100x. That is exactly what a senior engineer does at work.</p>
+  </div>
+
+  <div class="co co-note">
+    <p class="co-t">Words you will hear in every design talk</p>
+    <dl class="terms">
+      <dt>Scalability</dt><dd>The ability to handle more load by adding resources, without a redesign.</dd>
+      <dt>Availability</dt><dd>The fraction of time the system answers correctly (see <a href="#m4-availability">Availability</a>).</dd>
+      <dt>Consistency</dt><dd>Whether all readers see the same, latest data (see <a href="#m4-cap">CAP</a>).</dd>
+      <dt>Durability</dt><dd>Once the system says "saved", the data survives crashes.</dd>
+      <dt>Bottleneck</dt><dd>The one part that limits the whole system's speed. Find it, fix it, find the next one.</dd>
+    </dl>
+  </div>
+</article>
+
+<article class="topic" id="m4-communication">
+  <h3>Client–server and communication styles: REST, gRPC, WebSockets and more</h3>
+  <p class="tldr">Use REST over HTTP+JSON as the default for public APIs, gRPC for fast internal
+  service-to-service calls, WebSockets for two-way real-time traffic, SSE for server-to-browser streams,
+  long polling as a fallback, and webhooks to let another system call you when something happens.</p>
+
+  <h4>Client–server in one paragraph</h4>
+  <p>In the <strong>client–server model</strong> a <strong>client</strong> starts a conversation and a
+  <strong>server</strong> answers. The browser asks, your Spring Boot app replies. The client opens a
+  connection (TCP, usually with TLS on top), sends a <strong>request</strong>, and waits for a
+  <strong>response</strong>. HTTP is the request–response protocol of the web. Every style below is a
+  different way to use this connection. The key questions are: who starts the message, how long the
+  connection stays open, and how the data is encoded (text like JSON, or binary like Protocol Buffers).</p>
+
+  <h4>REST over HTTP and JSON</h4>
+  <p><strong>REST</strong> models your system as <em>resources</em> (<code>/orders/42</code>) and uses
+  HTTP verbs (GET, POST, PUT, PATCH, DELETE) and status codes. Bodies are usually JSON. It is stateless:
+  each request carries everything the server needs.</p>
+  <ul>
+    <li><strong>Strengths:</strong> universal (every language, browser and tool understands it),
+    easy to debug with curl, easy to cache (GET responses, CDN, ETag), mature tooling (Spring MVC,
+    OpenAPI).</li>
+    <li><strong>Costs:</strong> JSON is text, so payloads are larger and parsing is slower than binary.
+    You may need several round trips to build one screen (over-fetching or under-fetching). There is
+    no built-in streaming or schema enforcement.</li>
+    <li><strong>Use it for:</strong> public APIs, browser-to-backend calls, CRUD-style services.</li>
+  </ul>
+  <p>For the design details of REST (status codes, idempotency, versioning, pagination), see
+  <a href="04-spring-boot.html#m2">Spring Boot · Module 2</a>.</p>
+
+  <h4>gRPC</h4>
+  <p><strong>gRPC</strong> is a remote procedure call framework from Google. You describe your service
+  in a <code>.proto</code> file; tools generate client and server code in many languages. Messages are
+  encoded with <strong>Protocol Buffers</strong> (a compact binary format), and calls travel over
+  <strong>HTTP/2</strong>, which multiplexes many calls on one connection.</p>
+  <pre data-title="order.proto"><code class="language-plaintext">syntax = "proto3";
+
+service OrderService {
+  rpc GetOrder (OrderRequest) returns (OrderReply);            // unary
+  rpc WatchOrders (OrderRequest) returns (stream OrderReply);  // server streaming
+  rpc Upload (stream Chunk) returns (UploadSummary);           // client streaming
+  rpc Chat (stream Msg) returns (stream Msg);                  // bidirectional
+}
+
+message OrderRequest { int64 id = 1; }
+message OrderReply   { int64 id = 1; string status = 2; }</code></pre>
+  <ul>
+    <li><strong>Strengths:</strong> small and fast messages, strict typed contract, generated code,
+    four call types including streaming, deadlines and cancellation built in.</li>
+    <li><strong>Costs:</strong> not human-readable on the wire, browsers cannot call it directly
+    (they need gRPC-Web and a proxy), harder to debug, and load balancers must understand HTTP/2.</li>
+    <li><strong>Use it for:</strong> internal service-to-service calls in a microservice system where
+    latency and bandwidth matter.</li>
+  </ul>
+
+  <h4>WebSockets</h4>
+  <p>A <strong>WebSocket</strong> starts as an HTTP request that is "upgraded" to a long-lived,
+  <strong>full-duplex</strong> TCP connection: either side can send a message at any time without a
+  new request. Messages are small frames with very little overhead.</p>
+  <ul>
+    <li><strong>Strengths:</strong> real-time two-way traffic with low latency: chat, multiplayer games,
+    live collaboration, trading screens.</li>
+    <li><strong>Costs:</strong> the server must hold one open connection per user. That is memory and
+    file descriptors, so a node serves tens of thousands, not millions. The connection is
+    <em>stateful</em>, which makes load balancing, deploys and reconnects harder. You must write your own
+    heartbeat, reconnect and message-ordering logic. Proxies and firewalls sometimes interfere.</li>
+    <li><strong>Use it for:</strong> chat, live notifications with replies, collaborative editing.</li>
+  </ul>
+
+  <h4>Server-Sent Events, long polling and short polling</h4>
+  <ul>
+    <li><strong>Short polling:</strong> the client asks "anything new?" every few seconds. Simple, but
+    wasteful: most answers are empty, and updates are delayed up to one interval.</li>
+    <li><strong>Long polling:</strong> the client asks, and the server <em>holds the request open</em>
+    until it has data (or a timeout), then replies; the client immediately asks again. Works everywhere
+    over plain HTTP, with less waste than short polling, but each message costs a full request cycle.</li>
+    <li><strong>Server-Sent Events (SSE):</strong> one HTTP response that stays open and the server
+    pushes text events through it. One direction only (server to client), built-in auto-reconnect in
+    browsers, plain HTTP. Ideal for live scores, progress bars and notifications.</li>
+  </ul>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant S as Server
+  Note over C,S: Short polling
+  C->>S: any news?
+  S-->>C: no
+  C->>S: any news? (5 s later)
+  S-->>C: yes, message 1
+  Note over C,S: WebSocket
+  C->>S: HTTP upgrade request
+  S-->>C: 101 switching protocols
+  S-->>C: message 1 (pushed at once)
+  C->>S: message 2
+</pre>
+    <figcaption>Polling pays a request for every check; a WebSocket pushes data the moment it exists</figcaption>
+  </figure>
+
+  <h4>GraphQL (brief) and webhooks</h4>
+  <p><strong>GraphQL</strong> exposes a single endpoint where the client sends a query that names
+  exactly the fields it wants. This removes over-fetching and lets a mobile screen get everything in
+  one round trip. The costs: caching is harder (every query is a POST with a different body), a naive
+  resolver design causes the N+1 query problem, and expensive queries must be limited. It fits
+  client-driven apps with many different screens.</p>
+  <p>A <strong>webhook</strong> reverses the direction: you give another system a URL, and it sends an
+  HTTP POST to you when something happens (Razorpay telling you a payment succeeded, GitHub telling
+  you about a push). You avoid polling, but you must handle retries, duplicates (make the handler
+  idempotent), verify a signature so nobody can fake events, and respond fast (accept, then process
+  asynchronously).</p>
+
+  <h4>Comparison table</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Style</th><th>Direction</th><th>Format</th><th>Best for</th><th>Main cost</th></tr></thead>
+    <tbody>
+      <tr><td>REST</td><td>Client asks</td><td>JSON (text)</td><td>Public APIs, CRUD</td><td>Chatty, no streaming</td></tr>
+      <tr><td>gRPC</td><td>Both, with streaming</td><td>Protobuf (binary)</td><td>Internal service calls</td><td>Not browser-native</td></tr>
+      <tr><td>WebSocket</td><td>Full duplex</td><td>Any frames</td><td>Chat, games</td><td>Stateful, many open sockets</td></tr>
+      <tr><td>SSE</td><td>Server to client</td><td>Text events</td><td>Live feeds, progress</td><td>One-way only</td></tr>
+      <tr><td>Long polling</td><td>Client asks, server holds</td><td>Any</td><td>Fallback, simple push</td><td>Request per message</td></tr>
+      <tr><td>GraphQL</td><td>Client asks</td><td>JSON</td><td>Varied client screens</td><td>Caching, N+1, query cost</td></tr>
+      <tr><td>Webhook</td><td>Other system calls you</td><td>JSON</td><td>Event notifications between companies</td><td>Retries, duplicates, security</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every network call can fail, so set timeouts and make writes idempotent</p>
+    <p>A call may time out after the server already did the work. The client then retries and the work
+    runs twice. Give writes an idempotency key (for example a payment request id) so the retry is safe.
+    Never call another service without a timeout.</p>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects usually mix styles</p>
+    <p>A typical product uses REST between the mobile app and the API gateway, gRPC or REST between
+    internal services, a WebSocket or SSE channel for live notifications, Kafka for events between
+    services, and webhooks from the payment provider. You pick per interaction, not once for the whole
+    system.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"Chat needs both sides to push, so I use WebSockets. Notifications are one-way, so SSE is
+      lighter. For service-to-service I use gRPC for speed, and REST at the edge for compatibility."</li>
+      <li>Mention the cost of WebSockets: sticky connections and one socket per user, so the gateway
+      layer for sockets is scaled and deployed separately.</li>
+      <li>Say that you pick the simplest style that meets the latency need; polling every 30 seconds
+      is fine for a dashboard.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-latency-throughput">
+  <h3>Latency, throughput and percentiles</h3>
+  <p class="tldr">Latency is how long one request takes, throughput is how many requests finish per
+  second; measure latency with percentiles (p50, p95, p99), not averages, and remember the rough cost
+  of memory, disk and network operations.</p>
+
+  <h4>Two different questions</h4>
+  <p><strong>Latency</strong> is the time for one request, from sending to getting the answer, in
+  milliseconds. <strong>Throughput</strong> is how much work the system finishes per unit of time:
+  requests per second (RPS or QPS), messages per second, or megabytes per second.</p>
+  <p>Analogy: a motorway. Latency is how long one car takes from Mumbai to Pune. Throughput is how many
+  cars reach Pune per hour. Adding lanes raises throughput but does not make any single car faster. A
+  faster speed limit lowers latency. The two are linked but not the same: a system can have high
+  throughput and poor latency (a batch job that handles millions of rows but each takes minutes), or
+  low latency and low throughput (a fast server that handles only one request at a time).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Latency</th><th>Throughput</th></tr></thead>
+    <tbody>
+      <tr><td>Question</td><td>How long does one request take?</td><td>How many requests per second?</td></tr>
+      <tr><td>Unit</td><td>ms</td><td>RPS, MB/s</td></tr>
+      <tr><td>Improved by</td><td>Caching, closer servers (CDN), faster queries, less network hops</td><td>More servers, parallelism, batching, async work</td></tr>
+      <tr><td>Trade-off</td><td>Batching raises latency per item</td><td>Higher load at saturation raises latency</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Why averages lie: percentiles</h4>
+  <p>Suppose 99 requests take 100 ms and one takes 10 seconds. The average is about 199 ms and looks
+  healthy, but one in every hundred users waited ten seconds. Latency has a long tail, so we use
+  <strong>percentiles</strong>:</p>
+  <ul>
+    <li><strong>p50 (median):</strong> half of the requests are faster than this. The "typical" user.</li>
+    <li><strong>p95:</strong> 95% are faster; 1 in 20 is slower.</li>
+    <li><strong>p99:</strong> 1 in 100 is slower. Heavy users see it often.</li>
+    <li><strong>p99.9:</strong> the extreme tail, often GC pauses, cold caches or retries.</li>
+  </ul>
+  <p>The tail matters more than it looks. A page that makes 20 backend calls is slow if <em>any</em>
+  call is slow. If each call has a 1% chance of being slow, the page is slow with probability
+  1 − 0.99<sup>20</sup> ≈ 18%. This is called <strong>tail latency amplification</strong>. That is why
+  SLOs are written as "p99 under 300 ms", never "average under 100 ms".</p>
+
+  <h4>Latency numbers worth remembering</h4>
+  <p>These are rough orders of magnitude (hardware changes them, but the ratios hold). Their value is
+  telling you what to avoid in a hot path: every step down the table is roughly ten to a hundred times
+  slower.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operation</th><th>Approximate time</th><th>Feels like</th></tr></thead>
+    <tbody>
+      <tr><td>CPU register / L1 cache</td><td>about 1 ns</td><td>instant</td></tr>
+      <tr><td>Main memory (RAM) read</td><td>about 100 ns</td><td>fast</td></tr>
+      <tr><td>Compress 1 KB</td><td>a few microseconds</td><td>fast</td></tr>
+      <tr><td>SSD random read</td><td>about 100 µs</td><td>1,000x RAM</td></tr>
+      <tr><td>Round trip inside one data centre</td><td>about 0.5 ms</td><td>network is not free</td></tr>
+      <tr><td>Read 1 MB sequentially from SSD</td><td>about 1 ms</td><td>fine for bulk</td></tr>
+      <tr><td>Spinning disk seek</td><td>about 10 ms</td><td>avoid for random IO</td></tr>
+      <tr><td>Round trip across a continent</td><td>about 50–100 ms</td><td>physics (speed of light)</td></tr>
+      <tr><td>Round trip India to US or Europe</td><td>about 150–250 ms</td><td>why CDNs and regions exist</td></tr>
+    </tbody>
+  </table></div>
+  <p>The lessons: memory is fast, so cache in memory; disk is slower, so prefer sequential access and
+  indexes; each network hop costs real time, so avoid chatty calls; and distance cannot be tuned away,
+  so put data near users.</p>
+
+  <h4>Little's law</h4>
+  <p><strong>Little's law</strong> links three numbers in any stable system:</p>
+  <pre data-title="Little's law"><code class="language-plaintext">L = λ × W
+
+L = average number of requests inside the system at once
+λ = arrival rate (requests per second)
+W = average time each request spends in the system (seconds)</code></pre>
+  <p>Example: your service gets 2,000 requests per second and each takes 50 ms (0.05 s). Then
+  L = 2,000 × 0.05 = 100 requests in flight at once. If a Tomcat instance has 200 worker threads, one
+  instance handles it with room to spare. If a database call slows down to 500 ms, L becomes 1,000, the
+  threads run out, requests queue, and latency climbs further. This is how a slow dependency takes down
+  a healthy service. It also shows how to size connection pools and thread pools: concurrency needed =
+  rate × time.</p>
+
+  <h4>What happens near saturation</h4>
+  <p>A server at 50% load answers quickly. As utilisation approaches 100%, queues build and latency rises
+  sharply, not smoothly. Plan to run services at 60–70% of peak capacity, keep the rest as headroom for
+  spikes and failures, and use <strong>load shedding</strong> (reject some requests early with 503 or
+  429) rather than letting every request time out.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistake: reporting the average and the maximum only</p>
+    <p>The average hides the tail; the maximum is one unlucky request. Report p50, p95 and p99, and
+    measure at the client or load balancer so queueing time is included. Also avoid averaging percentiles
+    across servers; merge the raw histograms instead.</p>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: ways to cut latency, in the order you try them</p>
+    <ol>
+      <li>Do less: remove unneeded calls and use indexes.</li>
+      <li>Do it nearby: CDN for static content, regional deployments, a cache close to the app.</li>
+      <li>Do it in parallel: call independent services at the same time, not one after the other.</li>
+      <li>Do it later: return now and finish slow work through a queue.</li>
+    </ol>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"I would track p99 latency, because averages hide the slow tail that real users feel."</li>
+      <li>Quote ratios, not exact figures: memory is about 1,000x faster than SSD, and a cross-region
+      call is about 1,000x slower than a local memory read.</li>
+      <li>Use Little's law to justify thread-pool or connection-pool sizes.</li>
+    </ul>
+  </div>
+</article>

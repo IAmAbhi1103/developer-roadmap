@@ -1,0 +1,787 @@
+<article class="topic" id="m4-fetch">
+  <h3>fetch: calling a REST API from JavaScript</h3>
+  <p class="tldr">fetch(url, options) sends an HTTP request and returns a promise of a Response; it rejects only on network failure, so you must check <code>response.ok</code> yourself, then read the body with <code>response.json()</code> — wrap this in one reusable apiClient that adds the JWT header, a timeout and clear errors.</p>
+
+  <p><code>fetch</code> is the browser's built-in way to make HTTP calls (also available in Node.js 18 and later). It is how your frontend talks to the Spring Boot REST API you built, so every call is one request/response from the HTTP you learned in <a href="#m1">Module 1</a>. Fetch is promise-based, so you use it with <code>async</code>/<code>await</code> (see <a href="#m4-async-await">async and await</a>). The older <code>XMLHttpRequest</code> is not used in new code; libraries like Axios wrap fetch-like behaviour, but plain fetch is enough for most projects.</p>
+
+  <h4>A GET request</h4>
+  <pre data-title="get.js"><code class="language-javascript">async function loadProducts() {
+  const response = await fetch("http://localhost:8080/api/products");
+
+  console.log(response.status);       // 200
+  console.log(response.ok);           // true for status 200–299
+  console.log(response.headers.get("Content-Type")); // "application/json"
+
+  const products = await response.json();   // reads the body and parses the JSON — also a promise
+  console.log(products);   // [ { id: 1, name: 'Mouse', price: 499 }, ... ]
+  return products;
+}
+loadProducts();</code></pre>
+  <p>Two awaits are needed: the first resolves when the <strong>headers</strong> arrive (the response object), the second when the <strong>body</strong> has been read and parsed. The body can be read only once; calling <code>response.json()</code> twice throws <code>TypeError: body stream already read</code>. Use <code>response.clone()</code> if you need two reads. Other readers: <code>response.text()</code>, <code>response.blob()</code> (files, images), <code>response.formData()</code>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">fetch does NOT reject on 404 or 500</p>
+    <p>The promise rejects only when the request itself could not be completed: no network, DNS failure, CORS block, request aborted. An HTTP error such as 404, 401 or 500 is a <em>successful</em> fetch with <code>response.ok === false</code>. Java developers used to <code>RestTemplate</code> or <code>WebClient</code> throwing on 4xx/5xx are caught by this often. Always check <code>response.ok</code>.</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: error body parsed as data</p><pre><code class="language-javascript">const res = await fetch("/api/products/999");
+const product = await res.json();   // 404 JSON error
+render(product);                    // renders "Not found" as a product</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: check ok first</p><pre><code class="language-javascript">const res = await fetch("/api/products/999");
+if (!res.ok) throw new Error(`HTTP ${res.status}`);
+render(await res.json());</code></pre></div>
+  </div>
+
+  <h4>POST, PUT, PATCH, DELETE with a JSON body</h4>
+  <p>The second argument is an options object. For JSON you must set the method, the <code>Content-Type</code> header and a string body made with <code>JSON.stringify</code>. Without the header, Spring's <code>@RequestBody</code> answers 415 Unsupported Media Type.</p>
+  <pre data-title="write.js"><code class="language-javascript">const BASE = "http://localhost:8080/api";
+
+async function createProduct(product) {
+  const res = await fetch(`${BASE}/products`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(product),            // must be a string (or FormData, Blob)
+  });
+  if (!res.ok) throw new Error(`Create failed: ${res.status}`);
+  return res.json();                           // 201 Created with the saved product
+}
+
+async function updateProduct(id, changes) {
+  const res = await fetch(`${BASE}/products/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes),
+  });
+  if (!res.ok) throw new Error(`Update failed: ${res.status}`);
+  return res.json();
+}
+
+async function deleteProduct(id) {
+  const res = await fetch(`${BASE}/products/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`Delete failed: ${res.status}`);
+  // a 204 No Content response has NO body: do not call res.json() here
+}
+
+await createProduct({ name: "Keyboard", price: 899 });</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>method</code></td><td><code>"GET"</code> (default), <code>"POST"</code>, <code>"PUT"</code>, <code>"PATCH"</code>, <code>"DELETE"</code></td></tr>
+      <tr><td><code>headers</code></td><td>Object of request headers</td></tr>
+      <tr><td><code>body</code></td><td>String (JSON), <code>FormData</code>, <code>Blob</code>, <code>URLSearchParams</code>; not allowed on GET</td></tr>
+      <tr><td><code>signal</code></td><td>An <code>AbortSignal</code> to cancel the request</td></tr>
+      <tr><td><code>credentials</code></td><td><code>"omit"</code>, <code>"same-origin"</code> (default) or <code>"include"</code> to send cookies to another origin</td></tr>
+      <tr><td><code>cache</code>, <code>mode</code>, <code>redirect</code></td><td>Advanced controls; defaults are usually right</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Query strings and URLs</h4>
+  <p>Do not join query strings by hand: special characters (<code>&amp;</code>, spaces, <code>₹</code>) must be encoded. <code>URLSearchParams</code> does it for you.</p>
+  <pre data-title="query.js"><code class="language-javascript">const params = new URLSearchParams({ q: "mobile &amp; cover", page: 2, size: 10 });
+console.log(params.toString());   // q=mobile+%26+cover&amp;page=2&amp;size=10
+
+const res = await fetch(`${BASE}/products?${params}`);
+
+const url = new URL("/api/products", "http://localhost:8080");
+url.searchParams.set("category", "phones");
+console.log(url.href);            // http://localhost:8080/api/products?category=phones</code></pre>
+
+  <h4>Sending a JWT</h4>
+  <p>After login, Spring Boot returns a <strong>JWT</strong> (JSON Web Token). Protected endpoints expect it in the <code>Authorization</code> header with the word <code>Bearer</code> and a space. A <code>401</code> means "not logged in or token expired"; a <code>403</code> means "logged in but not allowed". The backend side is explained on the <a href="04-spring-boot.html#m4">Spring Boot page</a>.</p>
+  <pre data-title="auth.js"><code class="language-javascript">async function login(email, password) {
+  const res = await fetch(`${BASE}/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) throw new Error("Invalid email or password");
+  const { token } = await res.json();
+  return token;                           // keep it in memory or storage; see "Storage"
+}
+
+async function loadMyOrders(token) {
+  const res = await fetch(`${BASE}/orders/mine`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 401) throw new Error("Session expired, please log in again");
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}</code></pre>
+
+  <h4>Timeouts and cancelling with AbortController</h4>
+  <p>Fetch has no built-in timeout; a hung server would keep the request open for a very long time. An <strong>AbortController</strong> gives you a <code>signal</code> to pass to fetch; calling <code>controller.abort()</code> cancels the request, and the promise rejects with an error named <code>AbortError</code>. The same tool cancels outdated requests, for example when the user keeps typing in a search box or leaves a React screen.</p>
+  <pre data-title="abort.js"><code class="language-javascript">async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() =&gt; controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err.name === "AbortError") throw new Error("Request timed out");
+    throw err;
+  } finally {
+    clearTimeout(timer);                      // always clean up the timer
+  }
+}
+
+// Shorter, in newer browsers and Node 18+/20+: AbortSignal.timeout(8000)
+const res = await fetch(`${BASE}/products`, { signal: AbortSignal.timeout(8000) });</code></pre>
+
+  <h4>Network errors vs HTTP errors</h4>
+  <p>Handle the two kinds separately, because the user needs different messages.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Situation</th><th>What fetch does</th><th>How you see it</th></tr></thead>
+    <tbody>
+      <tr><td>Server down, no internet, DNS failure</td><td>Promise rejects</td><td><code>TypeError: Failed to fetch</code> (Chrome) / <code>NetworkError…</code> (Firefox)</td></tr>
+      <tr><td>CORS blocked by the browser</td><td>Promise rejects, response hidden</td><td>Same <code>TypeError: Failed to fetch</code>; the real reason is in the console</td></tr>
+      <tr><td>404, 401, 403, 500</td><td>Promise fulfils</td><td><code>response.ok === false</code>, <code>response.status</code></td></tr>
+      <tr><td>200 but body is not JSON</td><td>Fulfils; <code>json()</code> rejects</td><td><code>SyntaxError: Unexpected token '&lt;' …</code> (often an HTML error page)</td></tr>
+      <tr><td>Timeout / cancel</td><td>Promise rejects</td><td><code>AbortError</code> / <code>TimeoutError</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-exc">
+    <p class="co-t">CORS errors</p>
+    <p>If your React app runs on <code>http://localhost:5173</code> and calls <code>http://localhost:8080</code>, the browser treats these as different origins and blocks the response unless the server allows it. The console shows <em>"Access to fetch at '…' from origin '…' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header"</em>. The fix is on the server (Spring's <code>@CrossOrigin</code> or a global CORS configuration), or a Vite dev proxy. The request often reaches the server; the browser only refuses to let your code read the answer. JavaScript cannot "turn off" CORS. Full explanation in <a href="#m6">Module 6</a>.</p>
+  </div>
+
+  <h4>A reusable apiClient</h4>
+  <p>Repeating <code>headers</code>, <code>ok</code> checks and JSON parsing in every call leads to bugs. Put them in one small module. This version adds the base URL, the JWT, JSON handling, a timeout and a custom error that carries the status code and the server's message.</p>
+  <pre data-title="apiClient.js"><code class="language-javascript">const BASE_URL = "http://localhost:8080/api";
+
+export class ApiError extends Error {
+  constructor(status, message, body) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;     // e.g. 404
+    this.body = body;         // parsed error body from Spring, if any
+  }
+}
+
+function getToken() {
+  return localStorage.getItem("token");
+}
+
+async function request(path, { method = "GET", body, params, timeoutMs = 8000 } = {}) {
+  const url = new URL(`${BASE_URL}${path}`);
+  if (params) Object.entries(params).forEach(([k, v]) =&gt; url.searchParams.set(k, v));
+
+  const headers = { Accept: "application/json" };
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    // network failure, CORS, timeout
+    const msg = err.name === "TimeoutError" ? "The server took too long" : "Cannot reach the server";
+    throw new ApiError(0, msg);
+  }
+
+  // 204 No Content, or any empty body
+  const text = await response.text();
+  const data = text ? safeJson(text) : null;
+
+  if (!response.ok) {
+    const message = data?.message ?? data?.error ?? `Request failed (${response.status})`;
+    throw new ApiError(response.status, message, data);
+  }
+  return data;
+}
+
+function safeJson(text) {
+  try { return JSON.parse(text); } catch { return text; }
+}
+
+export const api = {
+  get: (path, params) =&gt; request(path, { params }),
+  post: (path, body) =&gt; request(path, { method: "POST", body }),
+  put: (path, body) =&gt; request(path, { method: "PUT", body }),
+  del: (path) =&gt; request(path, { method: "DELETE" }),
+};</code></pre>
+  <pre data-title="usage.js"><code class="language-javascript">import { api, ApiError } from "./apiClient.js";
+
+try {
+  const page = await api.get("/products", { category: "phones", page: 0 });
+  console.log(page.length, "products");
+  await api.post("/cart/items", { productId: 3, quantity: 2 });
+} catch (err) {
+  if (err instanceof ApiError &amp;&amp; err.status === 401) {
+    console.log("Please log in again");
+  } else if (err instanceof ApiError) {
+    console.log(`Error ${err.status}: ${err.message}`);
+  } else {
+    throw err;                              // a bug in our code: do not hide it
+  }
+}</code></pre>
+  <pre class="out" data-title="Console (example)"><code class="language-plaintext">12 products
+Error 400: Quantity must be at least 1</code></pre>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <ul>
+      <li>One <code>apiClient</code> (or an Axios instance with interceptors) is shared by all screens; on a 401 it clears the token and redirects to login.</li>
+      <li>React data libraries such as TanStack Query call your fetch functions and add caching, retries and loading states (<a href="#m5">Module 5</a>).</li>
+      <li>Spring Boot returns errors as JSON (a <code>message</code> or ProblemDetail <code>detail</code> field), which the client turns into a readable message. Agree the shape with the backend team.</li>
+      <li>The base URL comes from an environment variable (in Vite, <code>import.meta.env.VITE_API_URL</code>), not hard-coded.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Do not set <code>Content-Type</code> yourself when the body is <code>FormData</code>: the browser adds the boundary.</li>
+      <li>Do not <code>JSON.stringify</code> a <code>FormData</code> or file; upload it as the body directly.</li>
+      <li>Sending cookies to another origin needs <code>credentials: "include"</code> and a matching server CORS setting.</li>
+      <li>Redirects are followed automatically; a login redirect may return an HTML page with status 200 — a reason <code>json()</code> sometimes fails.</li>
+      <li>A request with a custom header such as <code>Authorization</code> triggers a CORS <strong>preflight</strong> (an automatic <code>OPTIONS</code> request first). Your Spring Security config must allow it.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>"Does fetch reject on a 404?"</b> No. Only on network-level failures; check <code>response.ok</code>.</li>
+      <li><b>"How do you send JSON with fetch?"</b> <code>method</code>, <code>Content-Type: application/json</code> header, <code>JSON.stringify</code> body.</li>
+      <li><b>"How do you send a JWT?"</b> <code>Authorization: Bearer &lt;token&gt;</code>.</li>
+      <li><b>"How do you time out or cancel a request?"</b> <code>AbortController</code> / <code>AbortSignal.timeout()</code>.</li>
+      <li><b>"fetch vs Axios?"</b> Axios rejects on HTTP errors, parses JSON automatically, has interceptors; fetch is built in with no dependency.</li>
+      <li><b>"What is CORS and where do you fix it?"</b> Browser same-origin protection; fix with server headers.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-modules">
+  <h3>ES modules: import and export</h3>
+  <p class="tldr">An ES module is a JavaScript file with its own private scope that shares only what it <code>export</code>s and takes what it needs with <code>import</code>; use named exports by default, one default export per file at most, and load the entry file with <code>type="module"</code>.</p>
+
+  <p>Before modules, every script shared one global scope, and files depended on the order of the script tags. <strong>ES modules</strong> (ES2015) solve this and are the standard in browsers, in Vite and React projects, and in modern Node.js. The idea is like Java packages and imports, but at the file level: one file is one module; there is no package declaration and no class-per-file rule.</p>
+
+  <h4>Named exports</h4>
+  <pre data-title="utils/price.js"><code class="language-javascript">export const GST_RATE = 0.18;
+
+export function addGst(amount) {
+  return amount * (1 + GST_RATE);
+}
+
+export const formatInr = (amount) =&gt;
+  new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(amount);
+
+const secret = "not exported";      // private to this file</code></pre>
+  <pre data-title="main.js"><code class="language-javascript">import { addGst, formatInr } from "./utils/price.js";   // names must match; braces required
+import { GST_RATE as TAX } from "./utils/price.js";       // rename on import
+import * as price from "./utils/price.js";                // everything in one namespace object
+
+console.log(formatInr(addGst(1000)));   // ₹1,180.00
+console.log(TAX);                       // 0.18
+console.log(price.addGst(100));         // 118
+console.log(Object.keys(price));        // [ 'GST_RATE', 'addGst', 'formatInr' ]</code></pre>
+
+  <h4>Default export</h4>
+  <p>A module can have <strong>one</strong> default export. The importer chooses any name, with no braces. React components are usually exported by default.</p>
+  <pre data-title="CartItem.jsx and usage"><code class="language-javascript">// CartItem.js
+export default function CartItem(props) { /* ... */ }
+
+// elsewhere
+import CartItem from "./CartItem.js";        // any local name works
+import Item, { helper } from "./CartItem.js"; // default + named together</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Named export</th><th>Default export</th></tr></thead>
+    <tbody>
+      <tr><td>Count per file</td><td>Any number</td><td>One</td></tr>
+      <tr><td>Import syntax</td><td><code>import { a } from</code></td><td><code>import a from</code></td></tr>
+      <tr><td>Rename on import</td><td><code>{ a as b }</code></td><td>Just use another name</td></tr>
+      <tr><td>Refactoring / auto-import</td><td>Safer: the name is fixed</td><td>Names can drift between files</td></tr>
+      <tr><td>Typical use</td><td>Utilities, hooks, constants</td><td>One main thing: a React component, a class</td></tr>
+    </tbody>
+  </table></div>
+  <p>You can also re-export: <code>export { addGst } from "./price.js";</code> and <code>export * from "./price.js";</code>, which is how an <code>index.js</code> file gathers a folder's exports ("barrel file").</p>
+
+  <h4>Rules of modules</h4>
+  <ul>
+    <li><strong>Module scope.</strong> Top-level variables are private to the file; no globals, no clash between files. Modules are always in strict mode and top-level <code>this</code> is <code>undefined</code>.</li>
+    <li><strong>Run once.</strong> A module is executed the first time it is imported and then cached; all importers share the same instance (like a Spring singleton). A module-level <code>let</code> counter is therefore shared state.</li>
+    <li><strong>Imports are live, read-only bindings</strong>, not copies. The importing file cannot assign to an imported name (<code>TypeError: Assignment to constant variable</code>), but sees later changes made inside the exporting module.</li>
+    <li><strong>Static and hoisted.</strong> <code>import</code> lines must be at the top level (not inside <code>if</code> or functions), and run before the rest of the file. This lets tools do "tree shaking": removing unused exports from the final bundle.</li>
+    <li><strong>The path.</strong> In the browser and in Node.js you write the file extension and a relative path starting with <code>./</code> or <code>../</code>: <code>"./price.js"</code>. Bundlers such as Vite let you leave the extension off for <code>.js</code>/<code>.jsx</code> files, but a bare name like <code>"react"</code> means a package from <code>node_modules</code>.</li>
+  </ul>
+  <pre data-title="index.html"><code class="language-html">&lt;script type="module" src="main.js"&gt;&lt;/script&gt;
+&lt;!-- main.js can import others; they load automatically, in parallel --&gt;</code></pre>
+
+  <h4>Dynamic import</h4>
+  <p><code>import("./chart.js")</code> loads a module on demand and returns a promise. Use it for code splitting: load a heavy page only when the user opens it. In React this is <code>React.lazy(() =&gt; import("./Reports"))</code>.</p>
+  <pre data-title="dynamic.js"><code class="language-javascript">button.addEventListener("click", async () =&gt; {
+  const { drawChart } = await import("./chart.js");   // downloaded only now
+  drawChart(data);
+});</code></pre>
+
+  <h4>CommonJS vs ES modules</h4>
+  <p>Node.js started with its own system, <strong>CommonJS</strong>: <code>const fs = require("fs")</code> and <code>module.exports = …</code>. You will still see it in older code and config files. Modern Node.js runs ES modules when the file ends in <code>.mjs</code> or <code>package.json</code> contains <code>"type": "module"</code>. Do not mix both styles in a file: <code>require is not defined in ES module scope</code> and <code>Cannot use import statement outside a module</code> are the two classic errors.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><b>Circular imports</b> (a imports b, b imports a) work only if the values are used later, not while the modules are loading; otherwise you see <code>ReferenceError: Cannot access 'x' before initialization</code>.</li>
+      <li>Wrong braces are silent surprises: <code>import { CartItem }</code> for a default export gives <code>SyntaxError: The requested module does not provide an export named 'CartItem'</code>.</li>
+      <li>Opening a module page from <code>file://</code> fails because of CORS; use a dev server (see <a href="#m4-where-js-runs">where JavaScript runs</a>).</li>
+      <li>Forgetting <code>./</code> in the path makes the browser treat it as a package name: <code>Failed to resolve module specifier "utils/price.js"</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Prefer named exports for helpers; one default export per React component file, with the file name equal to the component name.</li>
+      <li>Keep one purpose per module; group by feature (<code>cart/</code>, <code>orders/</code>), not only by type.</li>
+      <li>Order imports: libraries first, then your own modules, then CSS.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>"Named vs default export?"</b> Many vs one; braces vs none; name fixed vs free.</li>
+      <li><b>"ES modules vs CommonJS?"</b> Static <code>import/export</code> (tree-shakeable, async loading) vs dynamic <code>require/module.exports</code> (synchronous, Node).</li>
+      <li><b>"What is module scope?"</b> Variables are private to the file unless exported.</li>
+      <li><b>"What is tree shaking / dynamic import?"</b> Removing unused exports at build time; loading code on demand with <code>import()</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-npm">
+  <h3>Node.js, npm and Vite basics</h3>
+  <p class="tldr">Node.js runs JavaScript outside the browser and npm is its package manager (like Maven for Java): <code>package.json</code> lists your dependencies and scripts, <code>npm install</code> downloads them into <code>node_modules</code>, <code>package-lock.json</code> pins exact versions, and a bundler like Vite prepares your modules for the browser.</p>
+
+  <p>Real frontend projects use hundreds of libraries and build tools. They are all JavaScript packages, installed and run with <strong>npm</strong> (Node Package Manager), which comes with <strong>Node.js</strong>. Node uses the same V8 engine as Chrome (see <a href="#m4-where-js-runs">where JavaScript runs</a>). Install the LTS version from nodejs.org, then check:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ node --version
+v22.11.0
+$ npm --version
+10.9.0</code></pre>
+  <p>(Your numbers will differ; use an LTS release.)</p>
+
+  <h4>Maven vs npm</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Idea</th><th>Java / Maven</th><th>JavaScript / npm</th></tr></thead>
+    <tbody>
+      <tr><td>Project file</td><td><code>pom.xml</code></td><td><code>package.json</code></td></tr>
+      <tr><td>Repository</td><td>Maven Central</td><td>npm registry</td></tr>
+      <tr><td>Downloaded libraries</td><td><code>~/.m2</code> (shared)</td><td><code>node_modules/</code> inside each project (can be huge)</td></tr>
+      <tr><td>Exact versions file</td><td>Dependency management / BOM</td><td><code>package-lock.json</code></td></tr>
+      <tr><td>Install</td><td><code>mvn install</code></td><td><code>npm install</code></td></tr>
+      <tr><td>Run a task</td><td><code>mvn test</code></td><td><code>npm run test</code> / <code>npm test</code></td></tr>
+      <tr><td>Test-only dependency</td><td><code>&lt;scope&gt;test&lt;/scope&gt;</code></td><td><code>devDependencies</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>package.json</h4>
+  <pre data-title="package.json"><code class="language-json">{
+  "name": "shop-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "eslint": "^9.0.0"
+  }
+}</code></pre>
+  <ul>
+    <li><strong>dependencies</strong> — packages your app needs at runtime (and that get bundled): React, a date library.</li>
+    <li><strong>devDependencies</strong> — tools used only while building or testing: Vite, ESLint, Prettier, test libraries.</li>
+    <li><strong>scripts</strong> — named commands. <code>npm run dev</code> runs the command under <code>dev</code>. <code>start</code> and <code>test</code> can be run without the word <code>run</code>.</li>
+    <li><code>"type": "module"</code> tells Node that <code>.js</code> files are ES modules (see <a href="#m4-modules">ES modules</a>).</li>
+    <li>The versions in this file are examples; use the versions that <code>npm</code> installs for you.</li>
+  </ul>
+
+  <h4>Everyday commands</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>npm init -y</code></td><td>Create a default <code>package.json</code></td></tr>
+      <tr><td><code>npm install</code> (or <code>npm i</code>)</td><td>Install everything listed in <code>package.json</code>; updates the lock file if needed</td></tr>
+      <tr><td><code>npm install axios</code></td><td>Add a dependency and save it to <code>package.json</code></td></tr>
+      <tr><td><code>npm install -D vitest</code></td><td>Add a dev dependency</td></tr>
+      <tr><td><code>npm ci</code></td><td>Clean, exact install from the lock file; deletes <code>node_modules</code> first; fails if lock and <code>package.json</code> disagree. Use in CI and Docker builds.</td></tr>
+      <tr><td><code>npm uninstall axios</code></td><td>Remove a package</td></tr>
+      <tr><td><code>npm run dev</code></td><td>Run a script from <code>package.json</code></td></tr>
+      <tr><td><code>npx vite --version</code></td><td>Run a package's command without installing it globally (it uses the local copy or downloads a temporary one)</td></tr>
+      <tr><td><code>npm outdated</code>, <code>npm audit</code></td><td>Show old packages; scan for known vulnerabilities</td></tr>
+      <tr><td><code>npm create vite@latest</code></td><td>Start a new project from the Vite template (React, Vue …)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Semantic versions: ^ and ~</h4>
+  <p>Versions look like <code>MAJOR.MINOR.PATCH</code> (for example <code>19.1.2</code>): a major change may break your code, a minor adds features, a patch fixes bugs. Symbols in <code>package.json</code> say which updates are allowed:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Written</th><th>Accepts</th><th>Example range for the entry</th></tr></thead>
+    <tbody>
+      <tr><td><code>"^4.17.2"</code></td><td>Same major: minor and patch updates</td><td>≥ 4.17.2 and &lt; 5.0.0</td></tr>
+      <tr><td><code>"~4.17.2"</code></td><td>Same minor: patch updates only</td><td>≥ 4.17.2 and &lt; 4.18.0</td></tr>
+      <tr><td><code>"4.17.2"</code></td><td>That exact version</td><td>4.17.2</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>package-lock.json</code> records the exact version of every package, including those that your packages depend on (transitive dependencies). Commit it to Git so every developer and the build server get identical code. Never commit <code>node_modules</code>: add it to <code>.gitignore</code>, and anyone can recreate it with <code>npm ci</code>.</p>
+
+  <h4>What a bundler like Vite does</h4>
+  <p>Browsers can load ES modules directly, but a real app has hundreds of files, JSX that browsers cannot read, and packages in <code>node_modules</code>. A <strong>bundler</strong> reads your entry file, follows every <code>import</code>, transforms JSX and TypeScript to plain JavaScript, removes unused code (tree shaking), minifies, splits the result into chunks and writes a few optimised files to <code>dist/</code> that any web server (or the <code>static</code> folder of Spring Boot) can serve.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A[src: JSX, CSS, modules] --> B[Vite: dev server]
+  A --> C[Vite build]
+  C --> D[dist: HTML, JS, CSS]
+  D --> E[Web server or CDN]
+</pre>
+  <figcaption>Vite serves your source during development and builds optimised files for production</figcaption>
+  </figure>
+  <ul>
+    <li><code>npm run dev</code> starts the <strong>dev server</strong> (usually <code>http://localhost:5173</code>) with instant reload when you save a file.</li>
+    <li><code>npm run build</code> creates the production files in <code>dist/</code>.</li>
+    <li>Environment variables for the browser must start with <code>VITE_</code> in Vite (<code>import.meta.env.VITE_API_URL</code>), and are public: never put secrets in them.</li>
+  </ul>
+  <p>Vite, JSX and React come together in <a href="#m5">Module 5</a>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every dependency is code you run</p>
+    <p>An npm package can run scripts at install time and a compromised or look-alike package (typosquatting) is a real attack path. Install packages you recognise, check download counts and maintainers, commit the lock file, run <code>npm audit</code> and use <code>npm ci</code> in pipelines.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and common errors</p>
+    <ul>
+      <li><code>npm ERR! code ERESOLVE</code>: two packages need incompatible versions of a third (often React). Fix the versions rather than forcing with <code>--force</code> or <code>--legacy-peer-deps</code>.</li>
+      <li><code>'vite' is not recognized</code> / <code>command not found</code>: dependencies were not installed. Run <code>npm install</code>.</li>
+      <li><code>Error: Cannot find module 'x'</code>: package missing from <code>package.json</code> or <code>node_modules</code> deleted.</li>
+      <li>A global install (<code>npm i -g</code>) is for tools only; project dependencies stay local so every developer uses the same version.</li>
+      <li>Other managers (<code>yarn</code>, <code>pnpm</code>) use the same <code>package.json</code> with a different lock file. Use whatever the project already uses and never mix two in one repo.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>"dependencies vs devDependencies?"</b> Runtime libraries vs build/test tools.</li>
+      <li><b>"npm install vs npm ci?"</b> Resolves and may update the lock file vs exact reproducible install from it.</li>
+      <li><b>"What does <code>^</code> mean?"</b> Allow minor and patch updates, not major.</li>
+      <li><b>"Why commit package-lock.json but not node_modules?"</b> Lock gives reproducible versions; node_modules is generated and huge.</li>
+      <li><b>"What does a bundler do?"</b> Combines, transforms, tree-shakes and minifies modules into files for the browser.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-storage">
+  <h3>Browser storage: localStorage, sessionStorage and cookies</h3>
+  <p class="tldr">localStorage keeps strings in the browser until you delete them, sessionStorage until the tab closes, and cookies travel to the server with every request; store objects with <code>JSON.stringify</code>/<code>JSON.parse</code>, and never keep secrets in storage because any script on the page (XSS) can read it.</p>
+
+  <p>The browser can keep small amounts of data on the user's device. The data belongs to one <strong>origin</strong> (scheme + host + port): <code>http://localhost:5173</code> cannot read what <code>http://localhost:3000</code> stored. This is client-side only; the Spring Boot server does not see it unless you send it. Typical uses: a theme choice, a half-written form, the items of a to-do list, a cart for a guest, a login token (with caution, below).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>localStorage</code></th><th><code>sessionStorage</code></th><th>Cookies</th></tr></thead>
+    <tbody>
+      <tr><td>Lifetime</td><td>Until cleared by code or the user</td><td>Until the tab is closed</td><td>Until the expiry you set (or end of session)</td></tr>
+      <tr><td>Shared between tabs</td><td>Yes (same origin)</td><td>No — each tab has its own</td><td>Yes</td></tr>
+      <tr><td>Sent to the server</td><td>No</td><td>No</td><td>Yes, with every matching request</td></tr>
+      <tr><td>Size (approximate)</td><td>About 5 MB per origin</td><td>About 5 MB</td><td>About 4 KB each</td></tr>
+      <tr><td>Readable by JavaScript</td><td>Yes</td><td>Yes</td><td>Yes, unless <code>HttpOnly</code></td></tr>
+      <tr><td>Set by</td><td>JavaScript</td><td>JavaScript</td><td>Server (<code>Set-Cookie</code>) or JavaScript</td></tr>
+      <tr><td>API</td><td>Synchronous key-value</td><td>Synchronous key-value</td><td>String in <code>document.cookie</code> (awkward)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The Storage API</h4>
+  <p>Both storages have the same five methods. Keys and values are always <strong>strings</strong>: if you store a number or an object without converting it, you get text back.</p>
+  <pre data-title="storage.js"><code class="language-javascript">localStorage.setItem("theme", "dark");
+console.log(localStorage.getItem("theme"));       // "dark"
+console.log(localStorage.getItem("nothing"));     // null — missing key
+localStorage.removeItem("theme");
+localStorage.clear();                              // delete everything for this origin
+console.log(localStorage.length);                  // number of keys
+
+localStorage.setItem("visits", 5);
+console.log(typeof localStorage.getItem("visits")); // "string"
+console.log(localStorage.getItem("visits") + 1);    // "51"  — not 6!
+console.log(Number(localStorage.getItem("visits")) + 1); // 6
+
+localStorage.setItem("user", { name: "Asha" });
+console.log(localStorage.getItem("user"));          // "[object Object]" — data lost
+
+sessionStorage.setItem("draft", "Dear team...");    // same methods, gone when the tab closes</code></pre>
+
+  <h4>Storing objects with JSON</h4>
+  <p>Convert with <code>JSON.stringify</code> on the way in and <code>JSON.parse</code> on the way out (what survives is explained in <a href="#m4-objects">objects and JSON</a>). A small wrapper makes this safe: reading can return <code>null</code>, the stored text can be broken, and storage can be unavailable.</p>
+  <pre data-title="store.js"><code class="language-javascript">export const store = {
+  get(key, fallback = null) {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw === null ? fallback : JSON.parse(raw);
+    } catch {
+      return fallback;           // corrupt JSON, or storage blocked
+    }
+  },
+  set(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch (err) {
+      console.warn("Could not save", key, err.name);   // e.g. QuotaExceededError
+      return false;
+    }
+  },
+  remove(key) { localStorage.removeItem(key); },
+};
+
+store.set("cart", [{ id: 1, qty: 2 }]);
+console.log(store.get("cart"));         // [ { id: 1, qty: 2 } ]
+console.log(store.get("missing", []));  // []
+
+// To-do app: load on start, save after every change
+let tasks = store.get("tasks", []);
+function saveTasks() { store.set("tasks", tasks); }</code></pre>
+  <p>Other useful bits: the <code>storage</code> event (<code>window.addEventListener("storage", e =&gt; …)</code>) fires in <em>other</em> tabs when localStorage changes, which is handy for "logged out in one tab" behaviour. <code>Object.keys(localStorage)</code> lists the keys. Storage is synchronous, so do not store megabytes of data; for large data use IndexedDB.</p>
+
+  <h4>Cookies in short</h4>
+  <p>A <strong>cookie</strong> is a small piece of text the server sets with a <code>Set-Cookie</code> header; the browser sends it back automatically with every request to that site. Important flags the server sets: <code>HttpOnly</code> (JavaScript cannot read it, which blocks theft through XSS), <code>Secure</code> (HTTPS only), <code>SameSite=Lax|Strict|None</code> (limits sending on cross-site requests, a defence against CSRF), <code>Max-Age</code>/<code>Expires</code>. Session logins in Spring Security use a cookie named <code>JSESSIONID</code>.</p>
+
+  <h4>Security: what to store and what not</h4>
+  <div class="co co-mistake">
+    <p class="co-t">Never store secrets or sensitive personal data in web storage</p>
+    <p>Any script running on your page can read <code>localStorage</code>: an XSS bug, or a compromised npm package (see <a href="#m4-npm">npm</a>), can steal everything in it and send it to an attacker. Storage is not encrypted, and it is visible to the user in DevTools. Passwords, card numbers, Aadhaar or PAN numbers and API secrets do not belong there.</p>
+  </div>
+  <ul>
+    <li><strong>Safe:</strong> UI preferences, a draft, a cart of product ids, non-sensitive cached lists.</li>
+    <li><strong>Debated: JWTs.</strong> Many tutorials store the access token in localStorage because it is easy; it is exposed to XSS. A more secure option is an <code>HttpOnly</code>, <code>Secure</code>, <code>SameSite</code> cookie set by the server, or a short-lived access token kept only in memory. Which one fits depends on the architecture; the trade-offs (XSS vs CSRF) are covered in <a href="#m6">Module 6</a>. If you do use localStorage, keep tokens short-lived and prevent XSS (use <code>textContent</code>, escape output, set a Content-Security-Policy).</li>
+    <li>Always <strong>validate</strong> what you read back: the user can edit localStorage in DevTools. Never trust a stored <code>role: "admin"</code>; the server must check permissions on every request.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>QuotaExceededError</code> when the ~5 MB limit is hit; catch it in <code>setItem</code>.</li>
+      <li>In some private browsing modes or when the user blocks site data, access throws <code>SecurityError</code>; always wrap in try/catch if the feature is optional.</li>
+      <li>localStorage does not exist in Node.js (older versions) and in server-side rendering: guard with <code>typeof window !== "undefined"</code>.</li>
+      <li>Values with a <code>Date</code> come back as strings; <code>Map</code>/<code>Set</code> come back as <code>{}</code>.</li>
+      <li>Because the data is shared across tabs, two tabs can overwrite each other's saved state.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>"localStorage vs sessionStorage vs cookies?"</b> Use the table: lifetime, size, sent to server, who sets it.</li>
+      <li><b>"Can you store an object in localStorage?"</b> Only as a string: <code>JSON.stringify</code> and <code>JSON.parse</code>.</li>
+      <li><b>"Is it safe to store a JWT in localStorage?"</b> It is readable by any script (XSS); an HttpOnly cookie is safer against XSS but needs CSRF protection. Explain the trade-off.</li>
+      <li><b>"What does HttpOnly do?"</b> Hides the cookie from JavaScript.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-errors-debugging">
+  <h3>Error handling and debugging</h3>
+  <p class="tldr">Use <code>try</code>/<code>catch</code>/<code>finally</code> and <code>throw new Error()</code> as in Java (but there are no checked exceptions, and you can throw anything), create custom errors by extending <code>Error</code>, and find bugs with the browser's console, breakpoints and the <code>debugger</code> statement.</p>
+
+  <h4>try, catch, finally and throw</h4>
+  <pre data-title="errors.js"><code class="language-javascript">function parseQuantity(text) {
+  const qty = Number(text);
+  if (Number.isNaN(qty)) {
+    throw new Error(`"${text}" is not a number`);      // like throw new IllegalArgumentException
+  }
+  if (qty &lt;= 0) throw new RangeError("Quantity must be positive");
+  return qty;
+}
+
+try {
+  console.log(parseQuantity("3"));        // 3
+  console.log(parseQuantity("abc"));      // throws
+  console.log("never printed");
+} catch (err) {
+  console.log(err.name, "-", err.message);   // Error - "abc" is not a number
+  console.log(err instanceof Error);          // true
+  console.log(err.stack.split("\n")[0]);      // the stack trace text (non-standard but everywhere)
+} finally {
+  console.log("always runs, even after return or throw");
+}
+
+try { null.name; } catch { console.log("catch without a variable is allowed"); }</code></pre>
+  <p>The semantics match Java: a thrown error unwinds the stack until a <code>catch</code> handles it; <code>finally</code> always runs. The differences:</p>
+  <ul>
+    <li>There is <strong>one</strong> <code>catch</code> block per <code>try</code>; to react to different kinds, use <code>instanceof</code> or check <code>err.name</code> inside it.</li>
+    <li>All errors are unchecked; nothing forces you to catch. There is no <code>throws</code> clause.</li>
+    <li>You can <code>throw</code> any value (<code>throw "oops"</code>), but then you get no stack trace. Always throw <code>Error</code> objects.</li>
+    <li><code>try</code>/<code>catch</code> catches only errors from code that runs <em>inside</em> it while it is running. It does not catch errors in a later callback (<code>setTimeout</code>) or an un-awaited promise; use <code>await</code> inside the try, or <code>.catch()</code> (see <a href="#m4-async-await">async and await</a>).</li>
+  </ul>
+
+  <h4>Built-in error types</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Typical cause</th><th>Example message</th></tr></thead>
+    <tbody>
+      <tr><td><code>ReferenceError</code></td><td>Using a name that does not exist (or is in the TDZ)</td><td><code>x is not defined</code></td></tr>
+      <tr><td><code>TypeError</code></td><td>Wrong type of value: calling a non-function, reading a property of <code>undefined</code>, assigning to <code>const</code></td><td><code>Cannot read properties of undefined (reading 'name')</code>, <code>x is not a function</code></td></tr>
+      <tr><td><code>SyntaxError</code></td><td>Invalid code or invalid JSON</td><td><code>Unexpected token } in JSON at position 12</code></td></tr>
+      <tr><td><code>RangeError</code></td><td>A value outside the allowed range</td><td><code>Maximum call stack size exceeded</code>, <code>Invalid array length</code></td></tr>
+      <tr><td><code>URIError</code>, <code>EvalError</code></td><td>Rare</td><td><code>URI malformed</code></td></tr>
+      <tr><td><code>AggregateError</code></td><td>Several errors at once (<code>Promise.any</code>)</td><td><code>All promises were rejected</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>The most common one in real life is <code>TypeError: Cannot read properties of undefined (reading 'x')</code>. It means the value before the dot is <code>undefined</code>: an API response with a different shape, a missing array item, an element not found. Read the message, find that line in the stack trace, and check what the value really is (see <a href="#m4-operators-coercion">optional chaining</a>).</p>
+
+  <h4>Custom errors</h4>
+  <p>Extend <code>Error</code> to give your errors a name and extra data. This is the JavaScript version of your own exception classes, and it is how the <code>ApiError</code> in <a href="#m4-fetch">fetch</a> works.</p>
+  <pre data-title="custom-error.js"><code class="language-javascript">class ValidationError extends Error {
+  constructor(field, message) {
+    super(message);
+    this.name = "ValidationError";
+    this.field = field;
+  }
+}
+
+class PaymentError extends Error {
+  constructor(message, { cause, code } = {}) {
+    super(message, { cause });      // "cause" chains the original error (ES2022)
+    this.name = "PaymentError";
+    this.code = code;
+  }
+}
+
+function validateEmail(email) {
+  if (!email.includes("@")) throw new ValidationError("email", "Enter a valid email");
+}
+
+try {
+  validateEmail("asha.example.com");
+} catch (err) {
+  if (err instanceof ValidationError) {
+    console.log(`Fix the ${err.field} field: ${err.message}`);   // Fix the email field: Enter a valid email
+  } else {
+    throw err;                      // unknown problem: rethrow, do not swallow
+  }
+}
+
+try {
+  try { JSON.parse("{bad"); }
+  catch (e) { throw new PaymentError("Could not read gateway reply", { cause: e, code: "GW_PARSE" }); }
+} catch (e) {
+  console.log(e.name, e.code, e.cause.name);    // PaymentError GW_PARSE SyntaxError
+}</code></pre>
+
+  <h4>Where to catch</h4>
+  <ul>
+    <li>Catch where you can do something useful: show a message, retry, use a fallback value. Otherwise let it travel up.</li>
+    <li>Do not leave an empty <code>catch {}</code>: it hides bugs. At least log it with <code>console.error(err)</code>.</li>
+    <li>Global safety nets log unexpected errors to a monitoring service (Sentry or similar): <code>window.addEventListener("error", …)</code> for runtime errors and <code>window.addEventListener("unhandledrejection", …)</code> for forgotten promise rejections. In React, <strong>error boundaries</strong> catch errors while rendering (see <a href="#m5">Module 5</a>).</li>
+    <li>Show the user a friendly message; log the technical details. Never display raw stack traces on the page.</li>
+  </ul>
+  <pre data-title="global.js"><code class="language-javascript">window.addEventListener("unhandledrejection", (event) =&gt; {
+  console.error("Unhandled promise rejection:", event.reason);
+  // sendToMonitoring(event.reason);
+});</code></pre>
+
+  <h4>Debugging toolkit</h4>
+  <p><code>console.log</code> is fine for a quick look, but the console offers more:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td><code>console.log()</code>, <code>info()</code>, <code>warn()</code>, <code>error()</code></td><td>Messages by severity; warnings are yellow, errors are red with a stack trace</td></tr>
+      <tr><td><code>console.table(array)</code></td><td>Array of objects as a readable table</td></tr>
+      <tr><td><code>console.dir(obj)</code></td><td>Browse an object (including DOM elements) as a tree</td></tr>
+      <tr><td><code>console.group()</code> / <code>groupEnd()</code></td><td>Indented groups of logs</td></tr>
+      <tr><td><code>console.time("x")</code> / <code>timeEnd("x")</code></td><td>Measure how long something takes</td></tr>
+      <tr><td><code>console.assert(cond, msg)</code></td><td>Logs only if the condition is false</td></tr>
+      <tr><td><code>console.trace()</code></td><td>Print the current call stack</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="console.js"><code class="language-javascript">const orders = [
+  { id: 1, city: "Pune", total: 499 },
+  { id: 2, city: "Goa", total: 1299 },
+];
+console.table(orders);
+console.log({ orders });          // wrap in {} to print the variable name too
+console.time("sum");
+const sum = orders.reduce((s, o) =&gt; s + o.total, 0);
+console.timeEnd("sum");           // sum: 0.05 ms
+console.assert(sum &gt; 5000, "Total too small:", sum);   // Assertion failed: Total too small: 1798
+console.error(new Error("Payment failed"));</code></pre>
+  <pre class="out" data-title="console.table output"><code class="language-plaintext">┌─────────┬────┬────────┬───────┐
+│ (index) │ id │ city   │ total │
+├─────────┼────┼────────┼───────┤
+│ 0       │ 1  │ 'Pune' │ 499   │
+│ 1       │ 2  │ 'Goa'  │ 1299  │
+└─────────┴────┴────────┴───────┘</code></pre>
+  <p>Browsers draw the table in a nicer grid; the characters differ a little between Node.js versions.</p>
+
+  <h4>Breakpoints and the debugger statement</h4>
+  <p>A <strong>breakpoint</strong> pauses the program on a line so you can look at the values, like in IntelliJ. In Chrome or Edge DevTools open <strong>Sources</strong>, find your file, and click the line number. Then:</p>
+  <ol class="steps">
+    <li>Trigger the code (click the button). Execution stops on that line.</li>
+    <li>Read the <strong>Scope</strong> panel for local, closure and global variables, and the <strong>Call Stack</strong> panel to see who called this function.</li>
+    <li>Step with <strong>Step over</strong> (F10), <strong>Step into</strong> (F11), <strong>Step out</strong> (Shift+F11) or <strong>Resume</strong> (F8).</li>
+    <li>Add <strong>Watch</strong> expressions, or a <em>conditional breakpoint</em> (right-click the line number, "Add conditional breakpoint") to stop only when, for example, <code>order.id === 7</code>.</li>
+  </ol>
+  <p>Writing the statement <code>debugger;</code> in your code does the same thing: if DevTools is open, execution pauses there. Remove it before committing. In VS Code you can debug Node.js scripts, and with a launch configuration also your browser app, using the same step buttons.</p>
+  <p>Other DevTools panels you will use daily: <strong>Elements</strong> (live DOM and CSS), <strong>Network</strong> (every fetch call with status, headers, payload and timing; the first place to look when an API call fails), <strong>Application</strong> (localStorage, cookies), and <strong>Performance</strong>. The React Developer Tools extension adds component inspection for <a href="#m5">Module 5</a>.</p>
+
+  <div class="co co-tip">
+    <p class="co-t">A debugging routine that works</p>
+    <ol class="steps">
+      <li>Read the error message and the first line of the stack that is in <em>your</em> file.</li>
+      <li>Check the Network tab: was the request sent, which status, what response body?</li>
+      <li>Log or break just before the failing line and inspect real values (<code>console.log({ user })</code>).</li>
+      <li>Reduce the problem: remove code until it works, then add it back.</li>
+      <li>Fix the cause, not the symptom; add a test or a check so it cannot come back.</li>
+    </ol>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>finally</code> with <code>return</code> overrides a <code>return</code>/<code>throw</code> in <code>try</code>/<code>catch</code>, as in Java; avoid it.</li>
+      <li>A <code>SyntaxError</code> in a script file is not catchable inside that file: the file never runs. Only <code>eval</code>/<code>JSON.parse</code> can throw it at runtime.</li>
+      <li>A cross-origin script error is reported only as <code>Script error.</code> without details unless CORS headers are set.</li>
+      <li>Minified production code gives unreadable stack traces; build tools emit <strong>source maps</strong> that DevTools and monitoring tools use to map back to your source.</li>
+      <li><code>console.log(obj)</code> shows the object as it is when you <em>expand</em> it, not when it was logged. To freeze a snapshot, log <code>JSON.stringify(obj)</code> or <code>structuredClone(obj)</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistake: swallowing errors and throwing strings</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: hides the bug, no stack</p><pre><code class="language-javascript">try {
+  saveOrder(order);
+} catch (e) {
+  // nothing
+}
+throw "Payment failed";</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: handle or rethrow an Error</p><pre><code class="language-javascript">try {
+  saveOrder(order);
+} catch (e) {
+  console.error("saveOrder failed", e);
+  showToast("Could not save the order");
+}
+throw new Error("Payment failed");</code></pre></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>"How is error handling different from Java?"</b> One <code>catch</code>, no checked exceptions, can throw any value, and async errors need promises or <code>await</code>.</li>
+      <li><b>"Will try/catch catch an error inside setTimeout?"</b> No; the callback runs later outside the try. Put the try inside the callback.</li>
+      <li><b>"Name the error types."</b> <code>ReferenceError</code>, <code>TypeError</code>, <code>SyntaxError</code>, <code>RangeError</code>.</li>
+      <li><b>"How do you debug a failing API call?"</b> Network tab for status/response, console error, breakpoints in the handler.</li>
+      <li><b>"How do you create a custom error?"</b> <code>class X extends Error</code> and set <code>name</code>.</li>
+    </ul>
+  </div>
+</article>

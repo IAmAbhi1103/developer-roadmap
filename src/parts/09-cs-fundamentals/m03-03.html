@@ -1,0 +1,588 @@
+<article class="topic" id="m3-acid-transactions">
+  <h3>Transactions, ACID and transaction states</h3>
+  <p class="tldr">A transaction is a group of operations treated as one logical unit; ACID —
+  atomicity, consistency, isolation, durability — is the set of guarantees that makes it safe.</p>
+
+  <h4>What a transaction is</h4>
+  <p>A <strong>transaction</strong> is a sequence of database operations (reads and writes) that
+  performs one logical task and must be executed as a whole. The classic example is a UPI transfer of
+  ₹500 from account A to account B:</p>
+  <pre data-title="transfer.sql"><code class="language-sql">BEGIN;
+UPDATE account SET balance = balance - 500 WHERE id = 'A';   -- step 1
+UPDATE account SET balance = balance + 500 WHERE id = 'B';   -- step 2
+COMMIT;                          -- or ROLLBACK to cancel both steps</code></pre>
+  <p>If the system crashed between step 1 and step 2, ₹500 would vanish. A transaction makes the two
+  steps all-or-nothing. In a normal client library, each single statement is its own transaction
+  (<strong>autocommit</strong>) until you start one explicitly. The commands are <code>BEGIN</code>
+  (or <code>START TRANSACTION</code>), <code>COMMIT</code>, <code>ROLLBACK</code> and
+  <code>SAVEPOINT</code> (a point you can roll back to without cancelling everything).</p>
+
+  <h4>ACID</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Property</th><th>Definition</th><th>Transfer example</th><th>Mechanism</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Atomicity</strong></td><td>All operations happen or none do</td>
+      <td>Debit without credit never persists</td><td>Undo log, rollback</td></tr>
+      <tr><td><strong>Consistency</strong></td><td>A transaction takes the database from one valid
+      state to another valid state</td><td>Total money A + B is the same before and after; no
+      balance below zero</td><td>Constraints, triggers, application logic</td></tr>
+      <tr><td><strong>Isolation</strong></td><td>Concurrent transactions do not see each other's
+      partial work; the result is as if they ran one by one</td><td>Another transfer reading A mid-way
+      does not see the half-done state</td><td>Locks, MVCC, isolation levels</td></tr>
+      <tr><td><strong>Durability</strong></td><td>Once committed, changes survive crashes</td>
+      <td>After "success", a power cut does not undo the transfer</td>
+      <td>Write-ahead log flushed to disk</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Plain-words view of each property</h4>
+  <ul>
+    <li><strong>Atomicity</strong> — "all or nothing". The responsibility of the recovery manager.</li>
+    <li><strong>Consistency</strong> — "rules always hold". Partly the DBMS (it enforces declared
+    constraints) and partly you: if you write a transfer that debits ₹500 but credits ₹400, the
+    database cannot know it is wrong. Consistency is the one letter that is not purely a DBMS feature.</li>
+    <li><strong>Isolation</strong> — "each transaction behaves as if it were alone". The
+    responsibility of the concurrency-control manager. Full isolation costs speed, so databases offer
+    levels (see the isolation-levels article).</li>
+    <li><strong>Durability</strong> — "committed means permanent". The responsibility of the recovery
+    manager; commit is acknowledged only after the log record reaches stable storage.</li>
+  </ul>
+  <p>Memory hook: Atomicity and Durability belong to recovery; Isolation to concurrency control;
+  Consistency to constraints and the programmer.</p>
+
+  <div class="co co-note">
+    <p class="co-t">ACID "C" is not the CAP "C"</p>
+    <p>ACID consistency means "constraints and invariants hold". CAP consistency means "every read
+    sees the latest write across replicas". Same word, different meaning. See the CAP section in the
+    SQL vs NoSQL article.</p>
+  </div>
+
+  <h4>Transaction states</h4>
+  <figure class="fig">
+  <pre class="mermaid">
+stateDiagram-v2
+  [*] --> Active
+  Active --> PartiallyCommitted : last statement done
+  PartiallyCommitted --> Committed : log flushed
+  Active --> Failed : error or abort
+  PartiallyCommitted --> Failed : error before commit
+  Failed --> Aborted : rollback complete
+  Committed --> [*]
+  Aborted --> [*]
+  </pre>
+  <figcaption>The life cycle of a transaction</figcaption>
+  </figure>
+  <dl class="terms">
+    <dt>Active</dt><dd>The initial state; the transaction is executing its reads and writes.</dd>
+    <dt>Partially committed</dt><dd>The last statement has run, but results may still be only in
+    memory. The system now writes the log and checks that nothing violates constraints.</dd>
+    <dt>Committed</dt><dd>Success: the log is safely on disk. The effects are permanent. The only way
+    to "undo" is a new compensating transaction.</dd>
+    <dt>Failed</dt><dd>The transaction can no longer proceed (constraint violation, deadlock victim,
+    crash, user abort).</dd>
+    <dt>Aborted</dt><dd>The transaction was rolled back and the database restored to its state before
+    the transaction. The system can then <strong>restart</strong> the transaction (if the failure was
+    not a logic error) or <strong>kill</strong> it.</dd>
+    <dt>Terminated</dt><dd>The transaction has left the system (after commit or abort).</dd>
+  </dl>
+
+  <h4>Commit and rollback in application code</h4>
+  <pre data-title="TransferService.java"><code class="language-java">@Transactional   // Spring starts a transaction, commits on success, rolls back on RuntimeException
+public void transfer(long from, long to, long paise) {
+    accounts.debit(from, paise);
+    accounts.credit(to, paise);   // if this throws, the debit is rolled back too
+}</code></pre>
+  <p>Spring's rule: roll back on unchecked exceptions by default; checked exceptions commit unless
+  you configure <code>rollbackFor</code>. For the Spring side see
+  <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>; for how a database does this inside see
+  <a href="03-sql-databases.html#m5">SQL · Module 5</a>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: assuming DDL is always transactional</p>
+    <p>PostgreSQL lets you roll back most DDL (<code>CREATE TABLE</code>, <code>ALTER TABLE</code>).
+    MySQL and Oracle commit implicitly on DDL, so a rollback cannot undo it.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Define each letter in one line, give the bank-transfer example, and say which component
+    enforces it (log / constraints / locks / WAL). "Which ACID property is violated if the server
+    crashes after commit and data is lost?" Durability. "If two users book the last seat at the same
+    time?" Isolation.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-schedules-serializability">
+  <h3>Schedules, conflict serializability and recoverability</h3>
+  <p class="tldr">A schedule is an interleaving of transactions' operations; it is correct if it is
+  equivalent to some serial order, which you can test by drawing a precedence graph and looking for a
+  cycle.</p>
+
+  <h4>Schedules</h4>
+  <p>A <strong>schedule</strong> is the order in which operations of several transactions run. Write
+  <code>R1(A)</code> for "transaction T1 reads A" and <code>W1(A)</code> for "T1 writes A". Within one
+  transaction the order never changes.</p>
+  <ul>
+    <li><strong>Serial schedule</strong>: one transaction runs completely, then the next. Always
+    correct, but slow — nothing runs in parallel. With n transactions there are n! serial
+    schedules.</li>
+    <li><strong>Concurrent (non-serial) schedule</strong>: operations of different transactions
+    interleave. Fast, but only correct if equivalent to some serial schedule.</li>
+    <li>A concurrent schedule is <strong>serializable</strong> if its result equals that of some
+    serial schedule.</li>
+  </ul>
+
+  <h4>Conflicting operations</h4>
+  <p>Two operations <strong>conflict</strong> if all three hold: they belong to different
+  transactions, they access the same data item, and at least one is a write.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pair</th><th>Conflict?</th><th>Problem if reordered</th></tr></thead>
+    <tbody>
+      <tr><td>R(A) – R(A)</td><td>No</td><td>—</td></tr>
+      <tr><td>R(A) – W(A)</td><td>Yes (RW)</td><td>Unrepeatable read</td></tr>
+      <tr><td>W(A) – R(A)</td><td>Yes (WR)</td><td>Dirty read</td></tr>
+      <tr><td>W(A) – W(A)</td><td>Yes (WW)</td><td>Lost update / overwritten write</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two schedules are <strong>conflict equivalent</strong> if one can be turned into the other by
+  swapping adjacent non-conflicting operations. A schedule is <strong>conflict serializable</strong>
+  if it is conflict equivalent to a serial schedule.</p>
+
+  <h4>The precedence graph test</h4>
+  <ol class="steps">
+    <li>Make one node per transaction.</li>
+    <li>For each pair of conflicting operations where Ti's operation comes first and Tj's comes later,
+    draw a directed edge <code>Ti → Tj</code>.</li>
+    <li>If the graph has a <strong>cycle</strong>, the schedule is not conflict serializable. If it is
+    acyclic, it is, and any <strong>topological order</strong> of the nodes is an equivalent serial
+    order.</li>
+  </ol>
+
+  <h4>Worked example 1: acyclic</h4>
+  <p>T1 works on A and B, T2 only on A. Schedule S1:</p>
+  <pre data-title="S1"><code class="language-plaintext">Order:  R1(A)  W1(A)  R2(A)  W2(A)  R1(B)  W1(B)
+
+On A: R1(A) before W2(A)  -> T1 -> T2
+      W1(A) before R2(A)  -> T1 -> T2
+      W1(A) before W2(A)  -> T1 -> T2
+On B: only T1, no conflict.
+Graph: T1 -> T2   (no cycle)</code></pre>
+  <p>S1 is conflict serializable, equivalent to the serial schedule T1 then T2. Check by swapping:
+  <code>R1(B) W1(B)</code> do not conflict with T2's operations, so you can move them left past
+  <code>R2(A) W2(A)</code>, giving <code>R1(A) W1(A) R1(B) W1(B) R2(A) W2(A)</code> — the serial
+  order T1; T2.</p>
+
+  <h4>Worked example 2: a cycle (the lost update)</h4>
+  <p>Both transactions read A, then both write A (each adds 100 to the value they read):</p>
+  <pre data-title="S2"><code class="language-plaintext">Order:  R1(A)  R2(A)  W1(A)  W2(A)
+
+R1(A) before W2(A)  -> T1 -> T2
+R2(A) before W1(A)  -> T2 -> T1
+Graph: T1 -> T2 -> T1   (cycle)</code></pre>
+  <p>S2 is not conflict serializable. With A = 1000 both read 1000, T1 writes 1100, T2 writes 1100 —
+  one ₹100 update is lost. Any serial order would give 1200. The cycle in the graph is exactly the
+  anomaly.</p>
+
+  <h4>Worked example 3: three transactions</h4>
+  <p>T1 writes A; T2 reads A and writes B; T3 reads B. Schedule S3:
+  <code>W1(A) R2(A) W2(B) R3(B)</code>. Edges: W1(A) → R2(A) gives T1 → T2; W2(B) → R3(B) gives
+  T2 → T3. Acyclic. The topological order is T1, T2, T3, so S3 is equivalent to the serial schedule
+  T1; T2; T3.</p>
+
+  <h4>View serializability (brief)</h4>
+  <p>Two schedules are <strong>view equivalent</strong> if (1) each transaction reads the same
+  initial values, (2) each read sees the value written by the same transaction (same "read-from"
+  relationships), and (3) the final write of each item is by the same transaction. A schedule is
+  <strong>view serializable</strong> if it is view equivalent to a serial schedule.</p>
+  <ul>
+    <li>Every conflict serializable schedule is view serializable, but not the other way round.</li>
+    <li>The difference comes from <strong>blind writes</strong> (writes without a prior read). Example:
+    <code>R1(A) W2(A) W1(A) W3(A)</code> has a cycle T1 ⇄ T2, so it is not conflict serializable, yet
+    it is view equivalent to the serial order T1, T2, T3 (T1 reads the initial A; the last write is
+    T3's in both).</li>
+    <li>Testing view serializability is NP-complete, so databases use conflict serializability.</li>
+  </ul>
+
+  <h4>Recoverable, cascadeless and strict schedules</h4>
+  <p>Serializability ignores failures. Recoverability asks: what if a transaction aborts?</p>
+  <ul>
+    <li><strong>Irrecoverable</strong>: T2 reads data written by T1 and commits before T1. Example:
+    <code>W1(A) R2(A) C2 A1</code> — T1 aborts after T2 has already committed a result based on a
+    value that never existed. It cannot be fixed.</li>
+    <li><strong>Recoverable</strong>: if T2 reads from T1, T1 commits before T2 commits.</li>
+    <li><strong>Cascading rollback</strong>: <code>W1(A) R2(A) W2(A) A1</code> — T1 aborts, so T2
+    (which read the dirty value) must abort too, and so on down a chain.</li>
+    <li><strong>Cascadeless (ACA)</strong>: a transaction reads only values written by
+    <em>committed</em> transactions. No cascading rollbacks.</li>
+    <li><strong>Strict</strong>: no transaction reads <em>or overwrites</em> an item written by an
+    uncommitted transaction. Recovery by restoring "before images" is then simple.</li>
+  </ul>
+  <p>Relation: strict ⊂ cascadeless ⊂ recoverable. Strict two-phase locking (next article) produces
+  strict, conflict-serializable schedules.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: mixing up the edge direction</p>
+    <p>An edge <code>Ti → Tj</code> means "Ti must come before Tj in the equivalent serial order".
+    The edge goes from the transaction whose conflicting operation comes <em>first</em>. A wrong
+    direction on one edge can hide a cycle.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you check if a schedule is serializable?" Precedence graph, cycle means no. Draw it
+    live for a small schedule. Also: "conflict vs view serializable", "what is a cascading rollback",
+    "recoverable vs cascadeless".</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-concurrency-control">
+  <h3>Concurrency control: locks, 2PL, timestamps, MVCC and deadlocks</h3>
+  <p class="tldr">Databases keep concurrent transactions correct with locks (two-phase locking),
+  timestamps or multiple row versions (MVCC); locking can deadlock, which the DBMS detects with a
+  wait-for graph and breaks by aborting a victim.</p>
+
+  <h4>Lock-based protocols</h4>
+  <p>A <strong>lock</strong> controls access to a data item. The two basic modes:</p>
+  <ul>
+    <li><strong>Shared lock (S)</strong>: for reading; many transactions can hold it together.</li>
+    <li><strong>Exclusive lock (X)</strong>: for writing; only one holder, and no readers.</li>
+  </ul>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Held \ Requested</th><th>S</th><th>X</th></tr></thead>
+    <tbody>
+      <tr><td>S</td><td>Granted</td><td>Wait</td></tr>
+      <tr><td>X</td><td>Wait</td><td>Wait</td></tr>
+    </tbody>
+  </table></div>
+  <p>"Readers share, writers are alone." A transaction asks for a lock before using an item and
+  releases it later; a <strong>lock upgrade</strong> turns S into X. Locking only for the duration of
+  one operation is not enough: it still allows non-serializable schedules, so we need a protocol.</p>
+
+  <h4>Two-phase locking (2PL)</h4>
+  <p>Each transaction has two phases:</p>
+  <ol class="steps">
+    <li><strong>Growing phase</strong>: it may acquire locks but not release any.</li>
+    <li><strong>Shrinking phase</strong>: it may release locks but not acquire any new one.</li>
+  </ol>
+  <p>The moment of the last lock acquired is the <strong>lock point</strong>. <strong>Theorem:</strong>
+  every schedule produced by 2PL is conflict serializable, and the transactions are equivalent to a
+  serial order sorted by lock point. Limits of basic 2PL:</p>
+  <ul>
+    <li>It does <em>not</em> prevent <strong>deadlocks</strong>.</li>
+    <li>It does <em>not</em> prevent <strong>cascading rollbacks</strong>: T1 may release an X lock
+    in the shrinking phase, T2 reads the uncommitted value, then T1 aborts.</li>
+  </ul>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Variant</th><th>Rule</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td>Basic 2PL</td><td>Growing then shrinking</td><td>Conflict serializable; deadlocks and
+      cascading rollback possible</td></tr>
+      <tr><td>Strict 2PL</td><td>Hold all <em>exclusive</em> locks until commit or abort</td>
+      <td>Strict schedules: no cascading rollback; most databases behave like this</td></tr>
+      <tr><td>Rigorous 2PL</td><td>Hold <em>all</em> locks until commit or abort</td>
+      <td>Serial order = commit order</td></tr>
+      <tr><td>Conservative 2PL</td><td>Acquire all locks before starting</td>
+      <td>Deadlock-free, but you must know the lock set in advance</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Lock granularity and intention locks</h4>
+  <p>Locks can be on a row, a page or a whole table. Fine granularity allows more concurrency but
+  costs more lock memory. To let a table-level request find out quickly that some row inside is locked,
+  databases use <strong>intention locks</strong> on the parent: IS (intend to take shared locks below)
+  and IX (intend to take exclusive locks below). That is also why <code>SELECT ... FOR UPDATE</code>
+  on a row blocks a table-level <code>ALTER</code>.</p>
+
+  <h4>Deadlocks</h4>
+  <p>A <strong>deadlock</strong> is a cycle of transactions each waiting for a lock the next one
+  holds. T1 holds a lock on row A and wants B; T2 holds B and wants A. Neither can move.</p>
+  <figure class="fig">
+  <pre class="mermaid">
+flowchart LR
+  T1((T1)) -->|waits for| T2((T2))
+  T2 -->|waits for| T1
+  </pre>
+  <figcaption>A wait-for graph: an edge Ti to Tj means Ti waits for a lock held by Tj; a cycle is a
+  deadlock</figcaption>
+  </figure>
+  <p>Ways to handle it:</p>
+  <ul>
+    <li><strong>Detection</strong>: the DBMS builds the wait-for graph periodically (or on each wait),
+    finds cycles and aborts one <strong>victim</strong> (usually the cheapest to roll back). The
+    application sees an error (PostgreSQL: "deadlock detected", SQLSTATE 40P01; MySQL error 1213) and
+    should retry the transaction.</li>
+    <li><strong>Prevention with timestamps</strong>: each transaction gets a timestamp when it starts.
+    Suppose Ti requests an item held by Tj.
+      <ul>
+        <li><strong>Wait–die</strong> (non-preemptive): if Ti is older, it waits; if younger, it
+        "dies" (aborts and restarts with the same timestamp).</li>
+        <li><strong>Wound–wait</strong> (preemptive): if Ti is older, it "wounds" Tj (Tj aborts); if
+        younger, it waits.</li>
+      </ul>
+      In both schemes the older transaction is never starved, because restarted transactions keep
+      their original timestamp.</li>
+    <li><strong>Timeouts</strong>: abort a transaction that waits too long (simple, can be wrong).</li>
+  </ul>
+  <div class="co co-tip">
+    <p class="co-t">Avoiding deadlocks in your code</p>
+    <p>Always lock rows in the same order (for example, lower account id first in a transfer), keep
+    transactions short, and retry on a deadlock error. Details in
+    <a href="03-sql-databases.html#m5">SQL · Module 5</a>.</p>
+  </div>
+
+  <h4>Timestamp ordering (brief)</h4>
+  <p>Instead of locks, give each transaction T a unique timestamp TS(T) at start. Each item Q keeps
+  <code>R-TS(Q)</code> (the largest timestamp that read Q) and <code>W-TS(Q)</code> (the largest that
+  wrote it). The schedule must act as the serial order of timestamps.</p>
+  <ul>
+    <li><strong>Read(Q) by T</strong>: if <code>TS(T) &lt; W-TS(Q)</code>, T would read a value
+    "from the future" — reject and roll T back. Otherwise run it and set
+    <code>R-TS(Q) = max(R-TS(Q), TS(T))</code>.</li>
+    <li><strong>Write(Q) by T</strong>: if <code>TS(T) &lt; R-TS(Q)</code>, a younger transaction has
+    already read the old value — roll T back. If <code>TS(T) &lt; W-TS(Q)</code>, an obsolete write —
+    roll back (the <strong>Thomas write rule</strong> instead just ignores the write). Otherwise run it
+    and set <code>W-TS(Q) = TS(T)</code>.</li>
+  </ul>
+  <p>Timestamp ordering is deadlock-free (nobody waits), but can roll back often and may cause
+  starvation. <strong>Optimistic concurrency control</strong> (validation-based) is related: transactions
+  run without locks on private copies, then validate at commit that no conflict occurred, and restart
+  if one did. It suits workloads with few conflicts.</p>
+
+  <h4>MVCC (multi-version concurrency control)</h4>
+  <p><strong>MVCC</strong> keeps several <em>versions</em> of a row. A write creates a new version
+  instead of overwriting; every transaction reads from a consistent <strong>snapshot</strong> — the
+  versions that were committed when it (or its statement) started.</p>
+  <ul>
+    <li>Readers never block writers, and writers never block readers. Only writer–writer conflicts on
+    the same row wait or fail.</li>
+    <li>Old versions are cleaned up later (PostgreSQL: <code>VACUUM</code>; InnoDB: purge of undo
+    logs).</li>
+    <li>Used by PostgreSQL, Oracle and MySQL InnoDB, among others.</li>
+    <li>Plain MVCC gives <strong>snapshot isolation</strong>, which is not fully serializable: it
+    allows <strong>write skew</strong>. Example: two doctors on call each check "at least one other
+    doctor is on call" and both go off call. PostgreSQL's SERIALIZABLE level adds detection (SSI) to
+    prevent this; the application must be ready to retry on a serialization failure (SQLSTATE
+    40001).</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is 2PL and what does it guarantee?" Two phases; conflict serializability. "Does 2PL avoid
+    deadlock?" No. "Strict 2PL?" Hold X locks to commit, so no cascading aborts. "How does a database
+    detect a deadlock?" Wait-for graph cycle, then abort a victim. "What is MVCC and what is its
+    benefit?" Versions and snapshots, readers do not block writers.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-isolation-levels">
+  <h3>Isolation levels and the anomalies they allow</h3>
+  <p class="tldr">The four SQL isolation levels trade correctness for speed by allowing or forbidding
+  dirty reads, non-repeatable reads and phantom reads; Read Committed is the common default, and
+  Serializable is the only level with no anomalies.</p>
+
+  <h4>The anomalies</h4>
+  <p>All examples use an <code>account(id, balance)</code> table. T1 and T2 run at the same time.</p>
+  <dl class="terms">
+    <dt>Dirty read</dt><dd>T1 reads a value that T2 has written but not yet committed. If T2 rolls
+    back, T1 used data that never existed. Example: T2 sets balance to 0 (uncommitted); T1 reads 0 and
+    declines a loan; T2 rolls back.</dd>
+    <dt>Non-repeatable read</dt><dd>T1 reads the same row twice and gets different values because T2
+    updated and committed in between. Example: T1 reads balance 1000, T2 deducts 200 and commits, T1
+    reads 800.</dd>
+    <dt>Phantom read</dt><dd>T1 runs the same range query twice and gets different <em>sets of
+    rows</em> because T2 inserted or deleted matching rows and committed. Example: T1 counts accounts
+    with balance &gt; 5000 and gets 10; T2 inserts one; T1 counts 11. (A non-repeatable read concerns
+    a row that exists; a phantom concerns rows that appear or disappear.)</dd>
+    <dt>Lost update</dt><dd>Two transactions read the same value, both compute a new value and write
+    it; the second write silently overwrites the first (schedule S2 from the schedules article).</dd>
+    <dt>Write skew</dt><dd>Two transactions read overlapping data, then update <em>different</em> rows
+    based on what they read, breaking an invariant (both doctors go off call).</dd>
+  </dl>
+
+  <h4>Isolation levels vs anomalies (SQL standard)</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom read</th>
+    </tr></thead>
+    <tbody>
+      <tr><td>READ UNCOMMITTED</td><td>Possible</td><td>Possible</td><td>Possible</td></tr>
+      <tr><td>READ COMMITTED</td><td>Prevented</td><td>Possible</td><td>Possible</td></tr>
+      <tr><td>REPEATABLE READ</td><td>Prevented</td><td>Prevented</td><td>Possible</td></tr>
+      <tr><td>SERIALIZABLE</td><td>Prevented</td><td>Prevented</td><td>Prevented</td></tr>
+    </tbody>
+  </table></div>
+  <p>This is the table the standard defines, and the one interviewers expect. Higher level means fewer
+  anomalies, more blocking or retries, and lower throughput.</p>
+  <ul>
+    <li><strong>Read Uncommitted</strong>: no read locks; you can see uncommitted data. Rarely
+    useful.</li>
+    <li><strong>Read Committed</strong>: each statement sees only data committed before that statement
+    began (MVCC), or takes short read locks (lock-based). The usual default.</li>
+    <li><strong>Repeatable Read</strong>: rows you have read stay the same for the whole transaction
+    (snapshot taken at the first statement, or read locks held to the end).</li>
+    <li><strong>Serializable</strong>: the result equals some serial order. Implemented with range
+    locks, or with SSI that aborts conflicting transactions.</li>
+  </ul>
+
+  <h4>What real databases do</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Database</th><th>Default</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>PostgreSQL</td><td>READ COMMITTED</td><td>READ UNCOMMITTED behaves as READ COMMITTED
+      (no dirty reads ever). REPEATABLE READ is snapshot isolation and also prevents phantoms.
+      SERIALIZABLE may fail with a serialization error to retry.</td></tr>
+      <tr><td>MySQL InnoDB</td><td>REPEATABLE READ</td><td>Plain reads use a snapshot; locking reads
+      use next-key (gap) locks that block most phantoms.</td></tr>
+      <tr><td>Oracle</td><td>READ COMMITTED</td><td>Offers read committed, serializable and read
+      only; no read uncommitted or repeatable read.</td></tr>
+      <tr><td>SQL Server</td><td>READ COMMITTED</td><td>Lock-based by default; snapshot isolation
+      is an opt-in level.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Lost updates are not part of the standard's table. In practice, avoid them in any level with an
+  atomic statement (<code>SET balance = balance - 500</code>), a row lock
+  (<code>SELECT ... FOR UPDATE</code>), or a version column (optimistic locking). PostgreSQL's
+  REPEATABLE READ aborts the second writer with an error; do not rely on that elsewhere.</p>
+
+  <h4>Setting the level</h4>
+  <pre data-title="isolation.sql"><code class="language-sql">-- one transaction
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT balance FROM account WHERE id = 1;
+-- ... other work ...
+COMMIT;
+
+-- lock the row you are about to change
+SELECT balance FROM account WHERE id = 1 FOR UPDATE;</code></pre>
+  <pre data-title="Spring"><code class="language-java">@Transactional(isolation = Isolation.REPEATABLE_READ)
+public void report() { /* ... */ }</code></pre>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using SERIALIZABLE everywhere "to be safe"</p>
+    <p>It reduces throughput and causes serialization failures that your code must retry. Use the
+    default for most work, and raise the level (or use explicit row locks) only for the few places that
+    need it, such as booking the last seat or a balance check followed by a write.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Draw the 4 × 3 table from memory. Then be ready for: "what is a phantom read and how does it
+    differ from a non-repeatable read?", "which level does MySQL/PostgreSQL use by default?" and "how
+    do you prevent a lost update?". Full depth: <a href="03-sql-databases.html#m5">SQL · Module 5</a>.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-recovery">
+  <h3>Recovery: logs, write-ahead logging and checkpoints</h3>
+  <p class="tldr">A DBMS survives crashes by writing every change to a log on disk before the data
+  page (write-ahead logging), then after a crash redoing committed work and undoing unfinished work,
+  starting from the last checkpoint.</p>
+
+  <h4>Failures the DBMS must handle</h4>
+  <ul>
+    <li><strong>Transaction failure</strong>: a logic error, constraint violation or deadlock victim —
+    roll back that one transaction.</li>
+    <li><strong>System crash</strong>: power loss or OS crash; memory is lost, disk survives.</li>
+    <li><strong>Media failure</strong>: the disk is damaged — restore from backup and replay logs.</li>
+  </ul>
+
+  <h4>The log</h4>
+  <p>The <strong>log</strong> (journal) is an append-only file of records describing every change.
+  A typical record is <code>&lt;T, X, old, new&gt;</code>: transaction T changed item X from
+  <code>old</code> (the <strong>before image</strong>) to <code>new</code> (the <strong>after
+  image</strong>). Other records mark <code>&lt;T start&gt;</code>, <code>&lt;T commit&gt;</code> and
+  <code>&lt;T abort&gt;</code>. Appending sequentially to a log is cheap; updating scattered data
+  pages is not, which is why the log is written first.</p>
+
+  <h4>Write-ahead logging (WAL)</h4>
+  <p>The <strong>WAL rule</strong> has two parts:</p>
+  <ol class="steps">
+    <li>Before a modified data page is written to disk, the log records describing the change must
+    already be on disk (this makes <em>undo</em> possible).</li>
+    <li>A transaction is committed only when all its log records, including the commit record, are on
+    disk (this makes <em>redo</em> possible and gives durability).</li>
+  </ol>
+  <p>So at commit time the DBMS flushes only the log, not the data pages. The data pages can reach
+  disk later, in the background. PostgreSQL's WAL and InnoDB's redo log are exactly this.</p>
+
+  <h4>Buffer policies: steal and force</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Policy</th><th>Meaning</th><th>Consequence</th></tr></thead>
+    <tbody>
+      <tr><td>STEAL</td><td>Uncommitted changes may be written to disk</td><td>Needs UNDO after a
+      crash</td></tr>
+      <tr><td>NO-STEAL</td><td>Uncommitted pages stay in memory</td><td>No undo, but a big
+      transaction needs big memory</td></tr>
+      <tr><td>FORCE</td><td>All changed pages written at commit</td><td>No redo, but slow commits</td>
+      </tr>
+      <tr><td>NO-FORCE</td><td>Pages need not be written at commit</td><td>Needs REDO after a
+      crash</td></tr>
+    </tbody>
+  </table></div>
+  <p>Real systems use <strong>STEAL + NO-FORCE</strong> for performance, so they need both undo and
+  redo, driven by WAL.</p>
+
+  <h4>Recovery rules</h4>
+  <p>After a crash, scan the log. For each transaction:</p>
+  <ul>
+    <li><code>start</code> and <code>commit</code> both in the log: <strong>REDO</strong> — apply the
+    after images again (the data pages may not have reached disk).</li>
+    <li><code>start</code> but no <code>commit</code> (or an abort): <strong>UNDO</strong> — restore
+    the before images (some of its changes may have reached disk).</li>
+  </ul>
+  <pre data-title="log after a crash"><code class="language-plaintext">&lt;T1 start&gt;
+&lt;T1, A, 1000, 500&gt;
+&lt;T1, B, 2000, 2500&gt;
+&lt;T1 commit&gt;
+&lt;T2 start&gt;
+&lt;T2, C, 300, 400&gt;
+   --- crash ---</code></pre>
+  <p>T1 committed: redo, so A = 500 and B = 2500. T2 never committed: undo, so C goes back to 300.
+  The outcome is exactly as if T1 ran alone and T2 never started — atomicity and durability.</p>
+
+  <h4>Checkpoints</h4>
+  <p>Without help, recovery would scan the whole log since the database was created. A
+  <strong>checkpoint</strong> periodically flushes dirty pages to disk and writes a checkpoint record
+  listing the transactions active at that moment. After a crash, recovery starts from the last
+  checkpoint:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Transaction</th><th>Position</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td>T1</td><td>Started and committed before the checkpoint</td><td>Nothing; already on
+      disk</td></tr>
+      <tr><td>T2</td><td>Started before, committed after the checkpoint</td><td>REDO</td></tr>
+      <tr><td>T3</td><td>Started after the checkpoint, committed before the crash</td><td>REDO</td></tr>
+      <tr><td>T4</td><td>Started before or after, no commit at the crash</td><td>UNDO</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>ARIES, shadow paging and other ideas</h4>
+  <ul>
+    <li><strong>ARIES</strong> is the standard recovery algorithm in many commercial databases. It
+    runs three passes after a crash: <em>analysis</em> (find dirty pages and active transactions),
+    <em>redo</em> (repeat history from the log, including the work of transactions that will later be
+    undone) and <em>undo</em> (roll back the losers). It uses log sequence numbers (LSNs) on pages.</li>
+    <li><strong>Deferred update</strong> writes to the database only after commit (no undo needed).
+    <strong>Immediate update</strong> writes as the transaction proceeds (needs undo).</li>
+    <li><strong>Shadow paging</strong> keeps a copy of the page table and switches to the new one at
+    commit; no log needed, but fragmentation and poor concurrency make it uncommon.</li>
+    <li><strong>Backups</strong> (full plus incremental) and <strong>point-in-time recovery</strong>
+    (restore a backup, then replay archived logs to a chosen moment) protect against media failure and
+    human error.</li>
+  </ul>
+
+  <div class="co co-note">
+    <p class="co-t">How this appears in real projects</p>
+    <p>You see WAL when you configure PostgreSQL replication (replicas replay the WAL stream) and
+    point-in-time recovery. InnoDB's equivalent is the redo log plus undo logs, which also feed MVCC.
+    Settings that trade durability for speed (like not flushing the log on each commit) risk losing
+    the last few commits in a crash.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is WAL and why is it needed?" Log first, data later; enables undo and redo and cheap
+    commits. "Redo or undo?" Committed — redo; uncommitted — undo. "What is a checkpoint?" A marker
+    that bounds how much log recovery must read.</p>
+  </div>
+</article>

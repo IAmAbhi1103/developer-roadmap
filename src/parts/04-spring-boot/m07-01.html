@@ -1,0 +1,323 @@
+<div class="mintro">
+  <p>Everything in modules 1 to 6 built <strong>one</strong> application. Large companies run hundreds of small services that call each other and talk through message brokers. This module explains why they do that, what it costs, and how Spring supports it: gateways, service discovery, central configuration, resilience patterns, Kafka and RabbitMQ, tracing, and running many containers together with Docker Compose.</p>
+  <p>This is a "later" topic: most first jobs are in a monolith or a handful of services, and a wrong early move to microservices is a classic mistake. But interviews ask about it a lot, and the ideas (timeouts, retries, idempotency, events) improve ordinary applications too. Design theory lives in <a href="08-system-design.html#m6">System Design · Module 6</a>; here we focus on the Spring and Docker side.</p>
+  <ul>
+    <li>Compare monolith, modular monolith and microservices and say when each is right.</li>
+    <li>Draw service boundaries and choose between synchronous calls and events.</li>
+    <li>Configure Spring Cloud Gateway routes, and explain discovery and central configuration.</li>
+    <li>Protect calls with Resilience4j: timeout, retry with backoff, circuit breaker, bulkhead.</li>
+    <li>Produce and consume messages with Kafka and RabbitMQ, with retries and dead-letter handling.</li>
+    <li>Explain delivery semantics, idempotent consumers and the outbox pattern.</li>
+    <li>Follow a request across services with Micrometer Tracing.</li>
+    <li>Run two Spring Boot services, a database, Kafka and Redis with one <code>compose.yaml</code>.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m7-monolith-vs-micro">
+  <h3>Monolith, modular monolith and microservices</h3>
+  <p class="tldr">Start with a well-structured modular monolith and split into microservices only when team size, scaling needs or release independence justify the cost of a distributed system.</p>
+
+  <h4>The three architectures</h4>
+  <p>A <strong>monolith</strong> is one deployable application: one JAR, one process, usually one database. Everything you built in Project 2 is a monolith. A <strong>microservice architecture</strong> splits the system into many small, independently deployable services, each owning its data and talking to the others over the network. A <strong>modular monolith</strong> is a middle path: one deployable, but inside it the code is divided into strongly separated modules with clear interfaces, so it could be split later.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Monolith             Modular monolith          Microservices
+┌──────────────┐     ┌──────────────┐     ┌────┐ ┌────┐ ┌────┐
+│ jobs  users  │     │ [jobs]       │     │jobs│ │user│ │mail│
+│ apply mail   │     │ [users] [apply]    └─┬──┘ └─┬──┘ └─┬──┘
+│ (everything  │     │ [mail]       │       │      │      │
+│  tangled)    │     │ clear APIs   │     ┌─▼──┐ ┌─▼──┐ ┌─▼──┐
+└──────┬───────┘     └──────┬───────┘     │ DB │ │ DB │ │ DB │
+       ▼                    ▼             └────┘ └────┘ └────┘
+   one database         one database       network calls + events
+</pre>
+  <figcaption>One deployable vs one deployable with strict modules vs many deployables</figcaption>
+  </figure>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Monolith</th><th>Modular monolith</th><th>Microservices</th></tr></thead>
+    <tbody>
+      <tr><td>Deployment</td><td>One unit</td><td>One unit</td><td>Many units, each its own pipeline</td></tr>
+      <tr><td>Scaling</td><td>Whole app together</td><td>Whole app together</td><td>Each service by itself</td></tr>
+      <tr><td>Data</td><td>One shared schema</td><td>One database, schema or tables per module</td><td>Database per service</td></tr>
+      <tr><td>Calls between parts</td><td>Method calls</td><td>Method calls through module APIs</td><td>Network calls and events</td></tr>
+      <tr><td>Transactions</td><td>ACID across everything</td><td>ACID (use sparingly across modules)</td><td>No distributed ACID; sagas and eventual consistency</td></tr>
+      <tr><td>Complexity</td><td>Low at first, grows into a "big ball of mud"</td><td>Medium</td><td>High: networking, observability, DevOps</td></tr>
+      <tr><td>Team size that fits</td><td>1 to 15 people</td><td>5 to 40 people</td><td>Many teams that must ship independently</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>What microservices really buy you</h4>
+  <ul>
+    <li><strong>Independent deployment:</strong> a team ships its service without coordinating a release of everything.</li>
+    <li><strong>Independent scaling:</strong> the search service needs 20 instances, the admin service needs 1.</li>
+    <li><strong>Fault isolation and technology freedom:</strong> a crash in the recommendation service need not take down checkout; a service may use another language or database.</li>
+    <li><strong>Organisation:</strong> small teams own services end to end (Conway's law: system structure mirrors the communication structure of the organisation).</li>
+  </ul>
+
+  <h4>What they cost</h4>
+  <ul>
+    <li><strong>Network instead of method calls.</strong> A call that took nanoseconds now takes milliseconds and can fail, time out or arrive twice. You need timeouts, retries and circuit breakers (<a href="#m7-resilience4j">Resilience4j</a>).</li>
+    <li><strong>Distributed data.</strong> No joins across services and no single transaction. Consistency becomes eventual, and you need patterns like events, sagas and the outbox (<a href="#m7-delivery-outbox">delivery semantics</a>).</li>
+    <li><strong>Observability.</strong> One user request touches six services; you need central logs, metrics and distributed tracing (<a href="#m7-tracing">tracing</a>).</li>
+    <li><strong>DevOps load.</strong> Many pipelines, containers, configs, secrets, versions and environments (<a href="07-devops.html#m3">Docker</a>, Kubernetes).</li>
+    <li><strong>Testing</strong> gets harder: contracts between services, end-to-end environments.</li>
+    <li><strong>Latency and duplication:</strong> more hops per request, and the same code (auth, DTOs) repeated.</li>
+  </ul>
+
+  <h4>The distributed monolith anti-pattern</h4>
+  <p>The worst result is a <strong>distributed monolith</strong>: services that must be deployed together, share one database, call each other in long synchronous chains, or break whenever another service changes. You pay all the costs of microservices and get none of the benefits. Warning signs: a change always touches three services; services cannot start without each other; two services read each other's tables; a release needs a "deployment order".</p>
+
+  <h4>Why a modular monolith is often the better start</h4>
+  <ol class="steps">
+    <li>You do not yet know the right boundaries. Wrong boundaries in a monolith cost a refactor; wrong boundaries across services cost API versions, data migration and meetings.</li>
+    <li>You keep simple transactions, simple debugging, one deployment and fast local development.</li>
+    <li>If you structure it well (packages by business capability, no cross-module repository access, events between modules), extracting a module into a service later is a mechanical job.</li>
+  </ol>
+  <p>Many well-known companies run a monolith or a few large services successfully. Move to microservices when you have a concrete reason: several teams blocked on each other's releases, a part of the system with very different scaling or availability needs, or regulatory isolation.</p>
+
+  <h4>Spring Modulith (brief)</h4>
+  <p><strong>Spring Modulith</strong> is a Spring project that helps you build and keep a modular monolith. Each top-level package under your application class is an <em>application module</em>; other modules may use only its public API (the types in the module's base package), and a test verifies this:</p>
+  <pre data-title="Package layout and architecture test"><code class="language-java">// com.example.jobs.job          -> module "job"   (public API: JobApi, events)
+// com.example.jobs.job.internal -> hidden implementation
+// com.example.jobs.application  -> module "application"
+// com.example.jobs.notification -> module "notification"
+
+class ModularityTests {
+    @Test
+    void verifyModularity() {
+        ApplicationModules.of(JobsApplication.class).verify();   // fails on illegal dependencies
+    }
+}</code></pre>
+  <p>Modules communicate with application events (and Modulith can persist events so they are not lost), which is the same style you would use between microservices. It also generates documentation diagrams of the modules. Add the Spring Modulith starter and test dependencies from the Spring Modulith documentation.</p>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>A common path: monolith, then modular monolith, then extract one or two services that really need it (notifications, search, payments, report generation), often because they scale differently or are owned by a separate team. Companies "go back" from microservices to a monolith more often than people admit. Project 4 in this roadmap lets you practise the split on a small scale.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Choosing microservices because it looks good on a CV, with a team of three and no users.</li>
+      <li>Splitting by technical layer (a "database service", a "validation service") instead of business capability.</li>
+      <li>Sharing one database between services.</li>
+      <li>Making every call synchronous, building a chain: A calls B calls C calls D.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Monolith vs microservices?" Give a balanced table (deployment, scaling, data, transactions, complexity), not "microservices are modern". "When would you not use microservices?" Small team, unclear domain, no DevOps maturity. "What is a distributed monolith?" Coupled services that deploy together. "How would you migrate?" Modular monolith first, then the strangler pattern: extract one capability at a time behind a gateway.</p>
+  </div>
+</article>
+
+<article class="topic" id="m7-service-basics">
+  <h3>Microservice basics: boundaries, data ownership and communication</h3>
+  <p class="tldr">Draw service boundaries around business capabilities, give each service its own database, talk synchronously only where the caller needs the answer now, and use events for everything else.</p>
+
+  <h4>Service boundaries: business capabilities</h4>
+  <p>A good boundary groups things that change together and have one owner. Look at the <em>business</em>, not the code layers. For a food-delivery product the capabilities are: restaurants and menus, orders, payments, delivery tracking, notifications, users and authentication. Each becomes a candidate service with its own team, API and data. For the job portal of Project 2: <strong>identity</strong> (users), <strong>jobs</strong> (companies and jobs), <strong>applications</strong>, <strong>notifications</strong> (email) and <strong>search</strong>.</p>
+  <ul>
+    <li>A service should be small enough for one team to understand, large enough to do something useful alone. "Micro" does not mean one class.</li>
+    <li>Domain-driven design helps: a <strong>bounded context</strong> is an area where the words have one meaning ("customer" in billing differs from "customer" in support). Boundaries often follow bounded contexts.</li>
+    <li>If two services must always change together or call each other on every request, they are probably one service.</li>
+  </ul>
+
+  <h4>Database per service</h4>
+  <p>Each service owns its data and is the only one allowed to access it. Others use its API or listen to its events. This keeps services independently changeable: the jobs service can rename a column without breaking applications. The consequences:</p>
+  <ul>
+    <li>No SQL joins across services. If the applications service needs a job title, it calls the jobs service, or stores a copy of the fields it needs (updated by events).</li>
+    <li>No single ACID transaction across services. "Place order, charge payment, reserve stock" becomes a <strong>saga</strong>: a series of local transactions with compensating actions (refund) if a later step fails.</li>
+    <li>Data is <strong>eventually consistent</strong>: a copy may lag behind for milliseconds or seconds.</li>
+  </ul>
+  <p>"Database per service" may be separate servers or just separate schemas with separate credentials; what matters is that nobody reads another service's tables.</p>
+
+  <h4>Synchronous vs asynchronous communication</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Synchronous (REST, gRPC)</th><th>Asynchronous (events, messages)</th></tr></thead>
+    <tbody>
+      <tr><td>Style</td><td>Request and wait for the response</td><td>Send a message and continue; consumers react later</td></tr>
+      <tr><td>Coupling</td><td>Caller needs the callee up now</td><td>Loose: the producer does not know the consumers</td></tr>
+      <tr><td>Latency of the caller</td><td>Adds the callee's time (and failures)</td><td>Only the time to publish</td></tr>
+      <tr><td>Good for</td><td>Queries that need an answer now: "get job details", "validate the token"</td><td>Notifications, workflows, data replication, spikes</td></tr>
+      <tr><td>Failure handling</td><td>Timeouts, retries, circuit breaker, fallback</td><td>Broker buffers; retries, dead-letter queue, idempotent consumers</td></tr>
+      <tr><td>Debugging</td><td>Simpler, a call stack across services</td><td>Harder: need tracing and correlation ids</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>REST</strong> with JSON is the default for synchronous calls (you know it from <a href="#m2">module 2</a>; call it with <code>RestClient</code> or HTTP service clients, <a href="#m6-http-clients">module 6</a>). <strong>gRPC</strong> uses Protocol Buffers over HTTP/2: smaller, faster, strongly typed contracts, popular for internal calls between services, less friendly for browsers. Rule of thumb: <em>commands that need an immediate answer</em> go synchronous; <em>facts that happened</em> ("ApplicationSubmitted") are published as events. Details of communication styles: <a href="08-system-design.html#m6">System Design · Module 6</a>.</p>
+
+  <h4>API composition</h4>
+  <p>When a screen needs data from several services (an application page: job from the jobs service, candidate from identity, status from applications), someone must assemble it, since there is no join. Options:</p>
+  <ul>
+    <li><strong>API composition:</strong> a gateway, a backend-for-frontend or one service calls the others (in parallel) and merges the answers. Simple, but latency is the slowest call and one failure affects the page; use timeouts and partial results.</li>
+    <li><strong>Data replication / CQRS-style read model:</strong> a service keeps its own read-optimised copy built from events, so the page needs one query. More work, much faster reads.</li>
+  </ul>
+
+  <h4>Service-to-service contracts</h4>
+  <ul>
+    <li>Treat each API as a public contract: add fields, do not remove or rename them; version when you must (<code>/v2</code>). The consumers deploy on their own schedule.</li>
+    <li>Be liberal in what you accept: ignore unknown JSON fields (<code>spring.jackson.deserialization.fail-on-unknown-properties=false</code> is Boot's default).</li>
+    <li>Consider <strong>consumer-driven contract tests</strong> (Spring Cloud Contract, Pact) so a provider cannot break a consumer unnoticed.</li>
+    <li>Security: services trust the gateway or validate JWTs themselves (<a href="#m4">module 4</a>); never expose internal services directly to the internet.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>One service, one owner, one database. Never share tables.</li>
+      <li>Never design a long synchronous call chain; keep depth to one or two hops.</li>
+      <li>Every network call has a timeout; every message handler is idempotent.</li>
+      <li>Automate: one command to build, test and deploy each service.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Splitting too early into "nano-services" that cannot do anything alone.</li>
+      <li>Replicating whole tables by hand with a cron job instead of events.</li>
+      <li>Distributed transaction attempts (two-phase commit) instead of sagas and idempotency.</li>
+      <li>Putting business logic in the gateway.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you decide service boundaries?" Business capabilities and bounded contexts, data ownership, team ownership. "How do you handle a transaction across services?" Saga with compensation, idempotent steps, eventual consistency. "REST vs messaging between services?" Need-the-answer-now vs facts and decoupling. "How do you get data owned by another service?" API call, composition, or a local copy fed by events.</p>
+  </div>
+</article>
+
+<article class="topic" id="m7-gateway">
+  <h3>API gateway with Spring Cloud Gateway</h3>
+  <p class="tldr">An API gateway is the single entry point that routes client requests to the right service and handles cross-cutting concerns such as authentication, rate limiting, CORS and path rewriting; Spring Cloud Gateway configures this with routes made of predicates and filters.</p>
+
+  <h4>What and why</h4>
+  <p>Without a gateway, the React frontend would need to know the address of every service, handle each one's CORS and authentication, and the services would be exposed to the internet. An <strong>API gateway</strong> is one server in front of all of them. Clients call <code>https://api.jobs.example.com/...</code>; the gateway decides where each request goes.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  C[Browser / mobile app] --> G[API gateway]
+  G -->|/api/jobs/**| J[Job service]
+  G -->|/api/applications/**| A[Application service]
+  G -->|/api/auth/**| U[Identity service]
+  A -.->|event| N[Notification service]
+</pre>
+  <figcaption>One public entry point, several private services</figcaption>
+  </figure>
+  <p>Typical responsibilities:</p>
+  <ul>
+    <li><strong>Routing</strong> by path, host, method or header, plus path rewriting.</li>
+    <li><strong>Authentication:</strong> validate the JWT once at the edge and pass user information on (services may still validate again for defence in depth).</li>
+    <li><strong>Rate limiting</strong> and request size limits (<a href="#m6-rate-limiting">rate limiting</a>).</li>
+    <li><strong>CORS</strong> and security headers in one place; TLS termination.</li>
+    <li><strong>Load balancing</strong> to several instances (with discovery), retries, circuit breaking.</li>
+    <li><strong>Aggregation</strong> of several calls into one response, logging, correlation ids.</li>
+  </ul>
+  <p>Keep it thin: routing and cross-cutting rules only, no business logic. A fat gateway becomes a new monolith and a bottleneck owned by nobody.</p>
+
+  <h4>Spring Cloud Gateway: the model</h4>
+  <p><strong>Spring Cloud Gateway</strong> is a gateway built on Spring WebFlux (reactive, non-blocking, on Netty), so it handles many concurrent connections cheaply. It is a separate Spring Boot application, not a library inside your services. Its three core ideas:</p>
+  <dl class="terms">
+    <dt>Route</dt><dd>The basic building block: an id, a destination URI, a list of predicates and a list of filters.</dd>
+    <dt>Predicate</dt><dd>A condition that decides whether a route matches the incoming request (<code>Path</code>, <code>Method</code>, <code>Host</code>, <code>Header</code>, <code>Query</code>, <code>After</code>...).</dd>
+    <dt>Filter</dt><dd>A step that changes the request before it is sent on, or the response on its way back (<code>StripPrefix</code>, <code>AddRequestHeader</code>, <code>RequestRateLimiter</code>...).</dd>
+  </dl>
+
+  <h4>A route configuration</h4>
+  <pre data-title="gateway/application.yml"><code class="language-yaml">server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      routes:
+        - id: job-service
+          uri: http://job-service:8081            # or lb://job-service with service discovery
+          predicates:
+            - Path=/api/jobs/**, /api/companies/**
+          filters:
+            - AddRequestHeader=X-Gateway, api-gateway
+            - name: CircuitBreaker
+              args:
+                name: jobsCb
+                fallbackUri: forward:/fallback/jobs
+
+        - id: application-service
+          uri: http://application-service:8082
+          predicates:
+            - Path=/api/applications/**
+            - Method=GET,POST,PUT,DELETE
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10     # tokens per second
+                redis-rate-limiter.burstCapacity: 20
+                key-resolver: "#{@ipKeyResolver}"        # a KeyResolver bean
+
+        - id: identity-service
+          uri: http://identity-service:8083
+          predicates:
+            - Path=/auth/**
+          filters:
+            - StripPrefix=0
+            - RewritePath=/auth/(?&lt;segment&gt;.*), /api/auth/${segment}
+
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowedOrigins: "https://app.jobs.example.com"
+            allowedMethods: [GET, POST, PUT, DELETE, OPTIONS]
+            allowedHeaders: "*"
+      default-filters:
+        - DedupeResponseHeader=Access-Control-Allow-Origin Access-Control-Allow-Credentials</code></pre>
+  <ul>
+    <li><code>Path=/api/jobs/**</code> matches every URL under that path. Multiple predicates in one route are combined with AND.</li>
+    <li><code>StripPrefix=1</code> removes the first path segment before forwarding: <code>/job-api/jobs</code> becomes <code>/jobs</code>. <code>RewritePath</code> uses a regex for arbitrary changes.</li>
+    <li><code>RequestRateLimiter</code> uses Redis (the reactive Redis starter) with a token bucket and a <code>KeyResolver</code> bean that picks the key (IP, user, API key).</li>
+    <li>A <code>CircuitBreaker</code> filter needs the Resilience4j reactive circuit-breaker starter on the gateway's classpath (<a href="#m7-resilience4j">Resilience4j</a>), and a fallback endpoint.</li>
+    <li>You can also define routes in Java with <code>RouteLocatorBuilder</code> when you need logic:</li>
+  </ul>
+  <pre data-title="Routes in Java"><code class="language-java">@Bean
+RouteLocator routes(RouteLocatorBuilder builder) {
+    return builder.routes()
+            .route("job-service", r -&gt; r.path("/api/jobs/**")
+                    .filters(f -&gt; f.addRequestHeader("X-Gateway", "api-gateway"))
+                    .uri("http://job-service:8081"))
+            .build();
+}
+
+@Bean
+KeyResolver ipKeyResolver() {
+    return exchange -&gt; Mono.just(exchange.getRequest().getRemoteAddress()
+            .getAddress().getHostAddress());
+}</code></pre>
+  <p>A global filter (a <code>GlobalFilter</code> bean) applies to every route; it is the place for a correlation id, request logging, or JWT validation (with Spring Security's resource server support for WebFlux, <a href="#m4">module 4</a>).</p>
+  <div class="co co-version">
+    <p class="co-t">Version note</p>
+    <p>Dependency and property names of Spring Cloud Gateway changed in the Spring Cloud 2025.0 release train: the classic starter <code>spring-cloud-starter-gateway</code> is renamed <code>spring-cloud-starter-gateway-server-webflux</code>, and the configuration prefix becomes <code>spring.cloud.gateway.server.webflux.*</code> (there is also a separate servlet-based <code>gateway-server-webmvc</code> variant). The concepts (routes, predicates, filters) and the route syntax are the same. Always use the Spring Cloud release train that matches your Spring Boot version (the <code>spring-cloud-dependencies</code> BOM) and check its documentation for the property prefix.</p>
+  </div>
+
+  <h4>Backend for Frontend (BFF)</h4>
+  <p>A <strong>Backend for Frontend</strong> is a gateway-like service built for one kind of client: a mobile app needs small payloads and fewer calls, a web admin needs big tables. Each BFF aggregates and shapes data for its client. It is useful when clients differ a lot; do not create one until you feel the pain.</p>
+
+  <h4>Gateway alternatives</h4>
+  <p>Nginx, Kong, Traefik, Envoy, cloud gateways (AWS API Gateway, Azure API Management) and Kubernetes Ingress controllers all do routing and rate limiting. Spring Cloud Gateway is attractive when your team knows Spring and wants route logic in Java; a plain Nginx or ingress is often enough for pure routing (<a href="07-devops.html#m2">DevOps · Module 2</a>).</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Putting blocking code (JDBC, <code>RestTemplate</code>) in a reactive gateway filter: it blocks the Netty event loop and stalls all traffic.</li>
+      <li>CORS configured both in the gateway and in the services, giving duplicate <code>Access-Control-Allow-Origin</code> headers (hence <code>DedupeResponseHeader</code>).</li>
+      <li>Trusting a user-id header from clients: the gateway must remove incoming <code>X-User-Id</code> headers and set its own.</li>
+      <li>Leaving the services publicly reachable, so attackers bypass the gateway.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What does an API gateway do?" Routing, auth, rate limiting, CORS, aggregation, one entry point. "Route, predicate, filter?" Define each. "Why is Spring Cloud Gateway not a normal Spring MVC app?" It is reactive (WebFlux/Netty). "Gateway vs load balancer?" A load balancer spreads traffic across identical instances; a gateway routes to different services and applies policies.</p>
+  </div>
+</article>

@@ -1,0 +1,437 @@
+<article class="topic" id="m3-union-find">
+  <h3>Union-Find (Disjoint Set Union)</h3>
+  <p class="tldr">Union-find keeps a collection of disjoint groups and answers "are these two in the same group?" and "merge their groups" in nearly O(1) amortized time, using a parent array with path compression and union by size.</p>
+
+  <p>Suppose people join friend groups one friendship at a time, and after each friendship you must answer "are Asha and Ravi in the same group?" or "how many groups are there now?". A DFS after every update would cost O(V + E) each time. The <strong>union-find</strong> structure (also called <strong>disjoint set union</strong>, DSU) handles a stream of merges and queries in almost constant time per operation. It is the natural tool for dynamic connectivity, Kruskal's algorithm, cycle detection in undirected graphs and grouping problems.</p>
+
+  <h4>How it works</h4>
+  <p>Every group is a tree stored in a <code>parent[]</code> array. Each element points to a parent; the root points to itself and acts as the group's <strong>representative</strong>. Two elements are in the same group exactly when they have the same root.</p>
+  <ul>
+    <li><code>find(x)</code> — follow parents up to the root.</li>
+    <li><code>union(a, b)</code> — find both roots; if they differ, hang one root under the other.</li>
+  </ul>
+  <figure class="fig">
+<pre class="diagram">
+ start: each element alone        union(0,1), union(2,3), union(1,3)
+
+   0   1   2   3   4                    0            4
+                                       ┌┴─┐
+ parent = [0,1,2,3,4]                  1  2
+                                          │
+                                          3
+ parent = [0,0,0,2,4]   (after union(1,3): root of 3's group (2) goes under 0)
+</pre>
+    <figcaption>Union-find as a forest: merging two groups attaches one root under the other; 0 and 3 now share the root 0</figcaption>
+  </figure>
+  <p>Used naively, the trees can become long chains and <code>find</code> costs O(n). Two small optimisations fix that:</p>
+  <dl class="terms">
+    <dt>Path compression</dt>
+    <dd>While walking up in <code>find</code>, make the visited nodes point closer to (or directly at) the root. The next <code>find</code> on any of them is short. The code below uses <em>path halving</em>: each node on the way is re-pointed to its grandparent, a one-line iterative form of compression.</dd>
+    <dt>Union by size (or rank)</dt>
+    <dd>When merging, hang the smaller tree under the larger one. Trees then stay shallow: the height is at most log n.</dd>
+  </dl>
+  <p>With both, the amortized cost per operation is O(α(n)), where α is the inverse Ackermann function. It grows so slowly that α(n) is at most 4 for any n you can store; treat it as "nearly constant". With only one of the two optimisations the cost is O(log n) amortized.</p>
+
+  <h4>Java template</h4>
+<pre data-title="UnionFind.java"><code class="language-java">public class UnionFind {
+    private final int[] parent;
+    private final int[] size;        // size of the tree whose root is i (valid only for roots)
+    private int components;          // number of groups
+
+    public UnionFind(int n) {
+        parent = new int[n];
+        size = new int[n];
+        components = n;
+        for (int i = 0; i &lt; n; i++) {
+            parent[i] = i;           // everyone is their own root
+            size[i] = 1;
+        }
+    }
+
+    public int find(int x) {
+        while (parent[x] != x) {
+            parent[x] = parent[parent[x]];   // path halving: skip to the grandparent
+            x = parent[x];
+        }
+        return x;
+    }
+
+    // returns true if a merge happened, false if a and b were already in the same group
+    public boolean union(int a, int b) {
+        int ra = find(a), rb = find(b);
+        if (ra == rb) return false;
+        if (size[ra] &lt; size[rb]) { int t = ra; ra = rb; rb = t; }   // ra is the larger root
+        parent[rb] = ra;                     // hang the smaller tree under the larger
+        size[ra] += size[rb];
+        components--;
+        return true;
+    }
+
+    public boolean connected(int a, int b) { return find(a) == find(b); }
+
+    public int components() { return components; }
+    public int sizeOf(int x) { return size[find(x)]; }
+}</code></pre>
+  <p>The boolean result of <code>union</code> is the key trick: <code>false</code> means "this edge joins two vertices that were already connected", that is, the edge closes a cycle. The recursive form of <code>find</code> is <code>if (parent[x] != x) parent[x] = find(parent[x]); return parent[x];</code>; it is shorter but recurses as deep as the tree, so the iterative form is safer.</p>
+
+  <h4>Problem 1 — Number of Provinces (LeetCode 547)</h4>
+  <p>Same problem as in the traversal article, solved with union-find: union every pair of directly connected cities, then return the component count.</p>
+<pre data-title="ProvincesUnionFind.java"><code class="language-java">public class ProvincesUnionFind {
+    public static int findCircleNum(int[][] isConnected) {
+        int n = isConnected.length;
+        UnionFind uf = new UnionFind(n);
+        for (int i = 0; i &lt; n; i++) {
+            for (int j = i + 1; j &lt; n; j++) {          // upper triangle is enough (symmetric)
+                if (isConnected[i][j] == 1) uf.union(i, j);
+            }
+        }
+        return uf.components();
+    }
+
+    public static void main(String[] args) {
+        System.out.println(findCircleNum(new int[][]{{1, 1, 0}, {1, 1, 0}, {0, 0, 1}}));  // 2
+    }
+}</code></pre>
+  <p><strong>Complexity:</strong> O(n² · α(n)) because the input is an n × n matrix. With an edge list of E pairs it is O((n + E) · α(n)).</p>
+
+  <h4>Problem 2 — Redundant Connection (LeetCode 684)</h4>
+  <p>A tree with n nodes (labelled 1..n) had one extra edge added, so it now has exactly one cycle. Return the edge that can be removed to make it a tree again; if several work, return the one that appears last in the input.</p>
+  <p><strong>Idea.</strong> Add the edges in order. The first edge whose endpoints are already connected is the one that closes the cycle — and since we process in input order, it is the last of the cycle's edges to appear.</p>
+<pre data-title="RedundantConnection.java"><code class="language-java">public class RedundantConnection {
+    public static int[] findRedundantConnection(int[][] edges) {
+        UnionFind uf = new UnionFind(edges.length + 1);    // labels are 1..n, so size n + 1
+        for (int[] e : edges) {
+            if (!uf.union(e[0], e[1])) return e;           // already connected: this closes a cycle
+        }
+        return new int[0];                                 // not reached for valid input
+    }
+
+    public static void main(String[] args) {
+        int[][] edges = {{1, 2}, {1, 3}, {2, 3}};
+        System.out.println(java.util.Arrays.toString(findRedundantConnection(edges)));  // [2, 3]
+    }
+}</code></pre>
+  <p><strong>Complexity:</strong> O(n · α(n)) time, O(n) space. A DFS-based solution would cost O(n²).</p>
+
+  <h4>Problem 3 — Accounts Merge (LeetCode 721), briefly</h4>
+  <p>Each account is a name followed by email addresses. Two accounts belong to the same person if they share an email. Merge them and return, for each person, the name and the sorted list of all their emails.</p>
+  <p><strong>Idea.</strong> The accounts are the elements. Walk through all emails and remember which account first used each email in a map. When an email appears again, union the two accounts. At the end, group emails by the root of their account, sort each group and put the name in front.</p>
+<pre data-title="AccountsMerge.java"><code class="language-java">import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeSet;
+
+public class AccountsMerge {
+    public static List&lt;List&lt;String>> accountsMerge(List&lt;List&lt;String>> accounts) {
+        int n = accounts.size();
+        UnionFind uf = new UnionFind(n);
+        Map&lt;String, Integer> owner = new HashMap&lt;>();          // email → first account index
+        for (int i = 0; i &lt; n; i++) {
+            List&lt;String> acc = accounts.get(i);
+            for (int j = 1; j &lt; acc.size(); j++) {              // index 0 is the name
+                Integer prev = owner.putIfAbsent(acc.get(j), i);
+                if (prev != null) uf.union(prev, i);            // shared email → same person
+            }
+        }
+        Map&lt;Integer, TreeSet&lt;String>> groups = new HashMap&lt;>();   // TreeSet keeps emails sorted
+        for (Map.Entry&lt;String, Integer> e : owner.entrySet()) {
+            groups.computeIfAbsent(uf.find(e.getValue()), k -> new TreeSet&lt;>()).add(e.getKey());
+        }
+        List&lt;List&lt;String>> result = new ArrayList&lt;>();
+        for (Map.Entry&lt;Integer, TreeSet&lt;String>> g : groups.entrySet()) {
+            List&lt;String> row = new ArrayList&lt;>();
+            row.add(accounts.get(g.getKey()).get(0));            // the person's name
+            row.addAll(g.getValue());
+            result.add(row);
+        }
+        return result;
+    }
+}</code></pre>
+  <p><strong>Complexity:</strong> with N total emails and longest email length L: O(N · α · L) for the unions and map work plus O(N log N · L) for sorting. Space O(N · L).</p>
+
+  <h4>Other uses</h4>
+  <ul>
+    <li><strong>Kruskal's minimum spanning tree</strong> — next article.</li>
+    <li><strong>Number of Islands II</strong> (cells become land one at a time) — union with land neighbours, report the component count after each step; far better than recomputing with DFS.</li>
+    <li><strong>Graph Valid Tree</strong>: n − 1 edges and no <code>union</code> returns false (or exactly one component).</li>
+    <li><strong>Satisfiability of Equality Equations</strong>, <strong>Most Stones Removed</strong>, <strong>Smallest String With Swaps</strong>: group by connectivity, then answer per group.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: always compare roots, never raw parents</p>
+    <p>Two elements are in the same group when <code>find(a) == find(b)</code>. Comparing <code>parent[a] == parent[b]</code> is wrong because the parent array is not fully flattened: elements of one group can have different parents.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: union without finding roots</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: links the elements, not their roots</p><pre><code class="language-java">void union(int a, int b) {
+    parent[a] = b;          // a's old group is split off from a's old root
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: link the roots</p><pre><code class="language-java">void union(int a, int b) {
+    int ra = find(a), rb = find(b);
+    if (ra != rb) parent[ra] = rb;
+}</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Limits and edge cases</p>
+    <ul>
+      <li><strong>No delete / split.</strong> Union-find only merges. If groups can also split, process the operations in reverse (turn deletions into merges) or use another structure.</li>
+      <li>Labels from 1..n need an array of size n + 1; labels that are strings or large numbers need a map from label to index first.</li>
+      <li>Directed connectivity (strongly connected components) is not union-find's job; it ignores direction.</li>
+      <li><code>sizeOf</code> must go through <code>find</code> — <code>size[x]</code> is valid only at a root.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Describe the data structure in one sentence ("a forest in an array; the root is the group's name"), name both optimisations and the resulting O(α(n)) amortized time, and mention <code>union</code> returning a boolean for cycle detection. Compare with DFS: DFS is better for a single static query; union-find is better when edges arrive over time and you query connectivity repeatedly.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-mst">
+  <h3>Minimum spanning tree: Kruskal and Prim</h3>
+  <p class="tldr">A minimum spanning tree connects all vertices of a weighted undirected graph with V − 1 edges of the smallest possible total weight; Kruskal sorts the edges and adds each one that does not close a cycle (checked with union-find), while Prim grows one tree from a start vertex using a min-heap.</p>
+
+  <p>A <strong>spanning tree</strong> of a connected undirected graph is a subset of its edges that connects all V vertices without any cycle; it always has exactly V − 1 edges. Among all spanning trees, the one with the smallest total weight is the <strong>minimum spanning tree (MST)</strong>. Think of laying cable to connect all offices of a company: you want everyone connected, no wasted loops, and the lowest total cost. MSTs also appear in network design, clustering, and approximations for hard problems.</p>
+  <p>Do not confuse MST with shortest paths. A shortest-path tree minimises the distance from <em>one source</em> to each vertex; an MST minimises the <em>total weight</em> of the connecting edges and has no source.</p>
+
+  <h4>Why greedy works: the cut property</h4>
+  <p>Split the vertices into two non-empty sets in any way (a <em>cut</em>). The cheapest edge crossing the cut belongs to some MST. (If it did not, adding it to an MST would create a cycle that crosses the cut at least once more; removing that other crossing edge, which is not cheaper, gives a spanning tree that is no worse.) Both algorithms below keep picking such a "safe" cheapest edge, so they are exchange-argument greedy algorithms. If all edge weights are distinct, the MST is unique.</p>
+
+  <h4>Kruskal's algorithm: sort edges, skip cycles</h4>
+  <ol class="steps">
+    <li>Sort all edges by weight, smallest first.</li>
+    <li>For each edge (u, v, w): if u and v are in different components (<code>union</code> returns true), take the edge and add w to the total.</li>
+    <li>Stop when V − 1 edges are taken. If fewer, the graph is disconnected and has no spanning tree (only a spanning forest).</li>
+  </ol>
+<pre data-title="Kruskal.java"><code class="language-java">import java.util.Arrays;
+
+public class Kruskal {
+    // edges[i] = {u, v, w}; returns the MST weight, or -1 if the graph is disconnected
+    public static int mstWeight(int n, int[][] edges) {
+        int[][] sorted = edges.clone();
+        Arrays.sort(sorted, (a, b) -> Integer.compare(a[2], b[2]));   // cheapest first
+        UnionFind uf = new UnionFind(n);
+        int total = 0, taken = 0;
+        for (int[] e : sorted) {
+            if (uf.union(e[0], e[1])) {            // different components: safe to connect
+                total += e[2];
+                if (++taken == n - 1) break;       // a spanning tree has n - 1 edges
+            }                                      // else: would close a cycle, skip
+        }
+        return taken == n - 1 ? total : -1;
+    }
+
+    public static void main(String[] args) {
+        int[][] edges = {{0, 1, 10}, {0, 2, 6}, {0, 3, 5}, {1, 3, 15}, {2, 3, 4}};
+        System.out.println(mstWeight(4, edges));   // 19
+    }
+}</code></pre>
+  <p><strong>Dry run</strong> on the example: sorted weights are 4 (2-3), 5 (0-3), 6 (0-2), 10 (0-1), 15 (1-3). Take 2-3 (total 4). Take 0-3 (total 9). Edge 0-2: 0 and 2 are already connected through 3 → skip. Take 0-1 (total 19) — three edges, done. The MST is {2-3, 0-3, 0-1} with weight 19.</p>
+  <p><strong>Complexity:</strong> O(E log E) for the sort (equal to O(E log V), since E ≤ V²) plus O(E · α(V)) for the unions, so O(E log E) overall; O(V) extra space for union-find. Kruskal is the simplest MST code to write in an interview because it needs only an edge list and the DSU class you already have.</p>
+
+  <h4>Prim's algorithm: grow one tree</h4>
+  <p>Start from any vertex. Keep a min-heap of edges leaving the current tree. Repeatedly pop the cheapest edge; if its far end is already in the tree, skip it (stale), otherwise add that vertex and push its edges. It resembles <a href="#m3-dijkstra">Dijkstra</a>, with one difference: the heap key is the weight of the single connecting edge, not the total distance from the source.</p>
+<pre data-title="Prim.java"><code class="language-java">import java.util.List;
+import java.util.PriorityQueue;
+
+public class Prim {
+    // g.get(u) holds {neighbour, weight}; undirected graph (each edge stored both ways)
+    public static int mstWeight(List&lt;List&lt;int[]>> g) {
+        int n = g.size();
+        boolean[] inTree = new boolean[n];
+        PriorityQueue&lt;int[]> pq = new PriorityQueue&lt;>((a, b) -> Integer.compare(a[0], b[0]));
+        pq.add(new int[]{0, 0});                     // {edge weight, vertex}: enter at vertex 0
+        int total = 0, taken = 0;
+        while (!pq.isEmpty() &amp;&amp; taken &lt; n) {
+            int[] cur = pq.poll();
+            int w = cur[0], u = cur[1];
+            if (inTree[u]) continue;                 // far end already connected: skip
+            inTree[u] = true;
+            total += w;
+            taken++;
+            for (int[] e : g.get(u)) {
+                if (!inTree[e[0]]) pq.add(new int[]{e[1], e[0]});   // edge to a new vertex
+            }
+        }
+        return taken == n ? total : -1;              // -1: graph is disconnected
+    }
+
+    public static void main(String[] args) {
+        int[][] edges = {{0, 1, 10}, {0, 2, 6}, {0, 3, 5}, {1, 3, 15}, {2, 3, 4}};
+        System.out.println(mstWeight(GraphBuilder.buildWeighted(4, edges, false)));   // 19
+    }
+}</code></pre>
+  <p><strong>Complexity:</strong> O(E log V) time with a binary heap, O(V + E) space. For a <em>dense</em> graph (E near V²) the array version, which scans for the minimum instead of using a heap, runs in O(V²) and is faster; see the next problem.</p>
+
+  <h4>Problem — Min Cost to Connect All Points (LeetCode 1584)</h4>
+  <p>Points on a plane; the cost between two points is their Manhattan distance <code>|x1 − x2| + |y1 − y2|</code>. Find the minimum cost to connect all points. Every pair is connected, so the graph is complete: E = V(V − 1) / 2. Building and sorting all edges (Kruskal) costs O(V² log V); the heapless Prim below is O(V²) and uses only O(V) memory.</p>
+<pre data-title="MinCostConnectPoints.java"><code class="language-java">import java.util.Arrays;
+
+public class MinCostConnectPoints {
+    public static int minCostConnectPoints(int[][] p) {
+        int n = p.length;
+        int[] minDist = new int[n];            // cheapest known edge from the tree to vertex i
+        boolean[] used = new boolean[n];
+        Arrays.fill(minDist, Integer.MAX_VALUE);
+        minDist[0] = 0;
+        int total = 0;
+        for (int step = 0; step &lt; n; step++) {
+            int u = -1;
+            for (int i = 0; i &lt; n; i++) {                     // pick the closest outside vertex
+                if (!used[i] &amp;&amp; (u == -1 || minDist[i] &lt; minDist[u])) u = i;
+            }
+            used[u] = true;
+            total += minDist[u];
+            for (int v = 0; v &lt; n; v++) {                     // update distances to the tree
+                if (!used[v]) {
+                    int d = Math.abs(p[u][0] - p[v][0]) + Math.abs(p[u][1] - p[v][1]);
+                    if (d &lt; minDist[v]) minDist[v] = d;
+                }
+            }
+        }
+        return total;
+    }
+
+    public static void main(String[] args) {
+        int[][] points = {{0, 0}, {2, 2}, {3, 10}, {5, 2}, {7, 0}};
+        System.out.println(minCostConnectPoints(points));   // 20
+    }
+}</code></pre>
+  <p><strong>Complexity:</strong> O(n²) time, O(n) space.</p>
+
+  <h4>Kruskal vs Prim</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Kruskal</th><th>Prim</th></tr></thead>
+    <tbody>
+      <tr><td>Works on</td><td>Edge list</td><td>Adjacency list or matrix</td></tr>
+      <tr><td>Core structure</td><td>Sort + union-find</td><td>Min-heap (or array)</td></tr>
+      <tr><td>Time</td><td>O(E log E)</td><td>O(E log V); O(V²) with an array</td></tr>
+      <tr><td>Better for</td><td>Sparse graphs, edges already listed</td><td>Dense graphs</td></tr>
+      <tr><td>Disconnected graph</td><td>Naturally yields a spanning forest</td><td>Needs a restart from each component for a forest</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Problems that are MST in disguise</h4>
+  <ul>
+    <li><strong>Connecting Cities With Minimum Cost</strong> and <strong>Min Cost to Connect All Points</strong> — direct MST.</li>
+    <li><strong>Optimize Water Distribution in a Village</strong> — add a virtual vertex 0 joined to each house with the well-building cost, then MST.</li>
+    <li><strong>Critical and Pseudo-Critical Edges in the MST</strong> — compute the MST weight with and without each edge (advanced).</li>
+    <li><strong>Maximum spanning tree</strong> — sort descending.</li>
+    <li><strong>Clustering into k groups</strong> — run Kruskal and stop when k components remain.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using an MST when the question asks for shortest paths</p>
+    <p>The MST path between two vertices is not necessarily the shortest path between them. In a triangle with edge weights 1, 1 and 1.5, the MST skips the 1.5 edge, so the route between its two endpoints inside the MST costs 2, while the real shortest path is the direct edge with cost 1.5. Read whether the problem wants total cost of connecting everything (MST) or distance between specific vertices (shortest path).</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: forgetting to check connectivity</p>
+    <p>If the graph is disconnected there are fewer than V − 1 usable edges. Return −1 (or whatever the problem says) when <code>taken != n − 1</code> instead of returning a partial total.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A single vertex → MST weight 0.</li>
+      <li>Equal weights → several different MSTs exist, but all have the same total weight; if the problem asks for the tree itself, any valid one is accepted unless stated otherwise.</li>
+      <li>Negative weights are fine for both algorithms (unlike Dijkstra).</li>
+      <li>Directed graphs: the problem is different (minimum arborescence, Edmonds' algorithm) and not asked in interviews.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Know the definition (V − 1 edges, minimum total weight, no cycles), the cut-property reason that greedy works, and both algorithms with complexities. Say "I will use Kruskal since the edges are given as a list; union-find tells me whether an edge closes a cycle." If asked for dense graphs, mention array-based Prim in O(V²).</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-shortest-path-table">
+  <h3>Which graph algorithm should I use?</h3>
+  <p class="tldr">Pick the shortest-path algorithm from three facts — are edges weighted, can they be negative, is the graph a DAG — and pick the structure algorithm from the question: groups (DFS or union-find), order (topological sort), cheapest connection (MST).</p>
+
+  <p>In an interview the hardest step is often choosing the algorithm, not writing it. The tables below summarise the choices in this module. Use them as a checklist when you read a graph problem: first model the graph (what are the vertices, what are the edges, are they directed, weighted?), then match the question.</p>
+
+  <h4>Which shortest-path algorithm?</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A{Edges weighted} -->|No| B[BFS]
+  A -->|Yes| C{Negative weights}
+  C -->|No| D{Weights only 0 and 1}
+  D -->|Yes| E[0-1 BFS]
+  D -->|No| F[Dijkstra]
+  C -->|Yes| G[Bellman-Ford]
+</pre>
+    <figcaption>Decision flow for single-source shortest paths</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Situation</th><th>Algorithm</th><th>Time</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>Unweighted (or all weights equal)</td><td>BFS</td><td>O(V + E)</td><td>Multiply by the weight if all are equal</td></tr>
+      <tr><td>Weights are 0 or 1</td><td>0-1 BFS</td><td>O(V + E)</td><td>Deque: front for 0, back for 1</td></tr>
+      <tr><td>Non-negative weights</td><td>Dijkstra</td><td>O((V + E) log V)</td><td>Heap with lazy deletion</td></tr>
+      <tr><td>Negative weights, no negative cycle</td><td>Bellman-Ford</td><td>O(V · E)</td><td>Also detects a negative cycle</td></tr>
+      <tr><td>At most k edges</td><td>Bellman-Ford with k rounds</td><td>O(k · E)</td><td>Copy the array each round</td></tr>
+      <tr><td>DAG (any weights)</td><td>Relax edges in topological order</td><td>O(V + E)</td><td>Also gives the longest path</td></tr>
+      <tr><td>All pairs, small V</td><td>Floyd-Warshall</td><td>O(V³)</td><td>V up to a few hundred</td></tr>
+      <tr><td>All pairs, sparse and large V</td><td>Dijkstra from every vertex</td><td>O(V · E log V)</td><td>Non-negative weights only</td></tr>
+      <tr><td>Grid with moving costs</td><td>Dijkstra on cells</td><td>O(mn log mn)</td><td>Path cost may be a max, not a sum</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Which algorithm for which question?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Question</th><th>Use</th><th>Time</th></tr></thead>
+    <tbody>
+      <tr><td>Is B reachable from A? How many groups?</td><td>DFS / BFS, or union-find</td><td>O(V + E)</td></tr>
+      <tr><td>Groups that change as edges arrive</td><td>Union-find</td><td>≈ O(α(n)) per operation</td></tr>
+      <tr><td>Fewest steps in an unweighted graph or puzzle</td><td>BFS</td><td>O(V + E)</td></tr>
+      <tr><td>Something spreads from many places at once</td><td>Multi-source BFS</td><td>O(V + E)</td></tr>
+      <tr><td>Cycle in an undirected graph</td><td>DFS with parent, or union-find</td><td>O(V + E)</td></tr>
+      <tr><td>Cycle in a directed graph</td><td>Three-colour DFS or Kahn</td><td>O(V + E)</td></tr>
+      <tr><td>Order tasks with dependencies</td><td>Topological sort</td><td>O(V + E)</td></tr>
+      <tr><td>Two groups with no conflicts</td><td>Two-colouring (bipartite check)</td><td>O(V + E)</td></tr>
+      <tr><td>Cheapest way to connect everything</td><td>MST: Kruskal or Prim</td><td>O(E log E)</td></tr>
+      <tr><td>Count paths in a DAG, or best path with choices</td><td>Dynamic programming over a topological order</td><td>O(V + E)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Cheat-style comparison of the big four</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>BFS</th><th>Dijkstra</th><th>Bellman-Ford</th><th>Floyd-Warshall</th></tr></thead>
+    <tbody>
+      <tr><td>Sources</td><td>One</td><td>One</td><td>One</td><td>All pairs</td></tr>
+      <tr><td>Weights</td><td>None (equal)</td><td>≥ 0</td><td>Any (no neg. cycle)</td><td>Any (no neg. cycle)</td></tr>
+      <tr><td>Time</td><td>O(V + E)</td><td>O((V + E) log V)</td><td>O(V · E)</td><td>O(V³)</td></tr>
+      <tr><td>Structure</td><td>Queue</td><td>Min-heap</td><td>Edge list loop</td><td>Matrix, 3 loops</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A worked decision</h4>
+  <p><strong>Problem:</strong> "A delivery app has n junctions and roads with travel times in minutes. Find the fastest time from the restaurant to every customer." Vertices are junctions, edges are roads, weighted with positive times, one source → single-source shortest path with non-negative weights → <strong>Dijkstra</strong>. If a road also had a "toll refund" of −2 minutes, Dijkstra could be wrong → Bellman-Ford. If the app asked "which pair of junctions is farthest apart" on 300 junctions, → Floyd-Warshall.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: BFS on a weighted graph</p>
+    <p>BFS minimises the <em>number of edges</em>, not the total weight. On weighted graphs it can return a path with fewer roads but a longer distance. If someone says "shortest path", always ask what is being measured.</p>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: questions to ask the interviewer</p>
+    <ul>
+      <li>Directed or undirected? Weighted? Can weights be zero or negative?</li>
+      <li>Can the graph have cycles, self-loops or parallel edges? Is it connected?</li>
+      <li>How large are V and E? (This decides between O(V²), O(V³) and heap-based solutions.)</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Interviewers often ask the table itself: "when would you use BFS, Dijkstra, Bellman-Ford?" Answer with the three conditions (weighted? negative? edge limit?) and the complexities. Naming a trade-off — for example "Dijkstra is faster, but only valid without negative edges" — is worth more than reciting code.</p>
+  </div>
+</article>

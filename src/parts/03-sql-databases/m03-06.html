@@ -1,0 +1,292 @@
+<article class="topic recap" id="m3-interview">
+  <h3>Interview questions — Advanced SQL</h3>
+
+  <details class="qa">
+    <summary>What is a CTE, and how is it different from a subquery, a view and a temporary table?</summary>
+    <div class="qa-a">
+      <p>A CTE (<code>WITH name AS (…)</code>) is a named result that exists for one statement. Unlike a
+      subquery it has a name and can be used several times; unlike a view it is not stored in the database;
+      unlike a temporary table it holds no data between statements and cannot be indexed. It is mostly a
+      readability tool, and the only way (besides procedural code) to write recursive queries. In PostgreSQL 12+ a
+      CTE used once is inlined like a subquery.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does a recursive CTE work? How do you stop it looping forever?</summary>
+    <div class="qa-a">
+      <p>An anchor query returns the starting rows. The recursive member joins the CTE to the table to produce the
+      next level, and is repeated on the newest rows until it returns nothing; <code>UNION ALL</code> combines all
+      rounds. Typical uses: org charts, category trees, date series. Protect against cycles with a depth limit,
+      a visited-ids array, PostgreSQL's <code>CYCLE</code> clause, or MySQL's
+      <code>cte_max_recursion_depth</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a window function, and how is it different from GROUP BY?</summary>
+    <div class="qa-a">
+      <p>It computes a value over a set of related rows (the window, set by <code>OVER (PARTITION BY … ORDER BY
+      …)</code>) but returns one output row per input row. <code>GROUP BY</code> collapses rows into one per
+      group. Windows let you show row details next to group figures, rank rows, and compare with neighbouring
+      rows.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>ROW_NUMBER vs RANK vs DENSE_RANK?</summary>
+    <div class="qa-a">
+      <p>For salaries 300, 220, 150, 150, 120: <code>ROW_NUMBER</code> gives 1, 2, 3, 4, 5 (ties get different
+      numbers); <code>RANK</code> gives 1, 2, 3, 3, 5 (ties share a rank, then a gap); <code>DENSE_RANK</code> gives
+      1, 2, 3, 3, 4 (no gap). Use <code>DENSE_RANK</code> for the Nth highest value, <code>ROW_NUMBER</code> for
+      exactly N rows or de-duplication.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why can't you use a window function in WHERE? How do you filter on it?</summary>
+    <div class="qa-a">
+      <p>Window functions are evaluated in the <code>SELECT</code> step, after <code>WHERE</code>,
+      <code>GROUP BY</code> and <code>HAVING</code>. So <code>WHERE ROW_NUMBER() OVER (…) = 1</code> raises
+      "window functions are not allowed in WHERE". Compute it in a subquery or CTE and filter in the outer
+      query.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain window frames. What is the default frame, and why does LAST_VALUE surprise people?</summary>
+    <div class="qa-a">
+      <p>The frame is the set of rows around the current row that the function reads. With an <code>ORDER
+      BY</code> and no frame clause the default is <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>,
+      which includes peers with equal sort values. So <code>LAST_VALUE</code> returns the current row (or its last
+      peer), not the last row of the partition. Add <code>ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
+      FOLLOWING</code>. For running totals, use <code>ROWS</code> and a unique ordering.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Write a query for the second highest salary. What about the Nth?</summary>
+    <div class="qa-a">
+      <p><code>SELECT MAX(salary) FROM employees WHERE salary &lt; (SELECT MAX(salary) FROM
+      employees)</code>, or <code>SELECT DISTINCT salary … ORDER BY salary DESC LIMIT 1 OFFSET 1</code>, or
+      <code>DENSE_RANK() OVER (ORDER BY salary DESC)</code> filtered with <code>= N</code>. The last generalises
+      to N and to "per department", and handles ties. Say what you return if there is no Nth value (NULL).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you delete duplicate rows but keep one?</summary>
+    <div class="qa-a">
+      <p>Number the copies with <code>ROW_NUMBER() OVER (PARTITION BY the_columns ORDER BY id)</code> and delete
+      rows with number above 1, or self-join on the same values with <code>a.id &gt; b.id</code>, or delete
+      where <code>id NOT IN (SELECT MIN(id) … GROUP BY the_columns)</code>. Then add a unique constraint to stop
+      it recurring. In MySQL, delete through a join because you cannot select from the table being deleted in a
+      subquery.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you get the top 3 salaries in each department?</summary>
+    <div class="qa-a">
+      <p><code>DENSE_RANK() OVER (PARTITION BY dept_id ORDER BY salary DESC)</code> in a CTE, then filter
+      <code>rank &lt;= 3</code>. Ask about ties: <code>DENSE_RANK</code> returns every employee who shares one of
+      the top three salary values (4 rows for Engineering), <code>ROW_NUMBER</code> exactly 3 rows. Alternatives:
+      a correlated count of higher distinct salaries, or a <code>LATERAL</code> join with <code>LIMIT 3</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you find users who logged in on consecutive days?</summary>
+    <div class="qa-a">
+      <p>De-duplicate the (user, date) pairs, number them per user with <code>ROW_NUMBER</code>, and compute
+      <code>date - row_number</code>. That value is constant within a run of consecutive dates. Group by user and
+      that value, and use <code>COUNT(*)</code> as the streak length. For exactly "3 in a row" you can also use
+      <code>LEAD(login_date, 2)</code> and test that it equals the date plus 2.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>View vs materialized view?</summary>
+    <div class="qa-a">
+      <p>A view is a saved query: no data stored, always current, as fast as the underlying query. A
+      materialized view (PostgreSQL) stores the result, so reads are fast and indexable, but the data is stale
+      until <code>REFRESH MATERIALIZED VIEW</code> (use <code>CONCURRENTLY</code> with a unique index to avoid
+      blocking readers). MySQL has no materialized views; use a summary table.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Stored procedure vs function vs trigger. Would you put business logic in them?</summary>
+    <div class="qa-a">
+      <p>A function returns a value or table and can be used inside a query; a procedure is run with
+      <code>CALL</code> and can commit or roll back; a trigger runs automatically on <code>INSERT</code>,
+      <code>UPDATE</code> or <code>DELETE</code>. They run close to the data and cannot be bypassed, good for
+      audit logs, <code>updated_at</code>, batch jobs. But they are harder to test, version, debug and port, and
+      hide behaviour, so most Spring teams keep business rules in Java services and use triggers sparingly.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How would you compute month-over-month growth?</summary>
+    <div class="qa-a">
+      <p>Aggregate revenue per month in a CTE, then use <code>LAG(revenue) OVER (ORDER BY month)</code> to get the
+      previous month, and compute <code>(revenue - previous) / previous * 100</code>. The first month is NULL; guard
+      the division with <code>NULLIF(previous, 0)</code>; fill months without data with a generated calendar
+      (<code>generate_series</code>) so that <code>LAG</code> compares adjacent months.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you find the median in SQL?</summary>
+    <div class="qa-a">
+      <p>PostgreSQL: <code>PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY col)</code>. Elsewhere: number the rows
+      with <code>ROW_NUMBER()</code>, count them with <code>COUNT(*) OVER ()</code>, and average the rows where
+      <code>rn IN ((cnt+1)/2, (cnt+2)/2)</code> (integer division), which gives the middle row for an odd count
+      and the average of the two middle rows for an even count.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m3-cheatsheet">
+  <h3>Cheat sheet — Advanced SQL</h3>
+  <ul class="cheat">
+    <li><b>CTE</b> <code>WITH a AS (…), b AS (… FROM a …) SELECT … FROM b</code>; lives for one statement; later CTEs see earlier ones.</li>
+    <li><b>Recursive CTE</b> <code>WITH RECURSIVE t AS (anchor UNION ALL recursive-member-using-t)</code>; needs a stop condition.</li>
+    <li><b>Series</b> <code>generate_series(1, 10)</code> or dates with <code>INTERVAL '1 day'</code>; MySQL uses a recursive CTE.</li>
+    <li><b>Window syntax</b> <code>func() OVER (PARTITION BY a ORDER BY b ROWS BETWEEN … AND …)</code>; named with <code>WINDOW w AS (…)</code>.</li>
+    <li><b>Windows keep rows</b>; <code>GROUP BY</code> collapses them. Windows run after <code>WHERE</code>/<code>HAVING</code>.</li>
+    <li><b>Filter on a window</b> compute in a CTE or subquery, then filter outside; no window functions in <code>WHERE</code>.</li>
+    <li><b>ROW_NUMBER</b> 1,2,3,4 always unique; add a tie-breaker to make it deterministic.</li>
+    <li><b>RANK</b> 1,2,2,4 gap after ties. <b>DENSE_RANK</b> 1,2,2,3 no gap. <b>NTILE(n)</b> n equal buckets.</li>
+    <li><b>LAG / LEAD</b> <code>LAG(col, n, default)</code> previous row, <code>LEAD</code> next row; NULL at the edges.</li>
+    <li><b>FIRST_VALUE / LAST_VALUE</b> <code>LAST_VALUE</code> needs <code>UNBOUNDED FOLLOWING</code> in the frame.</li>
+    <li><b>Frames</b> default with <code>ORDER BY</code> is <code>RANGE … UNBOUNDED PRECEDING … CURRENT ROW</code> (peers included); use <code>ROWS</code> for running totals.</li>
+    <li><b>Running total</b> <code>SUM(x) OVER (PARTITION BY k ORDER BY d, id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)</code>.</li>
+    <li><b>Moving average</b> <code>AVG(x) OVER (ORDER BY d ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)</code>.</li>
+    <li><b>Percent of total</b> <code>100.0 * x / SUM(x) OVER ()</code>.</li>
+    <li><b>View</b> saved query, no data. <b>Materialized view</b> stores data, <code>REFRESH MATERIALIZED VIEW [CONCURRENTLY]</code>.</li>
+    <li><b>WITH CHECK OPTION</b> stops updates through a view that would hide the row.</li>
+    <li><b>Function</b> returns a value, used in queries. <b>Procedure</b> <code>CALL</code>, can commit. <b>Trigger</b> fires on row changes (<code>NEW</code>, <code>OLD</code>).</li>
+    <li><b>Nth highest</b> <code>DENSE_RANK() OVER (ORDER BY salary DESC) = N</code>, or <code>DISTINCT … OFFSET N-1</code>.</li>
+    <li><b>Duplicates</b> find with <code>GROUP BY … HAVING COUNT(*) &gt; 1</code>; delete with <code>ROW_NUMBER() &gt; 1</code> or a self join; prevent with <code>UNIQUE</code>.</li>
+    <li><b>Top N per group</b> <code>DENSE_RANK()/ROW_NUMBER() OVER (PARTITION BY g ORDER BY x DESC) &lt;= N</code> in a CTE.</li>
+    <li><b>Anti-join</b> <code>NOT EXISTS</code>; remember <code>NOT IN</code> fails with NULLs.</li>
+    <li><b>Consecutive days</b> group by <code>date - ROW_NUMBER()</code> (de-duplicate first).</li>
+    <li><b>Month-over-month</b> <code>(x - LAG(x) OVER (ORDER BY m)) / NULLIF(LAG(x) OVER (ORDER BY m), 0)</code>.</li>
+    <li><b>Pivot</b> one <code>SUM(CASE WHEN …)</code> or <code>FILTER</code> per output column. <b>Median</b> <code>PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)</code>.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m3-practice">
+  <h3>Practice — Advanced SQL</h3>
+  <p>The roadmap exercise is to build a college database and write 30 queries on it. Create it in a new database
+  (<code>college</code>) with the script below: 5 teachers, 8 courses, 15 students and 32 enrollments, 60 rows in
+  all. It has deliberate edge cases: a course without a teacher, a course without students, two students without
+  enrollments, a student without a city, and some enrollments without marks.</p>
+  <pre data-title="college.sql (1 of 2): tables"><code class="language-sql">DROP TABLE IF EXISTS enrollments, students, courses, teachers CASCADE;
+
+CREATE TABLE teachers (
+    teacher_id  INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    name        VARCHAR(50) NOT NULL,
+    department  VARCHAR(50) NOT NULL
+);
+CREATE TABLE courses (
+    course_id   INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    title       VARCHAR(60) NOT NULL UNIQUE,
+    credits     SMALLINT    NOT NULL CHECK (credits BETWEEN 1 AND 6),
+    teacher_id  INT,
+    CONSTRAINT fk_courses_teacher FOREIGN KEY (teacher_id) REFERENCES teachers (teacher_id)
+);
+CREATE TABLE students (
+    student_id    INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    name          VARCHAR(50) NOT NULL,
+    city          VARCHAR(50),
+    year_of_study SMALLINT    NOT NULL CHECK (year_of_study BETWEEN 1 AND 4),
+    joined_on     DATE        NOT NULL
+);
+CREATE TABLE enrollments (
+    student_id  INT NOT NULL,
+    course_id   INT NOT NULL,
+    marks       SMALLINT CHECK (marks BETWEEN 0 AND 100),
+    PRIMARY KEY (student_id, course_id),
+    CONSTRAINT fk_enr_student FOREIGN KEY (student_id) REFERENCES students (student_id),
+    CONSTRAINT fk_enr_course  FOREIGN KEY (course_id)  REFERENCES courses (course_id)
+);</code></pre>
+  <pre data-title="college.sql (2 of 2): data"><code class="language-sql">INSERT INTO teachers (teacher_id, name, department) VALUES
+    (1, 'Dr. Rao', 'Computer Science'), (2, 'Dr. Iyer', 'Mathematics'),
+    (3, 'Prof. Khan', 'Physics'), (4, 'Dr. Das', 'Computer Science'),
+    (5, 'Prof. Nair', 'Mathematics');
+
+INSERT INTO courses (course_id, title, credits, teacher_id) VALUES
+    (1, 'Databases', 4, 1), (2, 'Algorithms', 4, 4), (3, 'Calculus', 3, 2),
+    (4, 'Linear Algebra', 3, 5), (5, 'Mechanics', 3, 3), (6, 'Operating Systems', 4, 1),
+    (7, 'Statistics', 3, 2), (8, 'Ethics', 2, NULL);
+
+INSERT INTO students (student_id, name, city, year_of_study, joined_on) VALUES
+    (1, 'Asha Verma', 'Delhi', 1, '2025-07-01'),     (2, 'Bilal Ahmed', 'Mumbai', 2, '2024-07-01'),
+    (3, 'Chitra Nair', 'Kochi', 3, '2023-07-03'),    (4, 'Dev Patel', 'Ahmedabad', 1, '2025-07-01'),
+    (5, 'Esha Gupta', 'Delhi', 2, '2024-07-01'),     (6, 'Farhan Ali', 'Hyderabad', 3, '2023-07-03'),
+    (7, 'Gita Rao', 'Bengaluru', 1, '2025-07-01'),   (8, 'Harsh Jain', 'Jaipur', 2, '2024-07-01'),
+    (9, 'Isha Sen', 'Kolkata', 3, '2023-07-03'),     (10, 'Jai Menon', 'Kochi', 1, '2025-07-01'),
+    (11, 'Kiran Shah', 'Mumbai', 2, '2024-07-01'),   (12, 'Leela Das', 'Kolkata', 3, '2023-07-03'),
+    (13, 'Manav Singh', 'Delhi', 1, '2025-07-01'),   (14, 'Nita Bose', 'Kolkata', 2, '2024-07-01'),
+    (15, 'Om Prakash', NULL, 3, '2023-07-03');
+
+INSERT INTO enrollments (student_id, course_id, marks) VALUES
+    (1,1,88),(1,2,92),(1,3,75), (2,1,67),(2,3,81),(2,5,58), (3,2,95),(3,4,89),(3,6,91),
+    (4,1,45),(4,5,72), (5,1,78),(5,2,84),(5,7,NULL), (6,2,66),(6,6,70),(6,7,73),
+    (7,1,90),(7,3,88), (8,4,61),(8,5,77),(8,7,69), (9,1,82),(9,6,NULL), (10,3,55),(10,7,64),
+    (11,2,79),(11,4,85), (12,1,93),(12,2,87),(12,6,76), (13,3,NULL);</code></pre>
+  <ol class="steps">
+    <li><strong>Build the college database.</strong> Run the script and check the counts: 5 teachers, 8 courses,
+    15 students, 32 enrollments (<code>SELECT COUNT(*)</code> on each). Then add your own rows until every table
+    has more data, and write down which constraint rejects a duplicate enrollment and a mark of 101.</li>
+    <li><strong>Write these 30 queries.</strong> Save them in <code>college_queries.sql</code>. Write each one
+    yourself, then read the result and ask if it matches what you expect:
+      <ul>
+        <li><b>Basics:</b> (1) students from Kolkata, sorted by name; (2) students without a city; (3) courses
+        with 4 or more credits; (4) the distinct cities; (5) students whose name contains <code>a</code>
+        (case-insensitive), first five by name.</li>
+        <li><b>Joins:</b> (6) each student with the titles of their courses (inner join); (7) every course with
+        its teacher's name, including Ethics (left join); (8) every student with the number of courses they take,
+        including 0; (9) courses nobody takes; (10) students with no enrollment, using <code>NOT EXISTS</code>;
+        (11) a full join of teachers and courses; (12) pairs of students from the same city, each pair once;
+        (13) a cross join of students and courses, and the number of combinations that are not enrolled.</li>
+        <li><b>Aggregates:</b> (14) average marks per course; (15) courses with an average above 75
+        (<code>HAVING</code>); (16) cities with at least two students; (17) highest and lowest mark per student;
+        (18) total credits per student; (19) number of different students taught by each teacher.</li>
+        <li><b>Subqueries and sets:</b> (20) students whose average is above the overall average; (21) courses
+        taught by Mathematics teachers (<code>IN</code>); (22) students who scored more than every mark in
+        Calculus (<code>ALL</code>); (23) students who took both Databases and Algorithms (<code>INTERSECT</code>
+        or <code>EXISTS</code> twice).</li>
+        <li><b>CTEs and windows:</b> (24) per-student average with a band from <code>CASE</code>
+        (A from 85, B from 70, C otherwise); (25) rank students by average with <code>DENSE_RANK</code>;
+        (26) the top two marks in each course (<code>ROW_NUMBER</code>); (27) running total of credits per
+        student ordered by course id; (28) each mark minus the course average (window <code>AVG</code>);
+        (29) for each student, the mark of the previous course by course id (<code>LAG</code>); (30) with
+        <code>generate_series</code> or a recursive CTE, list the numbers 1 to 10 that are not a
+        <code>course_id</code>.</li>
+      </ul>
+      Done when all 30 run without errors, you can explain every row count, and at least ten of them use two
+      different solutions.</li>
+    <li><strong>The classic interview problems.</strong> On the company database from Module 1, write: second and
+    Nth highest salary (as a function), duplicate emails (build your own table with duplicates), employees earning
+    more than their managers (Karan), the top 3 salaries per department, and consecutive login days. Each in at
+    least two ways, with the output.</li>
+    <li><strong>Recursive CTE.</strong> Print the management tree indented by level, count the people under each
+    manager (direct and indirect), and list the chain of command from Divya up to Meera. Done when Meera has 11
+    people under her and Vikram has 4.</li>
+    <li><strong>Windows on the shop.</strong> Revenue per month with month-over-month growth, running total of
+    spending per customer, and each customer's most recent order (<code>ROW_NUMBER</code> and again with
+    <code>DISTINCT ON</code>). Compare the results.</li>
+    <li><strong>Views.</strong> Create <code>department_summary</code> and an updatable view with <code>WITH CHECK
+    OPTION</code>, prove the check rejects a bad update, then create <code>monthly_revenue</code> as a materialized
+    view, insert a new order and see that it only appears after <code>REFRESH</code>.</li>
+    <li><strong>Trigger and function.</strong> Add the <code>salary_audit</code> trigger, change three salaries,
+    and read the log. Write <code>salary_grade()</code> and use it in a query. Then write down in two sentences
+    whether you would keep each in the database or in Spring.</li>
+    <li><strong>Mock interview.</strong> Pick five queries at random from the 30 and the classics, give yourself
+    15 minutes each, and say your reasoning aloud, including tie and NULL assumptions. Then solve 10 problems from
+    LeetCode's Top SQL 50 plan.</li>
+  </ol>
+</article>

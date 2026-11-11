@@ -1,0 +1,452 @@
+<article class="topic" id="m3-volumes">
+  <h3>Volumes, bind mounts and keeping data safe</h3>
+  <p class="tldr">A container's own filesystem disappears with the container; use a named volume for data that
+  must survive (database files), a bind mount to share a host folder (source code, config), and remember that
+  <code>docker compose down -v</code> deletes volumes.</p>
+
+  <h4>The problem: containers are disposable</h4>
+  <p>Remove a PostgreSQL container and all its tables are gone, because they lived in the container's
+  writable layer. Containers should be disposable — you replace them on every release — so data that matters
+  must live <em>outside</em> the container's own filesystem. Docker offers three ways to mount storage:</p>
+  <figure class="fig">
+<pre class="diagram">
+  Container filesystem
+ ┌──────────────────────────────────┐
+ │ /var/lib/postgresql/data  ◄──────┼── named volume   (managed by Docker)
+ │ /app/config               ◄──────┼── bind mount     (a host folder)
+ │ /tmp/cache                ◄──────┼── tmpfs          (RAM, gone on stop)
+ │ everything else                  │   writable layer (gone on docker rm)
+ └──────────────────────────────────┘
+</pre>
+    <figcaption>Three mount types plus the throw-away writable layer</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Named volume</th><th>Bind mount</th><th>tmpfs</th></tr></thead>
+    <tbody>
+      <tr><td>Where the data lives</td><td>Docker-managed area (<code>/var/lib/docker/volumes</code>)</td><td>Any host path you choose</td><td>Host memory</td></tr>
+      <tr><td>Syntax</td><td><code>-v pgdata:/path</code></td><td><code>-v /host/dir:/path</code> or <code>-v ./dir:/path</code></td><td><code>--tmpfs /path</code></td></tr>
+      <tr><td>Survives container removal</td><td>Yes</td><td>Yes (it is your folder)</td><td>No</td></tr>
+      <tr><td>Best for</td><td>Databases, uploads, anything the app owns</td><td>Dev: source code, config files, reading logs</td><td>Temporary or sensitive scratch data</td></tr>
+      <tr><td>Portability</td><td>High</td><td>Depends on host paths and permissions</td><td>High</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Persisting PostgreSQL data</h4>
+  <pre data-title="A named volume for the database"><code class="language-shell">$ docker volume create pgdata
+$ docker run -d --name pg -e POSTGRES_PASSWORD=devpass \
+    -v pgdata:/var/lib/postgresql/data postgres:16
+$ docker exec -it pg psql -U postgres -c "CREATE TABLE t(id int); INSERT INTO t VALUES (1);"
+$ docker rm -f pg                        # container gone ...
+$ docker run -d --name pg2 -e POSTGRES_PASSWORD=devpass \
+    -v pgdata:/var/lib/postgresql/data postgres:16
+$ docker exec -it pg2 psql -U postgres -c "SELECT * FROM t;"
+ id
+----
+  1
+(1 row)</code></pre>
+  <p>The data survived because the volume <code>pgdata</code> was mounted at the directory where
+  PostgreSQL stores its files. If you mount a volume with a name that does not exist, Docker creates it. If
+  you use a volume for a database, use the data directory documented on the image's Docker Hub page
+  (<code>/var/lib/postgresql/data</code> for the official PostgreSQL image; MySQL uses
+  <code>/var/lib/mysql</code>).</p>
+
+  <div class="co co-version">
+    <p class="co-t">PostgreSQL 18 image path change</p>
+    <p>Check the image page for newer major versions: some recent PostgreSQL images changed the recommended
+    mount point (for example to <code>/var/lib/postgresql</code> for 18+). Always read the "PGDATA" notes for
+    the exact tag you use, otherwise your data may not land in the volume. For <code>postgres:16</code> the
+    path above is correct.</p>
+  </div>
+
+  <h4>Bind mounts for development</h4>
+  <pre data-title="Mount a config file read-only and a data folder"><code class="language-shell">$ docker run -d --name shop-api -p 8080:8080 \
+    -v "$(pwd)/config/application-prod.yml:/app/config/application-prod.yml:ro" \
+    -v "$(pwd)/uploads:/app/uploads" \
+    shop-api:1.0</code></pre>
+  <p>The suffix <code>:ro</code> makes the mount read-only inside the container. Spring Boot automatically
+  reads <code>./config/application*.yml</code> relative to its working directory, so a mounted
+  <code>/app/config</code> folder overrides settings without rebuilding the image. In compose files use
+  relative paths such as <code>./config:/app/config</code>.</p>
+
+  <h4>Managing volumes</h4>
+  <pre data-title="Volume commands"><code class="language-shell">$ docker volume ls
+$ docker volume inspect pgdata        # shows the Mountpoint on the host
+$ docker volume rm pgdata             # fails if a container still uses it
+$ docker volume prune                 # remove volumes no container uses (data loss!)</code></pre>
+
+  <h4>Backing up a volume (brief)</h4>
+  <p>For databases, prefer a logical backup that the database understands. For any volume, you can archive it
+  with a throw-away container that mounts both the volume and a host folder:</p>
+  <pre data-title="Backup and restore"><code class="language-shell">$ docker exec pg pg_dump -U postgres shop &gt; shop-backup.sql          # logical dump
+$ docker run --rm -v pgdata:/data -v "$(pwd)":/backup alpine \
+    tar czf /backup/pgdata.tar.gz -C /data .                         # raw copy (stop the DB first)
+$ docker exec -i pg psql -U postgres shop &lt; shop-backup.sql          # restore a dump</code></pre>
+  <p>A raw copy of a running database's files may be inconsistent; stop the database first or use
+  <code>pg_dump</code>. Real production databases normally run outside Docker, as managed services (Amazon
+  RDS) with automated backups.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: docker compose down -v wipes your database</p>
+    <p><code>docker compose down</code> removes containers and networks but keeps named volumes.
+    <code>docker compose down -v</code> also deletes the volumes. People run it to "clean up" and lose the
+    local database; on a server it would be a disaster. Likewise <code>docker system prune --volumes</code> and
+    <code>docker volume prune</code>. Use <code>-v</code> deliberately, only when you want a fresh database.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>An anonymous volume (<code>-v /var/lib/data</code> with no name) is created on each run with a random
+      name, and silently piles up. Always name volumes.</li>
+      <li>A bind mount hides whatever the image had at that path. Mounting an empty host folder over
+      <code>/app</code> hides your JAR.</li>
+      <li><strong>Permission denied</strong> on a mounted folder: the container user's UID (a non-root
+      <code>spring</code> user) must have rights to the host folder. On Linux fix with <code>chown</code> or
+      <code>--user</code>; Docker Desktop on Windows/Mac usually hides this problem, which then appears on the Linux
+      server.</li>
+      <li>The first start of the PostgreSQL image runs <code>*.sql</code> and <code>*.sh</code> files from
+      <code>/docker-entrypoint-initdb.d</code>, but only when the data directory is empty.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you persist database data in Docker?"</p>
+    <ul>
+      <li>Mount a named volume at the database's data directory; the volume outlives the container.</li>
+      <li>Volume versus bind mount: Docker-managed and portable versus a host path for dev.</li>
+      <li>Know <code>down -v</code> deletes volumes; back up with <code>pg_dump</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-networks">
+  <h3>Docker networks and the localhost trap</h3>
+  <p class="tldr">Containers on the same user-defined network reach each other by name (Docker's built-in DNS);
+  inside a container <code>localhost</code> means that container itself, so a Spring Boot container must connect
+  to the database at <code>postgres:5432</code>, not <code>localhost:5432</code>.</p>
+
+  <h4>Network drivers in practice</h4>
+  <p>Docker gives every container a virtual network interface. The default and most common driver is
+  <strong>bridge</strong>: a private virtual switch inside the host, with its own subnet (for example
+  <code>172.17.0.0/16</code>). Containers on it get private IPs and reach the internet through NAT (see
+  <a href="#m2">Networking</a>).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Network</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td>Default <code>bridge</code></td><td>Every container joins it if you say nothing. Containers can reach each other by <em>IP</em> only, no names.</td></tr>
+      <tr><td>User-defined bridge</td><td>You create it (<code>docker network create shop-net</code>). Adds <strong>DNS by container name</strong> and better isolation. Compose creates one for you.</td></tr>
+      <tr><td><code>host</code></td><td>Container shares the host's network stack; no port mapping. Linux only in practice.</td></tr>
+      <tr><td><code>none</code></td><td>No networking.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Name resolution on a user-defined network</h4>
+  <pre data-title="Two containers talking by name"><code class="language-shell">$ docker network create shop-net
+$ docker run -d --name postgres --network shop-net \
+    -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=shop postgres:16
+$ docker run -d --name shop-api --network shop-net -p 8080:8080 \
+    -e SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/shop \
+    -e SPRING_DATASOURCE_USERNAME=postgres \
+    -e SPRING_DATASOURCE_PASSWORD=devpass \
+    shop-api:1.0
+$ docker exec shop-api getent hosts postgres      # (if the image has getent)
+172.18.0.2      postgres</code></pre>
+  <p>Docker runs an embedded DNS server (at <code>127.0.0.11</code> inside the container) that resolves a
+  container's name, and in compose also its <em>service</em> name, to its IP on that network. The IP changes
+  when the container is recreated, but the name does not, so always use names.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  B["Browser on host"] -->|"localhost:8080"| API
+  subgraph NET["Docker network shop-net"]
+    API["shop-api container"] -->|"postgres:5432"| PG[("postgres container")]
+    API -->|"redis:6379"| RD[("redis container")]
+  end
+</pre>
+    <figcaption>The browser uses a published port; containers use service names on the network</figcaption>
+  </figure>
+
+  <h4>The localhost trap</h4>
+  <p>Each container has its own network namespace, so <code>localhost</code> (127.0.0.1) inside the Spring Boot
+  container is <em>the Spring Boot container</em>. If your datasource URL is
+  <code>jdbc:postgresql://localhost:5432/shop</code>, the app looks for PostgreSQL inside its own container,
+  finds nothing, and fails:</p>
+  <pre class="out" data-title="The classic error"><code class="language-plaintext">org.postgresql.util.PSQLException: Connection to localhost:5432 refused.
+Check that the hostname and port are correct and that the postmaster is accepting TCP/IP connections.
+Caused by: java.net.ConnectException: Connection refused</code></pre>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: localhost points at the app's own container</p><pre><code class="language-yaml">SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/shop</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: use the service name on the shared network</p><pre><code class="language-yaml">SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/shop</code></pre></div>
+  </div>
+  <p>It works on your laptop when you run the app from the IDE because there <code>localhost</code> is the
+  host, where the database port is published. The same value fails inside a container. The fix is not
+  "publish more ports" but "use the service name". This is the number one Docker bug in Spring Boot
+  projects: whenever you see <em>connection refused</em> between containers, check the host name first.</p>
+
+  <h4>Publishing ports versus internal communication</h4>
+  <ul>
+    <li><code>-p 8080:8080</code> (or compose <code>ports</code>) opens a port on the <strong>host</strong> for
+    people and tools outside Docker: the browser, curl, an IDE database client.</li>
+    <li>Containers on the same network need <strong>no published ports</strong> to talk. The app reaches
+    <code>postgres:5432</code> directly. Do not publish the database port on a server unless you need it;
+    leaving it unpublished means the internet cannot reach it at all.</li>
+    <li>The port on the right of <code>host:container</code> is the container's port, the one used inside the
+    network. Mapping <code>5433:5432</code> changes only what the host sees; containers still use 5432.</li>
+  </ul>
+
+  <h4>Reaching the host from a container</h4>
+  <p>Sometimes the app in a container must call something running on your machine (a database you installed
+  locally). Docker Desktop provides the special name <code>host.docker.internal</code> that resolves to the
+  host. On Linux Engine you add it yourself:
+  <code>docker run --add-host=host.docker.internal:host-gateway …</code> (in compose:
+  <code>extra_hosts: ["host.docker.internal:host-gateway"]</code>). Use it only for development; production
+  services should be containers or managed services on a real network.</p>
+
+  <h4>Network commands</h4>
+  <pre data-title="Inspecting networks"><code class="language-shell">$ docker network ls
+$ docker network inspect shop-net      # subnet, attached containers and their IPs
+$ docker network connect shop-net pg   # attach a running container
+$ docker network rm shop-net</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the app inside Docker must bind to 0.0.0.0, and call others by service name</p>
+    <p>Spring Boot listens on all interfaces by default, so published ports work. If you set
+    <code>server.address=127.0.0.1</code> (as on a bare-metal server behind Nginx), a published port in Docker
+    will not reach the app; leave it unset in containers.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>On the default bridge there is no name resolution; <code>--link</code> is legacy. Use a user-defined
+      network (compose does this automatically).</li>
+      <li>Two compose projects get separate networks, so their services cannot see each other unless you attach
+      both to an <code>external</code> network.</li>
+      <li>Publishing <code>-p 5432:5432</code> on a cloud server exposes PostgreSQL to the internet. Docker
+      writes its own firewall rules, so <code>ufw</code> rules may not block published ports.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Spring Boot in Docker cannot connect to PostgreSQL. Why?"</p>
+    <ul>
+      <li>Usually the URL uses <code>localhost</code>, which is the container itself; use the service name
+      (<code>postgres</code>) on a shared network.</li>
+      <li>Also check: same network, database healthy before the app starts, correct credentials, and the
+      container's port (5432), not the host-mapped one.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-compose">
+  <h3>Docker Compose: Spring Boot, PostgreSQL and Redis with one command</h3>
+  <p class="tldr">A <code>compose.yaml</code> file describes all your containers, networks and volumes;
+  <code>docker compose up -d --build</code> builds and starts the whole stack, and
+  <code>depends_on</code> with <code>condition: service_healthy</code> makes the app wait until the database is
+  really ready.</p>
+
+  <h4>What Compose is for</h4>
+  <p>A real app is several containers: the API, a database, a cache, maybe Nginx. Starting them with long
+  <code>docker run</code> commands is error-prone. <strong>Docker Compose</strong> lets you declare them once in
+  YAML and manage them together. The file is named <code>compose.yaml</code> (older name
+  <code>docker-compose.yml</code> also works), and the command is <code>docker compose</code> (a space; the
+  old standalone tool was <code>docker-compose</code> with a hyphen). A top-level <code>version:</code> key is
+  obsolete in current Compose and can be left out.</p>
+
+  <h4>File structure</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Key</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>services</code></td><td>The containers; each key is a service name (also its DNS name)</td></tr>
+      <tr><td><code>image</code> / <code>build</code></td><td>Use a ready image, or build from a Dockerfile (<code>build: .</code>)</td></tr>
+      <tr><td><code>ports</code></td><td>Publish <code>"host:container"</code> ports</td></tr>
+      <tr><td><code>environment</code> / <code>env_file</code></td><td>Variables, inline or from a file</td></tr>
+      <tr><td><code>volumes</code></td><td>Mount named volumes or host paths</td></tr>
+      <tr><td><code>networks</code></td><td>Attach to networks (default one is created automatically)</td></tr>
+      <tr><td><code>depends_on</code></td><td>Start order; with <code>condition</code> also wait for health</td></tr>
+      <tr><td><code>healthcheck</code></td><td>Command that tells Docker if the service is ready</td></tr>
+      <tr><td><code>restart</code></td><td>Restart policy: <code>no</code>, <code>on-failure</code>, <code>always</code>, <code>unless-stopped</code></td></tr>
+      <tr><td><code>volumes</code> / <code>networks</code> (top level)</td><td>Declare the named volumes and networks used above</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A complete stack: Spring Boot + PostgreSQL + Redis</h4>
+  <p>Project layout:</p>
+  <pre class="out" data-title="Files"><code class="language-plaintext">shop-api/
+  Dockerfile
+  compose.yaml
+  .env              (not committed)
+  .env.example      (committed: names only, fake values)
+  pom.xml
+  src/</code></pre>
+  <pre data-title=".env (never commit this file)"><code class="language-properties">POSTGRES_DB=shop
+POSTGRES_USER=shop
+POSTGRES_PASSWORD=change-me-locally
+APP_PORT=8080</code></pre>
+  <pre data-title="compose.yaml"><code class="language-yaml">services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: shop-api:dev
+    ports:
+      - "${APP_PORT}:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      SPRING_PROFILES_ACTIVE: prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:</code></pre>
+
+  <h4>What each part does</h4>
+  <dl class="terms">
+    <dt>Service names</dt><dd><code>postgres</code>, <code>redis</code>, <code>api</code> are also the host
+    names on the automatic default network. That is why the datasource URL uses <code>postgres</code>.</dd>
+    <dt>${POSTGRES_DB}</dt><dd>Compose reads a <code>.env</code> file in the same folder and substitutes
+    <code>${VAR}</code> in the YAML. You can set a default with <code>${VAR:-value}</code> or require a
+    value with <code>${VAR:?error message}</code>.</dd>
+    <dt>image: postgres:16</dt><dd>A pinned version, not <code>latest</code>.</dd>
+    <dt>volumes: pgdata:/var/lib/postgresql/data</dt><dd>The named volume holds the database. It is declared
+    in the top-level <code>volumes:</code> block.</dd>
+    <dt>healthcheck (postgres)</dt><dd><code>pg_isready</code> exits 0 once PostgreSQL accepts connections.
+    Compose runs it every 5 s; after enough passes the service state becomes <em>healthy</em>.</dd>
+    <dt>healthcheck (redis)</dt><dd><code>redis-cli ping</code> returns PONG when Redis is ready.</dd>
+    <dt>build: .</dt><dd>Builds the API image from the Dockerfile in this folder (the multi-stage one from
+    before). <code>image: shop-api:dev</code> names the result.</dd>
+    <dt>ports: "${APP_PORT}:8080"</dt><dd>Only the API is published. PostgreSQL and Redis are reachable
+    from the API through the network but not from outside.</dd>
+    <dt>SPRING_DATASOURCE_URL …</dt><dd>Spring Boot's <strong>relaxed binding</strong> maps the environment
+    variable <code>SPRING_DATASOURCE_URL</code> to the property <code>spring.datasource.url</code> (upper case,
+    dots become underscores). No code change needed.</dd>
+    <dt>SPRING_DATA_REDIS_HOST</dt><dd>Property <code>spring.data.redis.host</code>.</dd>
+    <dt>depends_on … service_healthy</dt><dd>Start the API only after PostgreSQL and Redis report healthy.
+    Plain <code>depends_on: [postgres]</code> waits only until the container has <em>started</em>, which is
+    long before the database accepts connections.</dd>
+    <dt>restart: unless-stopped</dt><dd>Containers come back after a crash or a server reboot.</dd>
+  </dl>
+  <div class="co co-version">
+    <p class="co-t">Spring Boot version differences</p>
+    <p>Spring Boot 3.x and 4.x use <code>spring.data.redis.*</code>. Boot 2.x used <code>spring.redis.*</code>
+    (so <code>SPRING_REDIS_HOST</code>). Schema changes: set
+    <code>SPRING_JPA_HIBERNATE_DDL_AUTO=validate</code> and use Flyway or Liquibase in production.</p>
+  </div>
+
+  <h4>Compose commands</h4>
+  <pre data-title="Daily use"><code class="language-shell">$ docker compose up -d --build        # build images if needed, start everything in the background
+$ docker compose ps                   # status, ports and health of each service
+NAME            SERVICE    STATUS                  PORTS
+shop-api-api-1  api        Up 25 seconds           0.0.0.0:8080-&gt;8080/tcp
+shop-api-postgres-1  postgres   Up 40 seconds (healthy)   5432/tcp
+shop-api-redis-1     redis      Up 40 seconds (healthy)   6379/tcp
+$ docker compose logs -f api          # follow one service's logs
+$ docker compose exec postgres psql -U shop -d shop
+$ docker compose up -d --build api    # rebuild and recreate only the API
+$ docker compose restart api
+$ docker compose down                 # stop and remove containers and the network; keep volumes
+$ docker compose down -v              # ALSO delete volumes (database data!)
+$ docker compose config               # print the final file with variables substituted</code></pre>
+  <p><code>docker compose config</code> is the quickest way to check that variables from <code>.env</code>
+  were substituted as you expected. Compose names containers
+  <code>&lt;project&gt;-&lt;service&gt;-&lt;number&gt;</code>; the project name defaults to the folder name
+  (override with <code>-p</code> or a top-level <code>name:</code>).</p>
+
+  <h4>Overriding files and profiles (brief)</h4>
+  <ul>
+    <li><strong>Override files.</strong> Compose automatically merges <code>compose.yaml</code> with
+    <code>compose.override.yaml</code> if it exists — handy for developer-only settings (publishing the DB
+    port, bind-mounting code). For production use explicit files:
+    <code>docker compose -f compose.yaml -f compose.prod.yaml up -d</code>. Later files override earlier ones.</li>
+    <li><strong>Profiles.</strong> Add <code>profiles: ["tools"]</code> to a service (for example pgAdmin);
+    it starts only with <code>docker compose --profile tools up</code>.</li>
+  </ul>
+  <pre data-title="compose.override.yaml: dev extras (picked up automatically)"><code class="language-yaml">services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"     # let my IDE reach the database
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    profiles: ["tools"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: dev@example.com
+      PGADMIN_DEFAULT_PASSWORD: devonly
+    ports:
+      - "5050:80"</code></pre>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: the app starts before the database is ready</p>
+    <p>Without a healthcheck and <code>condition: service_healthy</code>, the API starts at the same time as
+    PostgreSQL, tries to connect for the first time during DB initialisation and crashes with
+    <em>Connection refused</em>. <code>restart: unless-stopped</code> may hide it by retrying, but the proper
+    fix is the healthcheck. Spring's own retries (for example <code>spring.datasource.hikari</code>
+    initialisation) are not a substitute.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: YAML indentation and quoting</p>
+    <ul>
+      <li>Use spaces, never tabs; two spaces per level; list items start with <code>- </code>.</li>
+      <li>Quote port mappings (<code>"8080:8080"</code>): YAML can read unquoted <code>xx:yy</code> numbers
+      below 60 as base-60 numbers.</li>
+      <li>In <code>environment:</code> map form write <code>KEY: value</code>; in list form
+      <code>- KEY=value</code>. Do not mix.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>depends_on</code> only controls start order at <code>up</code>; if PostgreSQL restarts later,
+      the API is not restarted. The app must handle reconnects (HikariCP does).</li>
+      <li>Changing a <code>.env</code> value does not recreate containers by itself; run
+      <code>docker compose up -d</code> again.</li>
+      <li>Changing <code>POSTGRES_PASSWORD</code> after the volume exists has no effect: the database was
+      initialised with the old one. Remove the volume (<code>down -v</code>) in dev, or change the password
+      inside the database.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>The same <code>compose.yaml</code> is used on a developer laptop and on a small single-server
+    production (an EC2 instance that runs <code>docker compose pull &amp;&amp; docker compose up -d</code>; see
+    <a href="#m4-cd">CD over SSH</a>). Larger systems move to Kubernetes or ECS, but the concepts —
+    services, networks, volumes, health — carry over.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you run Spring Boot with PostgreSQL in Docker?"</p>
+    <ul>
+      <li>Compose file with three services, a named volume for the DB, and env vars with service names.</li>
+      <li>Healthcheck + <code>condition: service_healthy</code> so the app waits; publish only the API port.</li>
+      <li><code>up -d --build</code>, <code>logs -f</code>, <code>down</code> (not <code>down -v</code>).</li>
+    </ul>
+  </div>
+</article>

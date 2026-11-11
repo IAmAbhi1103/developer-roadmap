@@ -1,0 +1,481 @@
+<article class="topic" id="m5-db-scaling-ladder">
+  <h3>The database scaling ladder</h3>
+  <p class="tldr">Scale a database in order of cost and risk: tune queries and indexes, scale up the machine,
+  add caching, add read replicas, partition big tables, and only then shard; denormalization and federation
+  are side tools along the way.</p>
+
+  <h4>Why a ladder</h4>
+  <p>The database is usually the first real bottleneck, because it holds shared state and cannot simply be
+  cloned like a stateless app server. Each step up the ladder buys more capacity but costs more complexity.
+  A strong answer climbs one rung at a time and says what number forces the next rung. Jumping straight
+  to sharding for 500 requests per second is a classic over-engineering mistake.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A[1 Tune queries and indexes] --> B[2 Scale up: bigger machine]
+  B --> C[3 Cache hot reads]
+  C --> D[4 Read replicas]
+  D --> E[5 Partition large tables]
+  E --> F[6 Shard across servers]
+</pre>
+    <figcaption>Climb only as far as the numbers require; each rung adds operational cost</figcaption>
+  </figure>
+
+  <h4>Rung by rung</h4>
+  <ol class="steps">
+    <li><strong>Query and index tuning.</strong> Find slow queries (<code>EXPLAIN</code>, slow-query log),
+    add the right indexes, remove N+1 queries, fix missing pagination, use connection pooling (HikariCP) and
+    proper pool sizes. One missing index can cost 100x. This is free capacity and always comes first
+    (<a href="03-sql-databases.html#m5">SQL · Module 5</a>).</li>
+    <li><strong>Scale up (vertical).</strong> More CPU, RAM and faster NVMe disks. RAM matters most:
+    if the working set (the hot data and indexes) fits in memory, reads are fast. Needs no code change, but has
+    a ceiling and a single point of failure.</li>
+    <li><strong>Caching.</strong> Move repeated reads to Redis or a local cache (<a href="#m5-caching-patterns">Caching</a>).
+    Often removes 80–95% of read load for read-heavy products. Does nothing for writes.</li>
+    <li><strong>Read replicas.</strong> Copy the data to followers and send reads to them
+    (<a href="#m5-replication">Replication</a>). Scales reads almost linearly; writes still go to one primary;
+    adds replication lag.</li>
+    <li><strong>Partitioning.</strong> Split one huge table into smaller pieces inside the same database
+    (by date or id range). Queries touching one partition scan far less data, old partitions can be dropped
+    or archived cheaply. Still one server.</li>
+    <li><strong>Sharding.</strong> Split data across several independent database servers so writes and
+    storage scale out (<a href="#m5-sharding">Sharding</a>). The biggest step: queries, transactions and
+    operations all become harder.</li>
+  </ol>
+
+  <h4>Partitioning vs sharding</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Partitioning</th><th>Sharding</th></tr></thead>
+    <tbody>
+      <tr><td>Where</td><td>Inside one database server</td><td>Across many servers</td></tr>
+      <tr><td>Goal</td><td>Faster queries, easier maintenance</td><td>Scale writes and storage beyond one machine</td></tr>
+      <tr><td>Transactions and joins</td><td>Work normally</td><td>Hard across shards</td></tr>
+      <tr><td>Application impact</td><td>Mostly none</td><td>Large: routing, shard key, resharding</td></tr>
+    </tbody>
+  </table></div>
+  <p>The word "partition" is also used loosely for "a shard" (Kafka partitions, DynamoDB partitions), so ask
+  which one is meant.</p>
+
+  <h4>Side tools</h4>
+  <ul>
+    <li><strong>Denormalization:</strong> store redundant data to avoid joins (copy the user's name into
+    each comment row, keep a precomputed <code>like_count</code>). Reads get faster; writes get more
+    complex and the copies can drift apart, so update them from one place or an event.</li>
+    <li><strong>Federation (functional partitioning):</strong> split the database by feature, not by row:
+    a users database, an orders database, a products database. Each is smaller and can be scaled and tuned
+    separately. The price is that joins across them move into application code, and it fits naturally with
+    microservices owning their data.</li>
+    <li><strong>CQRS-style read models:</strong> write to the main store, project data into a separate store
+    optimised for reading (a search index, a denormalised table).</li>
+    <li><strong>Archival:</strong> move old rows to cheap storage; smaller hot tables are faster.</li>
+    <li><strong>Choose a different database</strong> when the access pattern fits one better
+    (<a href="#m5-sql-nosql">SQL vs NoSQL</a>).</li>
+  </ul>
+
+  <h4>Worked reasoning</h4>
+  <p>Suppose the estimate says 7,000 peak requests per second, 90% reads (<a href="#m4-estimation">the
+  estimation example</a>). Reads would be 6,300 per second. With a 90% cache hit ratio only about 630 reads
+  per second reach the database. A single primary with a couple of replicas handles that and the 700 writes
+  per second easily. So the design needs cache plus replicas, not sharding, today. Sharding enters only when
+  the dataset grows beyond one server's disk (the estimate showed about 36 TB of metadata in five years) or
+  writes exceed what one primary can do (many thousands per second).</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistake: sharding to fix a slow query</p>
+    <p>If one query is slow, spreading the table across servers will not fix a missing index; it will only
+    make the problem 10 times larger and harder to debug. Measure first, then pick the rung that addresses
+    the measured limit: CPU, memory, disk IO, connections, or storage size.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"I would start with indexes and query tuning, then a cache and read replicas. Sharding is the last
+      resort because it breaks joins and transactions."</li>
+      <li>Say which limit you are hitting: read throughput (cache and replicas), write throughput or
+      storage size (sharding).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-replication">
+  <h3>Replication: leader–follower, multi-leader, leaderless</h3>
+  <p class="tldr">Replication keeps copies of the data on several nodes for availability and read scale;
+  the usual setup is one leader with followers, synchronous replication is safer but slower than
+  asynchronous, and asynchronous replication causes lag, which you handle with read-your-writes tricks.</p>
+
+  <h4>Why replicate</h4>
+  <p>Three reasons: <strong>availability</strong> (if the primary dies, a copy can take over),
+  <strong>read scalability</strong> (many followers serve reads), and <strong>latency</strong> (a copy near
+  the users). Replication does not scale writes (every copy must apply every write) and it does not replace
+  backups (a bad <code>DELETE</code> replicates too). For SQL basics see
+  <a href="03-sql-databases.html#m6">SQL · Module 6</a>.</p>
+
+  <h4>Leader–follower (primary–replica)</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  W[Writes] --> L[(Leader)]
+  L -->|replication log| F1[(Follower 1)]
+  L -->|replication log| F2[(Follower 2)]
+  R1[Reads] --> F1
+  R2[Reads] --> F2
+</pre>
+    <figcaption>All writes go to the leader; followers apply its log and serve reads</figcaption>
+  </figure>
+  <p>One node, the <strong>leader</strong>, accepts writes and records them in a log (the WAL in PostgreSQL,
+  the binlog in MySQL). <strong>Followers</strong> stream and replay the log. Reads can go to any follower.
+  It is simple, has no write conflicts (one writer), and is the default in PostgreSQL, MySQL and
+  most managed databases (RDS, Cloud SQL). If the leader fails, a follower is promoted
+  (<a href="#m4-availability">failover</a>).</p>
+
+  <h4>Synchronous vs asynchronous</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Synchronous</th><th>Asynchronous</th><th>Semi-synchronous</th></tr></thead>
+    <tbody>
+      <tr><td>Leader waits for</td><td>All followers to confirm</td><td>Nobody</td><td>At least one follower</td></tr>
+      <tr><td>Write latency</td><td>Higher; slowest follower</td><td>Lowest</td><td>Medium</td></tr>
+      <tr><td>Data loss on leader crash</td><td>None</td><td>Possible: recent writes not copied</td><td>Very unlikely</td></tr>
+      <tr><td>If a follower is down</td><td>Writes can stall</td><td>No effect</td><td>Switch to another follower</td></tr>
+    </tbody>
+  </table></div>
+  <p>Fully synchronous replication to all followers is rarely used because one slow node blocks writes. Most
+  systems use async, or semi-sync with one synchronous follower so a committed write exists on at least two
+  machines. This is the PACELC latency vs consistency choice in action
+  (<a href="#m4-cap">CAP and PACELC</a>).</p>
+
+  <h4>Replication lag and its anomalies</h4>
+  <p>With async replication a follower may be milliseconds to seconds (sometimes minutes under load) behind.
+  Readers see odd things:</p>
+  <ul>
+    <li><strong>Read-your-writes violation:</strong> you post a comment, the page reloads from a follower
+    and your comment is missing.</li>
+    <li><strong>Non-monotonic reads:</strong> one read hits a fresh follower, the next hits a stale one and
+    data seems to go back in time.</li>
+    <li><strong>Causality violation:</strong> a reply is visible but the question is not yet.</li>
+  </ul>
+  <p>Mitigations: read from the leader for the user's own data or for a few seconds after a write; route
+  critical reads (balances, checkout) to the leader; track the log position of the user's last write and read
+  only from a follower that has reached it; pin a user to one follower (monotonic reads); monitor lag and
+  take a lagging follower out of rotation. In Spring, a routing <code>DataSource</code> chooses leader or
+  follower by whether a transaction is read-only (<code>@Transactional(readOnly = true)</code>).</p>
+  <pre data-title="ReplicaRouting.java"><code class="language-java">import org.springframework.jdbc.datasource.lookup.AbstractRoutingDataSource;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+public class ReadWriteRoutingDataSource extends AbstractRoutingDataSource {
+    @Override
+    protected Object determineCurrentLookupKey() {
+        return TransactionSynchronizationManager.isCurrentTransactionReadOnly()
+            ? "replica" : "primary";      // keys registered as target data sources
+    }
+}</code></pre>
+  <p>Wrap the target sources in a <code>LazyConnectionDataSourceProxy</code> so the routing decision is made
+  after the transaction's read-only flag is set; this is a common gotcha.</p>
+
+  <h4>Failover details</h4>
+  <p>Promoting a follower means: detect the failure (heartbeats and timeouts), choose the most up-to-date
+  follower, reconfigure the others and the clients, and fence the old leader. Risks: with async replication
+  the promoted follower may lack the last few writes (lost or conflicting writes), the old leader may return
+  and believe it is still leader (<strong>split-brain</strong>), and a too-short timeout causes needless
+  failovers during a load spike. Tools: Patroni (PostgreSQL), MySQL group replication or orchestrators,
+  managed Multi-AZ setups.</p>
+
+  <h4>Multi-leader replication</h4>
+  <p>Several nodes accept writes, usually one leader per data centre, and replicate to each other. Benefits:
+  low write latency in each region, and each region keeps working if the link between them fails. Cost:
+  <strong>write conflicts</strong> (two users edit the same row in different regions). You need conflict
+  resolution: last-write-wins, per-field merge, application-level merge, or CRDTs. It also has tricky
+  corner cases with auto-incrementing keys, triggers and constraints. Use it only for real multi-region
+  writes, or offline-capable clients (a calendar app syncing a phone), and prefer to avoid it otherwise.</p>
+
+  <h4>Leaderless replication</h4>
+  <p>No leader: the client (or a coordinator node) sends each write to several replicas and reads from
+  several, using quorums (<a href="#m4-consistency-models">N, R, W</a>). Used by Cassandra, Riak and
+  DynamoDB-style stores. Strengths: no failover event, writes continue as long as a quorum is reachable,
+  good for multi-region and high availability. Costs: weaker consistency, conflict handling (vector clocks
+  or last-write-wins), read repair and anti-entropy to heal replicas, and no multi-row transactions in
+  general.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Model</th><th>Writes accepted by</th><th>Conflicts</th><th>Examples</th><th>Best for</th></tr></thead>
+    <tbody>
+      <tr><td>Leader–follower</td><td>One leader</td><td>None</td><td>PostgreSQL, MySQL, MongoDB replica set</td><td>Most applications</td></tr>
+      <tr><td>Multi-leader</td><td>One per region</td><td>Yes: must resolve</td><td>MySQL group replication in multi-primary mode, CouchDB, Active Directory</td><td>Multi-region writes, offline sync</td></tr>
+      <tr><td>Leaderless</td><td>Any replica (quorum)</td><td>Yes: versions, LWW</td><td>Cassandra, Riak, DynamoDB-style</td><td>Always-on, huge scale</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Sending a "read after write" to a follower and showing the user stale data.</li>
+      <li>Treating replicas as backups; deletions and corruption replicate too. Keep point-in-time backups.</li>
+      <li>Ignoring lag until a follower is minutes behind; alert on it.</li>
+      <li>Promoting an out-of-date follower without checking, and losing committed writes.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"One leader takes writes, followers serve reads asynchronously. Replication lag means I read my
+      own writes from the leader."</li>
+      <li>Explain sync vs async as a durability vs latency trade-off, and semi-sync as the compromise.</li>
+      <li>Say that replication scales reads and availability, not writes; for writes you shard.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-sharding">
+  <h3>Sharding: strategies, shard keys, hot spots and resharding</h3>
+  <p class="tldr">Sharding splits one logical database into independent shards on different servers so
+  writes and storage scale out; the shard key decides how well it works, and the costs are cross-shard
+  queries, cross-shard transactions, hot spots and painful resharding.</p>
+
+  <h4>The idea</h4>
+  <p>When one primary cannot hold the data or handle the writes, you split the rows by a rule. Each
+  <strong>shard</strong> is a complete database (usually with its own replicas) holding a subset of the
+  rows. A router (in the application, a library, or a proxy such as Vitess or a MongoDB <code>mongos</code>)
+  maps each request to the right shard.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A[App servers] --> R[Shard router]
+  R -->|user ids 0 to 3M| S1[(Shard 1)]
+  R -->|user ids 3M to 6M| S2[(Shard 2)]
+  R -->|user ids 6M to 9M| S3[(Shard 3)]
+</pre>
+    <figcaption>The router uses the shard key (user id) to pick exactly one shard for a single-user query</figcaption>
+  </figure>
+
+  <h4>Sharding strategies</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Strategy</th><th>Rule</th><th>Strengths</th><th>Weaknesses</th></tr></thead>
+    <tbody>
+      <tr><td>Range</td><td>Key ranges: A–H, I–P, Q–Z, or ids 1–1M</td><td>Range queries stay on few shards; easy to understand</td><td>Hot spots (new ids all land on the last shard); uneven sizes</td></tr>
+      <tr><td>Hash</td><td><code>hash(key) mod N</code> (or consistent hashing)</td><td>Even spread, few hot spots</td><td>Range queries scatter to all shards; mod N moves most keys when N changes</td></tr>
+      <tr><td>Directory / lookup</td><td>A table maps each key (or range) to a shard</td><td>Fully flexible; move one tenant at a time</td><td>The directory is a bottleneck and SPOF; extra lookup</td></tr>
+      <tr><td>Geographic</td><td>By region: India users on the Mumbai shard</td><td>Low latency, data residency laws</td><td>Uneven regions; cross-region users and queries</td></tr>
+      <tr><td>Tenant-based</td><td>By customer or tenant id</td><td>Isolation; a big tenant gets its own shard</td><td>One huge tenant is a hot spot</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Choosing the shard key</h4>
+  <p>This is the most important decision, and it is hard to change later. A good shard key:</p>
+  <ul>
+    <li><strong>Has high cardinality</strong> (many distinct values): <code>user_id</code> is good,
+    <code>country</code> or <code>status</code> is bad.</li>
+    <li><strong>Spreads load evenly</strong>: no single value attracts most of the traffic.</li>
+    <li><strong>Matches the main access pattern</strong>, so common queries touch one shard: shard orders by
+    <code>customer_id</code> if you mostly fetch "my orders".</li>
+    <li><strong>Is stable</strong>: a key that changes means moving the row between shards.</li>
+    <li><strong>Avoids monotonic values</strong> in range sharding (timestamps, auto-increment ids send all
+    new writes to the newest shard).</li>
+  </ul>
+
+  <h4>Hot spots</h4>
+  <p>A <strong>hot shard</strong> gets disproportionate load: a celebrity account, one giant tenant, today's
+  date when sharding by date, or a flash-sale product. Fixes: hash-based keys; add a random suffix or salt to
+  spread one hot key (and merge on read); give the heavy tenant a dedicated shard (directory-based); cache
+  the hot data; split the hot shard further.</p>
+
+  <h4>Resharding</h4>
+  <p>Data grows, so shards fill up and you must add more. With <code>hash mod N</code>, going from 3 shards
+  to 4 moves about 75% of keys, a huge migration. Better approaches:</p>
+  <ul>
+    <li><strong>Many logical shards on few servers:</strong> create, say, 256 logical shards up front and map
+    them to 4 servers. To grow, move whole logical shards to new servers; the key-to-shard mapping never
+    changes. This is the most common pragmatic design.</li>
+    <li><strong>Consistent hashing</strong> moves only about 1/N of the keys when a node joins
+    (<a href="#m5-consistent-hashing">next article</a>).</li>
+    <li><strong>Directory-based</strong> mapping lets you move one range or tenant at a time.</li>
+    <li>Do the move online: copy data in the background, keep it in sync (dual writes or change-data
+    capture), verify, switch traffic, delete the old copy.</li>
+  </ul>
+
+  <h4>What sharding breaks</h4>
+  <ul>
+    <li><strong>Cross-shard queries:</strong> "all orders over ₹10,000 today" must go to every shard and be
+    merged (scatter–gather): slow and fragile. Mitigate with a secondary index or search store, or by
+    designing queries around the shard key.</li>
+    <li><strong>Joins:</strong> across shards they happen in application code, or are avoided by
+    denormalizing, or by co-locating related data (shard orders and order items by the same customer id).</li>
+    <li><strong>Transactions:</strong> an ACID transaction across shards needs two-phase commit (slow and
+    blocking) or a saga with compensating actions (<a href="#m6">Module 6</a>). Prefer designs where one
+    business operation touches one shard.</li>
+    <li><strong>Unique ids:</strong> auto-increment ids collide across shards. Use UUIDs, a Snowflake-style
+    id (timestamp + machine id + sequence), or an id service.</li>
+    <li><strong>Operations:</strong> schema migrations, backups, monitoring and rebalancing now multiply by
+    the number of shards.</li>
+  </ul>
+  <p>Tools that provide sharding: Vitess (MySQL), Citus (PostgreSQL), MongoDB's built-in sharding,
+  Cassandra and DynamoDB (shard by design with a partition key), CockroachDB and Spanner (distributed SQL
+  that shards automatically and keeps transactions).</p>
+  <pre data-title="HashShardRouter.java"><code class="language-java">public class ShardRouter {
+    private final int logicalShards = 256;              // fixed, never changes
+    private final java.util.List&lt;String&gt; shardUrls;     // logical shard -&gt; server
+
+    public ShardRouter(java.util.List&lt;String&gt; shardUrls) {
+        this.shardUrls = shardUrls;                     // size = 256, many point to one server
+    }
+
+    public String urlFor(long userId) {
+        int logical = (int) Math.floorMod(Long.hashCode(userId), logicalShards);
+        return shardUrls.get(logical);                  // moving a logical shard = edit the list
+    }
+}</code></pre>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Sharding by a low-cardinality key such as country, status or boolean.</li>
+      <li>Starting with <code>hash mod N</code> and no plan for adding nodes.</li>
+      <li>Designing queries that always need all shards.</li>
+      <li>Sharding early, before replicas, caching and indexing are used up.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"I would shard by user id with a hash, using many logical shards so I can rebalance by moving
+      whole shards. Single-user queries touch one shard."</li>
+      <li>Always name the cost: cross-shard joins, transactions and resharding. Offer co-location or sagas.</li>
+      <li>Say what you would watch: shard size, per-shard QPS, and skew.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-consistent-hashing">
+  <h3>Consistent hashing and virtual nodes</h3>
+  <p class="tldr">Consistent hashing places nodes and keys on a ring so that adding or removing a node moves
+  only about 1/N of the keys instead of nearly all of them; virtual nodes give each server many points on the
+  ring for an even spread.</p>
+
+  <h4>The problem with hash mod N</h4>
+  <p>To pick a cache server for a key, the obvious rule is <code>server = hash(key) mod N</code>. It works
+  until N changes. With 3 servers going to 4, a key stays only if <code>hash mod 3 == hash mod 4</code>,
+  which is true for about 25% of keys. The other 75% now map to a different server: cache misses everywhere
+  (a stampede on the database), or in a sharded database, a huge data migration. Servers join and leave
+  constantly (autoscaling, failures), so we need a rule that moves few keys.</p>
+
+  <h4>The ring</h4>
+  <p>Map the hash space (for example 0 to 2<sup>32</sup> − 1) onto a circle. Hash each <em>server</em> to a
+  position on the ring. To find the server for a key, hash the key to a position and walk
+  <strong>clockwise</strong> to the first server you meet.</p>
+  <figure class="fig">
+<pre class="diagram">
+              0
+          ┌───────┐
+       S3 ·         · S1          Keys walk clockwise to the next server:
+      ·               ·           k1 → S1,  k2 → S2,  k3 → S3
+     ·                 ·          Remove S2: only k2 moves (to S3).
+      ·       ring     ·          Add S4 between S1 and S2: only keys
+       S2 ·           ·           between S1 and S4 move to S4.
+          └───────┘
+</pre>
+    <figcaption>Servers and keys share one hash ring; a key belongs to the next server clockwise</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Remove a server:</strong> only its keys move, all to the next server clockwise. Everyone else
+    is untouched.</li>
+    <li><strong>Add a server:</strong> it takes over only the keys between itself and the previous server.</li>
+    <li>On average only K/N keys move (K keys, N servers), instead of almost all.</li>
+  </ul>
+
+  <h4>The unevenness problem and virtual nodes</h4>
+  <p>With only a few servers placed by hash, the arcs between them differ in size, so one server may own 50%
+  of the ring while another owns 10%. When a server fails, all its load falls on a single neighbour, which may
+  then fail too.</p>
+  <p>The fix is <strong>virtual nodes (vnodes)</strong>: each physical server gets many positions on the
+  ring (100–200 is typical), by hashing <code>"serverA#0"</code>, <code>"serverA#1"</code>, and so on. The
+  arcs average out, so each server owns roughly 1/N of the ring. When a server leaves, its many small arcs go
+  to many different neighbours, spreading the extra load evenly. A bigger machine can simply be given more
+  vnodes (weighting). The cost is a larger ring to store and search, and more metadata to keep in sync.</p>
+
+  <h4>A Java sketch with TreeMap</h4>
+  <p>A <code>TreeMap</code> keeps keys sorted, and <code>ceilingEntry</code> finds the first position at or
+  after a hash in O(log n). If there is none, wrap around to the first entry.</p>
+  <pre data-title="ConsistentHashRing.java"><code class="language-java">import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Map;
+import java.util.TreeMap;
+
+public class ConsistentHashRing {
+    private final TreeMap&lt;Long, String&gt; ring = new TreeMap&lt;&gt;();
+    private final int vnodes;
+
+    public ConsistentHashRing(int vnodes) {
+        this.vnodes = vnodes;
+    }
+
+    public void addNode(String node) {
+        for (int i = 0; i &lt; vnodes; i++) {
+            ring.put(hash(node + "#" + i), node);        // many points per server
+        }
+    }
+
+    public void removeNode(String node) {
+        for (int i = 0; i &lt; vnodes; i++) {
+            ring.remove(hash(node + "#" + i));
+        }
+    }
+
+    public String nodeFor(String key) {
+        if (ring.isEmpty()) {
+            throw new IllegalStateException("no nodes");
+        }
+        Map.Entry&lt;Long, String&gt; e = ring.ceilingEntry(hash(key));   // next clockwise
+        if (e == null) {
+            e = ring.firstEntry();                                   // wrap around
+        }
+        return e.getValue();
+    }
+
+    private static long hash(String s) {
+        try {
+            byte[] d = MessageDigest.getInstance("MD5")
+                .digest(s.getBytes(StandardCharsets.UTF_8));
+            return ByteBuffer.wrap(d).getLong();           // first 8 bytes as a long
+        } catch (java.security.NoSuchAlgorithmException ex) {
+            throw new IllegalStateException(ex);
+        }
+    }
+}</code></pre>
+  <p>Usage: create <code>new ConsistentHashRing(150)</code>, call <code>addNode("cache-1")</code> for each
+  server, and route with <code>nodeFor("user:42")</code>. If you add <code>cache-4</code> later and compare the
+  routing for a large set of keys, only about a quarter of them change, whereas with <code>mod N</code> about
+  three quarters would. (MD5 is used here only as a well-spread hash, not for security; the sketch is not
+  thread-safe and ignores replication.)</p>
+  <p>For replication on the ring, store each key on the next R distinct physical servers clockwise (the
+  preference list in Dynamo-style systems).</p>
+
+  <h4>Where it is used</h4>
+  <ul>
+    <li><strong>Distributed caches</strong> (client libraries for Memcached use it; Redis Cluster uses a
+    related fixed scheme of 16,384 hash slots, which also moves only slots when nodes change).</li>
+    <li><strong>Databases:</strong> Cassandra and DynamoDB-style stores partition data on a ring with vnodes.</li>
+    <li><strong>Load balancing</strong> with affinity: send the same key (user, URL) to the same backend
+    so local caches stay warm.</li>
+    <li><strong>CDNs and object stores</strong> to decide which node stores which object.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A single very hot key still lands on one server; consistent hashing balances keys, not traffic.</li>
+      <li>Hash collisions between nodes are rare but must be handled (add a salt).</li>
+      <li>After adding a node, the new node's cache is cold; the keys it takes over miss once.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"With mod N, adding a server remaps most keys. With consistent hashing only about 1/N move."</li>
+      <li>"Virtual nodes smooth the distribution and spread a failed node's load across many peers."</li>
+      <li>Be ready to code the TreeMap version: <code>ceilingEntry</code> with wrap-around.</li>
+    </ul>
+  </div>
+</article>

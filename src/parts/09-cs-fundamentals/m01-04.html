@@ -1,0 +1,350 @@
+<article class="topic" id="m1-deadlock-basics">
+  <h3>Deadlock: conditions, resource allocation graphs and prevention</h3>
+  <p class="tldr">A deadlock is a state where a set of processes each hold a resource and wait for one held by another in the set, so none can ever proceed; it needs four conditions together (mutual exclusion, hold and wait, no preemption, circular wait), and prevention works by making at least one of them impossible.</p>
+
+  <h4>What is a deadlock?</h4>
+  <p>A <strong>deadlock</strong> is a permanent blocking of a set of processes or threads, each waiting for a resource that another member of the set holds. Nobody can release anything, so nobody ever moves. A resource can be physical (a printer, a disk) or logical (a mutex, a file lock, a database row lock).</p>
+  <p>The everyday picture: a narrow bridge where two cars meet in the middle and neither will reverse. The software picture: thread 1 holds lock A and wants B, while thread 2 holds lock B and wants A. In banking code this is "transfer from account X to Y" running at the same time as "transfer from Y to X".</p>
+  <p>A process uses a resource in three steps: <strong>request</strong> (wait if not free), <strong>use</strong>, <strong>release</strong>.</p>
+
+  <h4>The four necessary (Coffman) conditions</h4>
+  <p>A deadlock can occur <em>only if all four</em> hold at the same time:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Condition</th><th>Meaning</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Mutual exclusion</strong></td><td>At least one resource can be used by only one process at a time.</td><td>A lock, a printer</td></tr>
+      <tr><td><strong>Hold and wait</strong></td><td>A process holding some resources is waiting to get more.</td><td>Holds lock A, asks for lock B</td></tr>
+      <tr><td><strong>No preemption</strong></td><td>A resource can be released only voluntarily by its holder; the OS cannot take it away.</td><td>You cannot yank a mutex away from a thread</td></tr>
+      <tr><td><strong>Circular wait</strong></td><td>There is a cycle P1 → P2 → ... → Pn → P1 where each waits for a resource held by the next.</td><td>T1 waits for T2, T2 waits for T1</td></tr>
+    </tbody>
+  </table></div>
+  <p>The conditions are necessary, not by themselves sufficient: with all four present a deadlock is <em>possible</em>; the circular wait actually closes the loop. Break any one and deadlock cannot happen. This is the key to prevention.</p>
+
+  <h4>Resource allocation graph (RAG)</h4>
+  <p>A <strong>resource allocation graph</strong> shows the state precisely. It has two kinds of nodes: processes (circles) and resources (rectangles; dots inside a rectangle are the instances of that resource). Two kinds of edges: a <strong>request edge</strong> P → R (P is waiting for R) and an <strong>assignment edge</strong> R → P (an instance of R is held by P).</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  P1((P1)) -->|requests| R2[R2]
+  R2 -->|held by| P2((P2))
+  P2 -->|requests| R1[R1]
+  R1 -->|held by| P1
+</pre>
+    <figcaption>A cycle in a graph with one instance per resource: P1 and P2 are deadlocked</figcaption>
+  </figure>
+  <p>Reading the graph here: P1 holds R1 and wants R2; P2 holds R2 and wants R1. The cycle P1 → R2 → P2 → R1 → P1 is a deadlock. The rules for reading any RAG:</p>
+  <ul>
+    <li><strong>No cycle</strong> → no deadlock.</li>
+    <li><strong>Cycle, and every resource has a single instance</strong> → deadlock for sure.</li>
+    <li><strong>Cycle, but some resources have several instances</strong> → deadlock is only <em>possible</em>. Example: a cycle through R1 (two instances), where the second instance is held by P3 outside the cycle. When P3 releases it, a waiting process gets it and the cycle breaks. So with multiple instances, a cycle is necessary but not sufficient.</li>
+  </ul>
+
+  <h4>Deadlock in Java</h4>
+  <pre data-title="DeadlockDemo.java"><code class="language-java">public class DeadlockDemo {
+    private static final Object lockA = new Object();
+    private static final Object lockB = new Object();
+
+    public static void main(String[] args) {
+        Thread t1 = new Thread(() -&gt; {
+            synchronized (lockA) {
+                System.out.println("T1 holds A, wants B");
+                pause();
+                synchronized (lockB) { System.out.println("T1 got both"); }
+            }
+        }, "T1");
+        Thread t2 = new Thread(() -&gt; {
+            synchronized (lockB) {                  // opposite order: the bug
+                System.out.println("T2 holds B, wants A");
+                pause();
+                synchronized (lockA) { System.out.println("T2 got both"); }
+            }
+        }, "T2");
+        t1.start();
+        t2.start();
+    }
+
+    private static void pause() {
+        try { Thread.sleep(200); } catch (InterruptedException e) { }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (the program then hangs forever)"><code class="language-plaintext">T1 holds A, wants B
+T2 holds B, wants A</code></pre>
+  <p>All four conditions are present: the locks are exclusive, each thread holds one while waiting for the other, a <code>synchronized</code> lock cannot be taken away, and the wait is circular. Run <code>jstack &lt;pid&gt;</code> (or <code>jcmd &lt;pid&gt; Thread.print</code>) and it prints "Found one Java-level deadlock" with the two threads and their locks. Code can also detect it with <code>ThreadMXBean.findDeadlockedThreads()</code>. More Java detail and the fix are in <a href="02-core-java.html#m6">Core Java · Module 6</a>.</p>
+
+  <h4>Deadlock vs starvation vs livelock</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Problem</th><th>What happens</th><th>CPU use</th><th>Example / fix</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Deadlock</strong></td><td>A group of processes wait for each other forever</td><td>None: all blocked</td><td>Two locks in opposite orders. Fix: lock ordering, timeouts</td></tr>
+      <tr><td><strong>Starvation</strong></td><td>One process waits indefinitely while others progress</td><td>System is busy; the victim never runs</td><td>Low priority never scheduled; writer behind endless readers. Fix: aging, fair locks</td></tr>
+      <tr><td><strong>Livelock</strong></td><td>Processes keep changing state in response to each other but make no progress</td><td>High: they are active</td><td>Two people in a corridor both step aside again and again; retry loops that collide forever. Fix: random back-off</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Four ways to handle deadlock</h4>
+  <ol class="steps">
+    <li><strong>Prevention:</strong> design the system so one Coffman condition can never hold.</li>
+    <li><strong>Avoidance:</strong> let all four be possible, but never enter an unsafe state (needs advance knowledge; <a href="#m1-bankers">Banker's algorithm</a>).</li>
+    <li><strong>Detection and recovery:</strong> allow deadlocks, find them, then break them (<a href="#m1-deadlock-detection-recovery">detection and recovery</a>).</li>
+    <li><strong>Ignore it</strong> (the <strong>ostrich algorithm</strong>, head in the sand): assume deadlocks are rare and reboot or kill when it happens. Windows and Unix general-purpose kernels largely take this approach for application-level deadlocks because the cost of prevention is higher than the damage of a rare deadlock.</li>
+  </ol>
+
+  <h4>Prevention: break one condition</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Break this</th><th>How</th><th>Drawback</th></tr></thead>
+    <tbody>
+      <tr><td>Mutual exclusion</td><td>Make resources sharable (read-only files, lock-free structures)</td><td>Impossible for inherently exclusive resources like a printer or a write lock</td></tr>
+      <tr><td>Hold and wait</td><td>Request all resources at once before starting, or release everything before asking for more</td><td>Low resource utilisation; starvation of processes needing popular resources; may not know needs in advance</td></tr>
+      <tr><td>No preemption</td><td>If a request cannot be granted, the process releases what it holds and retries later; or the OS preempts the holder</td><td>Works for CPU state and memory, not for printers or half-finished updates</td></tr>
+      <tr><td>Circular wait</td><td>Give all resources a global number; processes must request in increasing order</td><td>Awkward to impose; unnatural order for the application</td></tr>
+    </tbody>
+  </table></div>
+  <p>Breaking <strong>circular wait</strong> by lock ordering is the most practical, and it is what you do in real code. The deadlock above disappears if both threads take <code>lockA</code> before <code>lockB</code>. A transfer between two accounts can lock the account with the smaller id first. Another practical technique is <code>ReentrantLock.tryLock(timeout)</code>: if the second lock cannot be had in time, release the first and retry. That breaks no-preemption/hold-and-wait voluntarily. Beware that retry loops with identical timing can cause livelock, so add a random delay.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: all four conditions must hold at once</p>
+    <p>If an interview question asks "which condition would you remove?", the answer in practice is circular wait (lock ordering), because the other three are usually part of the problem definition.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A single thread can deadlock with itself on a non-reentrant lock (locking twice). Java's intrinsic locks are reentrant, so this does not happen there.</li>
+      <li>Deadlock is not only about locks: a full pipe plus a waiting parent, a thread pool whose tasks wait for other tasks in the same pool (thread starvation deadlock), and database row locks can all deadlock.</li>
+      <li>Databases detect deadlocks themselves and abort one transaction (see <a href="#m3">DBMS theory</a>).</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: confusing a cycle with a certain deadlock</p>
+    <p>A cycle in a resource allocation graph with multi-instance resources does not prove deadlock. Check whether a process outside the cycle can free an instance.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is deadlock? What are the necessary conditions? How do you prevent it?"</p>
+    <ul>
+      <li>Define it with a two-lock example. List the four Coffman conditions by name and meaning.</li>
+      <li>Give the four strategies: prevention, avoidance, detection and recovery, ignore. For each prevention row, name the drawback.</li>
+      <li>Show you know the practical fix: global lock ordering and <code>tryLock</code> with timeout.</li>
+      <li>Distinguish deadlock, starvation and livelock.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-bankers">
+  <h3>Deadlock avoidance and the Banker's algorithm</h3>
+  <p class="tldr">The Banker's algorithm grants a request only if the system stays in a safe state, meaning there is an order in which every process can still finish; it needs each process's maximum demand declared in advance and is checked with the safety algorithm.</p>
+
+  <h4>Safe and unsafe states</h4>
+  <p>Avoidance needs extra information: before running, each process declares the <strong>maximum</strong> number of instances of each resource it may ever need. The OS then checks every request against the current state.</p>
+  <ul>
+    <li>A state is <strong>safe</strong> if there is at least one <strong>safe sequence</strong> &lt;P<sub>a</sub>, P<sub>b</sub>, ...&gt; such that each process can get its remaining need from what is free plus what the earlier processes in the sequence will give back when they finish.</li>
+    <li>A state is <strong>unsafe</strong> if no safe sequence exists. Unsafe does not mean deadlocked yet; it means deadlock is <em>possible</em>, depending on future requests.</li>
+    <li>A deadlocked state is always unsafe. The OS keeps the system out of unsafe states.</li>
+  </ul>
+  <p>The banker analogy: a bank never lends cash in a way that leaves it unable to satisfy all its customers' maximum credit lines one after another.</p>
+
+  <h4>The data structures</h4>
+  <p>For <em>n</em> processes and <em>m</em> resource types:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Structure</th><th>Size</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>Available</code></td><td>vector of m</td><td>Free instances of each resource type right now</td></tr>
+      <tr><td><code>Max</code></td><td>n × m</td><td>Maximum demand of each process</td></tr>
+      <tr><td><code>Allocation</code></td><td>n × m</td><td>Instances each process currently holds</td></tr>
+      <tr><td><code>Need</code></td><td>n × m</td><td>Remaining need: <code>Need = Max − Allocation</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The safety algorithm</h4>
+  <ol class="steps">
+    <li>Set <code>Work = Available</code> and mark every process unfinished.</li>
+    <li>Find an unfinished process Pi with <code>Need[i] ≤ Work</code> (every resource type). If none exists, go to step 4.</li>
+    <li>Pretend Pi runs to completion and returns its resources: <code>Work = Work + Allocation[i]</code>; mark Pi finished. Go back to step 2.</li>
+    <li>If every process is finished, the state is <strong>safe</strong> (the order you picked is a safe sequence). Otherwise it is <strong>unsafe</strong>.</li>
+  </ol>
+
+  <h4>Worked example: is the state safe?</h4>
+  <p>The system has three resource types A, B, C with 10, 5 and 7 instances in total, and five processes. Current snapshot:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Process</th><th>Allocation (A B C)</th><th>Max (A B C)</th><th>Need = Max − Allocation</th></tr></thead>
+    <tbody>
+      <tr><td>P0</td><td>0 1 0</td><td>7 5 3</td><td>7 4 3</td></tr>
+      <tr><td>P1</td><td>2 0 0</td><td>3 2 2</td><td>1 2 2</td></tr>
+      <tr><td>P2</td><td>3 0 2</td><td>9 0 2</td><td>6 0 0</td></tr>
+      <tr><td>P3</td><td>2 1 1</td><td>2 2 2</td><td>0 1 1</td></tr>
+      <tr><td>P4</td><td>0 0 2</td><td>4 3 3</td><td>4 3 1</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Available.</strong> Allocated totals: A = 0 + 2 + 3 + 2 + 0 = 7, B = 1 + 0 + 0 + 1 + 0 = 2, C = 0 + 0 + 2 + 1 + 2 = 5. So Available = (10 − 7, 5 − 2, 7 − 5) = <strong>(3, 3, 2)</strong>.</p>
+  <p><strong>Safety check.</strong> Start with Work = (3, 3, 2).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Step</th><th>Choose</th><th>Need ≤ Work?</th><th>Work after releasing Allocation</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>P1</td><td>(1,2,2) ≤ (3,3,2) yes</td><td>(3,3,2) + (2,0,0) = (5,3,2)</td></tr>
+      <tr><td>2</td><td>P3</td><td>(0,1,1) ≤ (5,3,2) yes</td><td>(5,3,2) + (2,1,1) = (7,4,3)</td></tr>
+      <tr><td>3</td><td>P4</td><td>(4,3,1) ≤ (7,4,3) yes</td><td>(7,4,3) + (0,0,2) = (7,4,5)</td></tr>
+      <tr><td>4</td><td>P0</td><td>(7,4,3) ≤ (7,4,5) yes</td><td>(7,4,5) + (0,1,0) = (7,5,5)</td></tr>
+      <tr><td>5</td><td>P2</td><td>(6,0,0) ≤ (7,5,5) yes</td><td>(7,5,5) + (3,0,2) = (10,5,7)</td></tr>
+    </tbody>
+  </table></div>
+  <p>All five finish and the final Work (10, 5, 7) equals the total resources, a good sanity check. The state is <strong>safe</strong> with safe sequence <strong>&lt;P1, P3, P4, P0, P2&gt;</strong>. Other safe sequences exist; one is enough. (At the start P0, P2 and P4 cannot go first, because their needs exceed (3,3,2).)</p>
+
+  <h4>The resource-request algorithm</h4>
+  <p>When process Pi asks for <code>Request[i]</code>:</p>
+  <ol class="steps">
+    <li>If <code>Request ≤ Need[i]</code> is false, raise an error: the process exceeded its declared maximum.</li>
+    <li>If <code>Request ≤ Available</code> is false, Pi must wait: the resources are not free.</li>
+    <li>Otherwise <strong>pretend</strong> to grant it: <code>Available −= Request; Allocation[i] += Request; Need[i] −= Request</code>.</li>
+    <li>Run the safety algorithm on the pretend state. If safe, make the grant permanent. If unsafe, undo the pretend change and make Pi wait.</li>
+  </ol>
+  <p><strong>Request 1: P1 asks for (1, 0, 2).</strong> Check: (1,0,2) ≤ Need (1,2,2) yes; (1,0,2) ≤ Available (3,3,2) yes. Pretend: Available = (2,3,0), P1 Allocation = (3,0,2), P1 Need = (0,2,0). Safety with Work = (2,3,0): P1 can go (needs (0,2,0)) → Work (5,3,2); P3 (0,1,1) → (7,4,3); P4 (4,3,1) → (7,4,5); P0 (7,4,3) → (7,5,5); P2 (6,0,0) → (10,5,7). Safe, sequence &lt;P1, P3, P4, P0, P2&gt;. The request is <strong>granted</strong>.</p>
+  <p><strong>Request 2 (from the new state): P0 asks for (0, 2, 0).</strong> Check: (0,2,0) ≤ Need (7,4,3) yes; (0,2,0) ≤ Available (2,3,0) yes. Pretend: Available = (2,1,0), P0 Allocation = (0,3,0), P0 Need = (7,2,3). Safety with Work = (2,1,0): P0 needs (7,2,3) no; P1 needs (0,2,0), B: 2 &gt; 1 no; P2 needs (6,0,0) no; P3 needs (0,1,1), C: 1 &gt; 0 no; P4 needs (4,3,1) no. Nobody can finish: <strong>unsafe</strong>, so the request is <strong>denied</strong> and P0 waits, even though the resources are physically free.</p>
+  <p>That last point is the cost of avoidance: it can delay a process that, in hindsight, would not have deadlocked.</p>
+
+  <h4>Cost and limits</h4>
+  <ul>
+    <li>Running the safety check takes roughly <code>O(m × n²)</code> operations per request.</li>
+    <li>It needs the <strong>maximum demand known up front</strong>, a fixed number of processes and resources, and processes that always release what they hold. Real systems rarely satisfy these, so general-purpose OSes do not use the Banker's algorithm. It is mainly an exam and design-thinking tool, though the idea (check safety before granting) is used in some resource managers.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: Banker's algorithm checks, in order, Request ≤ Need, Request ≤ Available, then safety</p>
+    <p>Do all three. Skipping the first check lets a process exceed its declared maximum; skipping the last is simply prevention by guesswork.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Unsafe is not deadlock: an unsafe state may never actually deadlock if processes happen to release resources early. Avoidance is conservative.</li>
+      <li>Several different safe sequences may exist; any of them proves safety. Do not lose marks for finding a different one.</li>
+      <li>For a single-instance resource, avoidance can use a <em>claim edge</em> in the resource allocation graph instead: grant a request only if converting the claim edge to an assignment edge creates no cycle.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using Max instead of Need in the safety check</p>
+    <p>Compare <code>Need</code> (what the process still wants) with <code>Work</code>, never <code>Max</code>. Also remember to add the process's <em>Allocation</em> (not Need) back to Work when it finishes.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain the Banker's algorithm"</p>
+    <ul>
+      <li>Avoidance: grant a request only if the resulting state is safe. Safe = a sequence exists in which every process can finish.</li>
+      <li>Four structures: Available, Max, Allocation, Need = Max − Allocation.</li>
+      <li>Walk through the safety algorithm with Work and the Need ≤ Work test; then the request algorithm.</li>
+      <li>Limits: needs maximum demands in advance; overhead; unsafe does not mean deadlocked.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-deadlock-detection-recovery">
+  <h3>Deadlock detection and recovery</h3>
+  <p class="tldr">Instead of preventing deadlock, the system lets it happen, periodically searches for it (a cycle in a wait-for graph, or a Banker-style check for multi-instance resources) and then breaks it by terminating processes or preempting resources.</p>
+
+  <h4>Detection with single-instance resources: the wait-for graph</h4>
+  <p>When every resource has one instance, simplify the allocation graph by removing the resource nodes. Draw an edge <strong>Pi → Pj</strong> if Pi is waiting for a resource held by Pj. This is the <strong>wait-for graph</strong>. The system runs a cycle-detection algorithm on it from time to time (depth-first search, <code>O(n²)</code> in the number of processes in the worst case). <strong>A cycle means a deadlock</strong>, and the processes on the cycle are the deadlocked ones.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Resource allocation graph (P requests R: P ──► R; R held by P: R ──► P)
+
+   P1 ──► R1 ──► P2 ──► R2 ──► P3 ──► R3 ──► P1
+
+ Wait-for graph (resource nodes removed: P1 waits for P2, P2 for P3, P3 for P1)
+
+   P1 ──► P2 ──► P3 ──► P1      (a cycle: all three are deadlocked)
+</pre>
+    <figcaption>Collapsing resource nodes gives the wait-for graph; a cycle means deadlock</figcaption>
+  </figure>
+  <p>Database engines work this way: the lock manager keeps a graph of which transaction waits for which, finds a cycle and aborts one transaction (the "victim"), and your application sees a deadlock error and must retry. See <a href="#m3">DBMS theory</a> for transactions and locking.</p>
+
+  <h4>Detection with multiple instances</h4>
+  <p>With several instances of a resource, a cycle is not enough, so a variant of the Banker's safety algorithm is used. It has <code>Available</code>, <code>Allocation</code> and a <code>Request</code> matrix (what each process is currently waiting for). It optimistically assumes a process that can be satisfied now will finish and release everything, which is a way of asking "is there any order in which everyone can finish?"</p>
+  <ol class="steps">
+    <li>Set <code>Work = Available</code>. For each process, mark it finished if its <code>Allocation</code> is all zero, else unfinished.</li>
+    <li>Find an unfinished Pi with <code>Request[i] ≤ Work</code>. If none, go to step 4.</li>
+    <li><code>Work = Work + Allocation[i]</code>; mark Pi finished; go to step 2.</li>
+    <li>Any process still unfinished is <strong>deadlocked</strong>.</li>
+  </ol>
+  <p><strong>Worked example.</strong> Resources A, B, C with 7, 2, 6 instances; five processes:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Process</th><th>Allocation (A B C)</th><th>Request (A B C)</th></tr></thead>
+    <tbody>
+      <tr><td>P0</td><td>0 1 0</td><td>0 0 0</td></tr>
+      <tr><td>P1</td><td>2 0 0</td><td>2 0 2</td></tr>
+      <tr><td>P2</td><td>3 0 3</td><td>0 0 0</td></tr>
+      <tr><td>P3</td><td>2 1 1</td><td>1 0 0</td></tr>
+      <tr><td>P4</td><td>0 0 2</td><td>0 0 2</td></tr>
+    </tbody>
+  </table></div>
+  <p>Allocated totals: A = 0 + 2 + 3 + 2 + 0 = 7, B = 1 + 0 + 0 + 1 + 0 = 2, C = 0 + 0 + 3 + 1 + 2 = 6. So Available = (0, 0, 0). Work = (0,0,0):</p>
+  <ul>
+    <li>P0: Request (0,0,0) ≤ Work: yes → Work = (0,1,0).</li>
+    <li>P2: Request (0,0,0) ≤ (0,1,0): yes → Work = (3,1,3).</li>
+    <li>P3: Request (1,0,0) ≤ (3,1,3): yes → Work = (5,2,4).</li>
+    <li>P1: Request (2,0,2) ≤ (5,2,4): yes → Work = (7,2,4).</li>
+    <li>P4: Request (0,0,2) ≤ (7,2,4): yes → Work = (7,2,6).</li>
+  </ul>
+  <p>Everyone can finish (for example in the order P0, P2, P3, P1, P4), so <strong>there is no deadlock</strong>. Now suppose P2 makes one extra request for (0, 0, 1). Work starts at (0,0,0): only P0 can finish (Work becomes (0,1,0)). P1 needs (2,0,2), P2 needs (0,0,1), P3 needs (1,0,0), P4 needs (0,0,2): none fits within (0,1,0). So <strong>P1, P2, P3 and P4 are deadlocked</strong>.</p>
+
+  <h4>When to run detection</h4>
+  <ul>
+    <li><strong>On every request that cannot be granted immediately:</strong> finds deadlock as early as possible and identifies the process that caused it, but costs a lot of CPU.</li>
+    <li><strong>At fixed intervals</strong> (say every hour) or <strong>when CPU utilisation drops</strong> below a threshold (a deadlock stops useful work): cheaper, but you may not know which process closed the cycle.</li>
+  </ul>
+
+  <h4>Recovery</h4>
+  <p>Once a deadlock is found, there are two families of recovery.</p>
+  <p><strong>1. Process termination</strong></p>
+  <ul>
+    <li><em>Abort all deadlocked processes:</em> certain to break it, but throws away all their work.</li>
+    <li><em>Abort one at a time</em> until the cycle disappears: less waste, but the detection algorithm runs after every abort.</li>
+  </ul>
+  <p>Choosing the victim: lowest priority, least CPU time used so far, fewest resources held, closest to finishing, number of other processes that must be aborted too, and whether it is interactive or batch.</p>
+  <p><strong>2. Resource preemption</strong></p>
+  <ul>
+    <li><em>Select a victim</em> (minimise cost, as above).</li>
+    <li><em>Rollback:</em> return the victim to a safe earlier state (a checkpoint) from which it can restart; databases roll back the aborted transaction.</li>
+    <li><em>Avoid starvation:</em> if the same process is always chosen as the victim, it never finishes. Include the number of rollbacks in the cost, so a process already rolled back often is not picked again.</li>
+  </ul>
+
+  <h4>Detection in Java and in practice</h4>
+  <pre data-title="DetectDeadlock.java"><code class="language-java">import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
+
+public class DetectDeadlock {
+    // call this from a monitoring thread, for example once every few seconds
+    static void check() {
+        ThreadMXBean bean = ManagementFactory.getThreadMXBean();
+        long[] ids = bean.findDeadlockedThreads();      // null if none
+        if (ids != null) {
+            for (ThreadInfo info : bean.getThreadInfo(ids)) {
+                System.out.println("Deadlocked: " + info.getThreadName()
+                        + " waits for " + info.getLockName()
+                        + " held by " + info.getLockOwnerName());
+            }
+        }
+    }
+}</code></pre>
+  <p>Java can <em>detect</em> a deadlock but cannot recover automatically; you cannot safely kill a thread, so the usual recovery is to restart the service. That is why the best strategy for application code is prevention through lock ordering and timeouts, with a thread dump (<code>jstack</code>) taken when a service hangs. Spring Boot Actuator can expose thread dumps; see <a href="04-spring-boot.html#m6">Spring Boot · Module 6</a>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the wait-for graph is valid only for single-instance resources</p>
+    <p>For multi-instance resources use the Banker-style detection with the <code>Request</code> matrix. A cycle alone is not a proof there.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Processes that do not hold anything (Allocation all zero) cannot be part of a deadlock, which is why step 1 marks them finished.</li>
+      <li>A thread waiting on I/O or a sleep is not deadlocked even if it has been waiting a long time; deadlock needs a circular wait among the processes themselves.</li>
+      <li>Rolling back a process that has already produced external effects (sent an email, charged a card) is not always possible; only systems with transactions or idempotent operations recover cleanly.</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>You meet deadlock recovery in databases: PostgreSQL reports "deadlock detected" and aborts one transaction; the application should catch the error and retry the whole transaction. In services, a hung request thread pool is often a deadlock or a stuck downstream call: take two thread dumps a few seconds apart and compare. Timeouts on every lock, query and HTTP call turn a permanent deadlock into a failed request.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you detect and recover from deadlock?"</p>
+    <ul>
+      <li>Detection: cycle in the wait-for graph (single instances) or the Banker-style algorithm with a Request matrix (multiple instances).</li>
+      <li>Recovery: abort all deadlocked processes or one at a time; or preempt resources with rollback. Mention victim selection and starvation of the victim.</li>
+      <li>State the trade-off against prevention and avoidance, and the ostrich approach used by most general-purpose systems.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,518 @@
+<div class="mintro">
+  <p>Almost every real API has users, and almost every user-facing bug that hurts a company is a security bug: a recruiter editing another recruiter's job, a candidate reading all applications, a leaked password table. <strong>Spring Security</strong> is the standard framework that protects Spring Boot applications. It is big, and the old tutorials are mostly out of date, so this module teaches the current style (the lambda DSL, no <code>WebSecurityConfigurerAdapter</code>) from first principles.</p>
+  <p>You will first understand what happens when you add the security starter, how the filter chain works and where the <code>Authentication</code> object lives. Then you build the full login system for Project 2: users in the database, BCrypt password hashing, stateless JWT tokens (two ways: a custom filter and the OAuth2 Resource Server support), roles CANDIDATE, RECRUITER and ADMIN, owner-only edits, clean JSON error responses, CORS and CSRF. It builds on the REST layer from <a href="#m2">module 2</a> and the entities from <a href="#m3">module 3</a>. How to test all of this is in <a href="#m5">module 5</a>, and how a React app uses the token is in <a href="06-frontend.html#m6">Frontend · Module 6</a>.</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>Explain authentication vs authorization, 401 vs 403, and sessions vs tokens.</li>
+    <li>Describe the Spring Security filter chain and write a modern <code>SecurityFilterChain</code> bean.</li>
+    <li>Load users from a database and hash passwords with BCrypt.</li>
+    <li>Issue and validate JWTs with a custom filter or with the OAuth2 Resource Server support.</li>
+    <li>Protect URLs and methods by role, and enforce "only the owner can edit".</li>
+    <li>Configure CORS correctly, and decide when CSRF protection can be off.</li>
+    <li>Design refresh tokens, understand OAuth2 login, and apply a security checklist.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m4-authn-authz">
+  <h3>Authentication vs authorization, 401 vs 403, sessions vs tokens</h3>
+  <p class="tldr">Authentication asks "who are you?", authorization asks "what may you do?"; a failed login is 401, a known user without permission is 403, and a stateless API proves identity on every request with a signed token instead of a server-side session.</p>
+
+  <h4>Two different questions</h4>
+  <p><strong>Authentication</strong> (AuthN) is proving who you are: a username and password, a fingerprint, a one-time code, a signed token. <strong>Authorization</strong> (AuthZ) is deciding what an already-identified user is allowed to do: "a RECRUITER may post a job, a CANDIDATE may not". Authentication always comes first; you cannot authorize someone you cannot identify. Think of an airport: the passport check is authentication, the boarding pass that lets you into the business lounge is authorization.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Authentication</th><th>Authorization</th></tr></thead>
+    <tbody>
+      <tr><td>Question</td><td>Who are you?</td><td>What are you allowed to do?</td></tr>
+      <tr><td>Input</td><td>Credentials (password, token, certificate)</td><td>The identity plus roles, permissions, resource owner</td></tr>
+      <tr><td>Failure status</td><td><strong>401 Unauthorized</strong></td><td><strong>403 Forbidden</strong></td></tr>
+      <tr><td>Spring Security type</td><td><code>AuthenticationManager</code>, <code>Authentication</code></td><td><code>AuthorizationManager</code>, <code>@PreAuthorize</code></td></tr>
+      <tr><td>Example</td><td>Login with email and password</td><td>Only ADMIN can delete users</td></tr>
+    </tbody>
+  </table></div>
+  <p>In practice authorization has two levels. <strong>Role-based</strong> rules look only at the user ("RECRUITER may post jobs"). <strong>Ownership (resource-level)</strong> rules also look at the data ("a recruiter may edit only <em>their own</em> jobs"). Roles are checked by Spring Security rules; ownership is usually checked in the service layer (<a href="#m4-authorization">authorization</a>).</p>
+
+  <h4>How Spring Security models "who you are"</h4>
+  <p>Spring Security represents the current user as an <code>Authentication</code> object. It holds the <strong>principal</strong> (who: usually your <code>UserDetails</code>), the <strong>credentials</strong> (the password or token, erased after login), and the <strong>authorities</strong> (what: a list of strings such as <code>ROLE_RECRUITER</code>). A flag says whether it is authenticated. A filter puts it into the <code>SecurityContext</code>, stored in <code>SecurityContextHolder</code>, which keeps it in a thread-local for the length of the request. Your code reads it from there, or gets it as a controller parameter:</p>
+  <pre data-title="Reading the current user"><code class="language-java">@GetMapping("/api/me")
+public Map&lt;String, Object&gt; me(Authentication auth) {
+    return Map.of(
+            "name", auth.getName(),
+            "authorities", auth.getAuthorities().toString());
+}</code></pre>
+  <pre class="out" data-title="GET /api/me with a valid login"><code class="language-json">{"name":"asha@example.com","authorities":"[ROLE_RECRUITER]"}</code></pre>
+  <p>A request with no login is not "empty": Spring Security fills the context with an <em>anonymous</em> authentication (principal <code>anonymousUser</code>, role <code>ROLE_ANONYMOUS</code>). That lets rules like <code>permitAll()</code> and <code>authenticated()</code> work with one uniform check. How the filters build this object is shown in the <a href="#m4-filter-chain">filter chain article</a>.</p>
+
+  <h4>401 vs 403</h4>
+  <p>The name of status 401 is misleading: it means "<em>unauthenticated</em>". The server does not know who you are, or your credentials are missing, wrong or expired. Status 403 means "I know who you are, and you may not do this".</p>
+  <ul>
+    <li><strong>401</strong>: no token, bad password, expired or tampered JWT. The client should log in (or refresh the token) and retry.</li>
+    <li><strong>403</strong>: a valid CANDIDATE token calls <code>POST /api/jobs</code>. Logging in again changes nothing.</li>
+    <li><strong>404 instead of 403</strong>: sometimes you hide that a resource exists at all (a candidate asking for another candidate's application). Both are acceptable; choose one rule and keep it.</li>
+  </ul>
+  <pre class="out" data-title="Three requests to POST /api/jobs"><code class="language-http">POST /api/jobs                               (no Authorization header)
+HTTP/1.1 401
+
+POST /api/jobs   Authorization: Bearer eyJ... (valid token, role CANDIDATE)
+HTTP/1.1 403
+
+POST /api/jobs   Authorization: Bearer eyJ... (valid token, role RECRUITER)
+HTTP/1.1 201</code></pre>
+  <p>Inside Spring Security, one filter decides between the two. <code>ExceptionTranslationFilter</code> catches the exceptions thrown further down the chain. If it catches an <code>AuthenticationException</code>, or an <code>AccessDeniedException</code> for an anonymous user, it calls the <code>AuthenticationEntryPoint</code> (response 401, or a redirect to a login page for browsers). If it catches an <code>AccessDeniedException</code> for a logged-in user, it calls the <code>AccessDeniedHandler</code> (response 403). Both can be replaced to return your JSON (<a href="#m4-error-responses">JSON error responses</a>).</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A["Request arrives"] --> B{"Valid credentials?"}
+  B -->|no or missing| C["401 Unauthorized"]
+  B -->|yes| D{"Allowed to do this?"}
+  D -->|no| E["403 Forbidden"]
+  D -->|yes| F["Controller runs: 2xx"]
+</pre>
+<figcaption>Authentication is checked first (401), then authorization (403)</figcaption>
+  </figure>
+  <p>Strictly, a 401 response should carry a <code>WWW-Authenticate</code> header that names the scheme (<code>Bearer</code> or <code>Basic</code>). The resource server support in Spring Security adds it; hand-written entry points often forget it.</p>
+
+  <h4>Sessions (stateful) vs tokens (stateless)</h4>
+  <p>HTTP has no memory: each request stands alone. After login the server must recognise you again on the next request. There are two classic ways.</p>
+  <p><strong>Server-side session.</strong> The server stores your login state in memory (or Redis) under a random session id and sends the id in a <code>JSESSIONID</code> cookie. The browser returns the cookie automatically on every request; the server looks the session up. Spring Security can store the <code>SecurityContext</code> in that session. <strong>Token-based (stateless).</strong> The server stores nothing. After login it gives the client a signed token (usually a <strong>JWT</strong>, see <a href="#m4-jwt-basics">the JWT article</a>) containing the user id and roles. The client sends it in the <code>Authorization: Bearer ...</code> header, and the server only verifies the signature.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: POST /login (email, password)
+  S-->>C: Set-Cookie JSESSIONID (session stored on server)
+  C->>S: GET /api/orders + Cookie
+  S-->>C: 200 (server looks up the session)
+  Note over C,S: Token style: login returns a JWT instead
+  C->>S: GET /api/orders + Authorization Bearer JWT
+  S-->>C: 200 (server only verifies the signature)
+</pre>
+<figcaption>Session cookie compared with a bearer token</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Session + cookie</th><th>Stateless token (JWT)</th></tr></thead>
+    <tbody>
+      <tr><td>Server stores</td><td>Session data for each user</td><td>Nothing (only the signing key)</td></tr>
+      <tr><td>Scaling</td><td>Needs sticky sessions or shared store (Redis)</td><td>Any instance can verify; easy to scale</td></tr>
+      <tr><td>Logout / revoke</td><td>Easy: delete the session</td><td>Hard: token is valid until it expires (see refresh tokens)</td></tr>
+      <tr><td>Sent by</td><td>Cookie, automatically</td><td>Header, by your JavaScript code</td></tr>
+      <tr><td>CSRF risk</td><td>Yes, must protect</td><td>No, if not kept in a cookie (<a href="#m4-csrf">CSRF</a>)</td></tr>
+      <tr><td>Fits</td><td>Server-rendered web apps</td><td>REST APIs, SPAs, mobile apps, microservices</td></tr>
+    </tbody>
+  </table></div>
+  <p>Neither is "better". A server-rendered site with Thymeleaf is happy with sessions. A React app plus a Spring Boot REST API, plus a future mobile app and several services, is usually happier with tokens. Project 2 uses tokens.</p>
+
+  <h4>Security details that decide which one is safer</h4>
+  <ul>
+    <li><strong>Session cookies</strong> should be <code>HttpOnly</code> (JavaScript cannot read them, which limits XSS theft), <code>Secure</code> (HTTPS only) and <code>SameSite</code> (limits CSRF). Spring Security also changes the session id at login (<strong>session fixation protection</strong>), so an attacker cannot plant a known id before the victim logs in.</li>
+    <li><strong>Tokens in <code>localStorage</code></strong> are easy to use but any XSS bug can read them. A token in an <code>HttpOnly</code> cookie is safer against XSS but brings back CSRF protection duties. Many apps keep a short-lived access token in memory and a refresh token in an <code>HttpOnly</code> cookie (<a href="#m4-refresh-tokens">refresh tokens</a>).</li>
+    <li><strong>Sessions can scale</strong> too: with Spring Session the session data lives in Redis and every instance reads it. Stateless is simpler, not the only way.</li>
+    <li>A JWT cannot be "logged out" by the server alone. Keep access tokens short (minutes), or keep a deny list of revoked token ids.</li>
+  </ul>
+
+  <h4>Other ways to prove identity</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>How it works</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td>HTTP Basic</td><td>Base64 of <code>user:password</code> in every request</td><td>Quick internal tools; only over HTTPS</td></tr>
+      <tr><td>Form login + session</td><td>HTML form, then <code>JSESSIONID</code></td><td>Server-rendered apps</td></tr>
+      <tr><td>Bearer JWT</td><td>Signed token in the <code>Authorization</code> header</td><td>SPAs, mobile apps, APIs</td></tr>
+      <tr><td>API key</td><td>Long random key in a header</td><td>Server-to-server calls</td></tr>
+      <tr><td>OAuth2 / OpenID Connect</td><td>Login delegated to Google, GitHub or a company IdP</td><td>"Login with Google" (<a href="#m4-oauth2-login">OAuth2 login</a>)</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Check authentication first, then authorization; never decide permissions for an anonymous user.</li>
+      <li>Return 401 for "who are you?" problems and 403 for "not allowed". Do not mix them.</li>
+      <li>Do the authorization check on the server for every request. Hiding a button in React is not security.</li>
+      <li>Never trust a role or user id sent by the client in a body or query string; take it from the verified token or session.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Roles are named in upper case; Spring stores them as authorities with the prefix <code>ROLE_</code> (<code>ROLE_ADMIN</code>), and <code>hasRole("ADMIN")</code> adds the prefix for you. Fine-grained permissions (<code>job:write</code>) are authorities without the prefix.</li>
+      <li>Use one generic message for failed logins ("Invalid email or password"), so attackers cannot tell which emails exist.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: wrong status for the wrong problem</p><pre><code class="language-java">// token missing:
+return ResponseEntity.status(403).build();
+// logged-in CANDIDATE calling a RECRUITER endpoint:
+return ResponseEntity.status(401).build();</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: 401 = identity, 403 = permission</p><pre><code class="language-java">// token missing or invalid:
+return ResponseEntity.status(401).build();
+// logged-in CANDIDATE calling a RECRUITER endpoint:
+return ResponseEntity.status(403).build();</code></pre></div>
+    </div>
+    <ul>
+      <li>Putting secrets (a password, a card number) inside a JWT payload. A JWT is signed, not encrypted; anyone can read it.</li>
+      <li>Trusting the front end: checking the role only in React.</li>
+      <li>Treating "logged in" as "allowed": forgetting the ownership check, so any user can read another user's order by changing the id (broken access control, the top item of the OWASP list, <a href="#m4-best-practices">best practices</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and exceptions</p>
+    <ul>
+      <li><code>BadCredentialsException</code> (wrong password), <code>DisabledException</code>, <code>LockedException</code> and <code>UsernameNotFoundException</code> are all <code>AuthenticationException</code>s: they lead to 401.</li>
+      <li><code>AccessDeniedException</code> comes from failed authorization: it leads to 403 (or to 401 if the user is anonymous).</li>
+      <li>With default settings and no custom entry point, an API that disables form login and Basic may answer anonymous requests with 403 instead of 401 (see <a href="#m4-security-config">security configuration</a>).</li>
+      <li>A browser-oriented app redirects (302) to <code>/login</code> instead of returning 401. Fine for HTML pages, wrong for a JSON API.</li>
+      <li>With <code>@PreAuthorize</code> on a service method, the denial happens inside the call and is translated in the same way, but an unhandled <code>AccessDeniedException</code> thrown after the security filters ran is caught by your <code>@ExceptionHandler</code> if you have one for <code>Exception</code>, and may turn into a 500. Handle it explicitly or rethrow.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>A React + Spring Boot job portal usually works like this: <code>POST /api/auth/login</code> returns an access token (about 15 minutes) and sets a refresh token cookie; React sends the access token as a Bearer header; the API has stateless security with role rules for RECRUITER and CANDIDATE, plus ownership checks in services. An admin web UI built with Thymeleaf in the same company may still use sessions.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Difference between authentication and authorization?" Give the one-line definitions plus the airport or login-vs-role example. "401 vs 403?" 401 = not authenticated (who are you?), 403 = authenticated but not allowed. "Why JWT instead of sessions?" Stateless, scales across instances, works for SPAs and mobile; the price is that revocation is harder. Strong answers also mention where the token is stored (memory or <code>HttpOnly</code> cookie versus <code>localStorage</code>), that sessions can scale with Redis, and that authorization must be checked on the server.</p>
+  </div>
+</article>
+
+<article class="topic" id="m4-starter-default">
+  <h3>What happens when you add spring-boot-starter-security</h3>
+  <p class="tldr">Adding the starter secures every endpoint at once with a generated password and a default login page; you take control by defining your own SecurityFilterChain bean.</p>
+
+  <p>Add one dependency and nothing else:</p>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-security&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <p>Restart the application. Spring Boot's auto-configuration now does the following without any code from you:</p>
+  <ol class="steps">
+    <li><strong>Every endpoint requires authentication</strong>, including your existing REST controllers, static files and the error page. <code>GET /api/jobs</code> now returns <strong>401</strong>.</li>
+    <li><strong>A default user</strong> named <code>user</code> is created with a random password printed in the log at startup.</li>
+    <li><strong>Form login and HTTP Basic</strong> are enabled. A browser is redirected to a generated <code>/login</code> page; a client such as Postman can send Basic credentials.</li>
+    <li><strong>CSRF protection is on</strong>: <code>POST</code>, <code>PUT</code>, <code>PATCH</code> and <code>DELETE</code> without a CSRF token get <strong>403</strong>.</li>
+    <li><strong>A session</strong> is created after login, and the browser keeps the <code>JSESSIONID</code> cookie.</li>
+    <li><strong>Default security headers</strong> are added (<code>X-Content-Type-Options</code>, <code>Cache-Control: no-cache</code> for secured responses, <code>X-Frame-Options</code> and others).</li>
+  </ol>
+  <pre class="out" data-title="Console at startup"><code class="language-plaintext">Using generated security password: 8e557245-73e2-4286-969b-1e0e1c1d4a5f
+
+This generated password is for development use only. Your security
+configuration must be updated before running your application in production.</code></pre>
+  <pre data-title="Calling the secured API"><code class="language-shell">$ curl -i localhost:8080/api/jobs
+HTTP/1.1 401
+WWW-Authenticate: Basic realm="Realm"
+
+$ curl -u user:8e557245-73e2-4286-969b-1e0e1c1d4a5f localhost:8080/api/jobs
+HTTP/1.1 200</code></pre>
+
+  <h4>Taking control</h4>
+  <p>This default is a safe starting point, not a design. You change it in three steps: (1) define your own <code>SecurityFilterChain</code> bean (once Spring Boot sees one, it backs off its default chain, see the <a href="#m4-security-config">configuration article</a>), (2) define a <code>UserDetailsService</code> bean that loads real users, and (3) define a <code>PasswordEncoder</code> bean.</p>
+  <p>For quick experiments you can set the default user in <code>application.properties</code>:</p>
+  <pre data-title="application.properties (demo only)"><code class="language-properties">spring.security.user.name=admin
+spring.security.user.password=admin123
+spring.security.user.roles=ADMIN</code></pre>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Adding the starter late and thinking "my controllers broke". They did not; the whole app is now secured. Read the 401/403 as a feature.</li>
+      <li>Disabling security with <code>http.csrf(c -&gt; c.disable())</code> and <code>permitAll()</code> on everything "to make Postman work". Fix the configuration instead.</li>
+      <li>Following a tutorial that extends <code>WebSecurityConfigurerAdapter</code>. That class was removed in Spring Security 6 (Spring Boot 3), so the code will not compile.</li>
+    </ul>
+  </div>
+  <div class="co co-version">
+    <p class="co-t">Versions</p>
+    <p>Spring Boot 3.x uses Spring Security 6.x; Spring Boot 4.x uses Spring Security 7.x. The lambda DSL shown in this module works in both. In Security 7 the old non-lambda style (<code>http.csrf().disable()</code>, chained <code>.and()</code>) is gone, so always write <code>http.csrf(csrf -&gt; csrf.disable())</code>.</p>
+  </div>
+</article>
+
+<article class="topic" id="m4-filter-chain">
+  <h3>The Spring Security architecture: the filter chain and the Authentication object</h3>
+  <p class="tldr">Spring Security is a chain of servlet filters in front of your controllers; filters authenticate the request, store an Authentication in the SecurityContext, and the last filters decide whether the request may continue.</p>
+
+  <h4>Why filters</h4>
+  <p>Spring MVC's <code>DispatcherServlet</code> and your controllers sit at the end of the request path. A servlet <strong>filter</strong> is code that runs <em>before</em> the servlet and can read the request, change it, or stop it and write a response itself. Security must run before any controller, so Spring Security is built from filters.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  R[HTTP request] --> D[DelegatingFilterProxy]
+  D --> F[FilterChainProxy]
+  F --> M{"Which SecurityFilterChain matches?"}
+  M --> C1[CorsFilter]
+  C1 --> C2[CsrfFilter]
+  C2 --> C3["Authentication filter e.g. BearerTokenAuthenticationFilter"]
+  C3 --> C4[ExceptionTranslationFilter]
+  C4 --> C5[AuthorizationFilter]
+  C5 --> S[DispatcherServlet]
+  S --> K[Your controller]
+</pre>
+  <figcaption>The request path through Spring Security (simplified; the real chain has about fifteen filters)</figcaption>
+  </figure>
+  <dl class="terms">
+    <dt><code>DelegatingFilterProxy</code></dt><dd>A normal servlet filter registered with the container. It does no security itself; it hands over to a Spring bean. (Spring Boot registers an equivalent for you.)</dd>
+    <dt><code>FilterChainProxy</code></dt><dd>The bean it delegates to. It holds a list of <code>SecurityFilterChain</code>s and picks the first one whose request matcher matches the URL.</dd>
+    <dt><code>SecurityFilterChain</code></dt><dd>An ordered list of security filters for a group of URLs. This is what you configure with <code>HttpSecurity</code>.</dd>
+  </dl>
+
+  <h4>The important filters, in order</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Filter</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>SecurityContextHolderFilter</code></td><td>Loads the <code>SecurityContext</code> for the request (from the session, if any) and clears it at the end</td></tr>
+      <tr><td><code>CorsFilter</code></td><td>Answers CORS preflight requests and adds CORS headers (<a href="#m4-cors">CORS</a>)</td></tr>
+      <tr><td><code>CsrfFilter</code></td><td>Rejects state-changing requests without a valid CSRF token (<a href="#m4-csrf">CSRF</a>)</td></tr>
+      <tr><td><code>UsernamePasswordAuthenticationFilter</code></td><td>Handles form login (<code>POST /login</code>); not used by a JWT API</td></tr>
+      <tr><td><code>BasicAuthenticationFilter</code></td><td>Reads the <code>Authorization: Basic</code> header</td></tr>
+      <tr><td><code>BearerTokenAuthenticationFilter</code></td><td>Reads <code>Authorization: Bearer ...</code> and validates the JWT (added by the OAuth2 Resource Server support)</td></tr>
+      <tr><td><code>AnonymousAuthenticationFilter</code></td><td>If nobody logged in, sets an "anonymous" <code>Authentication</code> so later code never sees null</td></tr>
+      <tr><td><code>ExceptionTranslationFilter</code></td><td>Catches <code>AuthenticationException</code> and <code>AccessDeniedException</code> thrown below it and turns them into 401 / 403 responses</td></tr>
+      <tr><td><code>AuthorizationFilter</code></td><td>The last one: checks the URL rules (<code>authorizeHttpRequests</code>) and throws if the user may not continue</td></tr>
+    </tbody>
+  </table></div>
+  <p>Order matters: your own filter must be placed relative to these (for JWT, before <code>UsernamePasswordAuthenticationFilter</code>). To see the real chain of your app, set <code>logging.level.org.springframework.security=DEBUG</code>; at the first request it prints "Will secure any request with [filter1, filter2, ...]".</p>
+
+  <h4>What is stored: SecurityContext and Authentication</h4>
+  <p>After a successful authentication a filter puts an <code>Authentication</code> object into the <strong><code>SecurityContext</code></strong>, which is kept in the <strong><code>SecurityContextHolder</code></strong>, a thread-local holder (one value per request thread). Any code on that thread can read it.</p>
+  <dl class="terms">
+    <dt><code>Authentication</code></dt><dd>The "who" object. Before authentication it carries credentials (<code>isAuthenticated() == false</code>); after, it carries the principal and authorities.</dd>
+    <dt>Principal</dt><dd>The identity. Often a <code>UserDetails</code> (form login / Basic) or a <code>Jwt</code> (resource server). <code>getName()</code> returns the username.</dd>
+    <dt>Credentials</dt><dd>The proof (password or token). Erased after a successful login.</dd>
+    <dt><code>GrantedAuthority</code></dt><dd>One permission as a string, e.g. <code>ROLE_RECRUITER</code> or <code>jobs:write</code>.</dd>
+  </dl>
+  <pre data-title="Reading the current user"><code class="language-java">Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+String name = auth.getName();                              // e.g. "asha@example.com"
+Collection&lt;? extends GrantedAuthority&gt; roles = auth.getAuthorities();
+boolean loggedIn = auth.isAuthenticated()
+        &amp;&amp; !(auth instanceof AnonymousAuthenticationToken);</code></pre>
+
+  <h4>How a username and password is checked</h4>
+  <p>When some filter or your login controller has credentials, it calls the <code>AuthenticationManager</code>. The standard implementation, <code>ProviderManager</code>, asks a list of <code>AuthenticationProvider</code>s whether one supports this kind of credential. For username and password the provider is <code>DaoAuthenticationProvider</code>, which uses two collaborators you supply.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A["AuthenticationManager (ProviderManager)"] --> B[DaoAuthenticationProvider]
+  B --> C[UserDetailsService]
+  B --> D[PasswordEncoder]
+  C --> E[(Users table)]
+</pre>
+  <figcaption>Checking a username and password</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><code>DaoAuthenticationProvider</code> calls <code>userDetailsService.loadUserByUsername(name)</code> and receives a <code>UserDetails</code> (name, hashed password, authorities, status flags).</li>
+    <li>It checks the account flags (enabled, not locked, not expired). A bad flag throws <code>DisabledException</code>, <code>LockedException</code> and so on.</li>
+    <li>It calls <code>passwordEncoder.matches(rawPassword, storedHash)</code>. A mismatch throws <code>BadCredentialsException</code>.</li>
+    <li>On success it returns a fully authenticated <code>Authentication</code> with authorities.</li>
+  </ol>
+  <p>All exceptions here extend <code>AuthenticationException</code>, and <code>ExceptionTranslationFilter</code> turns them into 401. A missing user also gives <code>BadCredentialsException</code> by default (so attackers cannot tell "unknown email" from "wrong password").</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the SecurityContext is per thread and per request</p>
+    <p>The context lives in a thread-local. In a stateless app it is empty at the start of every request and filled again by your token filter. Code that starts another thread (<code>@Async</code>, a manual executor) does not automatically see it; Spring offers <code>DelegatingSecurityContextExecutor</code> and <code>MODE_INHERITABLETHREADLOCAL</code> for those rare cases.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Explain the Spring Security architecture." Filters in front of the DispatcherServlet; <code>FilterChainProxy</code> picks a <code>SecurityFilterChain</code>; an authentication filter builds an <code>Authentication</code> and stores it in the <code>SecurityContextHolder</code>; <code>AuthorizationFilter</code> checks the rules; <code>ExceptionTranslationFilter</code> maps failures to 401/403. Then draw the <code>AuthenticationManager</code> to <code>DaoAuthenticationProvider</code> to <code>UserDetailsService</code> and <code>PasswordEncoder</code> path.</p>
+  </div>
+</article>
+
+<article class="topic" id="m4-security-config">
+  <h3>Writing a SecurityFilterChain with the lambda DSL</h3>
+  <p class="tldr">Declare a SecurityFilterChain bean that sets the URL rules, switches off form login and Basic for an API, makes sessions stateless, and plugs in your authentication; matcher order matters, the first match wins.</p>
+
+  <p>In <a href="#m4-filter-chain">the architecture article</a> you saw that Spring Security is a list of servlet filters. The <code>SecurityFilterChain</code> bean is how <em>you</em> choose and configure those filters. You describe what you want with <code>HttpSecurity</code>, a builder, and call <code>http.build()</code>; the result is the list of filters for one group of URLs.</p>
+
+  <h4>A complete configuration for a stateless REST API</h4>
+  <pre data-title="SecurityConfig.java"><code class="language-java">import static org.springframework.security.config.Customizer.withDefaults;
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain api(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -&gt; csrf.disable())
+            .cors(withDefaults())
+            .sessionManagement(s -&gt;
+                    s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .httpBasic(basic -&gt; basic.disable())
+            .formLogin(form -&gt; form.disable())
+            .authorizeHttpRequests(auth -&gt; auth
+                .requestMatchers("/api/auth/**").permitAll()
+                .requestMatchers(HttpMethod.GET, "/api/jobs/**", "/api/companies/**")
+                        .permitAll()
+                .requestMatchers("/actuator/health").permitAll()
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .requestMatchers(HttpMethod.POST, "/api/jobs").hasRole("RECRUITER")
+                .anyRequest().authenticated());
+        return http.build();
+    }
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+}</code></pre>
+  <p>(Authentication of tokens is added later: one more line in the chain, shown in the JWT articles.) Line by line:</p>
+  <dl class="terms">
+    <dt><code>@EnableWebSecurity</code></dt><dd>Switches on web security. Optional in Spring Boot (auto-configured), but it states the intent.</dd>
+    <dt><code>@EnableMethodSecurity</code></dt><dd>Allows <code>@PreAuthorize</code> on methods (<a href="#m4-authorization">authorization</a>).</dd>
+    <dt><code>csrf(csrf -&gt; csrf.disable())</code></dt><dd>Turns off CSRF checks. Correct only for token-in-header APIs (<a href="#m4-csrf">CSRF</a>).</dd>
+    <dt><code>cors(withDefaults())</code></dt><dd>Uses your <code>CorsConfigurationSource</code> bean (<a href="#m4-cors">CORS</a>).</dd>
+    <dt><code>sessionCreationPolicy(STATELESS)</code></dt><dd>Spring Security never creates or uses an HTTP session to store the <code>SecurityContext</code>. Every request must carry its own token.</dd>
+    <dt><code>httpBasic</code> / <code>formLogin</code> disabled</dt><dd>An API has no HTML login page and does not use Basic. Disabling them removes the default login page and the redirect-to-login behaviour (you get a clean 401).</dd>
+    <dt><code>authorizeHttpRequests</code></dt><dd>The URL rules, evaluated by <code>AuthorizationFilter</code>.</dd>
+    <dt><code>permitAll()</code></dt><dd>Anyone, including anonymous users.</dd>
+    <dt><code>authenticated()</code></dt><dd>Any logged-in user.</dd>
+    <dt><code>hasRole("ADMIN")</code></dt><dd>Needs authority <code>ROLE_ADMIN</code>.</dd>
+    <dt><code>anyRequest().authenticated()</code></dt><dd>The safety net: everything not listed above needs a login. Always end with it (<em>deny by default</em>).</dd>
+  </dl>
+
+  <h4>What the DSL does inside</h4>
+  <p>The "lambda DSL" is the style where every feature gets its own lambda: <code>.csrf(csrf -&gt; ...)</code>. Each call configures one <em>configurer</em>, and each configurer adds one or more filters to the chain. So <code>.csrf(...)</code> adds <code>CsrfFilter</code>, <code>.cors(...)</code> adds <code>CorsFilter</code>, <code>.sessionManagement(...)</code> adds session-related filters, and <code>.authorizeHttpRequests(...)</code> adds <code>AuthorizationFilter</code> near the end. A configurer you disable (or never call) adds nothing. When you call <code>http.build()</code>, Spring Security sorts the filters into their fixed order, so the order of your DSL calls does not change the filter order.</p>
+  <p>At runtime Boot registers one servlet filter, <code>FilterChainProxy</code> (under the name <code>springSecurityFilterChain</code>), which holds all your <code>SecurityFilterChain</code> beans. For each request it picks the <strong>first</strong> chain whose request matcher matches, and runs only that chain's filters. A simplified view of a typical API chain:</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  R["Request"] --> P["FilterChainProxy"]
+  P --> F1["CorsFilter"]
+  F1 --> F2["Your JWT or Basic auth filter"]
+  F2 --> F3["AnonymousAuthenticationFilter"]
+  F3 --> F4["ExceptionTranslationFilter"]
+  F4 --> F5["AuthorizationFilter"]
+  F5 --> D["DispatcherServlet"]
+</pre>
+<figcaption>Filters configured by the DSL, in the order they run</figcaption>
+  </figure>
+  <p>Two other defaults come with the chain. First, <code>HeaderWriterFilter</code> adds security response headers such as <code>X-Content-Type-Options: nosniff</code> and <code>X-Frame-Options: DENY</code>; change them with <code>.headers(h -&gt; ...)</code>. Second, the chain needs an <code>AuthenticationManager</code>; Boot builds one from your <code>UserDetailsService</code> and <code>PasswordEncoder</code> beans, or from the JWT decoder when you use the resource server (<a href="#m4-users-db">users from the database</a>).</p>
+
+  <h4>Plugging in your own authentication filter</h4>
+  <p>A custom filter is placed relative to a known one with <code>addFilterBefore</code> or <code>addFilterAfter</code>. This is the "one more line" used by the custom JWT approach (<a href="#m4-jwt-custom-filter">JWT custom filter</a>).</p>
+  <pre data-title="Adding a filter"><code class="language-java">http.addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+
+// or, for the resource server approach, a single line:
+http.oauth2ResourceServer(oauth -&gt; oauth.jwt(withDefaults()));</code></pre>
+
+  <h4>Matcher order matters</h4>
+  <p>Rules are checked from top to bottom and the <strong>first matching rule wins</strong>. Put specific rules first, general ones last.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: the general rule hides the specific one</p><pre><code class="language-java">.authorizeHttpRequests(auth -> auth
+    .requestMatchers("/api/**").authenticated()          // matches everything
+    .requestMatchers("/api/auth/**").permitAll()         // never reached
+    .anyRequest().denyAll())</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: specific first</p><pre><code class="language-java">.authorizeHttpRequests(auth -> auth
+    .requestMatchers("/api/auth/**").permitAll()
+    .requestMatchers("/api/**").authenticated()
+    .anyRequest().denyAll())</code></pre></div>
+  </div>
+  <p>Spring Security even throws an error at startup if a rule after <code>anyRequest()</code> is added (<code>IllegalStateException: Can't configure requestMatchers after anyRequest</code>), because it could never match.</p>
+
+  <h4>Request matchers</h4>
+  <ul>
+    <li><code>requestMatchers("/api/jobs/**")</code>: Ant-style paths. <code>*</code> = one segment, <code>**</code> = any depth.</li>
+    <li><code>requestMatchers(HttpMethod.GET, "/api/jobs/**")</code>: path plus HTTP method. Use methods to make reads public and writes protected.</li>
+    <li><code>requestMatchers("/h2-console/**")</code> and similar for tools. In the old API this was <code>antMatchers</code> / <code>mvcMatchers</code>; both were replaced by <code>requestMatchers</code> in Spring Security 6.</li>
+  </ul>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Rule</th><th>Passes when</th><th>Failure</th></tr></thead>
+    <tbody>
+      <tr><td><code>permitAll()</code></td><td>Always</td><td>Never</td></tr>
+      <tr><td><code>denyAll()</code></td><td>Never</td><td>403 (or 401 for anonymous)</td></tr>
+      <tr><td><code>authenticated()</code></td><td>User is logged in (not anonymous)</td><td>401</td></tr>
+      <tr><td><code>hasRole("ADMIN")</code></td><td>Has <code>ROLE_ADMIN</code></td><td>403</td></tr>
+      <tr><td><code>hasAnyRole("ADMIN", "RECRUITER")</code></td><td>Has at least one of them</td><td>403</td></tr>
+      <tr><td><code>hasAuthority("job:write")</code></td><td>Has exactly that authority string</td><td>403</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>More than one filter chain</h4>
+  <p>You may define several <code>SecurityFilterChain</code> beans for different URL groups, each with <code>@Order</code> and a <code>securityMatcher</code>, for example one stateless chain for <code>/api/**</code> and one session-based chain for an admin web UI. The first chain whose matcher matches the request handles it.</p>
+  <pre data-title="Two chains"><code class="language-java">@Bean
+@Order(1)
+SecurityFilterChain apiChain(HttpSecurity http) throws Exception {
+    http.securityMatcher("/api/**")
+        .authorizeHttpRequests(a -&gt; a.anyRequest().authenticated())
+        .sessionManagement(s -&gt; s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+        .csrf(c -&gt; c.disable());
+    return http.build();
+}
+
+@Bean
+@Order(2)
+SecurityFilterChain webChain(HttpSecurity http) throws Exception {
+    http.authorizeHttpRequests(a -&gt; a.anyRequest().authenticated())
+        .formLogin(withDefaults());
+    return http.build();
+}</code></pre>
+  <p>The last chain has no <code>securityMatcher</code>, so it matches everything and must come last. If a chain that matches every request comes <em>before</em> another one, the later chain can never run; Spring Security 6 detects this and fails at startup with an <code>UnreachableFilterChainException</code>.</p>
+
+  <h4>Ignoring static resources</h4>
+  <p>Do not use <code>web.ignoring()</code> for URLs that need security headers; use <code>permitAll()</code> instead, so the filters (and headers) still run. Common Spring Boot static locations are already handled by <code>PathRequest.toStaticResources()</code> if you serve a UI from the same app.</p>
+
+  <h4>Try it: what the client sees</h4>
+  <pre data-title="With the configuration above" class="out"><code class="language-shell">$ curl -i localhost:8080/api/jobs                     # GET, public
+HTTP/1.1 200
+$ curl -i -X POST localhost:8080/api/jobs -d '{}'     # needs login
+HTTP/1.1 401
+$ curl -i -X POST localhost:8080/api/jobs -H "Authorization: Bearer $CANDIDATE" ...
+HTTP/1.1 403
+$ curl -i localhost:8080/api/unknown-thing            # anyRequest().authenticated()
+HTTP/1.1 401</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: deny by default</p>
+    <p>End every <code>authorizeHttpRequests</code> block with <code>anyRequest().authenticated()</code> (or <code>denyAll()</code>), and list public URLs explicitly. A forgotten endpoint is then protected, not exposed.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Keep the chain in one <code>SecurityConfig</code> class; keep filters and handlers as separate classes and inject them.</li>
+      <li>Expose <code>PasswordEncoder</code> as its own bean; services (registration) need it too.</li>
+      <li>Write one test per rule with MockMvc and <code>@WithMockUser</code> (<a href="#m5-webmvctest">controller tests</a>). A rule nobody tests breaks silently when someone reorders the lines.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Putting <code>permitAll()</code> for <code>/api/auth/**</code> after a broader rule (see the Wrong example).</li>
+      <li>Using <code>hasRole("ROLE_ADMIN")</code>. Spring adds the prefix itself, so use <code>hasRole("ADMIN")</code> (or <code>hasAuthority("ROLE_ADMIN")</code>).</li>
+      <li>Returning the <code>HttpSecurity</code> without calling <code>http.build()</code>.</li>
+      <li>Forgetting that the servlet <code>context-path</code> or a trailing slash can change matching; test your rules (<a href="#m5">module 5</a>).</li>
+      <li>Disabling CSRF on an app that uses session cookies. That is only right for token-in-header APIs.</li>
+      <li>Calling <code>permitAll()</code> on <code>/actuator/**</code> in production. Expose only health, or secure the rest (<a href="#m6-actuator">Actuator</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge case: 403 instead of 401 for missing credentials</p>
+    <p>If you disable <code>httpBasic</code> and <code>formLogin</code> and add no other authentication mechanism, there is no <code>AuthenticationEntryPoint</code> to say "401, please log in", and Spring Security falls back to a plain 403 for anonymous requests. Fix it by configuring an entry point (<a href="#m4-error-responses">JSON errors</a>), or by using the resource server support, which sets one.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">More edge cases and startup errors</p>
+    <ul>
+      <li><strong>The <code>/error</code> trap.</strong> When a controller throws an exception, the servlet container forwards to <code>/error</code>, and in Spring Security 6 the authorization rules also apply to that forward. A real 404 or 500 can then appear as 401 or 403. Add <code>.requestMatchers("/error").permitAll()</code> if you see this.</li>
+      <li><code>IllegalArgumentException: This method cannot decide whether these patterns are Spring MVC patterns or not</code> appears when a second servlet is registered (for example the H2 console) and you pass a string to <code>requestMatchers</code>. Use <code>PathRequest.toH2Console()</code> for that one.</li>
+      <li>Defining your own <code>SecurityFilterChain</code> makes Boot back off from its default chain (<a href="#m4-starter-default">starter defaults</a>): the generated password and default form login are gone.</li>
+      <li>A path with a different case or a trailing slash (<code>/API/jobs</code>) is not matched by <code>/api/jobs</code>; with deny-by-default it is still protected.</li>
+    </ul>
+  </div>
+
+  <div class="co co-version">
+    <p class="co-t">Spring Security 6 and 7</p>
+    <p>Spring Boot 3.x uses Spring Security 6; Boot 4.x uses Spring Security 7. The lambda style shown here is the supported style in both. The older chained style (<code>http.csrf().disable().and()...</code>) was deprecated in 6.x and is removed in 7, and <code>WebSecurityConfigurerAdapter</code> was already removed in Security 6. Write every new configuration in lambda style.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you configure security in Spring Boot 3?" Expose a <code>SecurityFilterChain</code> bean using <code>HttpSecurity</code> and the lambda DSL; mention that <code>WebSecurityConfigurerAdapter</code> was removed. Explain stateless sessions, why CSRF is disabled for token APIs, rule order, and "deny by default". A deeper answer adds that <code>FilterChainProxy</code> picks the first matching chain, that each DSL call configures filters, and where a custom JWT filter goes (<code>addFilterBefore</code>).</p>
+  </div>
+</article>

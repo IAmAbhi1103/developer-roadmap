@@ -1,0 +1,748 @@
+<article class="topic" id="m3-trie-basics">
+  <h3>Tries: TrieNode, insert, search and startsWith</h3>
+  <p class="tldr">A trie (prefix tree) stores strings character by character along tree edges, so insert, search and prefix checks cost O(L) for a word of length L, independent of how many words are stored.</p>
+
+  <p>Suppose you store a dictionary of words and keep getting questions like "is <code>app</code> a word?" and "does any word start with <code>app</code>?". A <code>HashSet&lt;String&gt;</code> answers the first in O(L) (hashing reads the string) but cannot answer the second without scanning every word. A <b>trie</b> (say "try", from re<em>trie</em>val) answers both in O(L). The root is empty; each edge is a character; a node is marked when a word ends there. All words that share a prefix share the same path.</p>
+  <figure class="fig">
+<pre class="diagram">
+ words: "app", "apple", "apt", "bat"
+
+            (root)
+            /    \
+           a      b
+           |      |
+           p      a
+          / \     |
+         p*  t*   t*
+         |
+         l
+         |
+         e*            * = a word ends here
+</pre>
+<figcaption>Trie for app, apple, apt and bat; "app" and "apple" share a path</figcaption>
+</figure>
+
+  <h4>TrieNode: array vs HashMap</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>TrieNode[26]</code></th><th><code>HashMap&lt;Character, TrieNode&gt;</code></th></tr></thead>
+    <tbody>
+      <tr><td>Alphabet</td><td>Fixed (for example a-z)</td><td>Any (Unicode, digits, mixed case)</td></tr>
+      <tr><td>Child lookup</td><td>Index <code>c - 'a'</code>, fastest</td><td>Hash lookup, a bit slower</td></tr>
+      <tr><td>Memory per node</td><td>26 references, even if mostly empty</td><td>Only existing children, plus map overhead</td></tr>
+      <tr><td>Best for</td><td>Interviews with lowercase letters</td><td>Large or unknown alphabets</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Implement Trie (LeetCode 208)</h4>
+  <p>Three methods: <code>insert(word)</code>, <code>search(word)</code> (the exact word was inserted) and <code>startsWith(prefix)</code> (some inserted word begins with it). Both lookups walk the same path; the only difference is the final check, "is the end flag set".</p>
+  <pre data-title="Trie.java"><code class="language-java">class Trie {
+    private static class Node {
+        Node[] next = new Node[26];            // children for 'a'..'z'
+        boolean isWord;                        // a word ends at this node
+    }
+
+    private final Node root = new Node();
+
+    public void insert(String word) {
+        Node cur = root;
+        for (int i = 0; i &lt; word.length(); i++) {
+            int idx = word.charAt(i) - 'a';
+            if (cur.next[idx] == null) cur.next[idx] = new Node();
+            cur = cur.next[idx];
+        }
+        cur.isWord = true;
+    }
+
+    public boolean search(String word) {
+        Node node = find(word);
+        return node != null &amp;&amp; node.isWord;    // path exists AND a word ends here
+    }
+
+    public boolean startsWith(String prefix) {
+        return find(prefix) != null;           // path exists
+    }
+
+    private Node find(String s) {              // follow the path, or null if it breaks
+        Node cur = root;
+        for (int i = 0; i &lt; s.length(); i++) {
+            cur = cur.next[s.charAt(i) - 'a'];
+            if (cur == null) return null;
+        }
+        return cur;
+    }
+}</code></pre>
+  <p>Example: after inserting <code>"apple"</code>, <code>search("apple")</code> is true, <code>search("app")</code> is false (the path exists but no word ends at the second <code>p</code>), and <code>startsWith("app")</code> is true. Inserting <code>"app"</code> then makes <code>search("app")</code> true.</p>
+  <p><b>Complexity:</b> insert, search and startsWith are each O(L). Space is O(total characters × alphabet size) in the worst case for the array version — up to 26 references per node.</p>
+
+  <h4>A HashMap-based node</h4>
+  <pre data-title="TrieMap.java"><code class="language-java">import java.util.HashMap;
+import java.util.Map;
+
+class TrieMap {
+    private static class Node {
+        Map&lt;Character, Node&gt; next = new HashMap&lt;&gt;();
+        boolean isWord;
+    }
+    private final Node root = new Node();
+
+    public void insert(String word) {
+        Node cur = root;
+        for (char ch : word.toCharArray()) {
+            cur = cur.next.computeIfAbsent(ch, k -&gt; new Node());   // create when missing
+        }
+        cur.isWord = true;
+    }
+    // search and startsWith follow the same path with cur.next.get(ch)
+}</code></pre>
+
+  <h4>Useful extras on a node</h4>
+  <ul>
+    <li><b>Count of words through a node</b> (<code>int pass</code>, incremented on insert): answers "how many words start with this prefix" in O(L).</li>
+    <li><b>Store the whole word at the end node</b> (<code>String word</code>): lets a DFS collect words without rebuilding the string, as in Word Search II.</li>
+    <li><b>Frequency or score:</b> for autocomplete ranking.</li>
+  </ul>
+
+  <h4>Delete (brief)</h4>
+  <p>Deleting a word is done recursively. Walk to the end of the word and clear <code>isWord</code>. On the way back up, remove a child link only if that child has no children and is not the end of another word. Many interview problems skip deletion; a simpler approach is to clear only the flag and leave the nodes in place.</p>
+  <pre data-title="TrieDelete.java"><code class="language-java">// inside class Trie (Node as above); returns true if the caller should unlink this node
+private boolean delete(Node node, String word, int depth) {
+    if (depth == word.length()) {
+        if (!node.isWord) return false;        // the word was never stored
+        node.isWord = false;
+        return isEmpty(node);                  // unlink only if no children remain
+    }
+    int idx = word.charAt(depth) - 'a';
+    Node child = node.next[idx];
+    if (child == null) return false;           // path missing: nothing to delete
+    boolean unlink = delete(child, word, depth + 1);
+    if (unlink) {
+        node.next[idx] = null;
+        return !node.isWord &amp;&amp; isEmpty(node);   // keep going up while nodes are useless
+    }
+    return false;
+}
+
+private boolean isEmpty(Node n) {
+    for (Node c : n.next) if (c != null) return false;
+    return true;
+}</code></pre>
+
+  <h4>When to choose a trie</h4>
+  <ul>
+    <li>Many prefix queries on a fixed dictionary: autocomplete, spell check, IP routing tables (binary tries).</li>
+    <li>Problems that grow a candidate word letter by letter and want to cut off dead prefixes early (Word Search II).</li>
+    <li>Matching a pattern with wildcards over many words.</li>
+  </ul>
+
+  <h4>Trie vs HashSet of prefixes</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Trie</th><th>HashSet of all prefixes</th></tr></thead>
+    <tbody>
+      <tr><td>Exact lookup</td><td>O(L)</td><td>O(L) (hashing the string)</td></tr>
+      <tr><td>Prefix lookup</td><td>O(L)</td><td>O(L) if you stored every prefix</td></tr>
+      <tr><td>Memory</td><td>Shares common prefixes</td><td>Stores every prefix as a separate string: O(L²) per word</td></tr>
+      <tr><td>List words with a prefix</td><td>Walk down, DFS the subtree</td><td>Not possible without scanning</td></tr>
+      <tr><td>Wildcard (<code>.</code>) search</td><td>Branch at the wildcard</td><td>Not possible</td></tr>
+      <tr><td>Simplicity</td><td>More code</td><td>Very simple</td></tr>
+    </tbody>
+  </table></div>
+  <p>If only exact and prefix membership are needed and the data is small, a HashSet of prefixes is perfectly acceptable. Choose the trie when you need to walk the structure (listing, wildcards, pruning a search).</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Returning true from <code>search</code> when the path exists but <code>isWord</code> is false (it only holds a prefix of a stored word).</li>
+      <li>Using <code>c - 'a'</code> on uppercase letters or digits, which gives an index outside 0-25 and throws <code>ArrayIndexOutOfBoundsException</code>. Check the input alphabet.</li>
+      <li>Creating a new node on <code>search</code> or <code>startsWith</code>. Only <code>insert</code> may create nodes.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Expected: draw the tree for three words, name the end-of-word flag, give O(L) per operation, and explain array vs map children. A follow-up is the memory cost: 26 references per node is wasteful for sparse data, so use a map or compress single-child chains (a radix tree).</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-trie-problems">
+  <h3>Trie problems: wildcard search, replace words, common prefix, autocomplete</h3>
+  <p class="tldr">Most trie problems are the basic trie plus one idea: branch at a wildcard, stop at the first end-of-word, stop where a node has several children, or DFS the subtree below a prefix.</p>
+
+  <p>All examples reuse the same node shape: <code>Node[] next = new Node[26]</code> and <code>boolean isWord</code>. Each snippet shows only what changes.</p>
+
+  <h4>Design Add and Search Words (LeetCode 211)</h4>
+  <p><code>addWord(word)</code> as usual; <code>search(word)</code> where <code>.</code> matches any one letter. A normal letter follows one child; a <code>.</code> must try <em>every</em> child, so the search becomes a DFS with an index into the word.</p>
+  <pre data-title="WordDictionary.java"><code class="language-java">class WordDictionary {
+    private static class Node {
+        Node[] next = new Node[26];
+        boolean isWord;
+    }
+    private final Node root = new Node();
+
+    public void addWord(String word) {
+        Node cur = root;
+        for (char ch : word.toCharArray()) {
+            int i = ch - 'a';
+            if (cur.next[i] == null) cur.next[i] = new Node();
+            cur = cur.next[i];
+        }
+        cur.isWord = true;
+    }
+
+    public boolean search(String word) {
+        return dfs(root, word, 0);
+    }
+
+    private boolean dfs(Node node, String word, int pos) {
+        if (node == null) return false;
+        if (pos == word.length()) return node.isWord;
+        char ch = word.charAt(pos);
+        if (ch != '.') {
+            return dfs(node.next[ch - 'a'], word, pos + 1);
+        }
+        for (Node child : node.next) {         // wildcard: try every existing child
+            if (child != null &amp;&amp; dfs(child, word, pos + 1)) return true;
+        }
+        return false;
+    }
+}</code></pre>
+  <p><b>Complexity:</b> <code>addWord</code> is O(L). <code>search</code> is O(L) without wildcards; with wildcards the worst case is O(26<sup>L</sup>) in theory, but bounded in practice by the number of nodes in the trie, so about O(total characters stored).</p>
+
+  <h4>Replace Words (LeetCode 648)</h4>
+  <p>Given a dictionary of roots (<code>cat</code>, <code>bat</code>, <code>rat</code>) and a sentence, replace every word by the <em>shortest</em> root that is its prefix. Insert the roots; for each word walk down and stop at the first node where <code>isWord</code> is true.</p>
+  <pre data-title="ReplaceWords.java"><code class="language-java">public String replaceWords(java.util.List&lt;String&gt; dictionary, String sentence) {
+    Trie trie = new Trie();                    // Trie from the previous article
+    for (String root : dictionary) trie.insert(root);
+    StringBuilder out = new StringBuilder();
+    for (String word : sentence.split(" ")) {
+        if (out.length() &gt; 0) out.append(' ');
+        out.append(trie.shortestRoot(word));
+    }
+    return out.toString();
+}
+
+// add inside class Trie:
+String shortestRoot(String word) {
+    Node cur = root;
+    for (int i = 0; i &lt; word.length(); i++) {
+        cur = cur.next[word.charAt(i) - 'a'];
+        if (cur == null) return word;          // no root is a prefix: keep the word
+        if (cur.isWord) return word.substring(0, i + 1);   // first (shortest) root
+    }
+    return word;
+}</code></pre>
+  <p>For "the cattle was rattled by the battery" with roots cat, bat, rat, the result is "the cat was rat by the bat". <b>Complexity:</b> O(total dictionary characters + sentence length).</p>
+
+  <h4>Longest Common Prefix with a trie</h4>
+  <p>The simple solution compares strings (O(total characters) with no trie). With a trie the common prefix is the path from the root that has <em>exactly one child</em> at every step and is not a word end. It is a good way to understand tries; for the single-query problem the plain loop is better.</p>
+  <pre data-title="CommonPrefixTrie.java"><code class="language-java">// after inserting every string into the trie:
+public String commonPrefix() {
+    StringBuilder sb = new StringBuilder();
+    Node cur = root;
+    while (true) {
+        int children = 0, only = -1;
+        for (int i = 0; i &lt; 26; i++) {
+            if (cur.next[i] != null) { children++; only = i; }
+        }
+        if (children != 1 || cur.isWord) break;   // a branch or a word end stops the prefix
+        sb.append((char) ('a' + only));
+        cur = cur.next[only];
+    }
+    return sb.toString();
+}</code></pre>
+  <p>Plain alternative: take the first string as the prefix and shorten it until every other string <code>startsWith</code> it. O(S) time where S is the total number of characters, O(1) extra space.</p>
+
+  <h4>Autocomplete: words with a prefix</h4>
+  <p>Walk down the prefix, then DFS the subtree to collect words. Store a <code>count</code> or a ranking on end nodes to return the top suggestions (Design Search Autocomplete System uses the number of times a sentence was typed).</p>
+  <pre data-title="Autocomplete.java"><code class="language-java">public java.util.List&lt;String&gt; withPrefix(String prefix) {
+    java.util.List&lt;String&gt; result = new java.util.ArrayList&lt;&gt;();
+    Node cur = root;
+    for (char ch : prefix.toCharArray()) {
+        cur = cur.next[ch - 'a'];
+        if (cur == null) return result;        // no word has this prefix
+    }
+    collect(cur, new StringBuilder(prefix), result);
+    return result;
+}
+
+private void collect(Node node, StringBuilder path, java.util.List&lt;String&gt; out) {
+    if (node.isWord) out.add(path.toString());
+    for (int i = 0; i &lt; 26; i++) {
+        if (node.next[i] != null) {
+            path.append((char) ('a' + i));     // choose
+            collect(node.next[i], path, out);
+            path.deleteCharAt(path.length() - 1);   // un-choose (backtracking)
+        }
+    }
+}</code></pre>
+  <p>Because children are visited in letter order, the results are in alphabetical order. For a real product, cache the top-k suggestions on each node, update them on insert, and rank by frequency; large systems also shard the trie. That design discussion belongs to system design; here the trie is the in-memory index.</p>
+
+  <h4>Other prefix problems</h4>
+  <ul>
+    <li><b>Map Sum Pairs:</b> store a value at the end node and keep a running sum on each node along the path, or DFS the subtree.</li>
+    <li><b>Maximum XOR of two numbers:</b> a binary trie over the 31 bits; for each number, walk preferring the opposite bit. O(31·n).</li>
+    <li><b>Longest Word in Dictionary:</b> insert all words and DFS only through nodes that are word ends.</li>
+    <li><b>Search Suggestions System:</b> sort the products, then binary search for the prefix; or use a trie with up to three suggestions per node.</li>
+  </ul>
+
+  <div class="co co-tip">
+    <p class="co-t">Recognising a trie problem</p>
+    <p>Look for: a dictionary of words plus prefix queries; a search that builds a word one letter at a time and can be cut off when no word has that prefix; or a bit-by-bit choice over integers (XOR). If there are only a few exact lookups, a HashSet is simpler.</p>
+  </div>
+  <h4 id="m3-trie-problems-dry">Dry run: wildcard search</h4>
+  <p>Add <code>bad</code>, <code>dad</code> and <code>mad</code> to a <code>WordDictionary</code>. The root has three children: <code>b</code>, <code>d</code> and <code>m</code>; each leads through <code>a</code> to <code>d</code>, which is a word end. Now search <code>b.d</code>.</p>
+  <ol class="steps">
+    <li><code>dfs(root, "b.d", 0)</code>: <code>b</code> is a normal letter, so follow the single child <code>b</code>.</li>
+    <li>At position 1 the character is <code>.</code>. Try every child of this node. Only <code>a</code> exists, so call <code>dfs(a-node, "b.d", 2)</code>.</li>
+    <li>At position 2 the character is <code>d</code>; follow that child. Now <code>pos == word.length()</code>, and <code>isWord</code> is true there, so the answer is true.</li>
+  </ol>
+  <p>Search <code>.ad</code> instead: at position 0 the wildcard tries <code>b</code>, <code>d</code> and <code>m</code> in turn, and the first branch already succeeds. Search <code>b..d</code>: the path breaks because a word of length 4 does not exist, and the recursion returns false when a child is missing or the end flag is not set. Searching <code>.</code> alone returns false unless the dictionary has a one-letter word.</p>
+
+  <h4 id="m3-trie-problems-mapsum">Map Sum Pairs: a running sum on every node</h4>
+  <p>Insert key-value pairs, then return the sum of the values of all keys with a given prefix. Store a <code>sum</code> on every node of a key's path. When a key is inserted again, add only the <em>difference</em> from its old value, so keep a side map of current values.</p>
+  <pre data-title="MapSum.java"><code class="language-java">class MapSum {
+    private static class Node {
+        Node[] next = new Node[26];
+        int sum;                               // sum of values of all keys through this node
+    }
+    private final Node root = new Node();
+    private final java.util.Map&lt;String, Integer&gt; values = new java.util.HashMap&lt;&gt;();
+
+    public void insert(String key, int val) {
+        int delta = val - values.getOrDefault(key, 0);   // re-inserting overwrites the old value
+        values.put(key, val);
+        Node cur = root;
+        for (char ch : key.toCharArray()) {
+            int i = ch - 'a';
+            if (cur.next[i] == null) cur.next[i] = new Node();
+            cur = cur.next[i];
+            cur.sum += delta;
+        }
+    }
+
+    public int sum(String prefix) {
+        Node cur = root;
+        for (char ch : prefix.toCharArray()) {
+            cur = cur.next[ch - 'a'];
+            if (cur == null) return 0;         // no key has this prefix
+        }
+        return cur.sum;                        // O(L) per query
+    }
+}</code></pre>
+  <p>Insert ("apple", 3), then ("app", 2): <code>sum("ap")</code> is 5. Insert ("apple", 5) again: the delta is 2, so <code>sum("ap")</code> becomes 7.</p>
+
+  <h4 id="m3-trie-problems-xor">Maximum XOR of two numbers: a binary trie</h4>
+  <p>Treat each non-negative <code>int</code> as a string of 31 bits and insert it into a trie with only two children per node (0 and 1). For each number, walk down from the top bit and at every level prefer the child with the <em>opposite</em> bit, because a 1 in a higher position beats any combination of lower bits. The path you follow is the number that gives the largest XOR with the current one. Total time is O(31 · n).</p>
+  <pre data-title="MaxXor.java"><code class="language-java">public int findMaximumXOR(int[] nums) {
+    int[][] next = new int[nums.length * 31 + 1][2];   // next[node][bit]; 0 means "no child"
+    int nodes = 1;                                     // node 0 is the root and never a child
+    for (int x : nums) {
+        int cur = 0;
+        for (int b = 30; b &gt;= 0; b--) {
+            int bit = (x &gt;&gt; b) &amp; 1;
+            if (next[cur][bit] == 0) next[cur][bit] = nodes++;
+            cur = next[cur][bit];
+        }
+    }
+    int best = 0;
+    for (int x : nums) {
+        int cur = 0, val = 0;
+        for (int b = 30; b &gt;= 0; b--) {
+            int bit = (x &gt;&gt; b) &amp; 1;
+            int want = bit ^ 1;                        // the opposite bit gives a 1 in the XOR
+            if (next[cur][want] != 0) {
+                val |= 1 &lt;&lt; b;
+                cur = next[cur][want];
+            } else {
+                cur = next[cur][bit];                  // forced: only the same bit exists
+            }
+        }
+        best = Math.max(best, val);
+    }
+    return best;
+}
+// [3, 10, 5, 25, 2, 8] gives 28, from 5 XOR 25</code></pre>
+  <p>An array-based trie like this one avoids creating thousands of node objects and is faster in Java, at the cost of readability.</p>
+
+  <h4 id="m3-trie-problems-table">Problem to trick</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Problem</th><th>What the trie stores</th><th>The trick</th></tr></thead>
+    <tbody>
+      <tr><td>Add and Search Words</td><td>End flag</td><td>DFS that branches at <code>.</code></td></tr>
+      <tr><td>Replace Words</td><td>End flag</td><td>Stop at the first end flag</td></tr>
+      <tr><td>Autocomplete</td><td>End flag or count</td><td>Walk the prefix, then DFS the subtree</td></tr>
+      <tr><td>Map Sum Pairs</td><td>A sum per node</td><td>Add the delta along the path</td></tr>
+      <tr><td>Maximum XOR</td><td>Bits, two children</td><td>Prefer the opposite bit</td></tr>
+      <tr><td>Longest Common Prefix</td><td>Child count</td><td>Follow single-child nodes</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Empty word or prefix:</strong> <code>startsWith("")</code> is true when the trie is not empty (the root exists), and <code>search("")</code> is true only if the empty string was inserted. Decide what the problem wants.</li>
+      <li><strong>A word that is a prefix of another</strong> ("app" and "apple"): the common-prefix loop must stop at the end flag, which is why it checks <code>cur.isWord</code>.</li>
+      <li><strong>Wildcard at the end or only wildcards:</strong> the DFS still works, since it ends with a check of <code>isWord</code> at depth equal to the length.</li>
+      <li><strong>Characters outside a–z:</strong> <code>ch - 'a'</code> gives a bad index and <code>ArrayIndexOutOfBoundsException</code>. Validate, or use a HashMap node.</li>
+      <li><strong>Overwriting a key</strong> in Map Sum: add the difference, never the new value again.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: forgetting to undo the choice in the autocomplete DFS</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: the path keeps growing</p><pre><code class="language-java">path.append((char) ('a' + i));
+collect(node.next[i], path, out);
+// no deleteCharAt: later words get extra letters</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: choose, explore, un-choose</p><pre><code class="language-java">path.append((char) ('a' + i));
+collect(node.next[i], path, out);
+path.deleteCharAt(path.length() - 1);</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Add and Search Words is the common one: say that exact letters follow one edge, a wildcard fans out to all children, and give the worst case honestly (bounded by the size of the trie). For autocomplete, expect the design follow-up: store the top three suggestions on each node, or sort candidates by frequency. For Maximum XOR, explain "opposite bit first, greedy from the top bit" and why a higher bit always outweighs all lower bits.</p>
+  </div>
+
+</article>
+
+<article class="topic" id="m3-trie-word-search-ii">
+  <h3>Word Search II: trie plus backtracking</h3>
+  <p class="tldr">Word Search II searches for many words in one grid by putting all words in a trie and running one DFS from each cell, walking the trie in step with the grid, so dead prefixes are cut off at once.</p>
+
+  <p><b>Problem (LeetCode 212):</b> given a grid of letters and a list of words, return all words that can be formed by walking through adjacent cells (up, down, left, right) without reusing a cell within one word. The earlier <a href="#m3-word-search">Word Search</a> problem handles one word; running it once per word is far too slow for many words, because each run repeats work on shared prefixes.</p>
+
+  <h4>The idea</h4>
+  <ol class="steps">
+    <li>Insert every word in a trie. Store the full word in the node where it ends (<code>node.word</code>), so no path rebuilding is needed.</li>
+    <li>For each cell, start a DFS with the trie root. At each step move into the child for the cell's letter. If there is no such child, no word has this prefix: stop immediately.</li>
+    <li>If the new node has a <code>word</code>, add it to the result and clear it (<code>node.word = null</code>) so the same word is not reported twice.</li>
+    <li>Mark the cell as visited while exploring its neighbours, then restore it (the usual backtracking step).</li>
+  </ol>
+  <figure class="fig">
+<pre class="diagram">
+ grid          words: oath, eat        trie
+  o a a n                               root
+  e t a e                              /    \
+  i h k r                             o      e
+  i f l v                             |      |
+                                       a      a
+ DFS from (0,0) 'o' -> child o        |      |
+ neighbour 'a' -> child a             t      t*
+ neighbour 't' -> child t             |
+ neighbour 'h' -> child h* => "oath"  h*
+</pre>
+<figcaption>The grid walk follows trie edges; a missing edge prunes the whole branch</figcaption>
+</figure>
+
+  <h4>Java solution</h4>
+  <pre data-title="WordSearchII.java"><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+class Solution {
+    private static class Node {
+        Node[] next = new Node[26];
+        String word;                           // non-null when a word ends here
+    }
+
+    public List&lt;String&gt; findWords(char[][] board, String[] words) {
+        Node root = new Node();
+        for (String w : words) {               // build the trie
+            Node cur = root;
+            for (char ch : w.toCharArray()) {
+                int i = ch - 'a';
+                if (cur.next[i] == null) cur.next[i] = new Node();
+                cur = cur.next[i];
+            }
+            cur.word = w;
+        }
+        List&lt;String&gt; result = new ArrayList&lt;&gt;();
+        for (int r = 0; r &lt; board.length; r++) {
+            for (int c = 0; c &lt; board[0].length; c++) {
+                dfs(board, r, c, root, result);
+            }
+        }
+        return result;
+    }
+
+    private void dfs(char[][] b, int r, int c, Node parent, List&lt;String&gt; result) {
+        char ch = b[r][c];
+        if (ch == '#') return;                 // already used on this path
+        Node node = parent.next[ch - 'a'];
+        if (node == null) return;              // no word has this prefix: prune
+        if (node.word != null) {
+            result.add(node.word);
+            node.word = null;                  // avoid duplicates
+        }
+        b[r][c] = '#';                         // mark visited
+        if (r &gt; 0) dfs(b, r - 1, c, node, result);
+        if (c &gt; 0) dfs(b, r, c - 1, node, result);
+        if (r &lt; b.length - 1) dfs(b, r + 1, c, node, result);
+        if (c &lt; b[0].length - 1) dfs(b, r, c + 1, node, result);
+        b[r][c] = ch;                          // restore (backtrack)
+    }
+}</code></pre>
+  <p>With the grid above and words <code>["oath", "pea", "eat", "rain"]</code> the result is <code>["oath", "eat"]</code> (in discovery order).</p>
+
+  <h4>Complexity</h4>
+  <p>Let <code>M × N</code> be the grid and <code>L</code> the longest word. Each DFS can go at most L deep and branches into at most 3 new directions after the first step, so the worst case is about O(M·N·4·3<sup>L-1</sup>). The trie makes the real cost much smaller, because the walk stops where no word continues. Space: the trie takes O(total characters of all words) nodes, plus O(L) recursion depth.</p>
+
+  <h4>Optimisation: prune empty branches</h4>
+  <p>Once a word is found, its nodes may be useless. If a node has no children and no word, remove it from its parent, so later DFS calls stop earlier. This matters for tests with large grids of one repeated letter. A simple way is to keep a child counter and unlink on the way back:</p>
+  <pre data-title="Prune (fragment)"><code class="language-java">// at the end of dfs, after restoring the cell:
+if (isLeafWithoutWord(node)) {
+    parent.next[ch - 'a'] = null;              // nothing left below this node
+}
+// isLeafWithoutWord: node.word == null and all node.next[i] are null
+// (use a "childCount" field to make this check O(1))</code></pre>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes in this problem</p>
+    <ul>
+      <li>Searching word by word (a new DFS per word): works on small inputs and times out otherwise.</li>
+      <li>Forgetting to restore <code>b[r][c]</code> after the recursive calls, which corrupts the grid for other paths.</li>
+      <li>Not clearing <code>node.word</code>, so a word reachable in two ways appears twice in the output.</li>
+      <li>Using a <code>String</code> path built by concatenation at every step; store the word in the node instead.</li>
+    </ul>
+  </div>
+  <h4 id="m3-trie-word-search-ii-why">Why the trie helps</h4>
+  <p>Word Search I tries to match one word. If you run it for each of w words, a prefix such as "oat" is walked again for "oath", "oats" and "oaten". The trie merges all words that share a prefix into one path, so a single walk through the grid tests all of them at once. More important, the walk stops the moment the current path is not a prefix of any word. Without the trie you would have to check each word separately to learn that a dead end is dead for all of them. The cost depends on the grid and the length of the words, not on how many words there are.</p>
+
+  <h4 id="m3-trie-word-search-ii-dry">Dry run on a 2 × 2 grid</h4>
+  <figure class="fig">
+<pre class="diagram">
+ board        words: oat, eat
+  o a
+  e t
+</pre>
+<figcaption>A 2 x 2 board and two words</figcaption>
+</figure>
+  <ol class="steps">
+    <li>Start at (0,0) <code>o</code>: the root has a child <code>o</code>, so go on. Mark the cell. Neighbours: up and left do not exist; down is <code>e</code>, but the <code>o</code> node has no child <code>e</code>, so return at once; right is <code>a</code>, which is a child.</li>
+    <li>At (0,1) <code>a</code>: left (0,0) is marked <code>#</code>; down is (1,1) <code>t</code>, which is a child and carries the word "oat". Add "oat" to the result and set the field to null. Restore the cells on the way back.</li>
+    <li>Start at (0,1) <code>a</code>: the root has no child <code>a</code>, so prune immediately. This is the saving: no word starts with <code>a</code>.</li>
+    <li>Start at (1,0) <code>e</code>: the root has a child <code>e</code>. Its neighbours are (0,0) <code>o</code> and (1,1) <code>t</code>. The <code>e</code> node has only the child <code>a</code>, so both fail.</li>
+    <li>Start at (1,1) <code>t</code>: no word starts with <code>t</code>.</li>
+  </ol>
+  <p>The result is <code>["oat"]</code>. "eat" is not found because its <code>a</code> at (0,1) is diagonal to the <code>e</code> at (1,0); moves are only up, down, left and right.</p>
+
+  <h4 id="m3-trie-word-search-ii-prune">Pruning with a leaf check, in code</h4>
+  <p>The version above never removes nodes. With many words and a grid of repeated letters, the DFS keeps walking branches whose words were already found. Removing a node once its subtree is empty fixes this. Here is the DFS with the pruning in place (the trie building and the outer loop are the same).</p>
+  <pre data-title="WordSearchIIPruned.java"><code class="language-java">private void dfs(char[][] b, int r, int c, Node parent, List&lt;String&gt; result) {
+    char ch = b[r][c];
+    if (ch == '#') return;                     // used on the current path
+    int idx = ch - 'a';
+    Node node = parent.next[idx];
+    if (node == null) return;                  // no word has this prefix
+    if (node.word != null) {
+        result.add(node.word);
+        node.word = null;                      // report each word once
+    }
+    b[r][c] = '#';
+    if (r &gt; 0) dfs(b, r - 1, c, node, result);
+    if (c &gt; 0) dfs(b, r, c - 1, node, result);
+    if (r &lt; b.length - 1) dfs(b, r + 1, c, node, result);
+    if (c &lt; b[0].length - 1) dfs(b, r, c + 1, node, result);
+    b[r][c] = ch;                              // backtrack
+    if (node.word == null &amp;&amp; isLeaf(node)) {
+        parent.next[idx] = null;               // this branch can never produce a word again
+    }
+}
+
+private boolean isLeaf(Node n) {
+    for (Node child : n.next) if (child != null) return false;
+    return true;                               // keep a childCount field to make this O(1)
+}</code></pre>
+  <p>The pruning is done after restoring the cell, so the board is never left corrupted. Because the pruned node's parent may then also become a leaf, the effect travels up the recursion: a path that only led to found words disappears completely.</p>
+
+  <h4 id="m3-trie-word-search-ii-compare">Word Search I versus II, and the alternatives</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Approach</th><th>Idea</th><th>When it works</th></tr></thead>
+    <tbody>
+      <tr><td>Word Search I, one DFS</td><td>Match one word along grid paths</td><td>A single word</td></tr>
+      <tr><td>Repeat Word Search I per word</td><td>w separate DFS runs</td><td>Few words only; times out for thousands</td></tr>
+      <tr><td>Trie plus DFS (this article)</td><td>One walk, shared prefixes, pruning</td><td>Many words</td></tr>
+      <tr><td>Aho–Corasick</td><td>Trie with failure links for text streams</td><td>Searching many patterns in a long text, not a grid with paths</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Duplicate words in the list:</strong> both inserts reach the same end node, and <code>node.word = null</code> after the first find means the word is reported once.</li>
+      <li><strong>A word longer than the number of cells</strong> can never be found; the DFS dies out without an error.</li>
+      <li><strong>1 × 1 board:</strong> the neighbour checks (<code>r &gt; 0</code>, <code>r &lt; b.length - 1</code>) all fail and only a one-letter word can match.</li>
+      <li><strong>The sentinel <code>'#'</code></strong> works because the letters are lowercase; if the board can contain <code>'#'</code>, use a <code>boolean[][] visited</code> instead.</li>
+      <li><strong>Words that are prefixes of each other</strong> ("oa" and "oath"): the end flag is on the inner node, and the DFS reports "oa" and keeps going to look for "oath".</li>
+      <li><strong>Recursion depth</strong> is at most the longest word, which is short in the usual constraints, so <code>StackOverflowError</code> is not a concern.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: checking the end flag before moving into the child</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: the word check is one step late</p><pre><code class="language-java">if (parent.word != null) { result.add(parent.word); }   // parent, not node
+Node node = parent.next[ch - 'a'];
+if (node == null) return;
+// a one-letter word on the last cell is never added</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: move first, then test the new node</p><pre><code class="language-java">Node node = parent.next[ch - 'a'];
+if (node == null) return;
+if (node.word != null) { result.add(node.word); node.word = null; }</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>The interviewer wants to hear "one trie, one DFS, prune when the prefix is missing". Say why the trie helps: all words sharing a prefix are explored together, and a failed prefix cuts off every word below it. Compare it with the one-word-at-a-time approach and state the complexity honestly as exponential in the word length.</p>
+  </div>
+</article>
+
+<article class="topic recap" id="m3-interview-b">
+  <h3>Interview questions — Dynamic programming and tries</h3>
+
+  <details class="qa">
+    <summary>How do you recognise a dynamic programming problem?</summary>
+    <div class="qa-a">
+      <p>Look for two properties: <b>overlapping subproblems</b> (the same smaller question is asked many times) and <b>optimal substructure</b> (the best answer is built from best answers of smaller parts). Typical wording: "minimum/maximum", "count the number of ways", "is it possible", over choices, with a brute force that tries all subsets or paths. If greedy fails on a small counter-example, DP is the usual next step.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between memoization and tabulation?</summary>
+    <div class="qa-a">
+      <p>Memoization is <b>top-down</b>: write the recursion and cache each result so it is computed once. It only visits states that are reachable and is easy to write, but uses recursion depth. Tabulation is <b>bottom-up</b>: fill a table from the base cases in an order that satisfies dependencies. It has no stack risk and allows space optimisation (rolling rows). Both have the same time complexity for the same state space.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Walk me through the steps for solving any DP problem.</summary>
+    <div class="qa-a">
+      <p>Define the state precisely ("<code>dp[i]</code> = ..."), write the transition from smaller states, set the base cases, choose an iteration order so dependencies are ready, and say where the answer is (last cell, or max over cells). Then check complexity and see whether a row or two variables are enough.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why does the 1D 0/1 knapsack loop run from high capacity to low?</summary>
+    <div class="qa-a">
+      <p>Because <code>dp[w]</code> must read <code>dp[w - wt]</code> from the <em>previous item's</em> row. A forward loop would already have updated <code>dp[w - wt]</code> for the current item, so the item could be used several times. Backward iteration keeps the lower cells untouched. Unbounded knapsack wants reuse, so it goes forward.</p>
+      <pre><code class="language-java">for (int w = W; w &gt;= wt; w--) dp[w] = Math.max(dp[w], dp[w - wt] + val);</code></pre>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>In Coin Change II, why must the coin loop be outside?</summary>
+    <div class="qa-a">
+      <p>With coins outside and amounts inside, each coin is "introduced" once, so each combination is counted in one fixed order: it counts <b>combinations</b>. Swapping the loops lets any coin follow any other at each amount, so <code>1+2</code> and <code>2+1</code> both count: it counts <b>permutations</b> (that is the Combination Sum IV problem).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain the O(n log n) LIS algorithm. Is the tails array the LIS?</summary>
+    <div class="qa-a">
+      <p><code>tails[k]</code> is the smallest possible last value of an increasing subsequence of length k+1. It stays sorted. For each number, binary search the first tail that is at least as large (for strict increase) and replace it; if none exists, append. The length of the array is the LIS length, but the array itself is not necessarily a real subsequence. Time O(n log n), space O(n).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Longest common subsequence versus longest common substring: what changes in the DP?</summary>
+    <div class="qa-a">
+      <p>Both use <code>dp[i][j]</code> over prefixes and extend the diagonal on a match. For the subsequence, a mismatch takes <code>max(up, left)</code> and the answer is the last cell. For the substring, a mismatch resets the cell to 0 (the run is broken) and the answer is the maximum over the whole table.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you reconstruct the LCS string, not just its length?</summary>
+    <div class="qa-a">
+      <p>Keep the full table. Start at <code>dp[m][n]</code>. If the two characters match, add the character and go diagonally. Otherwise move to the neighbour (up or left) with the larger value. The characters come out reversed, so reverse the result. The two-row space optimisation cannot do this.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain the three moves in edit distance.</summary>
+    <div class="qa-a">
+      <p>If the last characters match, take <code>dp[i-1][j-1]</code>. Otherwise 1 plus the minimum of the diagonal (replace), the cell above (delete from the first word) and the cell to the left (insert into the first word). Base cases: <code>dp[i][0] = i</code> and <code>dp[0][j] = j</code>. O(m·n) time.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you find the longest palindromic substring, and what is its complexity?</summary>
+    <div class="qa-a">
+      <p>Expand around each of the 2n-1 centres (n single characters and n-1 gaps), growing while the ends match, and track the best. That is O(n²) time and O(1) space. A DP table <code>isPal[i][j]</code> gives the same time but O(n²) space. Manacher's algorithm reaches O(n) but is rarely expected.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How is the longest palindromic subsequence related to LCS?</summary>
+    <div class="qa-a">
+      <p>It equals the LCS of the string and its reverse, because a palindrome reads the same both ways. The minimum number of insertions to make a string a palindrome is then <code>n - LPS</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why can a DP on a 40 × 40 grid of path counts give a negative number?</summary>
+    <div class="qa-a">
+      <p>The counts exceed the range of <code>int</code> (about 2.1 billion) and Java wraps around silently instead of throwing. Use <code>long</code>, or take the result modulo the value the problem gives, applying the modulo after every addition. Similar bugs come from adding 1 to <code>Integer.MAX_VALUE</code> used as infinity.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a trie and when would you use it instead of a HashSet?</summary>
+    <div class="qa-a">
+      <p>A trie stores words along a tree of characters, with an end-of-word flag. Insert, search and startsWith are O(L). Use it when you need prefix queries, listing all words under a prefix, wildcard search, or pruning a search once no word has the current prefix. A HashSet is simpler for exact lookups only.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why does Word Search II use a trie instead of searching each word separately?</summary>
+    <div class="qa-a">
+      <p>One DFS over the grid, guided by the trie, searches all words at once and shares work between words with the same prefix. When the next letter has no trie child, the DFS stops, which prunes whole groups of words. Searching word by word repeats the same grid walks and is too slow for large word lists.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Compare TrieNode[26] and HashMap children.</summary>
+    <div class="qa-a">
+      <p>The array gives O(1) indexed access with no hashing, but uses 26 references per node even when sparse. A map uses memory only for existing children and handles any alphabet, but each access costs more. For lowercase interview problems use the array; for Unicode or mixed content use a map.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m3-cheatsheet-b">
+  <h3>Cheat sheet — Dynamic programming and tries</h3>
+  <ul class="cheat">
+    <li><b>DP = recursion + cache</b> overlapping subproblems and optimal substructure; same answer asked many times.</li>
+    <li><b>Five questions</b> state, transition, base cases, iteration order, where the answer is.</li>
+    <li><b>Memo vs table</b> memo is top-down and lazy; the table is bottom-up and allows rolling arrays.</li>
+    <li><b>1D prefix DP</b> <code>dp[i] = f(dp[i-1], dp[i-2])</code> becomes two variables; for example house robber <code>max(dp[i-1], dp[i-2] + x)</code>.</li>
+    <li><b>Coin change (min)</b> <code>dp[0] = 0</code>, others <code>amount + 1</code>; <code>dp[a] = min(dp[a-c] + 1)</code>.</li>
+    <li><b>Coin change II (ways)</b> coins outer, amounts inner, <code>dp[a] += dp[a-c]</code>; swap loops and you count permutations.</li>
+    <li><b>LIS</b> O(n²): <code>dp[i]</code> ends at i, answer is the max. O(n log n): tails array plus lower bound (strict).</li>
+    <li><b>Grid DP</b> <code>dp[r][c]</code> from up and left; fill the first row and column or pad with zeros; shrink to one row.</li>
+    <li><b>Maximal square</b> <code>1 + min(up, left, up-left)</code> on cells that are 1.</li>
+    <li><b>0/1 knapsack 1D</b> capacity loop from high to low; each item used once.</li>
+    <li><b>Unbounded knapsack</b> capacity loop from low to high; unlimited use (rod cutting, coin change).</li>
+    <li><b>Subset sum family</b> <code>dp[0] = true</code> or 1; partition needs an even total; target sum: <code>P = (total + target) / 2</code>.</li>
+    <li><b>LCS</b> match: diagonal + 1; else max(up, left); answer in the corner; walk back to rebuild the string.</li>
+    <li><b>Longest common substring</b> mismatch resets to 0; the answer is the maximum cell.</li>
+    <li><b>Edit distance</b> match: diagonal; else 1 + min(replace, delete, insert); base <code>dp[i][0] = i</code>.</li>
+    <li><b>Palindromes</b> expand around 2n-1 centres for substrings; LPS = LCS(s, reverse s); interval DP loops <code>i</code> downwards.</li>
+    <li><b>Other shapes</b> stock states, interval DP by length, tree DP returning a pair, bitmask DP for n up to about 20.</li>
+    <li><b>Pitfalls</b> base cases, loop order, <code>long</code> for counts and a safe infinity, memo marker -1, recursion depth.</li>
+    <li><b>Trie</b> node = children + end flag; insert/search/startsWith O(L); <code>search</code> checks the flag, <code>startsWith</code> does not.</li>
+    <li><b>Wildcard trie search</b> on <code>.</code> loop over all children with DFS.</li>
+    <li><b>Word Search II</b> trie of words, DFS from each cell, prune on a missing child, store the word at the end node, null it after finding it.</li>
+    <li><b>Trie vs HashSet</b> the trie wins for listing, wildcards and pruning; the HashSet wins for simplicity.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m3-practice-b">
+  <h3>Practice — Dynamic programming and tries</h3>
+  <p>Month 9 target: about 40 problems on dynamic programming and tries. Write each in a blank editor first, then compare with the notes. Log every problem that needed help and re-solve it later (see <a href="#m4">Module 4</a>).</p>
+  <ol class="steps">
+    <li><b>Fibonacci ladder.</b> Solve Climbing Stairs four ways: plain recursion, memo, table, two variables. Done when you can state the complexity of each and explain why the first is exponential.</li>
+    <li><b>1D set (8 problems).</b> Min Cost Climbing Stairs, House Robber I and II, Decode Ways, Coin Change, Coin Change II, Word Break, Maximum Product Subarray. Done when you write the state and base case before any code.</li>
+    <li><b>LIS (3 problems).</b> Longest Increasing Subsequence in O(n²) and then O(n log n), plus Number of Longest Increasing Subsequence or Russian Doll Envelopes. Done when you can explain the tails array and strict vs non-strict.</li>
+    <li><b>Grid DP (6 problems).</b> Unique Paths I and II, Minimum Path Sum, Triangle, Maximal Square, Dungeon Game. Done when each uses one row of space and you can say the iteration order.</li>
+    <li><b>Knapsack family (8 problems).</b> 0/1 knapsack (2D then 1D), Subset Sum, Partition Equal Subset Sum, Target Sum, Last Stone Weight II, Ones and Zeroes, Unbounded knapsack, Rod Cutting. Done when you can predict the loop direction without trying it.</li>
+    <li><b>String DP (8 problems).</b> Longest Common Subsequence (with reconstruction), Longest Common Substring, Edit Distance, Longest Palindromic Subsequence, Longest Palindromic Substring, Palindromic Substrings, Distinct Subsequences, Wildcard Matching. Done when you can fill a small table by hand for LCS and edit distance.</li>
+    <li><b>Other shapes (4 problems).</b> Best Time to Buy and Sell Stock with Cooldown, Burst Balloons, House Robber III, one bitmask problem such as Partition to K Equal Sum Subsets. Done when you can name the shape before you write code.</li>
+    <li><b>Tries (5 problems).</b> Implement Trie, Design Add and Search Words, Replace Words, Longest Word in Dictionary, Word Search II. Done when you can write the trie class from memory in under ten minutes.</li>
+    <li><b>Pitfall drill.</b> Re-solve two earlier problems after deliberately breaking them (wrong loop direction, int overflow, memo filled with 0) and see the failure. Done when you can name each symptom.</li>
+  </ol>
+</article>

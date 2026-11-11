@@ -1,0 +1,763 @@
+<article class="topic" id="m4-maps">
+  <h3>Map: the API, HashMap vs LinkedHashMap vs TreeMap</h3>
+  <p class="tldr">A Map stores unique keys with one value each; HashMap is the fast default, LinkedHashMap remembers order, TreeMap keeps keys sorted, and the Java 8 methods merge, computeIfAbsent and getOrDefault replace most if-else code.</p>
+
+  <p>A <code>Map&lt;K, V&gt;</code> maps a <strong>key</strong> to a <strong>value</strong>. Keys are unique (decided by <code>equals</code>, or by the comparator in a <code>TreeMap</code>); values can repeat. Putting a key that already exists replaces its value. Think of a phone book, a Redis cache, or "order id → order". The three everyday implementations differ only in order and speed:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>HashMap</code></th><th><code>LinkedHashMap</code></th><th><code>TreeMap</code></th></tr></thead>
+    <tbody>
+      <tr><td>Iteration order</td><td>Undefined</td><td>Insertion order (or access order)</td><td>Sorted by key</td></tr>
+      <tr><td>Speed of get / put / remove</td><td>O(1) average</td><td>O(1) average</td><td>O(log n)</td></tr>
+      <tr><td>Null key</td><td>One allowed</td><td>One allowed</td><td>Not allowed (with natural order)</td></tr>
+      <tr><td>Built on</td><td>Table of buckets</td><td>HashMap + doubly linked list of entries</td><td>Red-black tree</td></tr>
+      <tr><td>Keys need</td><td><code>equals</code> + <code>hashCode</code></td><td><code>equals</code> + <code>hashCode</code></td><td><code>Comparable</code> or a <code>Comparator</code></td></tr>
+      <tr><td>Extra methods</td><td>—</td><td><code>removeEldestEntry</code>, Java 21 sequenced methods</td><td><code>NavigableMap</code>: <code>floorKey</code>, <code>headMap</code>, …</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The Map methods you must know</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>put(k, v)</code></td><td>Insert or replace; returns the old value or <code>null</code></td></tr>
+      <tr><td><code>get(k)</code></td><td>Value or <code>null</code> — also <code>null</code> if the stored value is <code>null</code></td></tr>
+      <tr><td><code>getOrDefault(k, d)</code></td><td>Value, or <code>d</code> if the key is absent</td></tr>
+      <tr><td><code>containsKey(k)</code> / <code>containsValue(v)</code></td><td>Key check (fast) / value check (scans everything)</td></tr>
+      <tr><td><code>putIfAbsent(k, v)</code></td><td>Put only if the key is absent (or maps to <code>null</code>); returns the existing value</td></tr>
+      <tr><td><code>computeIfAbsent(k, fn)</code></td><td>If absent, compute the value from the key and store it; returns the value</td></tr>
+      <tr><td><code>computeIfPresent(k, fn)</code></td><td>If present, replace with <code>fn(k, oldValue)</code>; returning <code>null</code> removes the entry</td></tr>
+      <tr><td><code>compute(k, fn)</code></td><td>Always run <code>fn(k, oldValueOrNull)</code> and store the result</td></tr>
+      <tr><td><code>merge(k, v, fn)</code></td><td>If absent store <code>v</code>; else store <code>fn(old, v)</code>. The counting idiom</td></tr>
+      <tr><td><code>remove(k)</code>, <code>remove(k, v)</code></td><td>Remove by key; remove only if the value matches too</td></tr>
+      <tr><td><code>replaceAll(fn)</code>, <code>forEach((k, v) -> …)</code></td><td>Transform all values; loop over all pairs</td></tr>
+      <tr><td><code>keySet()</code>, <code>values()</code>, <code>entrySet()</code></td><td>Live <em>views</em> of the keys, values and pairs</td></tr>
+      <tr><td><code>Map.entry(k, v)</code></td><td>An immutable key-value pair (no nulls)</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="MapMethods.java"><code class="language-java">import java.util.*;
+
+public class MapMethods {
+    public static void main(String[] args) {
+        Map&lt;String, Integer&gt; stock = new TreeMap&lt;&gt;();   // TreeMap: stable printing
+
+        stock.put("pen", 10);
+        System.out.println(stock.putIfAbsent("pen", 99));    // 10, value unchanged
+        System.out.println(stock.putIfAbsent("book", 5));    // null, inserted
+        System.out.println(stock);
+        System.out.println(stock.getOrDefault("bag", 0));    // 0, "bag" is NOT added
+
+        stock.merge("pen", 5, Integer::sum);                 // 10 + 5
+        stock.computeIfAbsent("cap", k -&gt; 3);                // absent → 3
+        stock.computeIfPresent("book", (k, v) -&gt; v - 1);     // 5 → 4
+        stock.compute("pen", (k, v) -&gt; v == null ? 1 : v + 1);   // 15 → 16
+        System.out.println(stock);
+
+        stock.remove("cap");
+        stock.replaceAll((k, v) -&gt; v * 2);
+        System.out.println(stock);
+
+        for (Map.Entry&lt;String, Integer&gt; e : stock.entrySet()) {   // best way to loop
+            System.out.println(e.getKey() + " = " + e.getValue());
+        }
+        stock.forEach((k, v) -&gt; System.out.println(k + " -&gt; " + v));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">10
+null
+{book=5, pen=10}
+0
+{book=4, cap=3, pen=16}
+{book=8, pen=32}
+book = 8
+pen = 32
+book -> 8
+pen -> 32</code></pre>
+  <p>Loop over <code>entrySet()</code> when you need both key and value. Looping over <code>keySet()</code> and calling <code>get(key)</code> inside does a second lookup for every key.</p>
+
+  <h4>Word frequency — the classic example</h4>
+  <p>Counting is the most common map task. There are three styles; the second is the idiom to learn.</p>
+  <pre data-title="WordCount.java"><code class="language-java">import java.util.*;
+import java.util.stream.*;
+
+public class WordCount {
+    public static void main(String[] args) {
+        String text = "to be or not to be that is the question";
+        String[] words = text.split(" ");
+
+        // 1. Classic: getOrDefault
+        Map&lt;String, Integer&gt; counts1 = new TreeMap&lt;&gt;();
+        for (String w : words) {
+            counts1.put(w, counts1.getOrDefault(w, 0) + 1);
+        }
+
+        // 2. merge: shortest and safe — "if absent put 1, else add 1"
+        Map&lt;String, Integer&gt; counts2 = new TreeMap&lt;&gt;();
+        for (String w : words) {
+            counts2.merge(w, 1, Integer::sum);
+        }
+
+        // 3. Streams
+        Map&lt;String, Long&gt; counts3 = Arrays.stream(words)
+                .collect(Collectors.groupingBy(w -&gt; w, TreeMap::new,
+                        Collectors.counting()));
+
+        System.out.println(counts1);
+        System.out.println(counts2.equals(counts1));
+        System.out.println(counts3);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{be=2, is=1, not=1, or=1, question=1, that=1, the=1, to=2}
+true
+{be=2, is=1, not=1, or=1, question=1, that=1, the=1, to=2}</code></pre>
+
+  <h4>Grouping with computeIfAbsent</h4>
+  <p>To build a "multi-map" (one key → a list of values), <code>computeIfAbsent</code> creates the list the first time and returns it, so you can add in the same line:</p>
+  <pre data-title="GroupByCity.java"><code class="language-java">record Employee(String name, String city) {}
+
+List&lt;Employee&gt; staff = List.of(new Employee("Ravi", "Mumbai"),
+        new Employee("Asha", "Pune"), new Employee("Meera", "Mumbai"));
+
+Map&lt;String, List&lt;String&gt;&gt; byCity = new TreeMap&lt;&gt;();
+for (Employee e : staff) {
+    byCity.computeIfAbsent(e.city(), city -&gt; new ArrayList&lt;&gt;()).add(e.name());
+}
+System.out.println(byCity);          // {Mumbai=[Ravi, Meera], Pune=[Asha]}</code></pre>
+
+  <h4>Sorting a map by value</h4>
+  <p>A map has no order to sort, so you stream its entries, sort them, and collect into an order-preserving map such as <code>LinkedHashMap</code>.</p>
+  <pre data-title="SortByValue.java"><code class="language-java">Map&lt;String, Integer&gt; marks = Map.of("Asha", 82, "Ravi", 91, "Meera", 75);
+
+List&lt;Map.Entry&lt;String, Integer&gt;&gt; ranked = marks.entrySet().stream()
+        .sorted(Map.Entry.&lt;String, Integer&gt;comparingByValue().reversed())
+        .toList();
+System.out.println(ranked);          // [Ravi=91, Asha=82, Meera=75]</code></pre>
+
+  <h4>Immutable maps</h4>
+  <p><code>Map.of(k1, v1, k2, v2, …)</code> (up to 10 pairs), <code>Map.ofEntries(Map.entry(…), …)</code> and <code>Map.copyOf(map)</code> create <strong>immutable</strong> maps. They reject <code>null</code> keys and values, throw <code>IllegalArgumentException</code> for duplicate keys, and their iteration order is deliberately unspecified and can differ from one JVM run to the next. Never write a test that depends on it.</p>
+
+  <h4>LinkedHashMap: order, and an LRU cache</h4>
+  <p><code>LinkedHashMap</code> is a <code>HashMap</code> in which every entry also sits in a <strong>doubly linked list</strong>. Lookups are as fast as <code>HashMap</code>, and iteration follows the list. The list order is <em>insertion order</em> by default (re-inserting an existing key does not move it). With the constructor <code>new LinkedHashMap&lt;&gt;(16, 0.75f, true)</code> the order becomes <strong>access order</strong>: every <code>get</code> or <code>put</code> of a key moves that entry to the end, so the first entry is always the least recently used.</p>
+  <p>The method <code>protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest)</code> is called after each insert. If you return <code>true</code>, the eldest (first) entry is removed. Together these give an <strong>LRU cache</strong> (least recently used: when full, throw away the entry unused for the longest time) in a dozen lines:</p>
+  <pre data-title="LruCache.java"><code class="language-java">import java.util.*;
+
+public class LruCache&lt;K, V&gt; extends LinkedHashMap&lt;K, V&gt; {
+    private final int capacity;
+
+    public LruCache(int capacity) {
+        super(16, 0.75f, true);              // true = access order
+        this.capacity = capacity;
+    }
+
+    @Override
+    protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) {
+        return size() &gt; capacity;              // evict when over capacity
+    }
+
+    public static void main(String[] args) {
+        LruCache&lt;String, Integer&gt; cache = new LruCache&lt;&gt;(3);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        cache.put("c", 3);
+        cache.get("a");                      // "a" becomes most recently used
+        cache.put("d", 4);                   // size 4 &gt; 3 → evict eldest, which is "b"
+        System.out.println(cache);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{c=3, a=1, d=4}</code></pre>
+  <p>Remember two things. In access-order mode even <code>get</code> changes the structure, so calling <code>get</code> inside a loop over the same map throws <code>ConcurrentModificationException</code>. And the class is not thread-safe; wrap it with <code>Collections.synchronizedMap</code> or use a cache library for shared use. "Design an LRU cache" is a popular interview question; the other answer is your own hash map plus a doubly linked list (see the DSA notes).</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: keys are unique and a Map is not a Collection</p>
+    <p>A second <code>put</code> with an equal key replaces the value. <code>Map</code> does not extend <code>Collection</code>, so you cannot use it in a for-each loop directly or call <code>stream()</code> on it; use <code>entrySet()</code>, <code>keySet()</code> or <code>values()</code>.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>NullPointerException</code> — unboxing a missing value: <code>int n = map.get("x");</code> where the key is absent. Use <code>getOrDefault</code>.</li>
+      <li><code>NullPointerException</code> — <code>null</code> key in <code>TreeMap</code> / <code>Map.of</code> / <code>ConcurrentHashMap</code>.</li>
+      <li><code>UnsupportedOperationException</code> — <code>put</code> on <code>Map.of(…)</code>, <code>Map.copyOf</code> or <code>Collections.unmodifiableMap</code>.</li>
+      <li><code>ConcurrentModificationException</code> — <code>map.put</code> or <code>map.remove</code> inside a loop over its own views. Use <code>entrySet().removeIf(…)</code> or <code>map.values().removeIf(…)</code>.</li>
+      <li><code>computeIfAbsent</code> with a function that modifies the same map throws <code>ConcurrentModificationException</code> in <code>HashMap</code> (this is why recursive memoisation with it is risky).</li>
+      <li><code>putIfAbsent</code> and <code>computeIfAbsent</code> treat a key mapped to <code>null</code> as absent.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Name maps by what they hold: <code>customerById</code>, <code>ordersByStatus</code> (<code>valueByKey</code> reads naturally: <code>customerById.get(id)</code>).</li>
+      <li>Use <code>merge</code> for counting and summing, <code>computeIfAbsent</code> for grouping.</li>
+      <li>Use an <code>EnumMap</code> when keys are enum constants: it is a compact array internally and iterates in enum order. <code>WeakHashMap</code> and <code>IdentityHashMap</code> exist for special cases.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: check-then-act on a shared map</p>
+    <p><code>if (!map.containsKey(k)) map.put(k, v);</code> is two steps. With a <code>ConcurrentHashMap</code> and several threads, another thread can insert between them. Use the single atomic call <code>putIfAbsent</code> or <code>computeIfAbsent</code>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "HashMap vs LinkedHashMap vs TreeMap"</p>
+    <ul>
+      <li>HashMap: no order, O(1), one null key. LinkedHashMap: insertion (or access) order, O(1), slightly more memory. TreeMap: sorted keys, O(log n), no null key, has <code>NavigableMap</code> methods.</li>
+      <li>"Build an LRU cache" → <code>LinkedHashMap</code> with access order and <code>removeEldestEntry</code>.</li>
+      <li>"Count word frequency" → <code>map.merge(word, 1, Integer::sum)</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-treemap">
+  <h3>TreeMap and NavigableMap: sorted keys and range queries</h3>
+  <p class="tldr">TreeMap keeps its keys sorted in a red-black tree, so every operation costs O(log n) but you gain first/last, floor/ceiling and range views that a HashMap cannot do.</p>
+
+  <p>A <code>TreeMap</code> stores entries in a <strong>red-black tree</strong>: a self-balancing binary search tree in which the left child is smaller and the right child is larger. The tree rebalances itself on insert and delete, so its height stays about log₂(n). Searching 1,000,000 keys takes about 20 comparisons. Keys are sorted by their <strong>natural order</strong> (<code>Comparable</code>) or by a <code>Comparator</code> you pass to the constructor.</p>
+  <figure class="fig">
+<pre class="diagram">
+          30
+        /    \
+      20      40         inorder walk (left, node, right)
+     /  \       \        gives the sorted order:
+   10    25      50      10, 20, 25, 30, 40, 50
+</pre>
+  <figcaption>A binary search tree: smaller keys on the left, larger on the right</figcaption>
+  </figure>
+
+  <h4>The NavigableMap methods</h4>
+  <p><code>TreeMap</code> implements <code>NavigableMap</code> (which extends <code>SortedMap</code>). These methods answer questions like "what is the nearest key to this value?" in O(log n).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Returns</th></tr></thead>
+    <tbody>
+      <tr><td><code>firstKey()</code>, <code>lastKey()</code></td><td>Smallest and largest key (<code>NoSuchElementException</code> if empty)</td></tr>
+      <tr><td><code>firstEntry()</code>, <code>lastEntry()</code></td><td>Same, as entries (<code>null</code> if empty)</td></tr>
+      <tr><td><code>floorKey(k)</code></td><td>Greatest key ≤ <code>k</code>, or <code>null</code></td></tr>
+      <tr><td><code>ceilingKey(k)</code></td><td>Smallest key ≥ <code>k</code>, or <code>null</code></td></tr>
+      <tr><td><code>lowerKey(k)</code> / <code>higherKey(k)</code></td><td>Greatest key &lt; <code>k</code> / smallest key &gt; <code>k</code> (strict)</td></tr>
+      <tr><td><code>headMap(to)</code>, <code>headMap(to, inclusive)</code></td><td>View of keys below <code>to</code> (exclusive by default)</td></tr>
+      <tr><td><code>tailMap(from)</code>, <code>tailMap(from, inclusive)</code></td><td>View of keys from <code>from</code> upward (inclusive by default)</td></tr>
+      <tr><td><code>subMap(from, to)</code></td><td>View of <code>from</code> (inclusive) up to <code>to</code> (exclusive)</td></tr>
+      <tr><td><code>descendingMap()</code>, <code>descendingKeySet()</code></td><td>Reverse-order views</td></tr>
+      <tr><td><code>pollFirstEntry()</code>, <code>pollLastEntry()</code></td><td>Remove and return the smallest / largest entry</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="TreeMapDemo.java"><code class="language-java">import java.util.*;
+
+public class TreeMapDemo {
+    public static void main(String[] args) {
+        TreeMap&lt;Integer, String&gt; t = new TreeMap&lt;&gt;();
+        for (int k : new int[] {30, 10, 50, 20, 40}) {
+            t.put(k, "v" + k);                       // inserted in any order
+        }
+        System.out.println(t);                       // always sorted by key
+        System.out.println(t.firstKey() + " " + t.lastKey());
+        System.out.println(t.floorKey(25) + " " + t.ceilingKey(25));
+        System.out.println(t.lowerKey(30) + " " + t.higherKey(30));
+        System.out.println(t.floorKey(5));           // nothing at or below 5
+        System.out.println(t.headMap(30));           // keys &lt; 30
+        System.out.println(t.headMap(30, true));     // keys &lt;= 30
+        System.out.println(t.tailMap(30));           // keys &gt;= 30
+        System.out.println(t.subMap(20, 40));        // 20 &lt;= key &lt; 40
+        System.out.println(t.descendingMap());
+        System.out.println(t.pollFirstEntry() + " -&gt; " + t.firstKey());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{10=v10, 20=v20, 30=v30, 40=v40, 50=v50}
+10 50
+20 30
+20 40
+null
+{10=v10, 20=v20}
+{10=v10, 20=v20, 30=v30}
+{30=v30, 40=v40, 50=v50}
+{20=v20, 30=v30}
+{50=v50, 40=v40, 30=v30, 20=v20, 10=v10}
+10=v10 -> 20</code></pre>
+  <p><code>headMap</code>, <code>tailMap</code> and <code>subMap</code> return <strong>views</strong> of the original map, like <code>subList</code>: changes write through. Putting a key outside a view's range into the view throws <code>IllegalArgumentException</code>.</p>
+
+  <h4>A realistic use: slab lookup</h4>
+  <p>Discounts by cart value ("₹500 and above: 5%", "₹1,000 and above: 10%") are a perfect fit for <code>floorEntry</code>: find the greatest slab start that is not above the amount.</p>
+  <pre data-title="DiscountSlabs.java"><code class="language-java">TreeMap&lt;Integer, Integer&gt; slabs = new TreeMap&lt;&gt;();
+slabs.put(0, 0);          // cart value from → discount percent
+slabs.put(500, 5);
+slabs.put(1000, 10);
+slabs.put(5000, 15);
+
+int[] carts = {120, 500, 1200, 9999};
+for (int cart : carts) {
+    System.out.println("Cart ₹" + cart + " → " + slabs.floorEntry(cart).getValue() + "%");
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Cart ₹120 → 0%
+Cart ₹500 → 5%
+Cart ₹1200 → 10%
+Cart ₹9999 → 15%</code></pre>
+  <p>Other uses: time-series data keyed by timestamp (find the reading just before a time), leaderboards, interval and calendar problems, and "find the closest value" in interviews.</p>
+
+  <h4>Custom ordering</h4>
+  <pre data-title="Comparators in a TreeMap"><code class="language-java">TreeMap&lt;String, Integer&gt; byLength =
+        new TreeMap&lt;&gt;(Comparator.comparingInt(String::length)
+                .thenComparing(Comparator.naturalOrder()));
+byLength.put("UPI", 1);
+byLength.put("NEFT", 2);
+byLength.put("IMPS", 3);
+byLength.put("RTGS", 4);
+System.out.println(byLength);       // {UPI=1, IMPS=3, NEFT=2, RTGS=4}
+
+TreeMap&lt;String, Integer&gt; ci = new TreeMap&lt;&gt;(String.CASE_INSENSITIVE_ORDER);
+ci.put("Mumbai", 1);
+ci.put("MUMBAI", 2);                // "equal" according to the comparator → replaces
+System.out.println(ci);             // {Mumbai=2}</code></pre>
+  <div class="co co-rule">
+    <p class="co-t">Rule: a TreeMap decides key equality with compareTo, not equals</p>
+    <p>If <code>compare(a, b) == 0</code> the keys are the same key, whatever <code>equals</code> says. That is why the second <code>put</code> above replaced the first. Make your ordering <strong>consistent with equals</strong> (compare equal exactly when <code>equals</code> is true), or the map will behave differently from a <code>HashMap</code> holding the same data.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>ClassCastException</code> — keys that are not <code>Comparable</code> and no comparator given. It is thrown on the very first <code>put</code>.</li>
+      <li><code>NullPointerException</code> — a <code>null</code> key with natural ordering (null values are fine).</li>
+      <li><code>firstKey()</code> on an empty map throws <code>NoSuchElementException</code>; <code>firstEntry()</code> returns <code>null</code>.</li>
+      <li>Not thread-safe. The concurrent sorted map is <code>ConcurrentSkipListMap</code>.</li>
+      <li>Iteration over a <code>TreeMap</code> is O(n) in sorted order; there is no capacity or load factor to tune.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: sort once with TreeMap, or build a HashMap and sort at the end?</p>
+    <p>If you only need sorted output once, collect into a <code>HashMap</code> and then copy: <code>new TreeMap&lt;&gt;(map)</code>. If you keep inserting and also query by range or nearest key, use a <code>TreeMap</code> all along.</p>
+  </div>
+
+  <h4 id="m4-treemap-balance">Why the tree stays balanced</h4>
+  <p>A plain binary search tree can degrade into a linked list if you insert sorted keys (1, 2, 3, 4…), and then every search costs O(n). A red-black tree prevents that with colour rules: the root is black, a red node never has a red child, and every path from the root to an empty spot has the same number of black nodes. After each <code>put</code> or <code>remove</code> the tree fixes itself with colour flips and <strong>rotations</strong> (small local re-arrangements). These rules guarantee that the longest path is at most twice the shortest, so the height is at most about 2·log₂(n+1). You never see this work; you only get O(log n) for <code>get</code>, <code>put</code>, <code>remove</code>, <code>containsKey</code>, <code>floorKey</code> and the other navigation methods.</p>
+
+  <h4>TreeMap vs HashMap vs LinkedHashMap</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>HashMap</code></th><th><code>LinkedHashMap</code></th><th><code>TreeMap</code></th></tr></thead>
+    <tbody>
+      <tr><td>Key order</td><td>None guaranteed</td><td>Insertion (or access) order</td><td>Sorted by key</td></tr>
+      <tr><td><code>get</code> / <code>put</code></td><td>O(1) average</td><td>O(1) average</td><td>O(log n)</td></tr>
+      <tr><td>Equality of keys</td><td><code>hashCode</code> + <code>equals</code></td><td><code>hashCode</code> + <code>equals</code></td><td><code>compareTo</code> / comparator</td></tr>
+      <tr><td><code>null</code> key</td><td>One allowed</td><td>One allowed</td><td>Not with natural ordering</td></tr>
+      <tr><td>Range and nearest-key queries</td><td>No</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Memory</td><td>Table + nodes</td><td>More (extra links)</td><td>One node per entry, no table</td></tr>
+    </tbody>
+  </table></div>
+  <p>See <a href="#m4-hashmap-internals">HashMap internals</a> for the hash-based side and <a href="#m4-maps">the other Map classes</a> for LinkedHashMap. Choose <code>TreeMap</code> only when you need the sort or the navigation methods; otherwise <code>HashMap</code> is faster.</p>
+
+  <h4>Entries, views and live changes</h4>
+  <p>The entries returned by <code>firstEntry()</code>, <code>floorEntry(k)</code>, <code>pollFirstEntry()</code> and the like are <strong>snapshots</strong>. Calling <code>setValue</code> on them throws <code>UnsupportedOperationException</code>; change the map with <code>put</code> instead. The entries you get while iterating <code>entrySet()</code> are the real ones and <code>setValue</code> works there.</p>
+  <pre data-title="ViewDemo.java"><code class="language-java">TreeMap&lt;Integer, String&gt; t = new TreeMap&lt;&gt;(Map.of(10, "a", 20, "b", 30, "c", 40, "d"));
+NavigableMap&lt;Integer, String&gt; mid = t.subMap(15, true, 35, true);   // 20 and 30
+System.out.println(mid);                  // {20=b, 30=c}
+
+t.put(25, "x");                           // change the original map...
+System.out.println(mid);                  // {20=b, 25=x, 30=c}  ...the view sees it
+
+mid.remove(20);                           // change the view...
+System.out.println(t);                    // {10=a, 25=x, 30=c, 40=d}  ...the map changes
+
+try {
+    mid.put(99, "out");                   // outside 15..35
+} catch (IllegalArgumentException e) {
+    System.out.println("key out of range");
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">{20=b, 30=c}
+{20=b, 25=x, 30=c}
+{10=a, 25=x, 30=c, 40=d}
+key out of range</code></pre>
+  <p>The four-argument <code>subMap(from, fromInclusive, to, toInclusive)</code> lets you choose either end. The same idea exists for sets: <code>TreeSet</code> is built on a <code>TreeMap</code> and offers <code>floor</code>, <code>ceiling</code>, <code>headSet</code>, <code>tailSet</code> and <code>subSet</code> (see <a href="#m4-sets">Sets</a>).</p>
+
+  <h4>Another realistic use: the reading just before a time</h4>
+  <p>Sensor readings, price history or audit entries keyed by a timestamp. "What was the price at 10:07?" is the entry with the greatest key not after 10:07.</p>
+  <pre data-title="PriceHistory.java"><code class="language-java">TreeMap&lt;LocalTime, Integer&gt; price = new TreeMap&lt;&gt;();
+price.put(LocalTime.of(9, 15), 2400);
+price.put(LocalTime.of(10, 0), 2450);
+price.put(LocalTime.of(11, 30), 2390);
+
+var at = LocalTime.of(10, 7);
+System.out.println("At 10:07 → " + price.floorEntry(at).getValue());        // 2450
+System.out.println("Next change → " + price.higherKey(at));                  // 11:30
+System.out.println("Before open → " + price.floorEntry(LocalTime.of(9, 0))); // null</code></pre>
+  <p>Always check for <code>null</code> from <code>floorEntry</code>, <code>ceilingEntry</code>, <code>lowerEntry</code> and <code>higherEntry</code>: there may be no such key.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: BigDecimal keys and other "equal but not equals" keys</p>
+    <p><code>new BigDecimal("1.0")</code> and <code>new BigDecimal("1.00")</code> are <em>not</em> <code>equals</code>, but <code>compareTo</code> returns 0. A <code>HashMap</code> keeps two entries; a <code>TreeMap</code> keeps one and overwrites the value. Neither is wrong, but you must know which one you have. The reverse also happens: a comparator that looks at only one field (say, the name) treats two different employees with the same name as one key, and the second silently replaces the first.</p>
+  </div>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: changing a key's sort field after insertion</p><pre><code class="language-java">TreeMap&lt;Employee, String&gt; m = new TreeMap&lt;&gt;(
+        Comparator.comparing(Employee::getSalary));
+m.put(emp, "Pune");
+emp.setSalary(900_000);        // the tree is now in the wrong order
+m.get(emp);                    // may return null</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: remove, change, re-insert</p><pre><code class="language-java">String city = m.remove(emp);
+emp.setSalary(900_000);
+m.put(emp, city);
+// better: use an immutable key such as an id or a record</code></pre></div>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">More edge cases</p>
+    <ul>
+      <li><code>ConcurrentModificationException</code> — you change the map (not through the iterator) while iterating it. Remove with <code>iterator.remove()</code> or <code>entrySet().removeIf(...)</code>.</li>
+      <li><code>headMap(k)</code> returns keys below <code>k</code>; <code>tailMap(k)</code> includes <code>k</code>. This asymmetry is a frequent off-by-one, so pass the inclusive flag explicitly.</li>
+      <li>Do not use <code>size()</code> on a sub-map in a hot loop: counting a view walks the entries, so it is O(n) rather than O(1).</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Declare the variable as <code>NavigableMap&lt;K, V&gt;</code> when you use navigation methods, or as <code>Map</code> when you only need sorted iteration.</li>
+      <li>Pass a comparator built with <code>Comparator.comparing(...).thenComparing(...)</code> and include a unique field (like an id) at the end so that different objects never compare as equal by accident.</li>
+      <li>Use immutable keys: <code>String</code>, numbers, <code>LocalDate</code>, records.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "When would you use TreeMap?"</p>
+    <ul>
+      <li>When keys must stay sorted or you need range/nearest queries: <code>floorKey</code>, <code>ceilingKey</code>, <code>headMap</code>, <code>tailMap</code>.</li>
+      <li>Cost: O(log n) per operation, no null key, keys need an ordering consistent with <code>equals</code>.</li>
+      <li>Internals: red-black tree (a balanced BST); height stays O(log n).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-sets">
+  <h3>Set: HashSet, LinkedHashSet and TreeSet</h3>
+  <p class="tldr">A Set holds no duplicates; HashSet is a HashMap in disguise and is the fast default, LinkedHashSet keeps insertion order, and TreeSet keeps elements sorted.</p>
+
+  <p>A <code>Set&lt;E&gt;</code> is a collection with no duplicate elements and no index. Use it for "have I seen this before?", unique tags, unique ids, and to remove duplicates. The main method is <code>add(e)</code>, which returns <code>true</code> if the element was new and <code>false</code> if an equal element was already there.</p>
+  <pre data-title="SetBasics.java"><code class="language-java">import java.util.*;
+
+public class SetBasics {
+    public static void main(String[] args) {
+        Set&lt;String&gt; emails = new HashSet&lt;&gt;();
+        System.out.println(emails.add("a@x.in"));      // true  — new
+        System.out.println(emails.add("a@x.in"));      // false — duplicate ignored
+        System.out.println(emails.size());             // 1
+        System.out.println(emails.contains("a@x.in")); // true, O(1)
+
+        List&lt;Integer&gt; withDupes = List.of(3, 1, 3, 2, 1);
+        System.out.println(new LinkedHashSet&lt;&gt;(withDupes));   // dedupe, keep order
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">true
+false
+1
+true
+[3, 1, 2]</code></pre>
+
+  <h4>HashSet — a HashMap inside</h4>
+  <p><code>HashSet</code> is implemented with a <code>HashMap</code>. Your element is stored as the <em>key</em>, and every key points to the same dummy object (a private static constant named <code>PRESENT</code>). So <code>add(e)</code> is <code>map.put(e, PRESENT) == null</code>, and everything you learned in <a href="#m4-hashmap-internals">How HashMap works inside</a> applies: buckets, load factor, collisions, resizing. Elements need correct <code>equals</code> and <code>hashCode</code>; do not mutate them while they are in the set; the iteration order is undefined; one <code>null</code> is allowed.</p>
+
+  <h4>LinkedHashSet</h4>
+  <p>A <code>HashSet</code> that also threads its elements on a linked list (it uses <code>LinkedHashMap</code> inside). It iterates in <strong>insertion order</strong>, costs a little more memory, and is still O(1). Re-adding an existing element does not change its position. Since Java 21 it is a <code>SequencedSet</code> with <code>getFirst</code>, <code>getLast</code> and <code>reversed</code>. The most common use: remove duplicates but keep the original order.</p>
+
+  <h4>TreeSet — sorted</h4>
+  <p><code>TreeSet</code> uses a <code>TreeMap</code> inside, so it is a red-black tree: elements stay sorted, and add, remove and contains are O(log n). It implements <code>NavigableSet</code>, which gives <code>first()</code>, <code>last()</code>, <code>floor(e)</code>, <code>ceiling(e)</code>, <code>lower(e)</code>, <code>higher(e)</code>, <code>headSet</code>, <code>tailSet</code>, <code>subSet</code>, <code>descendingSet()</code>, <code>pollFirst()</code> and <code>pollLast()</code>. These work exactly like the <code>TreeMap</code> methods in <a href="#m4-treemap">the previous article</a>.</p>
+  <pre data-title="TreeSetDemo.java"><code class="language-java">TreeSet&lt;Integer&gt; marks = new TreeSet&lt;&gt;(List.of(72, 91, 55, 88, 91));
+System.out.println(marks);                    // sorted, duplicate 91 dropped
+System.out.println(marks.first() + " " + marks.last());
+System.out.println(marks.floor(80) + " " + marks.ceiling(80));
+System.out.println(marks.headSet(72));        // below 72
+System.out.println(marks.tailSet(88));        // 88 and above
+System.out.println(marks.descendingSet());</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[55, 72, 88, 91]
+55 91
+72 88
+[55]
+[88, 91]
+[91, 88, 72, 55]</code></pre>
+
+  <h4>Comparator must be consistent with equals</h4>
+  <p>A <code>TreeSet</code> never calls <code>equals</code>; two elements are "the same" when <code>compareTo</code> (or the comparator) returns 0. For well-behaved classes both agree. <code>BigDecimal</code> is the famous exception: <code>new BigDecimal("1.0").equals(new BigDecimal("1.00"))</code> is <code>false</code> (the scales differ) while <code>compareTo</code> returns 0.</p>
+  <pre data-title="InconsistentWithEquals.java"><code class="language-java">import java.math.BigDecimal;
+import java.util.*;
+
+Set&lt;BigDecimal&gt; hash = new HashSet&lt;&gt;();
+Set&lt;BigDecimal&gt; tree = new TreeSet&lt;&gt;();
+for (String s : new String[] {"1.0", "1.00"}) {
+    hash.add(new BigDecimal(s));
+    tree.add(new BigDecimal(s));
+}
+System.out.println("HashSet size = " + hash.size());
+System.out.println("TreeSet size = " + tree.size());</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">HashSet size = 2
+TreeSet size = 1</code></pre>
+  <p>For your own classes: if you sort by a single field (say <code>salary</code>) and put employees into a <code>TreeSet</code>, two different employees with the same salary will be treated as duplicates and one silently disappears. Always add a tie-breaker (<code>thenComparing(Employee::id)</code>).</p>
+
+  <h4>Set operations</h4>
+  <p>The bulk methods give you the maths operations. They <strong>modify</strong> the set you call them on, so copy first.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operation</th><th>Code</th></tr></thead>
+    <tbody>
+      <tr><td>Union (A ∪ B)</td><td><code>result.addAll(b)</code></td></tr>
+      <tr><td>Intersection (A ∩ B)</td><td><code>result.retainAll(b)</code></td></tr>
+      <tr><td>Difference (A − B)</td><td><code>result.removeAll(b)</code></td></tr>
+      <tr><td>Subset (B ⊆ A)</td><td><code>a.containsAll(b)</code></td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="SetOperations.java"><code class="language-java">Set&lt;Integer&gt; a = new TreeSet&lt;&gt;(List.of(1, 2, 3, 4));
+Set&lt;Integer&gt; b = new TreeSet&lt;&gt;(List.of(3, 4, 5, 6));
+
+Set&lt;Integer&gt; union = new TreeSet&lt;&gt;(a);
+union.addAll(b);
+Set&lt;Integer&gt; common = new TreeSet&lt;&gt;(a);
+common.retainAll(b);
+Set&lt;Integer&gt; onlyA = new TreeSet&lt;&gt;(a);
+onlyA.removeAll(b);
+Set&lt;Integer&gt; either = new TreeSet&lt;&gt;(union);       // symmetric difference
+either.removeAll(common);
+
+System.out.println(union + " " + common);
+System.out.println(onlyA + " " + either);
+System.out.println(a.containsAll(common));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[1, 2, 3, 4, 5, 6] [3, 4]
+[1, 2] [1, 2, 5, 6]
+true</code></pre>
+  <p>Run time of <code>removeAll</code> depends on the argument: with a <code>List</code> argument it can be O(n·m), so pass a set.</p>
+
+  <h4>Immutable sets and EnumSet</h4>
+  <p><code>Set.of(a, b, c)</code> and <code>Set.copyOf(c)</code> are immutable, reject <code>null</code> (even in <code>contains(null)</code>, which throws), throw <code>IllegalArgumentException</code> on duplicate elements in <code>Set.of</code>, and have an unspecified iteration order. <code>EnumSet</code> is a very fast, compact set for enum values (internally a bit mask).</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: uniqueness comes from equals/hashCode (hash sets) or compare (tree sets)</p>
+    <p>A <code>HashSet</code> of objects whose class has no <code>hashCode</code> override accepts "duplicates". A <code>TreeSet</code> of objects that are not <code>Comparable</code> throws <code>ClassCastException</code> on the first <code>add</code>.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>TreeSet.add(null)</code> throws <code>NullPointerException</code>; <code>HashSet</code> and <code>LinkedHashSet</code> allow one <code>null</code>.</li>
+      <li>Mutating an element after adding it (changing a field used by <code>hashCode</code> or the ordering) breaks <code>contains</code> and <code>remove</code>, as with map keys.</li>
+      <li>A set has no <code>get(i)</code>. To read one element, iterate, or use a sorted/sequenced set method such as <code>first()</code>.</li>
+      <li><code>NoSuchElementException</code> — <code>TreeSet.first()</code> on an empty set; <code>pollFirst()</code> returns <code>null</code> instead.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: expecting a HashSet to keep the order you added</p>
+    <p>A <code>HashSet</code> of strings prints in an order that looks random. If the order matters, use <code>LinkedHashSet</code>; if the sort matters, use <code>TreeSet</code>.</p>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>Sets hold roles and authorities (<code>Set&lt;String&gt; roles</code> in a user), visited ids in graph searches, permission checks, and many-to-many JPA associations (<code>Set&lt;Course&gt;</code> avoids duplicate rows and the "multiple bag fetch" problem). Always give JPA entities a sensible <code>equals</code>/<code>hashCode</code> before putting them in a <code>Set</code>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How does HashSet work?" and "HashSet vs TreeSet"</p>
+    <ul>
+      <li>HashSet is backed by a HashMap: the element is the key, the value is a constant dummy object. <code>add</code> returns <code>false</code> for duplicates. O(1) average.</li>
+      <li>LinkedHashSet adds insertion order. TreeSet adds sorted order with O(log n) and <code>NavigableSet</code> methods.</li>
+      <li>Duplicate detection: <code>hashCode</code> + <code>equals</code> for hash sets; <code>compareTo</code> / comparator for TreeSet — and they should agree.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-queues-deques">
+  <h3>Queue and Deque: ArrayDeque, PriorityQueue and legacy classes</h3>
+  <p class="tldr">Use ArrayDeque for every stack and plain queue, PriorityQueue when you always need the smallest (or largest) element next, and avoid Stack, Vector and Hashtable.</p>
+
+  <p>A <strong>queue</strong> holds elements waiting to be processed — print jobs, Swiggy orders, tasks. A <code>Queue</code> normally works <strong>first in, first out</strong> (FIFO). A <strong>stack</strong> works <strong>last in, first out</strong> (LIFO): think of the browser's back button. A <code>Deque</code> (double-ended queue) can add and remove at both ends, so one class serves as a queue and as a stack.</p>
+
+  <h4>The Queue methods: two versions of each</h4>
+  <p>Every queue operation exists twice: one version throws an exception on failure, the other returns a special value.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operation</th><th>Throws an exception</th><th>Returns null / false</th></tr></thead>
+    <tbody>
+      <tr><td>Insert at the tail</td><td><code>add(e)</code></td><td><code>offer(e)</code></td></tr>
+      <tr><td>Remove the head</td><td><code>remove()</code></td><td><code>poll()</code></td></tr>
+      <tr><td>Look at the head (no removal)</td><td><code>element()</code></td><td><code>peek()</code></td></tr>
+    </tbody>
+  </table></div>
+  <p><code>remove()</code> and <code>element()</code> throw <code>NoSuchElementException</code> on an empty queue; <code>poll()</code> and <code>peek()</code> return <code>null</code>. <code>add</code> throws <code>IllegalStateException("Queue full")</code> when a <em>bounded</em> queue has no room; <code>offer</code> returns <code>false</code>. Prefer <code>offer</code>/<code>poll</code>/<code>peek</code> in normal code.</p>
+  <p>The <code>Deque</code> interface repeats the set for both ends: <code>addFirst</code>/<code>offerFirst</code>, <code>addLast</code>/<code>offerLast</code>, <code>removeFirst</code>/<code>pollFirst</code>, <code>removeLast</code>/<code>pollLast</code>, <code>getFirst</code>/<code>peekFirst</code>, <code>getLast</code>/<code>peekLast</code>. For stack use it adds three names: <code>push(e)</code> = <code>addFirst</code>, <code>pop()</code> = <code>removeFirst</code>, and <code>peek()</code> = <code>peekFirst</code>.</p>
+
+  <h4>ArrayDeque</h4>
+  <p><code>ArrayDeque</code> is a resizable <strong>circular array</strong> with a head and a tail index. Adding or removing at either end is O(1) amortized and needs no object allocation per element. It is faster than <code>LinkedList</code> as a queue and faster than <code>Stack</code> as a stack. It does <strong>not</strong> allow <code>null</code> elements (because <code>poll()</code> uses <code>null</code> to mean "empty") and is not thread-safe.</p>
+  <pre data-title="QueueAndStack.java"><code class="language-java">import java.util.*;
+
+public class QueueAndStack {
+    public static void main(String[] args) {
+        // As a QUEUE (FIFO): offer at the tail, poll from the head
+        Queue&lt;String&gt; orders = new ArrayDeque&lt;&gt;();
+        orders.offer("order-1");
+        orders.offer("order-2");
+        orders.offer("order-3");
+        System.out.println(orders.peek());     // order-1 (not removed)
+        System.out.println(orders.poll());     // order-1 (removed)
+        System.out.println(orders);
+
+        // As a STACK (LIFO): push and pop at the head
+        Deque&lt;String&gt; history = new ArrayDeque&lt;&gt;();
+        history.push("home");
+        history.push("search");
+        history.push("product");
+        System.out.println(history);           // top of the stack is on the left
+        System.out.println(history.pop());     // product
+        System.out.println(history.peek());    // search
+
+        Queue&lt;String&gt; empty = new ArrayDeque&lt;&gt;();
+        System.out.println(empty.poll());      // null
+        try {
+            empty.remove();
+        } catch (NoSuchElementException e) {
+            System.out.println("remove() on empty queue throws");
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">order-1
+order-1
+[order-2, order-3]
+[product, search, home]
+product
+search
+null
+remove() on empty queue throws</code></pre>
+  <p>A classic stack use case — checking balanced brackets:</p>
+  <pre data-title="Balanced.java"><code class="language-java">static boolean isBalanced(String s) {
+    Deque&lt;Character&gt; stack = new ArrayDeque&lt;&gt;();
+    for (char c : s.toCharArray()) {
+        switch (c) {
+            case '(', '[', '{' -&gt; stack.push(c);
+            case ')' -&gt; { if (stack.isEmpty() || stack.pop() != '(') return false; }
+            case ']' -&gt; { if (stack.isEmpty() || stack.pop() != '[') return false; }
+            case '}' -&gt; { if (stack.isEmpty() || stack.pop() != '{') return false; }
+            default -&gt; { }
+        }
+    }
+    return stack.isEmpty();
+}
+
+System.out.println(isBalanced("{[()]}"));   // true
+System.out.println(isBalanced("{[(])}"));   // false</code></pre>
+
+  <h4>PriorityQueue — always the smallest next</h4>
+  <p>A <code>PriorityQueue</code> is a queue ordered by priority, not by arrival. <code>poll()</code> always returns the <strong>smallest</strong> element according to natural order or a <code>Comparator</code>. Inside it is a <strong>binary min-heap</strong> stored in an array: a complete binary tree in which every parent is ≤ its children, so the smallest element is always at index 0. For index <code>i</code>, the parent is at <code>(i - 1) / 2</code> and the children at <code>2i + 1</code> and <code>2i + 2</code>.</p>
+  <figure class="fig">
+<pre class="diagram">
+          1                 array: [1, 2, 4, 5, 3]
+        /   \                       0  1  2  3  4
+       2     4
+      / \               offer(e): put e at the end, move it UP while smaller
+     5   3              poll():   take the root, move the last element to the
+                                  root, move it DOWN to restore the heap
+</pre>
+  <figcaption>A min-heap and its array form after offering 5, 1, 4, 2, 3</figcaption>
+  </figure>
+  <ul>
+    <li><code>offer</code> and <code>poll</code>: O(log n) (the height of the tree). <code>peek</code>: O(1).</li>
+    <li><code>contains</code> and <code>remove(Object)</code>: O(n) — a heap is not searchable.</li>
+    <li>Default initial capacity 11; it grows automatically. No <code>null</code> elements. Not thread-safe (use <code>PriorityBlockingQueue</code>).</li>
+    <li>Elements must be <code>Comparable</code>, or you pass a <code>Comparator</code>; otherwise <code>ClassCastException</code>.</li>
+    <li><strong>Iteration and <code>toString()</code> are not sorted.</strong> They show the array order. Only <code>poll()</code> gives sorted order.</li>
+    <li>Elements with equal priority come out in no guaranteed order (it is not a stable queue).</li>
+  </ul>
+  <pre data-title="PriorityQueueDemo.java"><code class="language-java">import java.util.*;
+
+public class PriorityQueueDemo {
+    record Task(String name, int priority) {}      // 1 = most urgent
+
+    public static void main(String[] args) {
+        PriorityQueue&lt;Integer&gt; minHeap = new PriorityQueue&lt;&gt;();
+        for (int n : new int[] {5, 1, 4, 2, 3}) {
+            minHeap.offer(n);
+        }
+        System.out.println(minHeap);               // heap array, NOT sorted
+        StringBuilder sb = new StringBuilder();
+        while (!minHeap.isEmpty()) {
+            sb.append(minHeap.poll()).append(' ');
+        }
+        System.out.println(sb);
+
+        // Max-heap: reverse the order
+        PriorityQueue&lt;Integer&gt; maxHeap = new PriorityQueue&lt;&gt;(Comparator.reverseOrder());
+        maxHeap.addAll(List.of(5, 1, 4, 2, 3));
+        System.out.println(maxHeap.poll() + " " + maxHeap.poll());
+
+        // Objects with a comparator
+        PriorityQueue&lt;Task&gt; tasks =
+                new PriorityQueue&lt;&gt;(Comparator.comparingInt(Task::priority));
+        tasks.offer(new Task("Pay bill", 2));
+        tasks.offer(new Task("Send newsletter", 5));
+        tasks.offer(new Task("Fix prod bug", 1));
+        while (!tasks.isEmpty()) {
+            System.out.println(tasks.poll());
+        }
+
+        // Top-3 largest numbers with a min-heap of size 3
+        int[] data = {7, 2, 9, 4, 11, 5};
+        PriorityQueue&lt;Integer&gt; top = new PriorityQueue&lt;&gt;();
+        for (int x : data) {
+            top.offer(x);
+            if (top.size() &gt; 3) {
+                top.poll();                         // drop the smallest of the four
+            }
+        }
+        List&lt;Integer&gt; result = new ArrayList&lt;&gt;();
+        while (!top.isEmpty()) {
+            result.add(top.poll());
+        }
+        System.out.println("Top 3: " + result);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[1, 2, 4, 5, 3]
+1 2 3 4 5
+5 4
+Task[name=Fix prod bug, priority=1]
+Task[name=Pay bill, priority=2]
+Task[name=Send newsletter, priority=5]
+Top 3: [7, 9, 11]</code></pre>
+  <p>The top-K trick is a favourite in interviews: a min-heap of size K keeps the K largest items in O(n log K) time and O(K) memory, without sorting everything.</p>
+
+  <h4>Legacy classes and why to avoid them</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Legacy class</th><th>Problem</th><th>Use instead</th></tr></thead>
+    <tbody>
+      <tr><td><code>Vector</code></td><td>Every method is <code>synchronized</code>: slow, and still not safe for compound actions like check-then-add</td><td><code>ArrayList</code> (or <code>CopyOnWriteArrayList</code> if shared)</td></tr>
+      <tr><td><code>Stack</code></td><td>Extends <code>Vector</code> (so it is synchronized and exposes <code>get(i)</code>, <code>add(i, e)</code>, breaking the stack idea)</td><td><code>ArrayDeque</code> through the <code>Deque</code> interface</td></tr>
+      <tr><td><code>Hashtable</code></td><td>One lock for the whole map; no null keys or values</td><td><code>HashMap</code>, or <code>ConcurrentHashMap</code> when shared</td></tr>
+      <tr><td><code>Enumeration</code></td><td>Old iteration interface</td><td><code>Iterator</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>One visible difference: <code>Stack</code> iterates from bottom to top, while an <code>ArrayDeque</code> used with <code>push</code> iterates top to bottom. For thread-safe queues (<code>ArrayBlockingQueue</code>, <code>LinkedBlockingQueue</code>, <code>ConcurrentLinkedQueue</code>) see <a href="#m6">Module 6</a>; they power producer-consumer designs.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: choose by the operations you need</p>
+    <p>FIFO queue or LIFO stack → <code>ArrayDeque</code>. Always the smallest or largest next → <code>PriorityQueue</code>. Need <code>null</code> elements or <code>List</code> methods too → <code>LinkedList</code> (rare).</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>NullPointerException</code> — <code>offer(null)</code> or <code>push(null)</code> on <code>ArrayDeque</code> or <code>PriorityQueue</code>.</li>
+      <li><code>NoSuchElementException</code> — <code>remove()</code>, <code>element()</code>, <code>pop()</code>, <code>getFirst()</code> on an empty queue or deque.</li>
+      <li><code>ClassCastException</code> — a <code>PriorityQueue</code> of objects that are not <code>Comparable</code> and no comparator. It fails on the first <code>offer</code>.</li>
+      <li><code>ArrayDeque.push</code> adds at the <em>front</em>; if you want stack order but then <code>add</code> at the end, you get a mix. Pick one set of method names and stick to it.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: printing or looping a PriorityQueue to see the order</p>
+    <p>The output <code>[1, 2, 4, 5, 3]</code> for the values 1 to 5 surprises many people. Sorted order exists only when you <code>poll()</code> repeatedly. If you need a sorted snapshot, copy to a list and sort it.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a subtraction comparator in a PriorityQueue</p>
+    <p><code>(a, b) -&gt; a - b</code> overflows for large ints and silently breaks the heap order. Use <code>Integer.compare(a, b)</code> or <code>Comparator.comparingInt</code> (details in <a href="#m4-comparators">Comparable vs Comparator</a>).</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Stack vs ArrayDeque", "How does PriorityQueue work?"</p>
+    <ul>
+      <li>Do not use <code>Stack</code>: it is a synchronized <code>Vector</code> subclass. <code>Deque&lt;Integer&gt; s = new ArrayDeque&lt;&gt;()</code> with <code>push</code>/<code>pop</code>/<code>peek</code> is the standard.</li>
+      <li>PriorityQueue: binary min-heap in an array; <code>offer</code>/<code>poll</code> O(log n), <code>peek</code> O(1); max-heap with <code>Comparator.reverseOrder()</code>; iteration is not sorted.</li>
+      <li>Queue method pairs: <code>add</code>/<code>offer</code>, <code>remove</code>/<code>poll</code>, <code>element</code>/<code>peek</code> — exception vs special value.</li>
+      <li>Use cases: BFS (queue), DFS and undo (stack), Dijkstra, top-K, task scheduling (priority queue).</li>
+    </ul>
+  </div>
+</article>

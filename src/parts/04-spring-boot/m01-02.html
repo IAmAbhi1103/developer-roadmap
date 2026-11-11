@@ -1,0 +1,751 @@
+<article class="topic" id="m1-configuration-bean">
+  <h3>@Configuration and @Bean: defining beans in Java code</h3>
+  <p class="tldr">A <code>@Configuration</code> class holds <code>@Bean</code> methods; each method's return value becomes a bean, which is how you register third-party classes and objects that need custom set-up.</p>
+
+  <p>Stereotypes only work on classes you own. You cannot put <code>@Component</code> on <code>ObjectMapper</code>, <code>RestClient</code> or <code>BCryptPasswordEncoder</code>, because you do not edit their source. For those, and for any object that needs set-up code, you write a method that builds the object and tell Spring to treat the result as a bean.</p>
+
+  <pre data-title="AppConfig.java"><code class="language-java">import java.time.Clock;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+
+@Configuration
+public class AppConfig {
+
+    @Bean
+    public Clock clock() {                         // bean name: "clock"
+        return Clock.systemUTC();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {     // bean name: "passwordEncoder"
+        return new BCryptPasswordEncoder(12);
+    }
+}</code></pre>
+  <p>Now any class can ask for a <code>Clock</code> or a <code>PasswordEncoder</code> in its constructor. Putting a <code>Clock</code> in the container is also a good testing habit: tests inject a fixed clock instead of calling <code>LocalDateTime.now()</code> directly.</p>
+
+  <h4>Beans that depend on other beans</h4>
+  <p>A <code>@Bean</code> method can take parameters; Spring resolves them as beans, exactly like a constructor.</p>
+  <pre data-title="Parameters are injected"><code class="language-java">@Configuration
+public class PaymentConfig {
+
+    @Bean
+    public PaymentClient paymentClient(RestClient.Builder builder,
+                                       PaymentProperties props) {
+        RestClient client = builder.baseUrl(props.baseUrl()).build();
+        return new PaymentClient(client, props.apiKey());
+    }
+}</code></pre>
+  <p>Here <code>RestClient.Builder</code> is provided by Boot's auto-configuration and <code>PaymentProperties</code> by your own <a href="#m1-configuration-properties">configuration properties</a>.</p>
+
+  <h4>Bean names and customising</h4>
+  <ul>
+    <li>The name is the <strong>method name</strong>. Change it with <code>@Bean("fastEncoder")</code> or <code>@Bean(name = {"a", "b"})</code> for aliases.</li>
+    <li>Several methods can return the same type with different names; choose between them with <code>@Qualifier</code> or <code>@Primary</code>.</li>
+    <li>Other attributes: <code>initMethod</code> and <code>destroyMethod</code> (lifecycle callbacks on a third-party class), and <code>@Scope</code>, <code>@Lazy</code>, <code>@Profile</code>, <code>@ConditionalOnProperty</code> next to <code>@Bean</code>.</li>
+  </ul>
+  <pre data-title="Two beans of one type"><code class="language-java">@Configuration
+public class HttpConfig {
+
+    @Bean
+    @Primary                        // chosen when nobody says which
+    public RestClient paymentRestClient() {
+        return RestClient.create("https://pay.example.com");
+    }
+
+    @Bean
+    public RestClient shippingRestClient() {
+        return RestClient.create("https://ship.example.com");
+    }
+}
+
+@Service
+class ShippingService {
+    ShippingService(@Qualifier("shippingRestClient") RestClient client) { /* ... */ }
+}</code></pre>
+
+  <h4>@Configuration, proxyBeanMethods and "full" vs "lite" mode</h4>
+  <p>A <code>@Configuration</code> class is itself a bean, and by default Spring wraps it in a CGLIB subclass (<code>proxyBeanMethods = true</code>). The proxy makes one promise: if one <code>@Bean</code> method calls another, the call goes through the container, so you still get the singleton and not a new object.</p>
+  <pre data-title="Calling a @Bean method from another @Bean method"><code class="language-java">@Configuration
+public class ServiceConfig {
+
+    @Bean
+    public AuditLog auditLog() {
+        return new AuditLog();
+    }
+
+    @Bean
+    public OrderService orderService() {
+        return new OrderService(auditLog());   // same AuditLog singleton
+    }
+}</code></pre>
+  <p>With <code>@Configuration(proxyBeanMethods = false)</code> (called <strong>lite mode</strong>) the proxy is skipped: startup is slightly faster, but <code>auditLog()</code> inside <code>orderService()</code> is a plain method call and creates a <em>second</em> object. Boot's own auto-configuration classes use <code>proxyBeanMethods = false</code> and take dependencies as method parameters instead. Your rule: keep the default, or use <code>false</code> and always pass dependencies as parameters.</p>
+
+  <h4>@Component with @Bean ("lite" beans)</h4>
+  <p><code>@Bean</code> methods also work inside any <code>@Component</code> class. They follow the lite rules: inter-method calls are plain Java calls. Use <code>@Configuration</code> for classes whose job is to define beans.</p>
+
+  <h4>When to use which</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Situation</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td>Your own class</td><td>A stereotype annotation (<code>@Service</code>, <code>@Component</code>)</td></tr>
+      <tr><td>A class from a library</td><td><code>@Bean</code> method</td></tr>
+      <tr><td>An object needing builder code, parameters or a condition</td><td><code>@Bean</code> method</td></tr>
+      <tr><td>Several differently configured instances of one class</td><td>Several <code>@Bean</code> methods with distinct names</td></tr>
+      <tr><td>Swap a Boot default (your own <code>ObjectMapper</code>, security chain)</td><td><code>@Bean</code>; Boot's version backs off (<a href="#m1-auto-configuration">auto-configuration</a>)</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li><code>@Bean</code> methods must not be <code>private</code> or <code>final</code> inside a <code>@Configuration</code> class that is proxied (CGLIB must override them).</li>
+      <li>The <code>@Configuration</code> class itself must not be <code>final</code> when proxyBeanMethods is true.</li>
+      <li>Return the interface or the most useful type; the declared return type is what Spring uses for type matching before the bean is created.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Split configuration by concern: <code>SecurityConfig</code>, <code>JacksonConfig</code>, <code>HttpClientConfig</code>. Do not make one giant <code>AppConfig</code>.</li>
+      <li>Prefer parameters over calling other <code>@Bean</code> methods.</li>
+      <li>Name beans for what they are, not how they are built (<code>paymentRestClient</code>, not <code>bean1</code>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: creating a bean with new in business code</p>
+    <p>Writing <code>PasswordEncoder encoder = new BCryptPasswordEncoder()</code> inside every service gives each one its own object and hard-wires the choice. Define it once as a <code>@Bean</code> and inject it.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "@Component vs @Bean? What does proxyBeanMethods do?"</p>
+    <ul>
+      <li><code>@Component</code> is class-level and found by scanning; <code>@Bean</code> is method-level and used inside configuration classes, so you control construction and can register third-party classes.</li>
+      <li>With <code>proxyBeanMethods = true</code> (default) calls between <code>@Bean</code> methods return the same singleton; with <code>false</code> they are plain calls, which is faster to start.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-injection-types">
+  <h3>Injection types: constructor, setter, field, and choosing between beans</h3>
+  <p class="tldr">Prefer constructor injection: it makes dependencies required, lets fields be <code>final</code> and lets you test with plain <code>new</code>; use <code>@Qualifier</code> and <code>@Primary</code> when several beans match.</p>
+
+  <p>Spring can hand a bean its dependencies in three ways. They differ in what they guarantee, not in what they can reach.</p>
+
+  <h4>Constructor injection (preferred)</h4>
+  <pre data-title="OrderService.java"><code class="language-java">@Service
+public class OrderService {
+
+    private final OrderRepository repository;
+    private final NotificationSender sender;
+
+    // Only one constructor: @Autowired is not needed (Spring 4.3+)
+    public OrderService(OrderRepository repository, NotificationSender sender) {
+        this.repository = repository;
+        this.sender = sender;
+    }
+}</code></pre>
+  <p>If a class has <strong>one</strong> constructor, Spring uses it automatically. With several constructors, mark the one to use with <code>@Autowired</code>. With Lombok you can drop the boilerplate:</p>
+  <pre data-title="Same class with Lombok"><code class="language-java">@Service
+@RequiredArgsConstructor      // generates a constructor for all final fields
+public class OrderService {
+    private final OrderRepository repository;
+    private final NotificationSender sender;
+}</code></pre>
+  <p>Records and Java 21 make this even lighter for small cases, but Lombok's <code>@RequiredArgsConstructor</code> is what you will see in most projects.</p>
+
+  <h4>Setter injection</h4>
+  <pre data-title="For optional dependencies"><code class="language-java">@Service
+public class ReportService {
+    private AuditLog auditLog;   // optional: the app works without it
+
+    @Autowired(required = false)
+    public void setAuditLog(AuditLog auditLog) {
+        this.auditLog = auditLog;
+    }
+}</code></pre>
+  <p>Use it for dependencies that are truly optional or that must be changeable after creation. The object can exist without them, which is both the benefit and the risk.</p>
+
+  <h4>Field injection (avoid)</h4>
+  <pre data-title="Works, but do not write this"><code class="language-java">@Service
+public class OrderService {
+    @Autowired
+    private OrderRepository repository;     // set by reflection
+    @Autowired
+    private NotificationSender sender;
+}</code></pre>
+
+  <h4>Why constructor injection wins</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Concern</th><th>Constructor</th><th>Setter</th><th>Field</th></tr></thead>
+    <tbody>
+      <tr><td>Fields can be <code>final</code> (immutable)</td><td>Yes</td><td>No</td><td>No</td></tr>
+      <tr><td>Object never half-built</td><td>Yes: fully ready after <code>new</code></td><td>No: can be missing parts</td><td>No: null until Spring sets it</td></tr>
+      <tr><td>Dependency is required</td><td>Yes, enforced by the compiler</td><td>Optional by nature</td><td>Hidden</td></tr>
+      <tr><td>Unit test without Spring</td><td><code>new OrderService(fakeRepo, fakeSender)</code></td><td>Call setters</td><td>Needs reflection or Spring test support</td></tr>
+      <tr><td>Too many dependencies is visible</td><td>Yes: a long constructor warns you</td><td>No</td><td>No: ten fields look harmless</td></tr>
+      <tr><td>Circular dependencies</td><td>Fail fast at startup</td><td>Can hide a bad design</td><td>Can hide a bad design</td></tr>
+      <tr><td>Needs reflection to inject</td><td>No</td><td>No</td><td>Yes (sets private fields)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Several beans of the same type</h4>
+  <p>Suppose two classes implement <code>NotificationSender</code>. A constructor parameter of that type matches both, and Spring cannot choose. Three tools solve it.</p>
+  <pre data-title="@Primary — the default choice"><code class="language-java">@Component
+@Primary
+public class EmailSender implements NotificationSender { /* ... */ }
+
+@Component
+public class SmsSender implements NotificationSender { /* ... */ }</code></pre>
+  <pre data-title="@Qualifier — an explicit choice at the injection point"><code class="language-java">@Service
+public class OtpService {
+    private final NotificationSender sender;
+
+    public OtpService(@Qualifier("smsSender") NotificationSender sender) {
+        this.sender = sender;      // bean name: class SmsSender -> "smsSender"
+    }
+}</code></pre>
+  <p>A third way: name the parameter like the bean (<code>NotificationSender smsSender</code>); Spring falls back to the parameter name when several beans match. It works but breaks silently when someone renames the parameter, so prefer <code>@Qualifier</code>. An explicit <code>@Qualifier</code> always wins over <code>@Primary</code>.</p>
+
+  <h4>Injecting all implementations: the strategy pattern</h4>
+  <p>Ask for a <code>List</code> or a <code>Map</code> and Spring injects every bean of the type. This gives you the <strong>strategy pattern</strong> with no <code>if</code> chains.</p>
+  <pre data-title="PaymentRouter.java"><code class="language-java">public interface PaymentService {
+    void pay(long amountInPaise);
+}
+
+@Service("upi")  public class UpiPayment  implements PaymentService { /* ... */ }
+@Service("card") public class CardPayment implements PaymentService { /* ... */ }
+
+@Service
+public class PaymentRouter {
+    private final Map&lt;String, PaymentService&gt; byName;   // key = bean name
+    private final List&lt;PaymentService&gt; all;
+
+    public PaymentRouter(Map&lt;String, PaymentService&gt; byName,
+                         List&lt;PaymentService&gt; all) {
+        this.byName = byName;
+        this.all = all;
+    }
+
+    public void pay(String method, long amountInPaise) {
+        PaymentService service = byName.get(method);    // "upi" or "card"
+        if (service == null) {
+            throw new IllegalArgumentException("Unknown method: " + method);
+        }
+        service.pay(amountInPaise);
+    }
+}</code></pre>
+  <p>Adding a new payment method means adding one new class; <code>PaymentRouter</code> does not change (open/closed principle). The order inside the <code>List</code> follows <code>@Order</code> or the <code>Ordered</code> interface when present.</p>
+
+  <h4>Optional dependencies</h4>
+  <pre data-title="Three ways to say 'maybe there is no bean'"><code class="language-java">@Service
+public class FeatureService {
+    private final Optional&lt;MetricsClient&gt; metrics;
+    private final ObjectProvider&lt;AuditLog&gt; audit;
+
+    public FeatureService(Optional&lt;MetricsClient&gt; metrics,
+                          ObjectProvider&lt;AuditLog&gt; audit,
+                          @Autowired(required = false) Cache cache) {
+        this.metrics = metrics;
+        this.audit = audit;
+    }
+
+    public void run() {
+        metrics.ifPresent(m -&gt; m.count("feature.run"));
+        audit.ifAvailable(a -&gt; a.record("run"));
+    }
+}</code></pre>
+  <p><code>ObjectProvider&lt;T&gt;</code> is the most flexible: <code>getIfAvailable()</code>, <code>ifAvailable(...)</code>, <code>getObject()</code>, <code>stream()</code>, and it also resolves late, which is how you get a new prototype bean each time (see <a href="#m1-bean-scopes">scopes</a>).</p>
+
+  <h4>@Resource and @Inject</h4>
+  <p><code>@Autowired</code> is Spring's own annotation (match by type, then name). <code>@Inject</code> (<code>jakarta.inject</code>) behaves almost the same. <code>@Resource</code> matches by name first. In new code use constructor injection and skip all three.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>A single constructor is autowired without any annotation; with two or more, annotate exactly one with <code>@Autowired</code>.</li>
+      <li>A required dependency with no matching bean stops startup (<code>NoSuchBeanDefinitionException</code>).</li>
+      <li>Two matching beans with no <code>@Primary</code> or <code>@Qualifier</code> stop startup (<code>NoUniqueBeanDefinitionException</code>).</li>
+      <li><code>@Autowired</code> works only on beans managed by Spring, never on objects you create with <code>new</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Constructor injection, <code>private final</code> fields, interface types.</li>
+      <li>Use <code>@Primary</code> for "the usual one" and <code>@Qualifier</code> for the exceptions.</li>
+      <li>If a constructor has more than about five parameters, split the class.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A <code>Map&lt;String, T&gt;</code> uses bean names as keys, so keep names meaningful (<code>"upi"</code>, not <code>"upiPaymentServiceImpl"</code>) when the key matters.</li>
+      <li>An injected <code>List</code> is empty (not an error) when no bean of the type exists, unlike a single required bean.</li>
+      <li>Constructor injection with <code>@Lazy</code> on a parameter injects a lazy proxy; useful to break a cycle, not as a habit.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: field injection and then new</p>
+    <p>A class with <code>@Autowired private Repo repo;</code> cannot be unit-tested with <code>new OrderService()</code>: <code>repo</code> stays <code>null</code> and you get a <code>NullPointerException</code>. Constructor injection makes that mistake impossible.</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: field injection</p><pre><code class="language-java">@Service
+class OrderService {
+    @Autowired OrderRepository repo;
+}
+// new OrderService().place()  -> NullPointerException</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: constructor injection</p><pre><code class="language-java">@Service
+class OrderService {
+    private final OrderRepository repo;
+    OrderService(OrderRepository repo) { this.repo = repo; }
+}
+// new OrderService(fakeRepo) works in a plain unit test</code></pre></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Constructor vs field injection? How do you pick between two beans?"</p>
+    <ul>
+      <li>Constructor injection: immutability, required dependencies, easy testing, no reflection, visible class size. Field injection hides all of that.</li>
+      <li>Setter injection for optional dependencies only.</li>
+      <li>Two candidates: <code>@Primary</code> on one, or <code>@Qualifier("name")</code> at the injection point, or inject a <code>Map</code>/<code>List</code> of all.</li>
+      <li>Single constructor needs no <code>@Autowired</code> since Spring 4.3.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-bean-errors">
+  <h3>Common bean errors and how to read the startup failure report</h3>
+  <p class="tldr">Most Spring startup failures are a missing bean, two matching beans or a circular dependency; the failure report at the end of the log names the class, the parameter and usually the fix.</p>
+
+  <p>When the container cannot build the object graph, the application refuses to start. Do not scroll through the 200-line stack trace. Look for the box that Boot prints at the bottom.</p>
+  <pre class="out" data-title="Failure analyzer output"><code class="language-plaintext">***************************
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+Parameter 0 of constructor in com.example.shop.order.OrderService
+required a bean of type 'com.example.shop.order.OrderRepository'
+that could not be found.
+
+Action:
+
+Consider defining a bean of type 'com.example.shop.order.OrderRepository'
+in your configuration.</code></pre>
+  <p>The <strong>Description</strong> says what went wrong and where; the <strong>Action</strong> suggests a fix. Read those two first. If you see only a long stack trace, scroll to the last <code>Caused by:</code>: the deepest cause is the real problem; the <code>BeanCreationException</code> lines above are wrappers.</p>
+
+  <h4>1. NoSuchBeanDefinitionException (the bean is missing)</h4>
+  <p>Cause: nothing in the container matches the required type or name.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Check</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>Class has no stereotype annotation</td><td>Add <code>@Service</code>, <code>@Component</code> or a <code>@Bean</code> method</td></tr>
+      <tr><td>Class is outside the scanned packages</td><td>Move it under the main class's package (<a href="#m1-stereotypes-scanning">scanning</a>)</td></tr>
+      <tr><td>You asked for the implementation, but the bean is a proxy of the interface</td><td>Inject the interface type</td></tr>
+      <tr><td>The bean is excluded by <code>@Profile</code> or a condition</td><td>Activate the profile or fix the condition</td></tr>
+      <tr><td>A starter is missing (no <code>DataSource</code> bean)</td><td>Add the dependency; check with the conditions report</td></tr>
+      <tr><td>Test with a slice (<code>@WebMvcTest</code>)</td><td>Mock the missing collaborator or <code>@Import</code> it</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>2. NoUniqueBeanDefinitionException (too many beans)</h4>
+  <pre class="out" data-title="Report"><code class="language-plaintext">Parameter 0 of constructor in com.example.shop.OtpService required a
+single bean, but 2 were found:
+    - emailSender: defined in file [.../EmailSender.class]
+    - smsSender: defined in file [.../SmsSender.class]
+
+Action: Consider marking one of the beans as @Primary, updating the
+consumer to accept multiple beans, or using @Qualifier to identify the
+bean that should be consumed</code></pre>
+  <p>Fix by one of: <code>@Primary</code> on the usual bean; <code>@Qualifier("smsSender")</code> at the injection point; accept <code>List</code>/<code>Map</code> of all; or a bean-name-matching parameter name. Another cause is two <code>@Bean</code> methods that both return the same type.</p>
+
+  <h4>3. UnsatisfiedDependencyException</h4>
+  <p>This is a wrapper. Spring says "I could not satisfy a dependency of bean X" and the <em>reason</em> is in the nested exception: usually one of the two above, or an exception thrown by another bean's constructor. Always read the last <code>Caused by</code>.</p>
+
+  <h4>4. Circular dependencies</h4>
+  <p>A needs B and B needs A. With constructors neither can be created first.</p>
+  <pre data-title="A cycle"><code class="language-java">@Service
+class OrderService {
+    OrderService(CustomerService customers) { }
+}
+
+@Service
+class CustomerService {
+    CustomerService(OrderService orders) { }
+}</code></pre>
+  <pre class="out" data-title="Report"><code class="language-plaintext">The dependencies of some of the beans in the application context
+form a cycle:
+
+┌─────┐
+|  orderService defined in file [.../OrderService.class]
+↑     ↓
+|  customerService defined in file [.../CustomerService.class]
+└─────┘
+
+Action: Despite circular references being allowed by default in Spring
+Framework, they are prohibited by Spring Boot by default...</code></pre>
+  <p>Since Spring Boot 2.6 cycles are <strong>prohibited by default</strong> (<code>spring.main.allow-circular-references</code> is <code>false</code>). Treat a cycle as a design smell and fix the design, in this order of preference:</p>
+  <ol class="steps">
+    <li><strong>Extract the shared logic</strong> into a third class that both use. Often A and B both really need "customer lookup", which belongs in its own service.</li>
+    <li><strong>Move one direction to events</strong>: A publishes an event, B listens (<a href="#m1-application-events">events</a>).</li>
+    <li><strong>Pass data, not services</strong>: give the method the values it needs instead of the whole bean.</li>
+    <li><strong>Last resort: <code>@Lazy</code></strong> on one constructor parameter, which injects a lazy proxy that resolves on first call. It hides the problem; document why.</li>
+  </ol>
+  <p>Setting <code>spring.main.allow-circular-references=true</code> brings the old behaviour back for setter and field injection. Do not do that; it only postpones the design fix.</p>
+
+  <h4>5. Other errors you will meet</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Message</th><th>Meaning and fix</th></tr></thead>
+    <tbody>
+      <tr><td><code>Failed to configure a DataSource: 'url' attribute is not specified</code></td><td>A JDBC starter is on the classpath but <code>spring.datasource.*</code> is not set. Add the properties, or exclude the auto-configuration if the app has no database.</td></tr>
+      <tr><td><code>Web server failed to start. Port 8080 was already in use</code></td><td>Another process uses the port. Stop it or set <code>server.port</code>.</td></tr>
+      <tr><td><code>ConflictingBeanDefinitionException</code></td><td>Two beans with the same name. Rename one or give an explicit name.</td></tr>
+      <tr><td><code>BeanCurrentlyInCreationException</code></td><td>Circular reference found while creating a bean (see above).</td></tr>
+      <tr><td><code>BeanInstantiationException</code></td><td>The constructor threw, or there is no usable constructor. Read the cause.</td></tr>
+      <tr><td><code>Could not resolve placeholder 'app.name'</code></td><td>A <code>@Value("${app.name}")</code> property does not exist. Add it, or give a default.</td></tr>
+      <tr><td><code>Binding to target ... failed</code></td><td>A <code>@ConfigurationProperties</code> value has the wrong type or fails validation.</td></tr>
+      <tr><td><code>BeanNotOfRequiredTypeException</code></td><td>The bean is a JDK proxy, so it cannot be cast to the class. Use the interface.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>A debugging routine</h4>
+  <ol class="steps">
+    <li>Read the "Description" and "Action" of the failure report.</li>
+    <li>Find the last <code>Caused by:</code> in the stack trace if no report was printed.</li>
+    <li>Check the three basics: annotation present, package scanned, profile active.</li>
+    <li>Run with <code>--debug</code> to print the conditions report, and list beans with <code>ctx.getBeanDefinitionNames()</code> if needed.</li>
+    <li>Fix the root cause, never by switching injection style or allowing cycles.</li>
+  </ol>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: fail fast is good</p>
+    <p>These errors appear at startup, because singletons are created eagerly. That is the container protecting you; never hide them with lazy tricks unless you understand why.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Field-injected cycles used to "work" before Boot 2.6 because Spring injected a half-built object. Upgrading old projects shows these cycles suddenly.</li>
+      <li>A <code>@Lazy</code> constructor parameter breaks a startup cycle but not a cycle in real method calls: infinite recursion causes a <code>StackOverflowError</code> at runtime.</li>
+      <li>An exception inside a <code>@PostConstruct</code> method also aborts startup, reported as <code>BeanCreationException: Invocation of init method failed</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: fixing a cycle with allow-circular-references</p>
+    <p>It silences the error and leaves two classes that know too much about each other. Extract a third class or use an event instead.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a circular dependency and how do you fix it?"</p>
+    <ul>
+      <li>A needs B and B needs A; constructor injection cannot create either first. Since Boot 2.6 it fails at startup by default.</li>
+      <li>Fix by redesign: extract a third class, use events, pass data instead of beans. <code>@Lazy</code> on one parameter or setter injection are last resorts.</li>
+      <li>Also be able to name <code>NoSuchBeanDefinitionException</code> (missing bean) and <code>NoUniqueBeanDefinitionException</code> (several candidates) with causes and fixes.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-bean-scopes">
+  <h3>Bean scopes: singleton, prototype and web scopes</h3>
+  <p class="tldr">The scope decides how many instances of a bean exist and how long they live; the default singleton scope gives one shared instance per container, so singleton beans must be stateless or thread-safe.</p>
+
+  <p>A <strong>scope</strong> answers: "when someone asks the container for this bean, does it give the same object or a new one?"</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Scope</th><th>Instances</th><th>Lives for</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>singleton</code> (default)</td><td>One per container</td><td>Whole application</td><td>Services, repositories, controllers, clients</td></tr>
+      <tr><td><code>prototype</code></td><td>A new one for every injection or <code>getBean</code></td><td>Until garbage collected; Spring does not destroy it</td><td>Stateful helper objects</td></tr>
+      <tr><td><code>request</code></td><td>One per HTTP request</td><td>The request</td><td>Per-request data (a request id, tenant)</td></tr>
+      <tr><td><code>session</code></td><td>One per HTTP session</td><td>The user session</td><td>Shopping cart in a server-side session</td></tr>
+      <tr><td><code>application</code></td><td>One per <code>ServletContext</code></td><td>Whole web application</td><td>Rare; usually a singleton does the same</td></tr>
+    </tbody>
+  </table></div>
+  <p>The web scopes (<code>request</code>, <code>session</code>, <code>application</code>) exist only in a web application. There is also <code>websocket</code>, which is rare.</p>
+
+  <h4>Singleton: shared, so keep it stateless</h4>
+  <p>"Singleton" here means one instance <em>per container</em>, not the classic Gang-of-Four pattern with a private constructor. Because every request thread uses the same instance at the same time, a singleton bean must hold no per-request mutable state.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: per-user state in a singleton</p><pre><code class="language-java">@Service
+public class CartService {
+    private List&lt;Item&gt; items = new ArrayList&lt;&gt;();   // shared by ALL users!
+
+    public void add(Item item) { items.add(item); }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: state passed in or stored per user</p><pre><code class="language-java">@Service
+public class CartService {
+    private final CartRepository carts;           // stateless; state lives in the DB
+    public CartService(CartRepository carts) { this.carts = carts; }
+
+    public void add(long userId, Item item) { carts.addItem(userId, item); }
+}</code></pre></div>
+  </div>
+  <p>Fields that are <code>final</code> collaborators are fine. Mutable counters, caches and lists are not, unless you use thread-safe types (<code>AtomicLong</code>, <code>ConcurrentHashMap</code>); see <a href="02-core-java.html#m6">Core Java · Module 6</a>.</p>
+
+  <h4>Prototype</h4>
+  <pre data-title="Declaring a prototype"><code class="language-java">@Component
+@Scope("prototype")          // or ConfigurableBeanFactory.SCOPE_PROTOTYPE
+public class ReportBuilder {
+    private final List&lt;String&gt; lines = new ArrayList&lt;&gt;();
+    public void add(String line) { lines.add(line); }
+}</code></pre>
+  <p>Spring creates and injects a prototype, then forgets it: <strong>destroy callbacks like <code>@PreDestroy</code> are not called</strong>. Releasing resources is your job.</p>
+
+  <h4>The classic trap: a prototype inside a singleton</h4>
+  <p>A singleton is built once, so its dependencies are injected once. If one of them is a prototype, the singleton keeps that single instance forever, and the "new instance every time" behaviour is lost.</p>
+  <pre data-title="Wrong: you always get the same ReportBuilder"><code class="language-java">@Service
+public class ReportService {
+    private final ReportBuilder builder;          // injected ONCE
+
+    public ReportService(ReportBuilder builder) { this.builder = builder; }
+
+    public String build() { return builder.toString(); }   // shared, grows forever
+}</code></pre>
+  <p>Ask the container for a fresh one each time, with <code>ObjectProvider</code>:</p>
+  <pre data-title="Right: ask at the moment you need it"><code class="language-java">@Service
+public class ReportService {
+    private final ObjectProvider&lt;ReportBuilder&gt; builders;
+
+    public ReportService(ObjectProvider&lt;ReportBuilder&gt; builders) {
+        this.builders = builders;
+    }
+
+    public String build() {
+        ReportBuilder builder = builders.getObject();    // a NEW instance
+        builder.add("Total: 1500");
+        return builder.toString();
+    }
+}</code></pre>
+  <p>Alternatives: <code>@Scope(value = "prototype", proxyMode = ScopedProxyMode.TARGET_CLASS)</code> (a proxy that gets a new target per call), or a <code>@Lookup</code> method. <code>ObjectProvider</code> is the clearest. Often the best answer is simpler still: create the helper with <code>new</code> inside the method, since it is not really a bean.</p>
+
+  <h4>Web scopes</h4>
+  <pre data-title="A request-scoped bean injected into a singleton"><code class="language-java">@Component
+@RequestScope                       // = @Scope(value = "request", proxyMode = TARGET_CLASS)
+public class RequestContext {
+    private String requestId;
+    // getters and setters
+}
+
+@Service
+public class AuditService {
+    private final RequestContext context;     // a proxy, safe to inject here
+    public AuditService(RequestContext context) { this.context = context; }
+
+    public void log(String action) {
+        System.out.println(context.getRequestId() + " " + action);
+    }
+}</code></pre>
+  <p>The singleton <code>AuditService</code> is created at startup, when there is no request. So Spring injects a <strong>scoped proxy</strong> instead of the real bean. On each call the proxy finds the real <code>RequestContext</code> of the <em>current</em> request and forwards the call. <code>@RequestScope</code> and <code>@SessionScope</code> set up that proxy for you; with plain <code>@Scope("request")</code> you must add <code>proxyMode</code> yourself. Using the bean outside a request (a scheduled job, a new thread) throws <code>IllegalStateException: No thread-bound request found</code>.</p>
+  <p>Server-side sessions fit badly with REST APIs, which should be stateless (<a href="#m2">Module 2</a>). So in API projects <code>request</code> scope is the only web scope you may use, and rarely.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Default is singleton; keep singleton beans free of mutable per-request state.</li>
+      <li>Spring calls <code>@PreDestroy</code> for singletons (and other long-lived scopes), not for prototypes.</li>
+      <li>A longer-lived bean (singleton) that needs a shorter-lived one (prototype, request) must get it through a provider or a scoped proxy.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Over 95 percent of beans are singletons; do not add <code>@Scope</code> without a clear reason.</li>
+      <li>Put request data (the user, a tenant, a trace id) in method parameters, a <code>ThreadLocal</code>-backed context, or the security context, not in a mutable singleton field.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Singleton beans are shared across threads, but created eagerly in <em>one</em> thread at startup; that does not make their later use thread-safe.</li>
+      <li>A prototype injected into a prototype is a new instance each time; the trap exists only when a longer-lived bean holds it.</li>
+      <li>Two <code>@Bean</code> methods returning the same class give two different singletons, because the scope is per bean definition, not per class.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What are bean scopes? Is a singleton bean thread-safe?"</p>
+    <ul>
+      <li>Singleton (default), prototype, request, session, application (and websocket). Singleton is one per container, not per JVM and not the GoF pattern.</li>
+      <li>A singleton is not automatically thread-safe: keep it stateless or use thread-safe state.</li>
+      <li>Prototype into singleton: injected once; fix with <code>ObjectProvider</code>, a scoped proxy, or <code>@Lookup</code>. Prototype beans are not destroyed by Spring.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-bean-lifecycle">
+  <h3>The bean lifecycle: from construction to destruction</h3>
+  <p class="tldr">The container creates a bean, injects its dependencies, calls the Aware and post-processor callbacks, runs your init methods, keeps it in use, and calls destroy methods at shutdown; AOP proxies are created right after initialization.</p>
+
+  <p>Knowing the order helps you decide where code belongs: dependencies are not available in the constructor of a field-injected bean, a proxy appears only after init, and cleanup runs at shutdown. This is a favourite interview topic.</p>
+
+  <h4>The steps, in order</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A[1 Instantiate: call the constructor] --> B[2 Populate properties: inject dependencies]
+  B --> C[3 Aware callbacks: BeanNameAware, ApplicationContextAware]
+  C --> D[4 BeanPostProcessor: postProcessBeforeInitialization]
+  D --> E[5 PostConstruct method]
+  E --> F[6 InitializingBean afterPropertiesSet]
+  F --> G[7 Custom init-method]
+  G --> H[8 BeanPostProcessor: postProcessAfterInitialization - AOP proxy made here]
+  H --> I[9 Bean in use]
+  I --> J[10 PreDestroy method]
+  J --> K[11 DisposableBean destroy]
+  K --> L[12 Custom destroy-method]
+</pre>
+    <figcaption>The lifecycle of a singleton bean; steps 1 to 8 run at startup, 10 to 12 at shutdown</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><strong>Instantiate</strong> — the constructor runs. With constructor injection all dependencies are already passed in.</li>
+    <li><strong>Populate properties</strong> — setter and field injection happen now (and <code>@Value</code> fields are set).</li>
+    <li><strong>Aware callbacks</strong> — if the bean implements <code>BeanNameAware</code>, <code>BeanFactoryAware</code> or <code>ApplicationContextAware</code>, Spring passes in the name, factory or context.</li>
+    <li><strong>BeanPostProcessor, before init</strong> — every registered <code>postProcessBeforeInitialization</code> runs. This is where the handling of <code>@PostConstruct</code> itself happens.</li>
+    <li><strong><code>@PostConstruct</code></strong> — your method runs; everything is injected.</li>
+    <li><strong><code>InitializingBean.afterPropertiesSet()</code></strong> — the interface-based alternative.</li>
+    <li><strong>Custom init method</strong> — <code>@Bean(initMethod = "start")</code>.</li>
+    <li><strong>BeanPostProcessor, after init</strong> — <code>postProcessAfterInitialization</code> may return a <em>replacement</em>. This is where Spring wraps the bean in an <strong>AOP proxy</strong> for <code>@Transactional</code>, <code>@Cacheable</code> and <code>@Async</code>. What other beans receive may be the proxy, not your object.</li>
+    <li><strong>In use</strong> — the bean serves calls until the context closes.</li>
+    <li><strong><code>@PreDestroy</code></strong>, then <code>DisposableBean.destroy()</code>, then a custom <code>destroyMethod</code> — cleanup at shutdown. Singletons only.</li>
+  </ol>
+
+  <h4>Watching the order yourself</h4>
+  <pre data-title="LifecycleDemo.java"><code class="language-java">import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import org.springframework.beans.factory.BeanNameAware;
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.stereotype.Component;
+
+@Component
+public class LifecycleDemo implements BeanNameAware, InitializingBean {
+
+    public LifecycleDemo() {
+        System.out.println("1 constructor");
+    }
+
+    @Override
+    public void setBeanName(String name) {
+        System.out.println("3 BeanNameAware: " + name);
+    }
+
+    @PostConstruct
+    public void init() {
+        System.out.println("5 @PostConstruct");
+    }
+
+    @Override
+    public void afterPropertiesSet() {
+        System.out.println("6 afterPropertiesSet");
+    }
+
+    @PreDestroy
+    public void cleanup() {
+        System.out.println("10 @PreDestroy");
+    }
+}</code></pre>
+  <pre class="out" data-title="Console"><code class="language-plaintext">1 constructor
+3 BeanNameAware: lifecycleDemo
+5 @PostConstruct
+6 afterPropertiesSet
+... application runs ...
+10 @PreDestroy</code></pre>
+  <p>The package is <code>jakarta.annotation</code> in Boot 3 and 4 (it was <code>javax.annotation</code> in Boot 2). The annotations come from the Jakarta Annotations API, which Boot's starters already include.</p>
+
+  <h4>@PostConstruct: what to use it for</h4>
+  <ul>
+    <li><strong>Validating configuration</strong>: fail startup if a required value is blank.</li>
+    <li><strong>Warming up</strong>: loading a small lookup table or opening a connection once.</li>
+    <li><strong>Setting derived fields</strong> that need injected dependencies.</li>
+  </ul>
+  <p>Keep it short and fast. Do not call slow remote services there; a slow <code>@PostConstruct</code> delays application startup, and a failure aborts it. For work that should run once the app is up, use a runner.</p>
+
+  <h4>CommandLineRunner and ApplicationRunner</h4>
+  <p>These run <em>after</em> the context is fully built, just before <code>SpringApplication.run</code> returns. They are good for seeding data or one-off start-up tasks.</p>
+  <pre data-title="SeedData.java"><code class="language-java">@Component
+@Order(1)
+public class SeedData implements CommandLineRunner {
+
+    private final ProductRepository products;
+    public SeedData(ProductRepository products) { this.products = products; }
+
+    @Override
+    public void run(String... args) {          // raw command-line arguments
+        if (products.count() == 0) {
+            products.save(new Product("MSE-1001", "Wireless Mouse"));
+        }
+    }
+}
+
+@Component
+class Warmup implements ApplicationRunner {
+    @Override
+    public void run(ApplicationArguments args) {        // parsed: --mode=fast
+        System.out.println("fast? " + args.containsOption("mode"));
+    }
+}</code></pre>
+  <p><code>ApplicationRunner</code> gives parsed options (<code>--name=value</code>) and non-option arguments; <code>CommandLineRunner</code> gives the raw string array. Order several runners with <code>@Order</code>. An exception in a runner fails startup.</p>
+
+  <h4>@Lazy and @DependsOn</h4>
+  <ul>
+    <li><code>@Lazy</code> on a bean (or class) delays creation until the first request for it. It speeds startup but moves errors to runtime. You can enable it for all beans with <code>spring.main.lazy-initialization=true</code>, a trade-off to use knowingly.</li>
+    <li><code>@DependsOn("databaseMigrator")</code> forces that bean to be created first even if there is no injection link between them (for example a bean that must exist before this one, as a side effect). Use it sparingly; normally injection already orders things.</li>
+  </ul>
+
+  <h4>Defining callbacks for third-party beans</h4>
+  <pre data-title="initMethod and destroyMethod on a @Bean"><code class="language-java">@Bean(initMethod = "connect", destroyMethod = "disconnect")
+public LegacyQueueClient queueClient() {
+    return new LegacyQueueClient("amqp://localhost");
+}</code></pre>
+  <p>For <code>@Bean</code> methods Spring also guesses a destroy method named <code>close</code> or <code>shutdown</code> if the class has one (this is called inference). Set <code>destroyMethod = ""</code> to turn that off.</p>
+
+  <h4>Why the order matters in practice</h4>
+  <ul>
+    <li>Do not use an injected field in a constructor of a <em>field-injected</em> bean: it is still <code>null</code>. This is another reason to prefer constructor injection.</li>
+    <li>Calling a <code>@Transactional</code> method of the same bean from <code>@PostConstruct</code> does not start a transaction, because the proxy is created in step 8, after the method runs.</li>
+    <li>Cleaning up resources (thread pools, files) belongs in <code>@PreDestroy</code> or a <code>close()</code> method; Spring Boot's graceful shutdown calls it when the JVM gets a stop signal.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li><code>@PostConstruct</code> and <code>@PreDestroy</code> methods take no arguments and should return <code>void</code>.</li>
+      <li>Destroy callbacks run for singletons at context close, not for prototypes, and not if the JVM is killed with <code>kill -9</code>.</li>
+      <li>Prefer the annotations over the interfaces <code>InitializingBean</code> and <code>DisposableBean</code>, which tie your class to Spring.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Constructor: assign fields only. <code>@PostConstruct</code>: light set-up. Runner: start-up tasks that need the running app.</li>
+      <li>Keep seed data and migrations out of production profiles (use <a href="#m1-profiles">profiles</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Both <code>@PostConstruct</code> and <code>afterPropertiesSet</code> exist: the annotation runs first. If the same method name is also declared as an init method, Spring runs it once.</li>
+      <li>If the constructor throws, you see <code>BeanInstantiationException</code>; if <code>@PostConstruct</code> throws, <code>BeanCreationException: Invocation of init method failed</code>.</li>
+      <li>A <code>BeanPostProcessor</code> is itself a bean; make its <code>@Bean</code> method <code>static</code> so it is created early and does not force its configuration class to load too soon.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain the bean lifecycle"</p>
+    <ul>
+      <li>Instantiate → populate dependencies → Aware callbacks → post-processor before → <code>@PostConstruct</code> → <code>afterPropertiesSet</code> → init-method → post-processor after (proxies) → ready → <code>@PreDestroy</code> → <code>destroy</code> → destroy-method.</li>
+      <li>Name one use for each hook: <code>@PostConstruct</code> to validate config; <code>BeanPostProcessor</code> to wrap beans (AOP); <code>@PreDestroy</code> to release resources.</li>
+      <li>Say prototype beans are not destroyed by Spring, and runners run after the context is ready.</li>
+    </ul>
+  </div>
+</article>

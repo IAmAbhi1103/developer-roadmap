@@ -1,0 +1,512 @@
+<article class="topic" id="m5-object-storage">
+  <h3>Object storage (S3) for files, presigned URLs and multipart uploads</h3>
+  <p class="tldr">Store files (images, videos, documents) in object storage such as S3, which is cheap,
+  extremely durable and scales without limit, and keep only the metadata and the object key in your
+  database; let clients upload and download directly with presigned URLs, and put a CDN in front.</p>
+
+  <h4>Why not store files in the database or on the app server</h4>
+  <p>Large binary files in a relational database bloat it, slow backups and replication, and waste expensive
+  storage. Files on an app server's disk break statelessness (the next instance cannot see them) and die
+  with the machine. <strong>Object storage</strong> is built for exactly this: a flat store of immutable blobs
+  addressed by key over HTTP. Examples: Amazon S3, Google Cloud Storage, Azure Blob Storage, and
+  self-hosted MinIO.</p>
+
+  <h4>S3 concepts</h4>
+  <dl class="terms">
+    <dt>Bucket</dt><dd>A top-level container with a globally unique name; holds objects. Settings such as
+    access policy, versioning and lifecycle rules apply per bucket.</dd>
+    <dt>Object</dt><dd>The file's bytes plus metadata. An object is written or replaced as a whole; you
+    cannot edit part of it in place.</dd>
+    <dt>Key</dt><dd>The object's name inside the bucket, for example
+    <code>users/42/avatar/2026-11.jpg</code>. The namespace is flat; the slashes only look like folders
+    (a "prefix").</dd>
+    <dt>Metadata</dt><dd>System metadata (size, content type, ETag, last-modified) and your own key-value
+    tags.</dd>
+    <dt>Storage class</dt><dd>Hot (frequent access), infrequent access, and archive tiers with lower price
+    and slower or paid retrieval. Lifecycle rules move or delete objects by age automatically.</dd>
+    <dt>Versioning</dt><dd>Keeps old versions of an object, so an overwrite or delete can be undone.</dd>
+  </dl>
+  <ul>
+    <li><strong>Durability:</strong> S3 advertises eleven nines (99.999999999%) of durability for standard
+    storage, achieved by storing data redundantly across multiple facilities. That is about durability (not
+    losing objects), not availability (always reachable), which is lower.</li>
+    <li><strong>Consistency:</strong> S3 now gives strong read-after-write consistency for object writes,
+    overwrites and deletes, so a read after a successful PUT sees the new data.</li>
+    <li><strong>Limits:</strong> a single object can be up to 5 TB; one PUT request up to 5 GB; larger uploads
+    use multipart.</li>
+    <li><strong>Not a file system:</strong> no append, no rename (it is copy and delete), no locking, and
+    each request has network latency of tens of milliseconds. Do not use it for databases or for tiny
+    frequent random writes.</li>
+  </ul>
+
+  <h4>The standard pattern: blob in S3, metadata in the database</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant A as API server
+  participant S as S3
+  participant D as Database
+  C->>A: request upload (name, type, size)
+  A->>A: validate user and limits
+  A-->>C: presigned PUT URL and object key
+  C->>S: PUT file directly (bytes bypass the API)
+  S-->>C: 200 OK
+  C->>A: confirm upload (key)
+  A->>D: save metadata (key, owner, size)
+  Note over S,A: Optional: S3 event notifies workers to scan or resize
+</pre>
+    <figcaption>The API server never carries the file bytes; it only hands out a short-lived permission</figcaption>
+  </figure>
+  <p>The database row holds the <code>object_key</code>, owner, content type, size and status, and the
+  bytes live in S3. Queries, permissions and joins stay in SQL, and storage scales separately.</p>
+
+  <h4>Presigned URLs</h4>
+  <p>A <strong>presigned URL</strong> is a normal S3 URL with a signature and expiry in its query string,
+  created by your server with its credentials. Whoever holds it can perform that one operation (upload this
+  key, or download this object) until it expires, with no AWS credentials of their own. Benefits: the file
+  bytes skip your servers (saving bandwidth, CPU and memory), the bucket can stay private, and access is
+  time-limited.</p>
+  <pre data-title="PresignService.java"><code class="language-java">import java.time.Duration;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.presigner.S3Presigner;
+import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest;
+
+public class PresignService {
+    private final S3Presigner presigner;                    // built once, reused
+
+    public PresignService(S3Presigner presigner) {
+        this.presigner = presigner;
+    }
+
+    public String uploadUrl(String bucket, String key, String contentType) {
+        PutObjectRequest put = PutObjectRequest.builder()
+            .bucket(bucket).key(key).contentType(contentType).build();
+        PutObjectPresignRequest req = PutObjectPresignRequest.builder()
+            .signatureDuration(Duration.ofMinutes(10))      // short-lived
+            .putObjectRequest(put).build();
+        return presigner.presignPutObject(req).url().toString();
+    }
+}</code></pre>
+  <p>Generate keys on the server (for example a UUID under the user's prefix) so clients cannot overwrite
+  other people's files, check the file type and size limits, and verify the upload before marking it
+  complete. Downloads work the same way with a presigned GET for private files.</p>
+
+  <h4>Multipart upload</h4>
+  <p>For large files (videos, backups) S3 supports <strong>multipart upload</strong>: start an upload,
+  send the file as numbered parts (5 MB to 5 GB each, up to 10,000 parts) in parallel, then complete the
+  upload and S3 assembles them. Benefits: parallel speed, <strong>resume</strong> by re-sending only failed
+  parts (important on mobile networks), and uploads beyond 5 GB. AWS recommends it for objects above about
+  100 MB. Add a lifecycle rule to abort unfinished uploads, or the abandoned parts keep costing money.</p>
+
+  <h4>CDN in front, and other practices</h4>
+  <ul>
+    <li>Serve public media through a CDN (<a href="#m5-cdn">CDN</a>) with the bucket private and the CDN
+    allowed to read it. This cuts latency and S3 request cost.</li>
+    <li>Use fingerprinted or unique keys so objects never change and caches stay valid.</li>
+    <li>Make thumbnails asynchronously: an upload event goes to a queue (<a href="#m5-queues">Queues</a>), a
+    worker resizes and writes several sizes.</li>
+    <li>Encrypt at rest and in transit; block public access by default; apply least-privilege roles.</li>
+    <li>Spread keys with varied prefixes only if you hit request-rate limits; S3 scales per prefix
+    automatically in most cases.</li>
+    <li>Be aware of costs: storage per GB-month, requests, and especially data transfer out.</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Making a bucket public to "make it work" and leaking private files.</li>
+      <li>Proxying every upload through the API server, so it becomes the bandwidth bottleneck.</li>
+      <li>Long-lived presigned URLs that get shared.</li>
+      <li>Forgetting to delete the S3 object when the database row is deleted (orphans cost money).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"Files go to S3, metadata to PostgreSQL. The client uploads with a presigned URL, so our servers
+      never touch the bytes, and a CDN serves downloads."</li>
+      <li>For large videos mention multipart upload and resumable uploads.</li>
+      <li>Quote durability vs availability correctly: eleven nines is about not losing data.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-search">
+  <h3>Search engines: the inverted index and Elasticsearch</h3>
+  <p class="tldr">A search engine answers "which documents contain these words, ranked by relevance" using an
+  inverted index; Elasticsearch and OpenSearch scale it with shards and replicas, but they are a secondary
+  index, not your source of truth, so keep them in sync with the database through events or change data
+  capture.</p>
+
+  <h4>The problem</h4>
+  <p>SQL <code>LIKE '%phone%'</code> scans every row, cannot use an index for a leading wildcard, ignores
+  spelling mistakes and word forms, and cannot rank results. Users expect Google-style search: typo
+  tolerance, relevance order, filters, highlights, autocomplete. A search engine is built for this.</p>
+
+  <h4>The inverted index in simple words</h4>
+  <p>A normal index maps a document to its words. An <strong>inverted index</strong> flips it: for each
+  word, it lists the documents that contain it (like the index at the back of a textbook).</p>
+  <pre data-title="Inverted index example"><code class="language-plaintext">Doc 1: "red running shoes"
+Doc 2: "blue running jacket"
+Doc 3: "red jacket"
+
+Term      → documents
+red       → 1, 3
+running   → 1, 2
+shoes     → 1
+blue      → 2
+jacket    → 2, 3
+
+Query "red jacket": red → {1,3}, jacket → {2,3}; intersect → {3}; OR → {1,2,3} ranked</code></pre>
+  <p>Before indexing, text goes through an <strong>analyzer</strong>: split into tokens, lowercase, remove
+  stop words ("the", "is"), and apply <strong>stemming</strong> (running to run) so related forms match.
+  The same analysis is applied to the query. Results are ranked by a relevance score, classically
+  TF-IDF and in modern engines BM25: a term that is frequent in this document but rare across all documents
+  scores higher.</p>
+
+  <h4>Elasticsearch and OpenSearch</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  Q[Search request] --> N[Coordinating node]
+  N --> S1[Shard 1 primary]
+  N --> S2[Shard 2 primary]
+  N --> S3[Shard 3 primary]
+  S1 -.-> R1[Shard 1 replica]
+  S2 -.-> R2[Shard 2 replica]
+  N --> M[Merge top results]
+</pre>
+    <figcaption>A query fans out to all shards of an index; results are merged and ranked</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Elasticsearch</strong> (built on Apache Lucene) and its fork <strong>OpenSearch</strong> store
+    JSON documents in an <strong>index</strong>, split into <strong>shards</strong> spread across nodes, each
+    with <strong>replicas</strong> for availability and read throughput. They expose a REST API with a rich
+    query language.</li>
+    <li>Use cases: product and site search, autocomplete and "did you mean", log and event analytics (the
+    ELK stack), filtering and faceting (price, brand), geo search.</li>
+    <li><strong>Near-real-time:</strong> new documents become searchable after a short refresh interval
+    (about a second by default), not instantly.</li>
+    <li>Number of primary shards is fixed when you create the index; plan it, or reindex later.</li>
+  </ul>
+  <div class="co co-rule">
+    <p class="co-t">Rule: treat the search index as derived data</p>
+    <p>It is optimised for reading, offers weaker transactional guarantees, and can be rebuilt. Keep the
+    source of truth in the database, and be able to reindex everything from it. Never store the only copy of
+    important data in Elasticsearch.</p>
+  </div>
+
+  <h4>Keeping search in sync with the database</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Approach</th><th>How</th><th>Pros</th><th>Cons</th></tr></thead>
+    <tbody>
+      <tr><td>Dual write</td><td>App writes to the DB and to the search index in the same request</td><td>Simple</td><td>Not atomic: one write can fail, leaving them different; ordering races</td></tr>
+      <tr><td>Events (outbox)</td><td>App writes the DB and an outbox row in one transaction; a relay publishes to Kafka; an indexer updates search</td><td>Reliable, decoupled, replayable</td><td>More components; eventual (seconds of delay)</td></tr>
+      <tr><td>Change data capture (CDC)</td><td>A tool such as Debezium reads the database's transaction log and emits change events</td><td>No app code change, captures every change, preserves order</td><td>Extra infrastructure; schema coupling</td></tr>
+      <tr><td>Periodic batch reindex</td><td>A job re-reads changed rows (by updated_at) on a schedule</td><td>Easy, self-healing</td><td>Delay; heavy for large tables; misses deletes without care</td></tr>
+    </tbody>
+  </table></div>
+  <p>Avoid dual writes for anything important. The common production answer is the outbox pattern or CDC
+  through a queue (<a href="#m5-queues">Queues</a>, <a href="#m6">Module 6</a>), plus a way to do a full
+  reindex into a new index and switch an alias to it with no downtime.</p>
+  <pre data-title="Search request (Elasticsearch REST)" class="out"><code class="language-http">GET /products/_search
+Content-Type: application/json
+
+{
+  "query": {
+    "bool": {
+      "must":   { "match": { "name": "running shoes" } },
+      "filter": { "range": { "price": { "lte": 3000 } } }
+    }
+  },
+  "size": 10
+}</code></pre>
+
+  <h4>Trade-offs and failure modes</h4>
+  <ul>
+    <li>Index lag: a just-added product may not appear for a second or more.</li>
+    <li>Memory and disk hungry; wrong mappings or too many shards hurt performance; deep pagination
+    (page 10,000) is expensive.</li>
+    <li>Cluster operations: split-brain risk if misconfigured, shard rebalancing, and version upgrades.</li>
+    <li>Relevance tuning is real work: analyzers, synonyms, boosting.</li>
+    <li>For small datasets, PostgreSQL full-text search (<code>tsvector</code>) may be enough, with no new
+    system.</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"Search uses an inverted index in Elasticsearch, fed from the database by CDC or the outbox
+      pattern. The database stays the source of truth."</li>
+      <li>Explain the inverted index with a two-word example, and mention analyzers and BM25 ranking.</li>
+      <li>Mention eventual consistency of search results and how you reindex.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-cheat-table">
+  <h3>Building blocks cheat table</h3>
+  <p class="tldr">One page that maps each building block to the problem it solves, its key trade-off and a
+  typical tool, plus a guide for which block to reach for first.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Block</th><th>Problem solved</th><th>Key trade-off</th><th>Typical tool</th></tr></thead>
+    <tbody>
+      <tr><td>DNS</td><td>Names to addresses; steer users to a region</td><td>Long TTL is fast but slow to change</td><td>Route 53, Cloudflare</td></tr>
+      <tr><td>CDN</td><td>Latency and origin load for static content</td><td>Stale content; slow invalidation; cost</td><td>CloudFront, Cloudflare, Akamai</td></tr>
+      <tr><td>Load balancer</td><td>Spread traffic, hide dead servers</td><td>L4 fast vs L7 smart; must itself be redundant</td><td>Nginx, HAProxy, ALB, NLB</td></tr>
+      <tr><td>API gateway</td><td>One front door: auth, routing, limits</td><td>Extra hop; can become a god service</td><td>Spring Cloud Gateway, Kong, AWS API Gateway</td></tr>
+      <tr><td>Rate limiter</td><td>Abuse and overload protection</td><td>Accuracy vs memory; fail open or closed</td><td>Redis, Bucket4j, gateway plugins</td></tr>
+      <tr><td>Cache</td><td>Read latency and database load</td><td>Staleness and invalidation</td><td>Redis, Memcached, Caffeine</td></tr>
+      <tr><td>Read replica</td><td>Scale reads and availability</td><td>Replication lag</td><td>PostgreSQL / MySQL replicas</td></tr>
+      <tr><td>Sharding</td><td>Scale writes and storage</td><td>No cross-shard joins or easy transactions; resharding</td><td>Vitess, Citus, MongoDB, Cassandra</td></tr>
+      <tr><td>Consistent hashing</td><td>Spread keys, few moves on change</td><td>Hot keys still hot; vnode metadata</td><td>Cassandra, DynamoDB, cache clients</td></tr>
+      <tr><td>SQL database</td><td>Relations, transactions, ad-hoc queries</td><td>Harder to scale writes</td><td>PostgreSQL, MySQL</td></tr>
+      <tr><td>NoSQL store</td><td>Scale or flexibility for one access pattern</td><td>Weaker queries; eventual consistency</td><td>DynamoDB, MongoDB, Cassandra, Neo4j</td></tr>
+      <tr><td>Message queue / stream</td><td>Decouple, buffer, retry</td><td>Eventual consistency; duplicates</td><td>Kafka, RabbitMQ, SQS</td></tr>
+      <tr><td>Object storage</td><td>Cheap, durable files</td><td>No in-place edits; latency; egress cost</td><td>S3, GCS, MinIO</td></tr>
+      <tr><td>Search engine</td><td>Full-text, ranking, filters</td><td>Derived data; sync lag; operations</td><td>Elasticsearch, OpenSearch</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Which block for which symptom</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Symptom</th><th>First thing to try</th></tr></thead>
+    <tbody>
+      <tr><td>Slow page loads for far-away users</td><td>CDN and regional deployment</td></tr>
+      <tr><td>App server CPU at the limit</td><td>More stateless instances behind a load balancer</td></tr>
+      <tr><td>Database read load too high</td><td>Indexes, then cache, then read replicas</td></tr>
+      <tr><td>Database write load or disk too high</td><td>Batching and async writes, then sharding</td></tr>
+      <tr><td>Slow work blocks the request</td><td>Queue plus workers</td></tr>
+      <tr><td>Traffic spikes crash a downstream service</td><td>Queue buffering, rate limiting, load shedding</td></tr>
+      <tr><td>Abusive client</td><td>Rate limiter at the gateway or edge</td></tr>
+      <tr><td>Users upload large files</td><td>Presigned URLs to object storage</td></tr>
+      <tr><td>Need keyword search</td><td>Search engine fed by CDC or events</td></tr>
+      <tr><td>One server failure takes the site down</td><td>Redundancy at every layer and health checks</td></tr>
+    </tbody>
+  </table></div>
+</article>
+
+<article class="topic recap" id="m5-interview">
+  <h3>Interview questions — Building blocks</h3>
+
+  <details class="qa">
+    <summary>Walk through what happens when a user types a URL, from a system design view.</summary>
+    <div class="qa-a">
+      <p>DNS resolves the name (cached; possibly geo-routed to the nearest region). Static assets come from a
+      CDN edge. API requests reach a load balancer that terminates TLS and picks a healthy app server. The app
+      checks Redis, and on a miss queries a database (reads from a replica). Slow work is put on a queue for
+      workers. Each hop adds latency and a failure mode, which is why each has caching, redundancy or
+      timeouts.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between an L4 and an L7 load balancer?</summary>
+    <div class="qa-a">
+      <p>L4 balances TCP/UDP connections using only IP and port: very fast, protocol-agnostic, few features.
+      L7 understands HTTP, so it can route by path, host or header, terminate TLS, set sticky cookies and
+      retry. Use L4 for raw speed and non-HTTP traffic, L7 when you need content-based routing. Many systems
+      use both.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Which load-balancing algorithm would you use and why?</summary>
+    <div class="qa-a">
+      <p>Round robin for identical servers and similar requests; weighted when machine sizes differ; least
+      connections when request durations vary a lot, since it adapts to load; consistent hashing when the
+      same key should reach the same server (local caches, sharded caches). Combine with active health checks
+      so dead servers leave the pool.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How would you rate limit an API? Compare token bucket and sliding window.</summary>
+    <div class="qa-a">
+      <p>Token bucket refills tokens at a steady rate and allows bursts up to the capacity; it needs only two
+      values per client. Fixed windows are simple but allow double bursts at the boundary. A sliding window
+      log is exact but stores every timestamp; the sliding window counter approximates it with two counters.
+      Distribute state in Redis with atomic operations (INCR with EXPIRE, or a Lua script). Return 429 with
+      Retry-After.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain cache-aside, write-through and write-behind.</summary>
+    <div class="qa-a">
+      <p>Cache-aside: the app reads the cache, loads from the database on a miss and fills the cache; on
+      writes it updates the database then deletes the key. Write-through: every write goes to cache and
+      database together, so the cache is fresh but writes are slower. Write-behind: write to the cache and
+      flush to the database later, which is fast but risks losing data if the cache fails.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a cache stampede and how do you prevent it?</summary>
+    <div class="qa-a">
+      <p>A hot key expires and many requests rebuild it at once, overloading the database. Prevent it with a
+      per-key lock or request coalescing so only one request loads, refreshing the entry before it expires
+      (or serving stale while refreshing), and jittered TTLs. Never-expiring hot keys refreshed by a
+      background job also work.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you handle cache penetration and cache avalanche?</summary>
+    <div class="qa-a">
+      <p>Penetration is repeated requests for keys that do not exist, so every one hits the database. Cache
+      the empty result for a short time, put a Bloom filter of valid keys in front, and validate input.
+      Avalanche is many keys expiring together or the cache dying: add random jitter to TTLs, warm the cache,
+      run it in a highly available setup and protect the database with limits.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the order of database scaling steps?</summary>
+    <div class="qa-a">
+      <p>Tune queries and indexes, scale up the machine, add a cache, add read replicas, partition large
+      tables, and finally shard. Each step adds complexity, so you move down only when a measured limit
+      (read load, write load, storage) forces it. Replicas and caches scale reads; only sharding scales
+      writes and total storage beyond one machine.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What problems does replication lag cause and how do you handle them?</summary>
+    <div class="qa-a">
+      <p>With async followers a read may miss a recent write (read-your-writes violation), or go back in time
+      across two followers (non-monotonic reads). Handle it by reading your own data from the leader for a
+      short time after a write, sending critical reads to the leader, tracking the last write position, and
+      pinning a user to one follower. Monitor lag and remove lagging followers.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you choose a shard key, and what are the downsides of sharding?</summary>
+    <div class="qa-a">
+      <p>Pick a high-cardinality, evenly distributed, stable key that matches the main query pattern, like
+      user id, so most queries touch one shard. Avoid monotonic keys with range sharding because they create a
+      hot shard. Downsides: cross-shard joins and transactions, scatter-gather queries, hot spots, uniqueness
+      of ids, and complex resharding. Many logical shards mapped to a few servers make rebalancing easier.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain consistent hashing and why virtual nodes are used.</summary>
+    <div class="qa-a">
+      <p>Servers and keys are hashed onto a ring; a key belongs to the next server clockwise. When a server
+      joins or leaves only about 1/N of the keys move, compared with most keys for hash mod N. With few
+      servers the arcs are uneven, so each server is placed at many virtual points, which evens out the load
+      and spreads a failed node's keys across many neighbours. In Java a TreeMap with ceilingEntry and
+      wrap-around implements the lookup.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you pick NoSQL over SQL?</summary>
+    <div class="qa-a">
+      <p>When the access pattern is simple and known and scale is huge (key-value or wide-column), when data is
+      flexible and nested (document), or when relationship traversal is central (graph). I still default to a
+      relational database for business data that needs transactions and ad-hoc queries, and add specialised
+      stores next to it (polyglot persistence). I would not claim NoSQL is simply faster.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Kafka vs RabbitMQ vs SQS: how do you choose?</summary>
+    <div class="qa-a">
+      <p>Kafka is a replayable partitioned log with very high throughput, ordering per partition and consumer
+      groups; choose it for event streaming and many independent consumers. RabbitMQ is a broker with flexible
+      routing, acks and priorities; choose it for task queues and complex routing. SQS is a managed queue with
+      no operations on AWS and simple semantics. Delivery is typically at least once, so consumers must be
+      idempotent.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How would you design file upload for a photo app?</summary>
+    <div class="qa-a">
+      <p>The client asks the API for an upload permission; the API validates and returns a short-lived
+      presigned PUT URL for a server-generated key. The client uploads directly to S3 (multipart for large
+      files) and then confirms. The API stores metadata in the database. An S3 event goes to a queue and workers
+      scan and create thumbnails. A CDN serves downloads from the private bucket.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you keep a search index in sync with your database?</summary>
+    <div class="qa-a">
+      <p>Avoid dual writes because they are not atomic. Use the outbox pattern (write the change and an event in
+      one transaction, publish it, let an indexer update Elasticsearch) or change data capture from the database
+      log. The index is derived data and eventually consistent, and you must be able to reindex everything
+      from the database into a new index and swap an alias.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m5-cheatsheet">
+  <h3>Cheat sheet — Building blocks</h3>
+  <ul class="cheat">
+    <li><b>DNS</b> name to IP, cached by TTL; geo and latency routing; failover is minutes, not seconds.</li>
+    <li><b>CDN</b> edge caches near users; use fingerprinted URLs with long max-age, purge only in emergencies.</li>
+    <li><b>Cache-Control</b> max-age, s-maxage, private, no-store, immutable, stale-while-revalidate, ETag.</li>
+    <li><b>L4 vs L7</b> L4 sees IP and port (fast); L7 sees HTTP (routing, TLS, cookies).</li>
+    <li><b>LB algorithms</b> round robin, weighted, least connections, IP hash, consistent hashing.</li>
+    <li><b>Health checks</b> active probes plus passive error watching; readiness vs liveness; connection draining.</li>
+    <li><b>LB availability</b> run two across zones or a managed balancer; avoid sticky sessions.</li>
+    <li><b>API gateway</b> routing, auth, rate limits, aggregation, protocol translation; BFF per client type.</li>
+    <li><b>Rate limit algorithms</b> token bucket (bursts), leaky bucket (smooth), fixed window (boundary burst), sliding log (exact), sliding counter (cheap approximation).</li>
+    <li><b>Rate limit response</b> 429, Retry-After, X-RateLimit headers; atomic Redis INCR+EXPIRE or Lua; decide fail open or closed.</li>
+    <li><b>Cache layers</b> browser, CDN, proxy, local, Redis, database buffer cache.</li>
+    <li><b>Cache patterns</b> cache-aside (default), read-through, write-through, write-behind, write-around.</li>
+    <li><b>Eviction</b> LRU default, LFU for stable popularity; always set a TTL.</li>
+    <li><b>Cache problems</b> stampede (lock, coalesce, early refresh), penetration (null cache, Bloom), avalanche (TTL jitter), hot key (local copy, replicate).</li>
+    <li><b>Hit ratio</b> hits / (hits + misses); average latency = hit% × hit time + miss% × miss time.</li>
+    <li><b>DB ladder</b> indexes, scale up, cache, replicas, partitioning, sharding.</li>
+    <li><b>Replication</b> leader-follower is default; async is fast but lags; multi-leader needs conflict handling; leaderless uses quorums.</li>
+    <li><b>Replication lag fix</b> read own writes from the leader; pin users; monitor lag.</li>
+    <li><b>Sharding</b> range, hash, directory, geo; key needs high cardinality and even load; use many logical shards.</li>
+    <li><b>Sharding costs</b> cross-shard joins, transactions, scatter-gather, resharding, unique ids.</li>
+    <li><b>Consistent hashing</b> ring plus virtual nodes; adding a node moves about 1/N of keys; TreeMap ceilingEntry with wrap-around.</li>
+    <li><b>NoSQL types</b> key-value (Redis, DynamoDB), document (MongoDB), wide-column (Cassandra), graph (Neo4j), plus time-series and search.</li>
+    <li><b>Queues</b> decouple, buffer, retry; point-to-point vs pub/sub; at-least-once so make consumers idempotent; use a DLQ.</li>
+    <li><b>Kafka vs RabbitMQ vs SQS</b> replayable log with partitions; smart routing broker; managed simple queue.</li>
+    <li><b>Object storage</b> blob in S3, metadata in the DB, presigned URLs, multipart for big files, CDN in front.</li>
+    <li><b>Search</b> inverted index, analyzers, BM25; Elasticsearch is derived data synced by outbox or CDC.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m5-practice">
+  <h3>Practice — Building blocks</h3>
+  <ol class="steps">
+    <li>Run two Spring Boot instances on ports 8081 and 8082 and put Nginx in front with
+    <code>least_conn</code> and passive health checks. Stop one instance during a load test and confirm
+    that traffic continues. Done when you can show the Nginx config and the result of the test.</li>
+    <li>Add a response header <code>Cache-Control: public, max-age=300</code> and an ETag to a read-only
+    endpoint, then show with curl that a repeat request with <code>If-None-Match</code> returns 304. Explain
+    what a CDN would do with it.</li>
+    <li>Implement a fixed-window limiter with Redis INCR and EXPIRE in a Spring filter that returns 429 with
+    Retry-After. Then replace it with the token bucket Lua script and show the difference when you send a
+    burst of 20 requests.</li>
+    <li>Add cache-aside with Redis to one read endpoint, with TTL jitter. Measure the response time and the
+    Redis hit ratio before and after, using <code>INFO stats</code>. Done when you can quote both numbers.</li>
+    <li>Reproduce a cache stampede with a load tool on an expired key, and fix it with a per-key lock or the
+    single-flight class. Show the number of database queries before and after.</li>
+    <li>Write an LRU cache with <code>LinkedHashMap</code>, then rewrite it with a HashMap and a doubly
+    linked list. State the time complexity of get and put (both O(1)).</li>
+    <li>Run PostgreSQL with a streaming read replica (Docker is fine). Write on the primary, read from the
+    replica, and observe replication lag under a bulk insert. Describe how you would avoid a stale read after
+    a write.</li>
+    <li>Implement the <code>ConsistentHashRing</code> class with virtual nodes. Route 100,000 keys across 4
+    nodes, add a fifth node, and count how many keys moved; compare with <code>hash mod N</code>. Done when
+    the moved fraction is close to 20% for consistent hashing and about 80% for mod N.</li>
+    <li>Design the storage for a photo-sharing app: choose a database, a shard key, an object store and a
+    cache, and draw the upload and the feed-read paths. Use the numbers from the estimation article.</li>
+    <li>Roadmap check: without notes, explain to a friend what caching, load balancing, replication,
+    sharding and queues each do, and give one situation where you would use each and one where you would
+    not.</li>
+  </ol>
+</article>

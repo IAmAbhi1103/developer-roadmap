@@ -1,0 +1,749 @@
+<article class="topic" id="m1-data-types">
+  <h3>Data types: numbers, text and booleans</h3>
+  <p class="tldr">Every column has a type that decides what it can store, how much space it takes and how it
+  behaves. Use integers for counts and ids, <code>NUMERIC</code> for money, <code>VARCHAR</code> or
+  <code>TEXT</code> for text, and never use <code>REAL</code> or <code>DOUBLE</code> for rupees.</p>
+
+  <h4>Why the type matters</h4>
+  <p>A <strong>data type</strong> is a rule attached to a column. The database rejects values that do not fit
+  (<code>'abc'</code> in an integer column), stores each value in the right number of bytes, and knows how to
+  compare and calculate with it. A wrong type causes bugs that are hard to see later: a phone number stored as
+  an integer loses its leading zero, a price stored as a float is off by a paisa, and an
+  <code>INT</code> id column overflows when the table grows. Choose the type once, carefully, because changing
+  it later on a big table is slow and risky.</p>
+
+  <h4>Integers</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Size</th><th>Range</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td><code>SMALLINT</code></td><td>2 bytes</td><td>−32,768 to 32,767</td><td>small counters, hours per week</td></tr>
+      <tr><td><code>INT</code> / <code>INTEGER</code></td><td>4 bytes</td><td>about ±2.1 billion</td><td>most ids and counts</td></tr>
+      <tr><td><code>BIGINT</code></td><td>8 bytes</td><td>about ±9.2 × 10<sup>18</sup></td><td>ids of big tables, UPI transaction numbers, paise totals</td></tr>
+    </tbody>
+  </table></div>
+  <p>MySQL has the same three plus <code>TINYINT</code> (1 byte) and <code>MEDIUMINT</code>, and allows
+  <code>UNSIGNED</code> (so <code>INT UNSIGNED</code> reaches about 4.29 billion). PostgreSQL has no unsigned
+  types; use a <code>CHECK (x &gt;= 0)</code> instead. In Java: <code>SMALLINT</code> maps to
+  <code>short</code>, <code>INT</code> to <code>int</code>, <code>BIGINT</code> to <code>long</code>. If a
+  value does not fit you get <code>ERROR:  integer out of range</code> (PostgreSQL) or
+  <code>ERROR 1264 ... Out of range value</code> (MySQL in strict mode).</p>
+
+  <h4>Exact decimals: NUMERIC and DECIMAL</h4>
+  <p><code>NUMERIC(p, s)</code> stores a decimal number exactly. <code>p</code> is the <strong>precision</strong>
+  (total digits) and <code>s</code> is the <strong>scale</strong> (digits after the point).
+  <code>NUMERIC(10, 2)</code> holds up to 8 digits before the point and 2 after: <code>99999999.99</code>.
+  <code>DECIMAL</code> is a synonym in both databases. Use it for money, tax rates and anything that must add
+  up to the last paisa.</p>
+  <pre data-title="Scale rounds, precision overflows"><code class="language-sql">SELECT 123.456::NUMERIC(10, 2) AS rounded;        -- 123.46 (rounded, no error)
+SELECT 123456789.5::NUMERIC(10, 2) AS too_big;
+-- ERROR:  numeric field overflow
+-- DETAIL:  A field with precision 10, scale 2 must round to an absolute value
+--          less than 10^8.</code></pre>
+
+  <h4>Approximate decimals: REAL and DOUBLE PRECISION</h4>
+  <p><code>REAL</code> (4 bytes, about 6 digits) and <code>DOUBLE PRECISION</code> (8 bytes, about 15 digits;
+  <code>DOUBLE</code> in MySQL) are binary floating-point types, the same as Java's <code>float</code> and
+  <code>double</code>. They are fast, but they cannot store 0.1 exactly, just as 1/3 cannot be written exactly
+  in decimal. Good for sensor readings and statistics. Wrong for money.</p>
+  <pre data-title="Why not floats for money"><code class="language-sql">SELECT 0.1::DOUBLE PRECISION + 0.2::DOUBLE PRECISION = 0.3::DOUBLE PRECISION AS float_sum,
+       0.1::NUMERIC + 0.2::NUMERIC = 0.3::NUMERIC                          AS numeric_sum;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> float_sum | numeric_sum
+-----------+-------------
+ f         | t
+(1 row)</code></pre>
+  <p>A float sum of many small amounts drifts; an invoice total that is one paisa off fails an audit. In Java
+  the pair is <code>BigDecimal</code> for <code>NUMERIC</code>, never <code>double</code>. Another option is to
+  store whole paise in a <code>BIGINT</code> (<code>price_paise = 79900</code>), which many payment systems do.</p>
+
+  <h4>Text: CHAR, VARCHAR and TEXT</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Meaning</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>CHAR(n)</code></td><td>Exactly <code>n</code> characters, padded with spaces</td>
+      <td>Only for truly fixed codes (country code <code>'IN'</code>). Padding surprises people.</td></tr>
+      <tr><td><code>VARCHAR(n)</code></td><td>Up to <code>n</code> characters</td>
+      <td>Rejects longer values. Good when a real limit exists (email 100, PIN code 6).</td></tr>
+      <tr><td><code>TEXT</code></td><td>Any length</td>
+      <td>PostgreSQL: same speed as <code>VARCHAR</code>. MySQL: separate family (<code>TEXT</code> 64 KB,
+      <code>MEDIUMTEXT</code> 16 MB, <code>LONGTEXT</code> 4 GB).</td></tr>
+    </tbody>
+  </table></div>
+  <p>In PostgreSQL there is no performance gain from <code>VARCHAR(50)</code> over <code>TEXT</code>; the
+  length is only a validation rule. Use <code>VARCHAR(n)</code> when the limit is a business rule, and
+  <code>TEXT</code> for free text such as descriptions and comments. In MySQL <code>VARCHAR</code> is stored
+  inside the row and can be indexed fully, while <code>TEXT</code> columns need a prefix length in an index, so
+  prefer <code>VARCHAR</code> for searchable columns. Also in MySQL the limit counts characters, but the whole
+  row cannot exceed 65,535 bytes.</p>
+  <pre data-title="Length limits"><code class="language-sql">INSERT INTO departments (name, location) VALUES ('Research', 'A very long city name ...
+    repeated until it passes fifty characters in total length ok');
+-- ERROR:  value too long for type character varying(50)</code></pre>
+  <p>MySQL in strict mode (the default since 5.7) gives <code>ERROR 1406 (22001): Data too long for column
+  'location' at row 1</code>. With strict mode off, MySQL silently cuts the value, which hides bugs. Check
+  <code>SELECT @@sql_mode;</code> contains <code>STRICT_TRANS_TABLES</code>.</p>
+
+  <h4>Boolean</h4>
+  <p>PostgreSQL has a real <code>BOOLEAN</code> type with values <code>TRUE</code>, <code>FALSE</code> and
+  <code>NULL</code>. It also accepts <code>'t'</code>, <code>'yes'</code>, <code>'1'</code> and similar text.
+  MySQL's <code>BOOLEAN</code> is only another name for <code>TINYINT(1)</code>, so
+  <code>TRUE</code> is stored as 1 and the column accepts 2 or 7 as well. Write
+  <code>WHERE is_active</code> or <code>WHERE NOT is_active</code> in PostgreSQL. Add
+  <code>NOT NULL DEFAULT FALSE</code> to avoid a third, meaningless state.</p>
+
+  <h4>All together: PostgreSQL and MySQL compared</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>You want to store</th><th>PostgreSQL</th><th>MySQL 8</th><th>Java type</th></tr></thead>
+    <tbody>
+      <tr><td>Small / normal / big whole number</td><td><code>SMALLINT</code> / <code>INT</code> / <code>BIGINT</code></td>
+      <td>same, plus <code>TINYINT</code>, <code>UNSIGNED</code></td><td><code>short</code> / <code>int</code> / <code>long</code></td></tr>
+      <tr><td>Money, exact</td><td><code>NUMERIC(12,2)</code></td><td><code>DECIMAL(12,2)</code></td><td><code>BigDecimal</code></td></tr>
+      <tr><td>Scientific, approximate</td><td><code>REAL</code>, <code>DOUBLE PRECISION</code></td>
+      <td><code>FLOAT</code>, <code>DOUBLE</code></td><td><code>float</code>, <code>double</code></td></tr>
+      <tr><td>Short text with a limit</td><td><code>VARCHAR(n)</code></td><td><code>VARCHAR(n)</code></td><td><code>String</code></td></tr>
+      <tr><td>Long text</td><td><code>TEXT</code></td><td><code>TEXT</code> / <code>MEDIUMTEXT</code> / <code>LONGTEXT</code></td><td><code>String</code></td></tr>
+      <tr><td>Yes / no</td><td><code>BOOLEAN</code></td><td><code>BOOLEAN</code> (= <code>TINYINT(1)</code>)</td><td><code>boolean</code></td></tr>
+      <tr><td>Day, time, moment</td><td><code>DATE</code>, <code>TIME</code>, <code>TIMESTAMPTZ</code></td>
+      <td><code>DATE</code>, <code>TIME</code>, <code>DATETIME</code> / <code>TIMESTAMP</code></td><td>see next article</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: money is NUMERIC (or whole paise), never FLOAT</p>
+    <p>Use <code>NUMERIC(p, s)</code> with the scale your currency needs (2 for rupees) and map it to
+    <code>BigDecimal</code>. Choose the precision for the largest value you can imagine, not the smallest.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: storing phone numbers, PIN codes and Aadhaar numbers as integers</p>
+    <p>You never do arithmetic on them, and integers drop leading zeros (<code>0123</code> becomes
+    <code>123</code>) and break on <code>+91</code>. Store identifiers as <code>VARCHAR</code>, and add a
+    <code>CHECK</code> for the format if you want. That is why <code>customers.phone</code> is
+    <code>VARCHAR(15)</code>.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases: silent changes and implicit casts</p>
+    <ul>
+      <li><code>NUMERIC</code> rounds extra decimals silently; only extra <em>digits before the point</em> raise
+      an error.</li>
+      <li>Comparing text with a number (<code>WHERE phone = 9876500001</code>) makes PostgreSQL fail with
+      <code>operator does not exist: character varying = integer</code>, while MySQL converts silently and may
+      also stop using the index. Pass the right type from JDBC.</li>
+      <li><code>CHAR(5)</code> pads <code>'ab'</code> to <code>'ab   '</code>. PostgreSQL ignores the padding
+      when comparing; avoid <code>CHAR</code> and the question never arises.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Which type for money?" gets the answer <code>NUMERIC</code>/<code>DECIMAL</code> with a reason: floats
+    cannot represent 0.1 exactly. Also expect "<code>VARCHAR</code> vs <code>TEXT</code>" (same speed in
+    PostgreSQL, the length is a rule) and "<code>INT</code> vs <code>BIGINT</code> for ids" (an
+    <code>INT</code> runs out at 2.1 billion rows, which a busy event table reaches in a few years).</p>
+  </div>
+</article>
+
+<article class="topic" id="m1-date-json-id-types">
+  <h3>Data types: dates, UUID, JSON, identity columns and ENUM</h3>
+  <p class="tldr">Store moments as <code>TIMESTAMPTZ</code> (PostgreSQL), days as <code>DATE</code>, structured
+  extras as <code>JSONB</code>, and generate ids with <code>GENERATED ... AS IDENTITY</code> (MySQL:
+  <code>AUTO_INCREMENT</code>). Prefer a <code>CHECK</code> or lookup table over <code>ENUM</code>.</p>
+
+  <h4>Date and time types</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Stores</th><th>Example value</th></tr></thead>
+    <tbody>
+      <tr><td><code>DATE</code></td><td>a calendar day</td><td><code>2026-04-10</code></td></tr>
+      <tr><td><code>TIME</code></td><td>a time of day</td><td><code>14:30:00</code></td></tr>
+      <tr><td><code>TIMESTAMP</code></td><td>day + time, no time zone</td><td><code>2026-04-10 14:30:00</code></td></tr>
+      <tr><td><code>TIMESTAMPTZ</code></td><td>an exact moment in time (PostgreSQL)</td><td><code>2026-04-10 14:30:00+05:30</code></td></tr>
+      <tr><td><code>INTERVAL</code></td><td>a length of time (PostgreSQL)</td><td><code>3 days 02:00:00</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>The difference between <code>TIMESTAMP</code> and <code>TIMESTAMPTZ</code> trips up many developers.
+  <strong><code>TIMESTAMPTZ</code></strong> ("timestamp with time zone") does not store a zone. It converts
+  every input to UTC for storage, and converts back to the session's <code>TimeZone</code> setting when it
+  prints. So the same row shows <code>09:00</code> in London and <code>14:30</code> in Mumbai, and it is still
+  the same instant. <strong><code>TIMESTAMP</code></strong> stores the digits you gave it and knows nothing
+  about zones, so it is only right for things like "the shop opens at 10:00 local time".</p>
+  <pre data-title="Same instant, two sessions"><code class="language-sql">CREATE TEMP TABLE t (at TIMESTAMPTZ);
+INSERT INTO t VALUES ('2026-04-10 14:30:00+05:30');
+
+SET TimeZone = 'Asia/Kolkata';
+SELECT at FROM t;
+SET TimeZone = 'UTC';
+SELECT at FROM t;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">           at
+------------------------
+ 2026-04-10 14:30:00+05:30
+
+           at
+------------------------
+ 2026-04-10 09:00:00+00</code></pre>
+  <p>MySQL has <code>DATETIME</code> (no conversion, years 1000–9999) and <code>TIMESTAMP</code> (converted to
+  UTC for storage, range 1970 to 2038-01-19, so avoid it for far-future dates). Many Spring Boot teams run the
+  database in UTC and map to <code>Instant</code> or <code>OffsetDateTime</code>; for
+  <code>DATE</code> use <code>LocalDate</code>. Time-zone handling in queries is in
+  <a href="#m2-date-ranges-time-zones">Date ranges and time zones</a>.</p>
+
+  <h4>UUID</h4>
+  <p>A <strong>UUID</strong> is a 128-bit identifier such as
+  <code>3f2b8c1e-5a7d-4c9e-9b21-0d4e6f7a8b90</code>. It can be created by any application server without asking
+  the database, which is useful when ids are generated before the insert or across several services, and it
+  does not reveal how many rows exist. PostgreSQL has a native <code>UUID</code> type (16 bytes) and the
+  built-in <code>gen_random_uuid()</code> (PostgreSQL 13 and later). Random UUIDs make index inserts scatter
+  across the whole B-tree, so for very write-heavy tables prefer time-ordered UUIDs (UUIDv7; PostgreSQL 18 added
+  a <code>uuidv7()</code> function). MySQL has <code>UUID()</code> and stores it best as
+  <code>BINARY(16)</code> via <code>UUID_TO_BIN()</code>. A <code>BIGINT</code> identity is smaller and
+  faster; choose UUID for a reason, not by habit.</p>
+  <pre data-title="UUID primary key"><code class="language-sql">CREATE TABLE sessions (
+    session_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id INT  NOT NULL REFERENCES customers (customer_id)
+);</code></pre>
+
+  <h4>JSON and JSONB</h4>
+  <p>PostgreSQL can keep a JSON document in a column. <code>JSON</code> stores the text exactly as given.
+  <code>JSONB</code> parses it into a binary form: slightly slower to write, faster to query, it removes
+  duplicate keys and does not keep key order or spaces, and it supports indexes (GIN). Use <code>JSONB</code>
+  unless you must keep the original text. MySQL's single <code>JSON</code> type is stored in binary too.</p>
+  <pre data-title="JSONB basics"><code class="language-sql">CREATE TEMP TABLE events (id INT, payload JSONB);
+INSERT INTO events VALUES (1, '{"type": "login", "device": {"os": "Android"}}');
+
+SELECT payload -&gt; 'device'            AS device_json,   -- returns JSON
+       payload -&gt;&gt; 'type'            AS type_text,     -- returns text
+       payload -&gt; 'device' -&gt;&gt; 'os'  AS os
+FROM events
+WHERE payload @&gt; '{"type": "login"}';  -- containment, can use a GIN index</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">     device_json     | type_text |   os
+---------------------+-----------+---------
+ {"os": "Android"}   | login     | Android
+(1 row)</code></pre>
+  <p>MySQL uses the same <code>-&gt;</code> and <code>-&gt;&gt;</code> operators on a path:
+  <code>payload-&gt;&gt;'$.type'</code>. JSON is good for data that really has no fixed shape (audit payloads,
+  third-party webhooks, optional settings). If you filter or join on a field all the time, make it a normal
+  column. More in <a href="#m6">Module 6</a>.</p>
+
+  <h4>Auto-generated ids: SERIAL, IDENTITY and AUTO_INCREMENT</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Option</th><th>Database</th><th>How it works</th></tr></thead>
+    <tbody>
+      <tr><td><code>GENERATED ALWAYS AS IDENTITY</code></td><td>PostgreSQL 10+</td>
+      <td>SQL standard. The database always supplies the value; supplying your own is an error unless you add
+      <code>OVERRIDING SYSTEM VALUE</code>.</td></tr>
+      <tr><td><code>GENERATED BY DEFAULT AS IDENTITY</code></td><td>PostgreSQL 10+</td>
+      <td>Same, but you may supply your own value (our sample script does, to load fixed ids).</td></tr>
+      <tr><td><code>SERIAL</code> / <code>BIGSERIAL</code></td><td>PostgreSQL</td>
+      <td>Old shorthand: creates a sequence and a default. Works, but the sequence is a separate object with
+      looser ownership. Seen in older code.</td></tr>
+      <tr><td><code>AUTO_INCREMENT</code></td><td>MySQL</td><td>Counter on the table; moves forward by itself,
+      even after manual inserts.</td></tr>
+    </tbody>
+  </table></div>
+  <p>For new PostgreSQL tables use <code>GENERATED ALWAYS AS IDENTITY</code> (or <code>BY DEFAULT</code> if you
+  load data with fixed ids). In Spring Data JPA the matching setting is
+  <code>@GeneratedValue(strategy = GenerationType.IDENTITY)</code>. Ids are <strong>not gap-free</strong>:
+  a rolled-back insert or a failed statement still uses a number, so never rely on "no gaps".</p>
+  <pre data-title="Identity in action"><code class="language-sql">CREATE TEMP TABLE tickets (
+    ticket_id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title     VARCHAR(100) NOT NULL
+);
+INSERT INTO tickets (title) VALUES ('Login fails') RETURNING ticket_id;
+INSERT INTO tickets (ticket_id, title) VALUES (99, 'Manual id');</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> ticket_id
+-----------
+         1
+(1 row)
+
+ERROR:  cannot insert a non-DEFAULT value into column "ticket_id"
+DETAIL:  Column "ticket_id" is an identity column defined as GENERATED ALWAYS.
+HINT:  Use OVERRIDING SYSTEM VALUE to override.</code></pre>
+
+  <h4>ENUM, briefly</h4>
+  <p>An <strong>ENUM</strong> is a column that accepts only a fixed list of words. PostgreSQL defines it as a
+  separate type, MySQL writes it inline:</p>
+  <pre data-title="ENUM in both databases"><code class="language-sql">-- PostgreSQL
+CREATE TYPE order_status AS ENUM ('PLACED', 'SHIPPED', 'DELIVERED', 'CANCELLED');
+-- MySQL
+CREATE TABLE orders_demo (status ENUM('PLACED', 'SHIPPED', 'DELIVERED', 'CANCELLED'));</code></pre>
+  <p>Adding a value later is easy in PostgreSQL (<code>ALTER TYPE ... ADD VALUE</code>), but removing or
+  renaming one is painful, and in MySQL changing the list rewrites the table. Our sample schema uses
+  <code>VARCHAR(20)</code> with a <code>CHECK (status IN (...))</code> instead: easy to change, easy to map to
+  a Java <code>enum</code> with <code>@Enumerated(EnumType.STRING)</code>. If the list has attributes or changes
+  often, use a small lookup table with a foreign key.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: store moments in UTC-aware columns</p>
+    <p>In PostgreSQL use <code>TIMESTAMPTZ</code> for "when did it happen" (<code>created_at</code>,
+    <code>paid_at</code>). Use <code>DATE</code> for a day with no time (<code>hire_date</code>). Never store a
+    moment as text.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using TIMESTAMP for events and getting shifted times</p>
+    <p>A server in Mumbai writes <code>14:30</code> into a plain <code>TIMESTAMP</code>; a reporting job in UTC
+    reads it as <code>14:30 UTC</code>, five and a half hours off. With <code>TIMESTAMPTZ</code> both sides agree
+    on the instant.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Invalid dates fail: <code>'2026-02-30'</code> raises
+      <code>ERROR:  date/time field value out of range</code>.</li>
+      <li>MySQL (non-strict) can store <code>0000-00-00</code>; modern strict mode refuses it.</li>
+      <li>A JSON text that is not valid JSON fails with <code>ERROR:  invalid input syntax for type json</code>.</li>
+      <li>Identity counters never go back after <code>ROLLBACK</code> or <code>DELETE</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Common questions: <code>TIMESTAMP</code> vs <code>TIMESTAMPTZ</code> (the second normalises to UTC),
+    <code>JSON</code> vs <code>JSONB</code> (binary, indexable), UUID vs auto-increment (UUID: generated
+    anywhere, no guessable order, bigger, scattered index writes; identity: small and ordered), and
+    <code>SERIAL</code> vs <code>IDENTITY</code> (identity is the standard, newer form).</p>
+  </div>
+</article>
+
+<article class="topic" id="m1-create-alter-drop">
+  <h3>CREATE TABLE, ALTER TABLE and DROP TABLE</h3>
+  <p class="tldr"><code>CREATE TABLE</code> defines a table with its columns, types and constraints,
+  <code>ALTER TABLE</code> changes it afterwards, and <code>DROP TABLE</code> removes it with all its data. Real
+  projects keep every such change in versioned migration files instead of typing it by hand.</p>
+
+  <h4>CREATE TABLE</h4>
+  <p>A table definition is a list of columns, each with a name, a type and optional rules, followed by optional
+  table-level constraints. This is a small, complete example you can run next to the sample database:</p>
+  <pre data-title="A new table"><code class="language-sql">CREATE TABLE IF NOT EXISTS leave_requests (
+    request_id  INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    emp_id      INT          NOT NULL REFERENCES employees (emp_id),
+    start_date  DATE         NOT NULL,
+    end_date    DATE         NOT NULL,
+    reason      TEXT,
+    status      VARCHAR(10)  NOT NULL DEFAULT 'PENDING',
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    CONSTRAINT ck_leave_dates  CHECK (end_date &gt;= start_date),
+    CONSTRAINT ck_leave_status CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED'))
+);</code></pre>
+  <p><code>IF NOT EXISTS</code> makes the statement do nothing (with a notice) when the table is already there,
+  so a script can be re-run. Without it you get <code>ERROR:  relation "leave_requests" already exists</code>.
+  Two more ways to create a table:</p>
+  <pre data-title="Copy a structure or a result"><code class="language-sql">-- same columns, no data (PostgreSQL: add INCLUDING ALL to copy constraints and indexes)
+CREATE TABLE employees_backup (LIKE employees INCLUDING ALL);
+
+-- table made from a query: columns and data, but no constraints
+CREATE TABLE high_earners AS
+SELECT emp_id, first_name, salary FROM employees WHERE salary &gt;= 150000;</code></pre>
+  <p>A <strong>temporary table</strong> (<code>CREATE TEMP TABLE</code>) lives only for your session and is
+  handy for experiments, as in the examples above. Tables can also live in a <strong>schema</strong>, a named
+  folder inside the database: <code>hr.employees</code>. The default schema in PostgreSQL is
+  <code>public</code> (see <a href="#m4">Module 4</a>).</p>
+
+  <h4>ALTER TABLE: the common changes</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Task</th><th>PostgreSQL</th><th>MySQL 8</th></tr></thead>
+    <tbody>
+      <tr><td>Add a column</td><td colspan="2"><code>ALTER TABLE t ADD COLUMN c INT;</code></td></tr>
+      <tr><td>Drop a column</td><td colspan="2"><code>ALTER TABLE t DROP COLUMN c;</code></td></tr>
+      <tr><td>Rename a column</td><td colspan="2"><code>ALTER TABLE t RENAME COLUMN c TO d;</code></td></tr>
+      <tr><td>Rename a table</td><td colspan="2"><code>ALTER TABLE t RENAME TO t2;</code></td></tr>
+      <tr><td>Change a type</td><td><code>ALTER COLUMN c TYPE BIGINT</code></td><td><code>MODIFY COLUMN c BIGINT</code></td></tr>
+      <tr><td>Set / drop default</td><td colspan="2"><code>ALTER COLUMN c SET DEFAULT 0</code> / <code>DROP DEFAULT</code></td></tr>
+      <tr><td>Set / drop NOT NULL</td><td><code>ALTER COLUMN c SET NOT NULL</code> / <code>DROP NOT NULL</code></td>
+      <td>repeat the whole column with <code>MODIFY COLUMN c INT NOT NULL</code></td></tr>
+      <tr><td>Add a constraint</td><td colspan="2"><code>ALTER TABLE t ADD CONSTRAINT name ...;</code></td></tr>
+      <tr><td>Drop a constraint</td><td><code>DROP CONSTRAINT name</code></td>
+      <td><code>DROP FOREIGN KEY</code> / <code>DROP CHECK</code> / <code>DROP INDEX</code> / <code>DROP PRIMARY KEY</code></td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="A sequence of changes on leave_requests"><code class="language-sql">ALTER TABLE leave_requests ADD COLUMN approved_by INT;
+ALTER TABLE leave_requests
+    ADD CONSTRAINT fk_leave_approver FOREIGN KEY (approved_by) REFERENCES employees (emp_id);
+ALTER TABLE leave_requests RENAME COLUMN reason TO reason_text;
+ALTER TABLE leave_requests ALTER COLUMN reason_text SET DEFAULT 'Not given';
+ALTER TABLE leave_requests ALTER COLUMN status TYPE VARCHAR(20);
+ALTER TABLE leave_requests DROP CONSTRAINT ck_leave_status;
+ALTER TABLE leave_requests DROP COLUMN approved_by;     -- also removes fk_leave_approver</code></pre>
+  <p>Several actions can go in one statement separated by commas, and PostgreSQL runs them together. If the new
+  type cannot be converted automatically, PostgreSQL asks you to say how:
+  <code>ALTER COLUMN age TYPE INT USING age::INT</code>.</p>
+
+  <h4>What goes wrong on a table that already has rows</h4>
+  <pre data-title="NOT NULL on existing data"><code class="language-sql">ALTER TABLE employees ADD COLUMN grade VARCHAR(2) NOT NULL;
+-- ERROR:  column "grade" of relation "employees" contains null values
+
+ALTER TABLE employees ADD COLUMN grade VARCHAR(2) NOT NULL DEFAULT 'L1';   -- works</code></pre>
+  <p>Existing rows need a value for the new column. Give a default, or add the column as nullable, fill it with
+  an <code>UPDATE</code>, then add <code>SET NOT NULL</code>. The same applies when you add a constraint:
+  <code>ADD CONSTRAINT ... CHECK (salary &gt; 100000)</code> fails with
+  <code>check constraint "..." of relation "employees" is violated by some row</code> if any row breaks it.
+  Fix the data first.</p>
+
+  <h4>Cost and locks on production tables</h4>
+  <p>Most <code>ALTER TABLE</code> forms take a strong lock, so other queries wait. Adding a column with a
+  constant default is instant in PostgreSQL 11 and later, but changing a column type usually rewrites the whole
+  table while holding the lock. Adding a foreign key or <code>CHECK</code> scans the table. For big tables,
+  PostgreSQL lets you add a constraint as <code>NOT VALID</code> (new rows are checked, old rows are not) and
+  later run <code>ALTER TABLE ... VALIDATE CONSTRAINT name</code>, which checks without blocking writes. Teams
+  run schema changes through <strong>Flyway</strong> or <strong>Liquibase</strong> migrations, in a
+  quiet period, after testing on a copy of production data (see
+  <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>).</p>
+
+  <h4>DROP TABLE</h4>
+  <pre data-title="Dropping"><code class="language-sql">DROP TABLE IF EXISTS leave_requests;
+DROP TABLE departments;
+-- ERROR:  cannot drop table departments because other objects depend on it
+-- DETAIL:  constraint fk_employees_dept on table employees depends on table departments
+-- HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+
+DROP TABLE departments CASCADE;   -- removes the foreign keys that point at it (and views)</code></pre>
+  <p><code>DROP TABLE</code> deletes the structure and all data at once and cannot be undone except by a
+  rollback or a backup. <code>CASCADE</code> does <em>not</em> delete the child table, only the constraints and
+  views that depend on it; <code>RESTRICT</code> (the default) refuses. <code>DROP TABLE a, b, c</code> drops
+  several. See <a href="#m1-safe-changes">Safe changes, TRUNCATE and DROP</a> for the difference from
+  <code>DELETE</code> and <code>TRUNCATE</code>.</p>
+  <p>Another difference: PostgreSQL has <strong>transactional DDL</strong>, so you can wrap
+  <code>ALTER</code> and <code>DROP</code> in <code>BEGIN ... ROLLBACK</code> and test them safely. MySQL
+  commits implicitly before and after every DDL statement, so there is nothing to roll back.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every table gets a primary key, and every constraint a name</p>
+    <p>A table without a primary key has no way to identify one row, and JPA refuses it. Name constraints
+    yourself (<code>fk_leave_approver</code>), because only a named constraint can be dropped by a readable
+    command, and its name appears in the error message.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: add columns, do not edit history</p>
+    <p>Never edit an old migration after it ran anywhere. Add a new migration. Prefer additive, backwards
+    compatible changes (new nullable column) first, deploy the code, and only then drop what is unused.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: DROP in the wrong database</p>
+    <p>Check <code>\conninfo</code> before a destructive script. The editor tab for staging and production look
+    the same. Many teams give developers no <code>DROP</code> permission on production at all.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and errors</p>
+    <ul>
+      <li><code>ERROR:  relation "x" already exists</code> on repeated <code>CREATE</code>; use
+      <code>IF NOT EXISTS</code>.</li>
+      <li><code>ERROR:  column "x" of relation "t" already exists</code> on a repeated
+      <code>ADD COLUMN</code> (PostgreSQL also has <code>ADD COLUMN IF NOT EXISTS</code>).</li>
+      <li><code>ERROR:  cannot alter type of a column used by a view or rule</code>: drop and recreate the
+      view.</li>
+      <li>Dropping a column used by a foreign key in another table fails until you use <code>CASCADE</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Expect to write a <code>CREATE TABLE</code> with a primary key, foreign key and a check on the board, and
+    to answer "how do you add a NOT NULL column to a table with a million rows?" (nullable or default first,
+    backfill in batches, then <code>SET NOT NULL</code>, in a migration tool).</p>
+  </div>
+</article>
+
+<article class="topic" id="m1-constraints">
+  <h3>Constraints in depth: PRIMARY KEY, UNIQUE, NOT NULL, CHECK and DEFAULT</h3>
+  <p class="tldr">A <strong>constraint</strong> is a rule the database enforces on every write, so bad data
+  cannot get in whatever the application does. Each constraint has its own error message, and naming constraints
+  makes those messages readable.</p>
+
+  <h4>Why the database must enforce rules</h4>
+  <p>Validation in Java (<code>@NotNull</code>, <code>@Size</code>) is good for friendly messages, but it can be
+  bypassed: a second service, a data-fix script, a bug, or two requests racing each other. A constraint inside
+  the database cannot be bypassed. It is also checked atomically, which is the only reliable way to guarantee
+  "no two users with the same email" under concurrency. Use both layers.</p>
+
+  <h4>The six constraints at a glance</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Constraint</th><th>Guarantees</th><th>NULL allowed?</th><th>Index created?</th></tr></thead>
+    <tbody>
+      <tr><td><code>PRIMARY KEY</code></td><td>unique and not null: identifies a row</td><td>No</td><td>Yes (unique)</td></tr>
+      <tr><td><code>UNIQUE</code></td><td>no two rows with the same value</td><td>Yes; several NULLs allowed</td><td>Yes (unique)</td></tr>
+      <tr><td><code>NOT NULL</code></td><td>a value must be present</td><td>No</td><td>No</td></tr>
+      <tr><td><code>CHECK (condition)</code></td><td>the condition is true or unknown</td><td>Yes, passes (see below)</td><td>No</td></tr>
+      <tr><td><code>DEFAULT value</code></td><td>a value used when none is given</td><td>n/a (not a real constraint)</td><td>No</td></tr>
+      <tr><td><code>FOREIGN KEY</code></td><td>value exists in another table</td><td>Yes, passes</td><td>No (add one yourself)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Foreign keys have their own article: <a href="#m1-foreign-keys">Foreign keys and referential
+  actions</a>.</p>
+
+  <h4>Column constraint vs table constraint</h4>
+  <p>A <strong>column constraint</strong> is written on the column line and concerns that column. A
+  <strong>table constraint</strong> is written after the columns and can involve several columns. Anything with
+  two or more columns must be a table constraint.</p>
+  <pre data-title="Both styles"><code class="language-sql">CREATE TABLE enrollments_demo (
+    student_id  INT          NOT NULL,                          -- column constraint
+    course_id   INT          NOT NULL,
+    grade       CHAR(1)      CHECK (grade IN ('A','B','C','D','F')),  -- column check
+    credits     SMALLINT     NOT NULL DEFAULT 3,
+    CONSTRAINT pk_enrollments_demo PRIMARY KEY (student_id, course_id),   -- table, composite
+    CONSTRAINT uq_demo_pair        UNIQUE (course_id, student_id, grade)  -- table
+);</code></pre>
+  <p>If you do not name a constraint, PostgreSQL invents a name (<code>employees_email_key</code>,
+  <code>employees_pkey</code>, <code>employees_salary_check</code>, <code>orders_customer_id_fkey</code>). The
+  generated names are predictable, but your own (<code>uq_employees_email</code>) are clearer and let a Java
+  exception handler recognise the constraint by name.</p>
+
+  <h4>PRIMARY KEY</h4>
+  <p>A primary key marks the column (or columns) that identify a row. It is <code>UNIQUE</code> plus
+  <code>NOT NULL</code>, a table can have only one, and the database builds a unique index for it. A
+  <strong>composite primary key</strong> uses two or more columns: <code>employee_projects</code> uses
+  <code>(emp_id, project_id)</code>, so one employee can be on many projects and each pair appears once. Choosing
+  keys (natural vs surrogate) is in <a href="#m4">Module 4</a>.</p>
+  <pre data-title="Violating the primary key"><code class="language-sql">INSERT INTO departments (dept_id, name, location) VALUES (1, 'Legal', 'Chennai');
+-- ERROR:  duplicate key value violates unique constraint "departments_pkey"
+-- DETAIL:  Key (dept_id)=(1) already exists.
+
+INSERT INTO employee_projects (emp_id, project_id, role, hours_per_week)
+VALUES (5, 1, 'Lead', 30);
+-- ERROR:  duplicate key value violates unique constraint "employee_projects_pkey"
+-- DETAIL:  Key (emp_id, project_id)=(5, 1) already exists.</code></pre>
+  <p>MySQL: <code>ERROR 1062 (23000): Duplicate entry '1' for key 'departments.PRIMARY'</code>.</p>
+
+  <h4>UNIQUE</h4>
+  <p><code>UNIQUE</code> allows no repeats but, unlike a primary key, allows <code>NULL</code>, and since NULL
+  is never equal to NULL, <strong>many NULLs are allowed</strong> in a unique column (PostgreSQL 15 added
+  <code>UNIQUE NULLS NOT DISTINCT</code> to change this; MySQL also allows multiple NULLs). A table can have
+  many unique constraints, and they can cover several columns together: <code>UNIQUE (dept_id, name)</code>
+  means a name is unique inside a department.</p>
+  <pre data-title="Violating UNIQUE"><code class="language-sql">INSERT INTO employees (first_name, last_name, email, salary)
+VALUES ('Meera', 'Iyer 2', 'meera.iyer@example.com', 90000);
+-- ERROR:  duplicate key value violates unique constraint "employees_email_key"
+-- DETAIL:  Key (email)=(meera.iyer@example.com) already exists.</code></pre>
+  <p>MySQL: <code>ERROR 1062 (23000): Duplicate entry 'meera.iyer@example.com' for key
+  'employees.email'</code>. Case matters: <code>Meera.Iyer@example.com</code> is a different value in
+  PostgreSQL but a duplicate in MySQL (case-insensitive collation). To make emails case-insensitive in
+  PostgreSQL use a unique index on <code>lower(email)</code> (indexes are in <a href="#m5">Module 5</a>).</p>
+
+  <h4>NOT NULL</h4>
+  <p>The simplest and most valuable constraint. Columns are nullable by default, so you must say
+  <code>NOT NULL</code> every time a value is required. Decide per column: is "unknown" a valid state? A hire
+  date, yes it must exist; a project <code>end_date</code>, no, it can be open.</p>
+  <pre data-title="Violating NOT NULL"><code class="language-sql">INSERT INTO employees (first_name, email, salary) VALUES ('Zoya', 'z@example.com', 50000);
+-- ERROR:  null value in column "last_name" of relation "employees" violates not-null constraint
+-- DETAIL:  Failing row contains (13, Zoya, null, z@example.com, null, null, 50000.00, ...).</code></pre>
+  <p>MySQL: <code>ERROR 1364 (HY000): Field 'last_name' doesn't have a default value</code> when the column is
+  omitted, or <code>ERROR 1048 (23000): Column 'last_name' cannot be null</code> when NULL is given.</p>
+
+  <h4>CHECK</h4>
+  <p><code>CHECK</code> tests a condition on the row's own columns. The row is accepted when the condition is
+  <code>TRUE</code> <em>or unknown (NULL)</em>. This surprises people: <code>CHECK (salary &gt; 0)</code> lets a
+  NULL salary through, so pair it with <code>NOT NULL</code> when the value is mandatory. A check cannot contain
+  a subquery or look at other rows; use a unique index, foreign key or trigger for that.</p>
+  <pre data-title="Violating CHECK"><code class="language-sql">INSERT INTO employees (first_name, last_name, email, salary)
+VALUES ('Zoya', 'Khan', 'zoya.khan@example.com', -5);
+-- ERROR:  new row for relation "employees" violates check constraint "employees_salary_check"
+-- DETAIL:  Failing row contains (13, Zoya, Khan, zoya.khan@example.com, null, null, -5.00, ...).
+
+UPDATE projects SET end_date = '2023-01-01' WHERE project_id = 1;
+-- ERROR:  new row for relation "projects" violates check constraint "ck_projects_dates"</code></pre>
+  <p>MySQL 8.0.16+: <code>ERROR 3819 (HY000): Check constraint 'employees_chk_1' is violated.</code> Older
+  MySQL accepted the syntax and ignored it, so confirm the version.</p>
+
+  <h4>DEFAULT</h4>
+  <p><code>DEFAULT</code> is not a rule but a fallback: when an <code>INSERT</code> leaves the column out (or
+  says the word <code>DEFAULT</code>), the database uses the default. It can be a constant or an expression such
+  as <code>now()</code> or <code>CURRENT_DATE</code>. It is used only when the column is missing. Explicitly
+  inserting <code>NULL</code> does <em>not</em> trigger the default; it stores NULL, or fails if the column is
+  <code>NOT NULL</code>.</p>
+  <pre data-title="Default versus explicit NULL"><code class="language-sql">INSERT INTO orders (customer_id) VALUES (6);               -- status = 'PLACED', today's date
+INSERT INTO orders (customer_id, status) VALUES (6, NULL);
+-- ERROR:  null value in column "status" of relation "orders" violates not-null constraint</code></pre>
+
+  <h4>Adding and removing constraints later</h4>
+  <pre data-title="ALTER TABLE forms"><code class="language-sql">ALTER TABLE employees ADD CONSTRAINT uq_employees_email UNIQUE (email);
+ALTER TABLE employees ADD CONSTRAINT ck_employees_salary CHECK (salary &gt; 0);
+ALTER TABLE employees ALTER COLUMN last_name SET NOT NULL;
+ALTER TABLE employees ALTER COLUMN hire_date SET DEFAULT CURRENT_DATE;
+ALTER TABLE employees DROP CONSTRAINT ck_employees_salary;</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: constraints see rows, not statements' intent</p>
+    <p>They run on every <code>INSERT</code> and <code>UPDATE</code>. A constraint that fails aborts the whole
+    statement (all rows of a multi-row insert) and, inside a transaction, marks the transaction as failed in
+    PostgreSQL: you must <code>ROLLBACK</code> before running anything else.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: be strict by default</p>
+    <p>Start every column as <code>NOT NULL</code> and relax it only when "no value" is a real state. Add
+    <code>CHECK</code> for ranges, small value lists and date order. Put the real rules in the database and
+    translate its errors (SQLState <code>23505</code> unique, <code>23503</code> foreign key,
+    <code>23502</code> not null, <code>23514</code> check) into clean API messages in Spring.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: checking "does it exist" in Java, then inserting</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: race condition</p><pre><code class="language-java">if (!repo.existsByEmail(email)) {   // two requests can both pass here
+    repo.save(new Employee(email));
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: UNIQUE plus handling the error</p><pre><code class="language-java">try {
+    repo.save(new Employee(email));          // UNIQUE decides
+} catch (DataIntegrityViolationException e) {
+    throw new EmailAlreadyUsedException(email);
+}</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Several NULLs in a <code>UNIQUE</code> column are fine; several empty strings are not. Do not store
+      <code>''</code> where you mean NULL.</li>
+      <li><code>CHECK</code> passes on NULL. <code>CHECK (end_date &gt;= start_date)</code> passes when
+      <code>end_date</code> is NULL, which is what <code>ck_projects_dates</code> relies on.</li>
+      <li>MySQL's <code>CHECK</code> before 8.0.16 was parsed and ignored.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Likely: "primary key vs unique key" (one per table, never NULL vs many, NULLs allowed), "can a unique
+    column hold several NULLs?" (yes), "does <code>CHECK</code> reject NULL?" (no), and "how do you stop duplicate
+    emails under concurrent requests?" (a unique constraint, not an application check).</p>
+  </div>
+</article>
+
+<article class="topic" id="m1-foreign-keys">
+  <h3>Foreign keys and referential actions</h3>
+  <p class="tldr">A <strong>foreign key</strong> forces a column to hold only values that exist in another
+  table's key, which keeps relationships valid. <code>ON DELETE</code> and <code>ON UPDATE</code> decide what
+  happens to the child rows when the parent changes: refuse, delete, or set NULL.</p>
+
+  <h4>What a foreign key guarantees</h4>
+  <p>In <code>employees</code>, <code>dept_id</code> must be a real <code>departments.dept_id</code> or NULL. The
+  table that holds the foreign key is the <strong>child</strong>; the table it points to is the
+  <strong>parent</strong>. The database then blocks two things: inserting (or updating to) a child row whose
+  parent does not exist, and deleting (or changing the key of) a parent that still has children, unless an action
+  says otherwise. This is <strong>referential integrity</strong>. The foreign key must point to a column that is
+  a primary key or has a unique constraint.</p>
+  <pre data-title="Declaring a foreign key"><code class="language-sql">-- inline form (PostgreSQL; MySQL IGNORES this form)
+dept_id INT REFERENCES departments (dept_id)
+
+-- table form (works everywhere, can be named)
+CONSTRAINT fk_employees_dept FOREIGN KEY (dept_id) REFERENCES departments (dept_id)
+    ON DELETE SET NULL ON UPDATE CASCADE</code></pre>
+
+  <h4>Errors when the rule is broken</h4>
+  <pre data-title="Child without a parent"><code class="language-sql">INSERT INTO employees (first_name, last_name, email, dept_id, salary)
+VALUES ('Zoya', 'Khan', 'zoya.khan@example.com', 99, 50000);
+-- ERROR:  insert or update on table "employees" violates foreign key constraint "fk_employees_dept"
+-- DETAIL:  Key (dept_id)=(99) is not present in table "departments".
+
+DELETE FROM departments WHERE dept_id = 1;
+-- ERROR:  update or delete on table "departments" violates foreign key constraint
+--         "fk_projects_dept" on table "projects"
+-- DETAIL:  Key (dept_id)=(1) is still referenced from table "projects".</code></pre>
+  <p>MySQL words: <code>ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint
+  fails (...)</code> and <code>ERROR 1451 (23000): Cannot delete or update a parent row: a foreign key
+  constraint fails (...)</code>. A NULL foreign key is always allowed, as the CEO's <code>dept_id</code> shows;
+  add <code>NOT NULL</code> when the relationship is mandatory (<code>projects.dept_id</code>).</p>
+
+  <h4>ON DELETE and ON UPDATE actions</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Action</th><th>When the parent row is deleted or its key changes</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td><code>NO ACTION</code> (default)</td><td>Error. Checked at the end of the statement; in PostgreSQL the check can be
+      deferred to commit time.</td><td>Safe default</td></tr>
+      <tr><td><code>RESTRICT</code></td><td>Error immediately, never deferrable. In MySQL (InnoDB) it behaves the same as
+      <code>NO ACTION</code>.</td><td>You want an unmistakable block (products that were sold)</td></tr>
+      <tr><td><code>CASCADE</code></td><td>The child rows are deleted (or their key is updated to the new value)</td>
+      <td>Children have no meaning without the parent (order lines, project assignments)</td></tr>
+      <tr><td><code>SET NULL</code></td><td>The child's column becomes NULL (column must be nullable)</td>
+      <td>The link is optional (employee's department)</td></tr>
+      <tr><td><code>SET DEFAULT</code></td><td>The child's column becomes its default value</td>
+      <td>Rare. PostgreSQL only; InnoDB rejects it.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The sample schema uses all the common ones. Watch each in a transaction and roll back afterwards, so the
+  data stays unchanged:</p>
+  <pre data-title="Actions in practice"><code class="language-sql">BEGIN;
+
+-- SET NULL: HR (3) has employees 4, 11, 12, but also projects. Remove the project first.
+DELETE FROM projects WHERE dept_id = 3;
+DELETE FROM departments WHERE dept_id = 3;
+SELECT emp_id, first_name, dept_id FROM employees WHERE emp_id IN (4, 11, 12) ORDER BY emp_id;
+
+-- CASCADE: deleting order 1 deletes its two lines in order_items
+DELETE FROM orders WHERE order_id = 1;
+SELECT COUNT(*) AS lines_of_order_1 FROM order_items WHERE order_id = 1;
+
+-- RESTRICT: product 1 was sold, so it cannot be deleted
+DELETE FROM products WHERE product_id = 1;   -- ERROR (inside a transaction: now aborted)
+
+ROLLBACK;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> emp_id | first_name | dept_id
+--------+------------+---------
+      4 | Sunita     |  (null)
+     11 | Farhan     |  (null)
+     12 | Isha       |  (null)
+(3 rows)
+
+ lines_of_order_1
+------------------
+                0
+(1 row)
+
+ERROR:  update or delete on table "products" violates foreign key constraint "fk_items_product"
+        on table "order_items"
+DETAIL:  Key (product_id)=(1) is still referenced from table "order_items".</code></pre>
+  <p><code>ON UPDATE</code> works the same way for changes to the parent key, but keys rarely change, so the
+  default <code>NO ACTION</code> is almost always right. You do not need it with surrogate ids.</p>
+
+  <h4>Choosing the action</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  Q{"Child can exist without parent?"}
+  Q -- No --> W{"Is the child part of the parent?"}
+  W -- Yes --> C["ON DELETE CASCADE"]
+  W -- "No, it is history" --> R["RESTRICT / NO ACTION"]
+  Q -- Yes --> N["ON DELETE SET NULL"]
+</pre>
+  <figcaption>Picking a delete action for a foreign key</figcaption>
+  </figure>
+
+  <h4>Foreign keys need indexes on the child side</h4>
+  <p>PostgreSQL indexes the parent key (it is a primary key) but <strong>does not</strong> create an index on
+  the foreign-key column of the child. Deleting a department then has to scan all of <code>employees</code> to
+  look for children, and joins on that column are slow. Add one yourself:
+  <code>CREATE INDEX idx_employees_dept_id ON employees (dept_id);</code>. MySQL InnoDB creates it
+  automatically if none exists. See <a href="#m5">Module 5</a>.</p>
+
+  <h4>Special cases</h4>
+  <ul>
+    <li><strong>Self-reference:</strong> <code>employees.manager_id</code> points to
+    <code>employees.emp_id</code>. The top of the tree has NULL. Inserting a row that refers to a row inserted
+    later fails in MySQL (row-by-row check) unless you insert in the right order.</li>
+    <li><strong>Composite foreign keys:</strong> a key with two columns references a composite key and is
+    declared with both columns in the same constraint.</li>
+    <li><strong>Deferrable constraints (PostgreSQL):</strong> <code>DEFERRABLE INITIALLY DEFERRED</code> delays the
+    check until <code>COMMIT</code>, useful for loading circular references.</li>
+    <li><strong>Many-to-many</strong> uses a junction table with two foreign keys and a composite primary key,
+    like <code>employee_projects</code> and <code>order_items</code> (designed in <a href="#m4">Module 4</a>).</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: always declare foreign keys</p>
+    <p>"We check it in the application" is how orphan rows (orders for deleted customers) are born. Declare the
+    foreign key, make the child column <code>NOT NULL</code> when the link is mandatory, and index it.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: CASCADE everywhere</p>
+    <p><code>ON DELETE CASCADE</code> on <code>orders.customer_id</code> would delete a customer's whole order
+    history, and the invoices, with one careless <code>DELETE</code>. Cascade only for true parts-of-a-whole.
+    Many systems never delete at all and use a <code>deleted_at</code> or <code>is_active</code> column
+    (soft delete).</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>SET NULL</code> on a <code>NOT NULL</code> column fails at definition time in MySQL, and at delete
+      time in PostgreSQL.</li>
+      <li>Cascades chain: deleting a customer can delete orders, which delete order items.</li>
+      <li>MySQL ignores inline <code>REFERENCES</code>, so always use the table-level form for portability.</li>
+      <li>A database dump may need constraints disabled to load tables in any order; in PostgreSQL
+      <code>pg_dump</code> orders them correctly.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Typical questions: "what happens when you delete a parent row that has children?" (error by default;
+    cascade or set null if declared), "<code>RESTRICT</code> vs <code>NO ACTION</code>" (when the check runs;
+    same in MySQL), "does PostgreSQL index a foreign key column?" (no, create the index), and the JPA link:
+    <code>@OneToMany(cascade = REMOVE)</code> is Hibernate deleting children, while
+    <code>ON DELETE CASCADE</code> is the database doing it.</p>
+  </div>
+</article>

@@ -1,0 +1,356 @@
+<article class="topic" id="m4-consistency-models">
+  <h3>Strong vs eventual consistency, consistency models and quorums</h3>
+  <p class="tldr">Strong (linearizable) consistency makes a distributed store look like one copy, eventual
+  consistency lets replicas catch up later, and in between sit useful guarantees such as read-your-writes,
+  monotonic reads and causal consistency; quorums (R + W &gt; N) let you tune the trade-off per request.</p>
+
+  <h4>Why replicas disagree</h4>
+  <p>To survive failures and serve more reads, data is copied to several nodes. A write reaches the copies
+  at slightly different times: network delay, a slow node, an asynchronous replication stream. In the
+  gap, two readers can ask two nodes and get two different answers. A <strong>consistency model</strong>
+  is the promise a system makes about which answers are allowed. Stronger promises are easier for
+  application programmers but cost latency and availability.</p>
+
+  <h4>The models, strongest to weakest</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Model</th><th>Promise (one line)</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Strong / linearizable</td><td>Every read returns the latest completed write; the system behaves like a single copy with one global order</td><td>Bank balance, seat lock, etcd, Spanner</td></tr>
+      <tr><td>Sequential</td><td>All clients see the operations in the same order, though not necessarily real-time order</td><td>Some coordination services</td></tr>
+      <tr><td>Causal</td><td>If B happened because of A (a reply to a comment), everyone sees A before B; unrelated writes may appear in any order</td><td>Comment threads, chat replies</td></tr>
+      <tr><td>Read-your-writes</td><td>After you write, your own later reads see that write</td><td>Edit profile, then refresh and see the change</td></tr>
+      <tr><td>Monotonic reads</td><td>Once you have seen a value, you never see an older one later (time does not go backwards)</td><td>Scrolling a feed without items vanishing</td></tr>
+      <tr><td>Eventual</td><td>If writes stop, all replicas converge to the same value eventually; no promise when</td><td>DNS, like counts, Cassandra at low consistency levels</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Strong consistency</strong> is the simplest to reason about, but it needs coordination
+  (a leader or consensus such as Raft or Paxos) on every write and often on reads, so it costs latency,
+  and during a partition the minority side cannot proceed. <strong>Eventual consistency</strong> is fast
+  and always available, but the application must tolerate stale reads and conflicting writes.</p>
+
+  <h4>A stale read, step by step</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant U as User
+  participant P as Primary
+  participant R as Replica
+  U->>P: update profile name
+  P-->>U: ok
+  P-)R: replicate (async, takes 200 ms)
+  U->>R: read profile
+  R-->>U: old name (replica not caught up)
+  Note over R: 200 ms later the replica has the new name
+</pre>
+    <figcaption>With asynchronous replication a read from a replica can miss your own write</figcaption>
+  </figure>
+  <p>Ways to give users read-your-writes without making everything strongly consistent:</p>
+  <ul>
+    <li>Read from the primary for a short window (for example 5 seconds) after the user writes.</li>
+    <li>Route a user's reads to the primary for data they own, and to replicas for other people's data.</li>
+    <li>Remember the log position or version of the user's last write and read only from a replica that has
+    caught up to it.</li>
+    <li>Sticky routing of a user to one replica also gives monotonic reads.</li>
+  </ul>
+
+  <h4>Quorums: N, R and W in simple words</h4>
+  <p>In leaderless stores such as Cassandra, DynamoDB-style systems and Riak, data is stored on
+  <strong>N</strong> replicas. A write is reported successful when <strong>W</strong> replicas have
+  acknowledged it. A read asks <strong>R</strong> replicas and returns the newest version among them.</p>
+  <pre data-title="Quorum rule"><code class="language-plaintext">If R + W &gt; N, every read set overlaps every write set in at least one replica,
+so a read always includes at least one node that has the latest write.
+
+N = 3 (three copies)
+W = 2, R = 2  → R + W = 4 &gt; 3  → reads see the latest write (strong-ish)
+W = 1, R = 1  → R + W = 2 ≤ 3  → fast, but reads may be stale (eventual)
+W = 3, R = 1  → R + W = 4 &gt; 3  → fast reads, slow writes, writes fail if any node is down
+W = 1, R = 3  → R + W = 4 &gt; 3  → fast writes, slow reads</code></pre>
+  <figure class="fig">
+<pre class="diagram">
+ N = 3 replicas: A, B, C            W = 2, R = 2
+
+ write x=5   ──▶ A ✓   B ✓   C (slow, not yet)
+ read        ──▶ A (x=5)  C (x=old)   → picks the newer: x=5
+
+ The write set {A,B} and any read set of 2 must share a node.
+</pre>
+    <figcaption>With R + W &gt; N at least one node in the read set has the latest write</figcaption>
+  </figure>
+  <p>A quorum is not a full guarantee of linearizability: sloppy quorums, concurrent writes, clock skew
+  and nodes that join or leave can still produce surprises. Systems add <em>read repair</em> (fix stale
+  replicas when a read notices a difference), <em>hinted handoff</em> (hold a write for a down node) and
+  <em>anti-entropy</em> (background sync) to converge.</p>
+  <p>Common settings are N = 3 with quorum reads and writes (R = W = 2). That tolerates one failed
+  replica and still reads fresh data. In Cassandra you choose per query: <code>ONE</code>,
+  <code>QUORUM</code>, <code>ALL</code>, or a local variant per data centre.</p>
+
+  <h4>Conflict resolution when writes diverge</h4>
+  <ul>
+    <li><strong>Last write wins (LWW):</strong> keep the highest timestamp. Simple, but clocks drift and
+    silently drops a concurrent update.</li>
+    <li><strong>Version vectors:</strong> detect that two writes were concurrent and keep both versions
+    for the application to merge (the Dynamo shopping-cart approach).</li>
+    <li><strong>CRDTs:</strong> data types designed so concurrent updates merge automatically (counters,
+    sets). Good for likes and collaborative editing.</li>
+  </ul>
+
+  <h4>Choosing consistency per feature</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Feature</th><th>Minimum consistency</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Payment, wallet debit</td><td>Strong (single leader, transaction)</td><td>Double spend is unacceptable</td></tr>
+      <tr><td>Seat or stock reservation</td><td>Strong on the final claim</td><td>Overselling is costly</td></tr>
+      <tr><td>Own profile after edit</td><td>Read-your-writes</td><td>Users think the save failed otherwise</td></tr>
+      <tr><td>Comment thread</td><td>Causal</td><td>A reply must not appear before its parent</td></tr>
+      <tr><td>Like and view counters</td><td>Eventual</td><td>Slight errors are invisible</td></tr>
+      <tr><td>Search results, recommendations</td><td>Eventual</td><td>Index updates seconds later are fine</td></tr>
+    </tbody>
+  </table></div>
+  <p>The expensive part of a system (payments) can be strongly consistent in a small, well-protected
+  database, while the high-volume parts (feed, counters) are eventually consistent. Mixing models in one
+  product is normal.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Exception: eventual consistency is not "no consistency"</p>
+    <p>Eventual consistency promises convergence once writes stop. Production systems usually converge in
+    milliseconds to seconds. The danger is not that data is wrong forever, but that the application logic
+    (for example "check balance, then debit") assumes freshness it does not have.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistake: reading the balance from a replica before debiting</p>
+    <p>A check-then-act sequence on stale data lets two requests both pass the check. Do the check and the
+    update on the primary in one transaction, or use a conditional update such as
+    <code>UPDATE ... SET balance = balance - 800 WHERE id = ? AND balance &gt;= 800</code>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"With N = 3, W = 2 and R = 2 the read and write sets overlap, so reads see the latest write
+      while tolerating one node down."</li>
+      <li>Name the model you need instead of just saying "eventual": read-your-writes for profile
+      edits, causal for comments.</li>
+      <li>Explain how you would fix a stale read after a write (read from primary briefly, or track the
+      replica position).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m4-interview">
+  <h3>Interview questions — HLD fundamentals</h3>
+
+  <details class="qa">
+    <summary>What do system design interviews test, and how do you structure your answer?</summary>
+    <div class="qa-a">
+      <p>They test whether you can handle an open problem: clarify requirements, estimate scale, propose a
+      simple design, find the bottleneck, and justify trade-offs. A structure that works: clarify scope,
+      list functional and non-functional requirements, estimate load, define the API and data model, draw
+      the high-level design, deep-dive into the hard part, then cover failures and scaling.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>When would you choose gRPC over REST?</summary>
+    <div class="qa-a">
+      <p>For internal service-to-service calls where latency, payload size and a strict contract matter.
+      gRPC uses HTTP/2 and Protocol Buffers, giving smaller binary messages, multiplexing, generated
+      clients and streaming. REST is better at the public edge: browsers call it natively, it is easy to
+      debug and cache, and any partner can use it.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>WebSockets, SSE or long polling for live notifications?</summary>
+    <div class="qa-a">
+      <p>If only the server pushes (notifications, scores), SSE is the lightest: plain HTTP with
+      auto-reconnect. If both sides send frequently (chat, games, collaboration), use WebSockets, and
+      accept the cost of one open connection per user. Long polling is a fallback when proxies block the
+      others. For infrequent updates, plain polling every 30 seconds may be enough.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between latency and throughput?</summary>
+    <div class="qa-a">
+      <p>Latency is the time one request takes; throughput is how many requests complete per second. A
+      motorway analogy: latency is one car's journey time, throughput is cars per hour. More servers raise
+      throughput but do not make one request faster. Caching and nearby servers cut latency. Batching
+      raises throughput but can raise per-item latency.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why use p99 instead of the average latency?</summary>
+    <div class="qa-a">
+      <p>Latency distributions have a long tail. An average of 200 ms can hide 1% of requests taking ten
+      seconds. Those users are real, and a page with many backend calls hits the slow tail often: with 20
+      calls and a 1% slow chance each, about 18% of page loads are slow. SLOs are therefore stated as
+      percentiles, for example "p99 under 300 ms".</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Estimate the requests per second for 10 million daily users making 20 requests each.</summary>
+    <div class="qa-a">
+      <p>10 million × 20 = 200 million requests per day. Divide by about 86,400 seconds: roughly 2,300
+      requests per second on average. With a peak factor of 3, plan for about 7,000 RPS. At about 700 RPS
+      per instance that is 10 instances at peak, and about 20 with headroom and zone redundancy.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is Little's law and how do you use it?</summary>
+    <div class="qa-a">
+      <p>L = λ × W: requests in flight equals arrival rate times time in system. At 2,000 RPS with 50 ms per
+      request, 100 requests are in flight. It sizes thread and connection pools, and shows why a slow
+      dependency is dangerous: if a call goes from 50 ms to 500 ms, concurrency needed grows tenfold, pools
+      run out and the service stalls.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Vertical vs horizontal scaling: which first, and why?</summary>
+    <div class="qa-a">
+      <p>Vertical is simplest (a bigger machine, no code changes) so it is a good first step, especially for
+      databases. But it has a ceiling, costs rise steeply and it is a single point of failure. Horizontal
+      scaling adds machines behind a load balancer and has no hard ceiling, but needs stateless services and
+      shared or partitioned data. Typically you scale the stateless app tier out and the database up
+      first, then add replicas and shards.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What makes a service stateless, and where do sessions go?</summary>
+    <div class="qa-a">
+      <p>A stateless service keeps no per-client data in its own memory or disk between requests, so any
+      instance can handle any request. Sessions move to Redis (shared store, instant revocation) or to a
+      signed JWT (no lookup, but harder to revoke). Sticky sessions work but cause uneven load and lose
+      sessions when an instance dies. Files go to object storage, scheduled jobs use a lock.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does 99.9% availability mean in downtime?</summary>
+    <div class="qa-a">
+      <p>(1 − 0.999) × one year = about 8.77 hours per year, or about 43 minutes per month. 99.99% is about
+      52 minutes a year, and 99.999% about 5 minutes a year. Each extra nine costs far more and usually
+      requires automatic failover because humans cannot respond in minutes.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Three components each have 99.9% availability. What is the total in series and what if two are in parallel?</summary>
+    <div class="qa-a">
+      <p>In series you multiply: 0.999<sup>3</sup> ≈ 0.997, so 99.7% (about 26 hours of downtime a year).
+      Two in parallel: 1 − (0.001 × 0.001) = 99.9999%, assuming failures are independent. In practice
+      shared racks, zones, deploys and bugs break that assumption, so redundancy must be spread across
+      failure domains.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain the CAP theorem with an example. Why is "CA" not a real choice?</summary>
+    <div class="qa-a">
+      <p>When a network partition separates replicas, a system must choose: refuse some requests to stay
+      consistent (CP) or answer with possibly stale data to stay available (AP). Example: Mumbai and
+      Chennai lose their link; Mumbai accepts a withdrawal; Chennai cannot know. Partitions cannot be
+      prevented in a real network, so P is forced, and the only choice is C or A during the partition. "CA"
+      only describes a system that is not distributed.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does PACELC add to CAP?</summary>
+    <div class="qa-a">
+      <p>If there is a Partition choose Availability or Consistency; Else, in normal operation, choose
+      Latency or Consistency. It captures the daily cost of strong consistency: waiting for replicas to
+      acknowledge. Cassandra defaults to PA/EL (fast and available), while a single-primary database with
+      synchronous replication is PC/EC.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a quorum and when does R + W &gt; N matter?</summary>
+    <div class="qa-a">
+      <p>With N replicas, a write waits for W acknowledgements and a read queries R replicas. If R + W &gt; N
+      the read and write sets must share at least one replica, so a read includes a node with the latest
+      write. N = 3, R = W = 2 is the common setting: one node can be down and reads stay fresh. Lower R
+      and W give speed and availability but allow stale reads.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How would you pick consistency for payments vs likes?</summary>
+    <div class="qa-a">
+      <p>Payments use strong consistency: one leader, transactions, conditional updates; an error is
+      better than a double spend. Likes use eventual consistency: availability and latency matter more, and
+      small count errors do not matter. Profile edits need read-your-writes. Consistency is chosen per
+      feature, not once per product.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m4-cheatsheet">
+  <h3>Cheat sheet — HLD fundamentals</h3>
+  <ul class="cheat">
+    <li><b>Interview flow</b> clarify, requirements, estimate, API and data, high-level design, deep dive, failures.</li>
+    <li><b>Request path</b> client, DNS, CDN, load balancer, app servers, cache, database, queue, workers.</li>
+    <li><b>REST</b> default for public APIs, JSON, easy caching, no streaming.</li>
+    <li><b>gRPC</b> HTTP/2 plus Protobuf, fast internal calls, streaming, not browser-native.</li>
+    <li><b>WebSocket</b> full duplex, one open connection per user, stateful.</li>
+    <li><b>SSE</b> server-to-client push over HTTP with auto-reconnect.</li>
+    <li><b>Polling</b> short polling wastes requests; long polling holds the request open.</li>
+    <li><b>Webhook</b> the other system calls you; verify signature, be idempotent, reply fast.</li>
+    <li><b>Latency vs throughput</b> time per request vs requests per second.</li>
+    <li><b>Percentiles</b> use p50, p95, p99; averages hide the tail.</li>
+    <li><b>Latency ladder</b> RAM about 100 ns, SSD about 100 µs, same-DC hop about 0.5 ms, cross-continent about 100 ms.</li>
+    <li><b>Little's law</b> L = λ × W (in flight = rate × time).</li>
+    <li><b>Time constants</b> a day is about 10<sup>5</sup> s; 1 million per day is about 12 per second.</li>
+    <li><b>Estimation</b> average RPS = per day / 86,400; peak = 2–5x average; storage = items × size × days × replicas.</li>
+    <li><b>Scale up vs out</b> up is simple but capped; out needs stateless services and a load balancer.</li>
+    <li><b>Stateless</b> no per-client memory or disk; sessions in Redis or JWT, files in S3.</li>
+    <li><b>Nines</b> 99.9% about 8.77 h/year; 99.99% about 52.6 min/year; 99.999% about 5.26 min/year.</li>
+    <li><b>Series</b> multiply availabilities (worse); <b>parallel</b> 1 − product of failure chances (better).</li>
+    <li><b>SLI / SLO / SLA</b> measurement, internal target, customer contract; the gap is the error budget.</li>
+    <li><b>SPOF</b> any single component whose failure stops the system; remove with redundancy.</li>
+    <li><b>Failover</b> active-passive (standby, slower) vs active-active (all serve, more complex); beware split-brain.</li>
+    <li><b>CAP</b> during a partition choose consistency (CP) or availability (AP); "CA" is not a distributed option.</li>
+    <li><b>PACELC</b> partition: A or C; else: latency or consistency.</li>
+    <li><b>Quorum</b> R + W &gt; N makes read and write sets overlap; N = 3, R = W = 2 is typical.</li>
+    <li><b>Models</b> strong, causal, read-your-writes, monotonic reads, eventual; choose per feature.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m4-practice">
+  <h3>Practice — HLD fundamentals</h3>
+  <ol class="steps">
+    <li>Draw the request path for opening your favourite shopping app's home page. Name every hop and say
+    what could be cached at each one. Done when your diagram has at least six boxes and each has a one-line
+    purpose.</li>
+    <li>For each case choose REST, gRPC, WebSocket, SSE, long polling or webhook, and give one reason:
+    live cricket score, food delivery map tracking, order service calling inventory service, payment
+    confirmation from Razorpay, collaborative document editing.</li>
+    <li>A service handles 3,000 requests per second with an average of 80 ms per request. Use Little's law
+    to find the requests in flight. How many Tomcat threads per instance if you run 4 instances and want
+    50% headroom? Done when you show the calculation.</li>
+    <li>Estimate for a URL shortener with 100 million new URLs per month and a 10:1 read to write ratio:
+    writes per second, reads per second, storage for 5 years at 500 bytes per record. Done when each line
+    has units and a one-line conclusion about the design.</li>
+    <li>Estimate storage and bandwidth for a video app: 5 million daily users each upload 0.02 videos of
+    50 MB and watch 20 minutes at 2 Mbps. State your assumptions and the peak egress in Gbps.</li>
+    <li>Calculate availability: a load balancer (99.99%), 3 app servers in parallel (99.9% each), and one
+    database (99.95%). Then add a hot standby database (99.95%) in parallel and recalculate. Done when you
+    show both numbers and say which component was the weak point.</li>
+    <li>Convert your Spring Boot demo to be stateless: move <code>HttpSession</code> data to Redis with
+    Spring Session, start two instances on ports 8081 and 8082, and show that logging in on one keeps you
+    logged in on the other.</li>
+    <li>Write the partition scenario for a seat-booking system in your own words: which side does what if
+    it chooses CP, and what if it chooses AP? Which would you choose for seats, and for a "viewing now"
+    counter?</li>
+    <li>With N = 5, list three (R, W) pairs: one that guarantees fresh reads, one fast-write setting, one
+    fast-read setting. Say how many node failures each tolerates for reads and for writes.</li>
+    <li>Roadmap check: explain to a friend, in two minutes and without notes, the difference between
+    latency and throughput, why we need percentiles, and what 99.99% uptime allows per year.</li>
+  </ol>
+</article>

@@ -1,0 +1,667 @@
+<div class="mintro">
+  <p>Java 8 (2014) was the biggest change in the language's history. It added <strong>lambdas</strong>, <strong>method references</strong> and the <strong>Stream API</strong>, so you can pass behaviour around as a value and describe <em>what</em> you want instead of writing every loop by hand. It also added <code>Optional</code> and the <code>java.time</code> API. Every release since then has added more: <code>var</code>, text blocks, switch expressions, records, pattern matching, sealed classes, sequenced collections and unnamed variables.</p>
+  <p>This is not optional syntax sugar. Spring Boot code, code reviews and interviews all assume you can read and write it fluently — "find the second highest salary using streams" is one of the most asked Java interview questions. This module builds on OOP (<a href="#m2">Module 2</a>) and collections (<a href="#m4">Module 4</a>). The functional interfaces you learn here come back in <code>CompletableFuture</code> (<a href="#m6">Module 6</a>) and all over Spring.</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>write lambdas and method references, and explain target typing and the "effectively final" rule;</li>
+    <li>pick the right interface from <code>java.util.function</code> and compose small functions into bigger ones;</li>
+    <li>build stream pipelines that filter, map, sort, group and reduce — and solve the common stream interview questions;</li>
+    <li>use <code>Optional</code> the way it was designed and avoid <code>NullPointerException</code>;</li>
+    <li>handle dates, times, time zones and durations correctly with <code>java.time</code>;</li>
+    <li>use <code>var</code>, text blocks, switch expressions, pattern matching, record patterns, sealed classes and sequenced collections, and say which Java version brought each one.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m5-functional-ideas">
+  <h3>Functional programming ideas in one page</h3>
+  <p class="tldr">Functional style means treating behaviour as a value you can pass around, preferring pure functions and immutable data, and describing what result you want instead of how to loop for it.</p>
+
+  <p>Java is an object-oriented language, and it stays one. Since Java 8, though, it has borrowed a few ideas from <strong>functional programming</strong> (FP) — a style where programs are built mainly from functions that take values and return new values. You do not need to learn Haskell. You need five ideas, because lambdas, streams and <code>Optional</code> are all built on them.</p>
+
+  <h4>The five ideas</h4>
+  <dl class="terms">
+    <dt>Behaviour as data</dt>
+    <dd>A piece of code can be stored in a variable, passed to a method and returned from a method, just like a number or a string. In "sort these orders by price", the "by price" part is behaviour that you hand to <code>sort()</code>. A method that accepts or returns behaviour is called a <strong>higher-order function</strong>; <code>filter</code>, <code>map</code> and <code>Comparator.comparing</code> are examples.</dd>
+    <dt>Pure functions</dt>
+    <dd>A <strong>pure function</strong> returns a result that depends only on its arguments and does nothing else. It does not change fields, modify its arguments, print, write to a database or read the clock. Call it twice with the same input and you always get the same output.</dd>
+    <dt>Side effects</dt>
+    <dd>A <strong>side effect</strong> is anything a function does besides returning a value: printing, saving a row, changing a shared list, sending an SMS. Real programs need side effects. The goal is to keep them few, obvious and at the edges of the program.</dd>
+    <dt>Immutability</dt>
+    <dd>An <strong>immutable</strong> object cannot change after it is created. <code>String</code>, <code>Integer</code>, records with immutable fields, <code>List.of(...)</code> and every <code>java.time</code> type are immutable. To "change" one, you create a new one.</dd>
+    <dt>Declarative style</dt>
+    <dd><strong>Imperative</strong> code says <em>how</em>: create a list, loop, check, add, sort. <strong>Declarative</strong> code says <em>what</em>: "names of active customers in Mumbai, in upper case, sorted". Streams are Java's declarative tool.</dd>
+  </dl>
+
+  <h4>Imperative vs declarative — the same task twice</h4>
+  <pre data-title="FunctionalIdeas.java"><code class="language-java">import java.util.*;
+
+public class FunctionalIdeas {
+    record Customer(String name, String city, boolean active) {}
+
+    public static void main(String[] args) {
+        List&lt;Customer&gt; customers = List.of(
+                new Customer("Ravi", "Mumbai", true),
+                new Customer("Asha", "Pune", true),
+                new Customer("Kiran", "Mumbai", false),
+                new Customer("Meera", "Mumbai", true));
+
+        // Imperative: say HOW, step by step, with a mutable result list
+        List&lt;String&gt; result1 = new ArrayList&lt;&gt;();
+        for (Customer c : customers) {
+            if (c.active() &amp;&amp; c.city().equals("Mumbai")) {
+                result1.add(c.name().toUpperCase());
+            }
+        }
+        Collections.sort(result1);
+
+        // Declarative: say WHAT you want; each step is a small function
+        List&lt;String&gt; result2 = customers.stream()
+                .filter(Customer::active)
+                .filter(c -&gt; c.city().equals("Mumbai"))
+                .map(c -&gt; c.name().toUpperCase())
+                .sorted()
+                .toList();
+
+        System.out.println(result1);
+        System.out.println(result2);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">[MEERA, RAVI]
+[MEERA, RAVI]</code></pre>
+  <p>Both are correct. The second one reads like the requirement, has no temporary list to manage and no index to get wrong. Each step (<code>filter</code>, <code>map</code>) receives a small function — behaviour as data.</p>
+
+  <h4>Behaviour as data in a real setting</h4>
+  <p>Suppose each payment mode has its own fee rule. Instead of a long <code>if-else</code> chain, store the rules as values in a map:</p>
+  <pre data-title="Fee rules as data"><code class="language-java">Map&lt;String, Function&lt;Long, Long&gt;&gt; feeRules = Map.of(
+        "UPI", amount -&gt; 0L,                               // no fee
+        "CARD", amount -&gt; amount * 2 / 100,                // 2%
+        "WALLET", amount -&gt; Math.min(amount / 100, 50L));  // 1%, at most ₹50
+
+System.out.println(feeRules.get("UPI").apply(1500L));      // 0
+System.out.println(feeRules.get("CARD").apply(1500L));     // 30
+System.out.println(feeRules.get("WALLET").apply(10000L));  // 50</code></pre>
+  <p>Adding a new payment mode is now one new map entry, not a new branch in five places. This is the <strong>strategy pattern</strong> without writing a class per strategy.</p>
+
+  <h4>Pure vs impure</h4>
+  <pre data-title="GstCalculator.java"><code class="language-java">public class GstCalculator {
+    private int gstPercent = 18;   // anyone with a reference can change this
+    private int callCount = 0;
+
+    // Impure: reads mutable state, changes state and does I/O
+    public long withGstImpure(long amount) {
+        callCount++;                                   // side effect
+        System.out.println("Calculating GST...");      // side effect
+        return amount + amount * gstPercent / 100;     // depends on a field
+    }
+
+    // Pure: the result depends only on the arguments; nothing else happens
+    public static long withGst(long amount, int gstPercent) {
+        return amount + amount * gstPercent / 100;     // withGst(1000, 18) is always 1180
+    }
+}</code></pre>
+  <p>Why prefer the pure version where you can:</p>
+  <ul>
+    <li><strong>Easy to test</strong> — no setup, no mocks: give an input, check the output.</li>
+    <li><strong>Safe with threads</strong> — nothing shared is modified, so there is nothing to race on (see <a href="#m6">Module 6</a>).</li>
+    <li><strong>Easy to reason about</strong> — you can replace a call with its result in your head. This property is called <strong>referential transparency</strong>.</li>
+    <li><strong>Cacheable</strong> — same input, same output, so a result can be stored and reused.</li>
+  </ul>
+
+  <h4>Imperative vs declarative at a glance</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Imperative (loops)</th><th>Declarative (streams, lambdas)</th></tr></thead>
+    <tbody>
+      <tr><td>Focus</td><td>How to do it, step by step</td><td>What result you want</td></tr>
+      <tr><td>State</td><td>Counters, temporary lists, flags</td><td>Values flow through steps; little mutable state</td></tr>
+      <tr><td>Reading</td><td>You trace the loop to find the intent</td><td>Reads close to the requirement</td></tr>
+      <tr><td>Parallel work</td><td>Manual threads and locks</td><td>Possible with <code>parallelStream()</code> if functions are pure</td></tr>
+      <tr><td>Debugging</td><td>Simple step-through</td><td>Deeper stack traces; use small named methods</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: functions you pass to streams must not modify the stream's source</p>
+    <p>The Stream API requires the functions you give it to be <strong>non-interfering</strong> (they never modify the source collection) and, in most cases, <strong>stateless</strong> (the result does not depend on state that changes while the pipeline runs). Break this and you get wrong results or a <code>ConcurrentModificationException</code>. Details in <a href="#m5-streams-vs-loops">Streams vs loops</a>.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases: what "immutable" really means in Java</p>
+    <ul>
+      <li><code>final</code> makes the <em>reference</em> constant, not the object. <code>final List&lt;String&gt; names = new ArrayList&lt;&gt;();</code> still allows <code>names.add("x")</code>.</li>
+      <li><code>Collections.unmodifiableList(list)</code> returns a read-only <em>view</em>. If someone changes the original list, the view shows the change.</li>
+      <li><code>List.of</code> and <code>List.copyOf</code> are unmodifiable, but only <strong>shallowly</strong>: if the elements are mutable objects, those objects can still change.</li>
+      <li>Java is not a pure functional language. Lambdas can still change state, and there is no tail-call optimisation, so deep recursion still ends in <code>StackOverflowError</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: leaking an internal mutable list</p>
+    <p>A getter that returns its private list lets any caller change your object's state behind your back.</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: the caller can add to or clear the cart</p><pre><code class="language-java">public class Cart {
+    private final List&lt;String&gt; items = new ArrayList&lt;&gt;();
+
+    public List&lt;String&gt; getItems() {
+        return items;
+    }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: return an unmodifiable snapshot</p><pre><code class="language-java">public class Cart {
+    private final List&lt;String&gt; items = new ArrayList&lt;&gt;();
+
+    public List&lt;String&gt; getItems() {
+        return List.copyOf(items);
+    }
+}</code></pre></div>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects: functional core, imperative shell</p>
+    <p>In a Spring Boot service, keep calculations — pricing, discount rules, validation, entity-to-DTO mapping — as pure methods that take values and return values. Keep the side effects (repository calls, Kafka publishing, HTTP calls, logging) in the outer service and controller layer. The pure core is unit-tested in milliseconds without starting Spring; the shell is thin. Records with a compact constructor that calls <code>List.copyOf(...)</code> are a common way to make value objects truly immutable.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Is Java a functional language? What is a pure function?"</p>
+    <ul>
+      <li>Java is object-oriented with functional features since Java 8: lambdas, functional interfaces, method references, streams and <code>Optional</code>.</li>
+      <li>A function in Java is still an object — an instance of a functional interface — but you can pass it around like a value.</li>
+      <li>A pure function: same input → same output, no side effects. Benefits: easy testing, thread safety, caching, readable code.</li>
+      <li>Immutability removes a whole class of bugs (shared mutable state) and makes objects safe to share between threads.</li>
+      <li>Mention a trade-off: debugging long pipelines is harder, and not every loop should become a stream.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-lambdas">
+  <h3>Lambda expressions: syntax, target typing and captured variables</h3>
+  <p class="tldr">A lambda is a short anonymous function — parameters, an arrow and a body — that the compiler turns into an object of the functional interface the surrounding code expects.</p>
+
+  <p>Before Java 8, passing behaviour meant writing an <strong>anonymous inner class</strong>: a class with no name, declared and instantiated in one expression. Sorting names by length looked like this:</p>
+  <pre data-title="Before and after Java 8"><code class="language-java">List&lt;String&gt; names = new ArrayList&lt;&gt;(List.of("Priya", "Om", "Lakshmi"));
+
+// Before Java 8: anonymous inner class — five lines of ceremony
+Collections.sort(names, new Comparator&lt;String&gt;() {
+    @Override
+    public int compare(String a, String b) {
+        return Integer.compare(a.length(), b.length());
+    }
+});
+
+// Java 8+: a lambda keeps only the idea
+names.sort((a, b) -&gt; Integer.compare(a.length(), b.length()));
+
+// Even shorter: a ready-made comparator plus a method reference
+names.sort(Comparator.comparingInt(String::length));
+
+System.out.println(names);   // [Om, Priya, Lakshmi]</code></pre>
+  <p>A <strong>lambda expression</strong> is that idea written as <code>(parameters) -&gt; body</code>. It has no name, no class declaration and no <code>@Override</code>. It can only be used where Java expects a <strong>functional interface</strong> — an interface with exactly one abstract method (next article). The lambda <em>is</em> the implementation of that one method.</p>
+
+  <h4>Syntax variants</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Form</th><th>Example</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>No parameters</td><td><code>() -&gt; "Namaste"</code></td><td>Empty parentheses are required</td></tr>
+      <tr><td>One parameter</td><td><code>n -&gt; n * n</code></td><td>Parentheses are optional only for one untyped parameter</td></tr>
+      <tr><td>Several parameters</td><td><code>(a, b) -&gt; a + b</code></td><td>Parentheses required</td></tr>
+      <tr><td>Explicit types</td><td><code>(Integer a, Integer b) -&gt; a + b</code></td><td>Type all parameters or none</td></tr>
+      <tr><td><code>var</code> parameters (Java 11)</td><td><code>(var a, var b) -&gt; a + b</code></td><td>Useful when you want to put an annotation on a parameter</td></tr>
+      <tr><td>Expression body</td><td><code>n -&gt; n * n</code></td><td>No braces, no <code>return</code>; the value of the expression is returned</td></tr>
+      <tr><td>Block body</td><td><code>msg -&gt; { log(msg); }</code></td><td>Statements in braces; write <code>return</code> if a value is returned</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="LambdaSyntax.java"><code class="language-java">import java.util.*;
+import java.util.function.*;
+
+public class LambdaSyntax {
+    public static void main(String[] args) {
+        Supplier&lt;String&gt; greeting = () -&gt; "Namaste";
+        UnaryOperator&lt;Integer&gt; square = n -&gt; n * n;
+        BinaryOperator&lt;Integer&gt; add = (a, b) -&gt; a + b;
+        BinaryOperator&lt;Integer&gt; addTyped = (Integer a, Integer b) -&gt; a + b;
+        BinaryOperator&lt;Integer&gt; addVar = (var a, var b) -&gt; a + b;
+
+        Consumer&lt;String&gt; printer = msg -&gt; {          // block body, no return value
+            String line = "[LOG] " + msg;
+            System.out.println(line);
+        };
+
+        Function&lt;Integer, String&gt; grade = marks -&gt; {  // block body with return
+            if (marks &gt;= 60) {
+                return "First class";
+            }
+            return "Keep going";
+        };
+
+        System.out.println(greeting.get());
+        System.out.println(square.apply(7));
+        System.out.println(add.apply(2, 3) + " " + addTyped.apply(2, 3) + " "
+                + addVar.apply(2, 3));
+        printer.accept("Order placed");
+        System.out.println(grade.apply(72));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Namaste
+49
+5 5 5
+[LOG] Order placed
+First class</code></pre>
+
+  <h4>Target typing: a lambda takes its type from the context</h4>
+  <p>A lambda has no type of its own. The compiler looks at where it appears — the <strong>target type</strong> — and checks that the lambda fits the single abstract method of that interface. Target typing works in assignments, method arguments, return statements and casts. The same lambda text can therefore become different types:</p>
+  <pre data-title="Same lambda, two types"><code class="language-java">Predicate&lt;String&gt; isEmptyP = s -&gt; s.isEmpty();         // boolean test(String)
+Function&lt;String, Boolean&gt; isEmptyF = s -&gt; s.isEmpty();  // Boolean apply(String)
+
+System.out.println(isEmptyP.test("") + " " + isEmptyF.apply("UPI"));   // true false
+
+Object o = () -&gt; System.out.println("hi");                // compile error
+Object ok = (Runnable) () -&gt; System.out.println("hi");    // fine: the cast is the target</code></pre>
+  <pre class="out" data-title="javac"><code class="language-plaintext">error: incompatible types: Object is not a functional interface</code></pre>
+  <p>Because the parameter types come from the target, you rarely write them. In <code>names.sort((a, b) -&gt; ...)</code>, the compiler knows <code>sort</code> takes a <code>Comparator&lt;String&gt;</code>, so <code>a</code> and <code>b</code> are <code>String</code>.</p>
+
+  <h4>What the compiler and JVM do with a lambda</h4>
+  <ol class="steps">
+    <li>javac moves the lambda body into a private method of your class, with a generated name such as <code>lambda$run$0</code>.</li>
+    <li>Where the lambda is created, javac emits an <code>invokedynamic</code> instruction instead of <code>new SomeClass()</code>.</li>
+    <li>The first time that instruction runs, the JVM (through <code>LambdaMetafactory</code>) generates a small class at runtime that implements the interface and calls the private method.</li>
+    <li>After that, creating the lambda is cheap. A lambda that captures nothing is usually created once and reused — an implementation detail, so never compare lambdas with <code>==</code>.</li>
+  </ol>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ javac ThisDemo.java
+$ ls *.class
+ThisDemo$1.class  ThisDemo.class
+$ javap -p ThisDemo
+Compiled from "ThisDemo.java"
+public class ThisDemo {
+  public ThisDemo();
+  public java.lang.String toString();
+  void run();
+  public static void main(java.lang.String[]);
+  private void lambda$run$0();
+}</code></pre>
+  <p><code>ThisDemo$1.class</code> is the anonymous class from the demo below. The lambda has no class file — only the private method <code>lambda$run$0</code>.</p>
+
+  <h4>Capturing variables: the "effectively final" rule</h4>
+  <p>A lambda can use local variables of the method it is written in. This is called <strong>capturing</strong>. The rule: a captured local variable must be <code>final</code> or <strong>effectively final</strong> — never assigned again after its first assignment, so adding <code>final</code> would not cause an error.</p>
+  <pre data-title="Capturing locals"><code class="language-java">String city = "Pune";                         // effectively final
+Runnable r = () -&gt; System.out.println("Delivering in " + city);
+r.run();                                      // Delivering in Pune
+
+int count = 0;
+orders.forEach(o -&gt; count++);                 // compile error</code></pre>
+  <pre class="out" data-title="javac"><code class="language-plaintext">error: local variables referenced from a lambda expression must be final or effectively final</code></pre>
+  <p>Even a reassignment <em>after</em> the lambda (<code>city = "Delhi";</code> on a later line) makes <code>city</code> not effectively final, and the lambda line fails to compile.</p>
+  <p><strong>Why Java has this rule:</strong></p>
+  <ol>
+    <li>A local variable lives in the method's stack frame, which disappears when the method returns. A lambda can live longer — it can be stored in a field or run later on another thread. So the lambda receives a <em>copy</em> of the value when it is created.</li>
+    <li>If you could change the variable later, the copy and the original would disagree. Forbidding reassignment guarantees they are always equal, so "copy" and "same variable" behave identically.</li>
+    <li>Local variables are private to one thread by design. If lambdas running on other threads could write to them, every local would become a possible data race.</li>
+  </ol>
+  <p>What you <em>can</em> do:</p>
+  <ul>
+    <li>Read and modify <strong>fields</strong> (instance and static). The lambda captures <code>this</code> — a reference — and reaches the field through the object on the heap. It compiles, but it is still a side effect, and it is unsafe in parallel streams.</li>
+    <li>Modify the <strong>object</strong> a final variable points to: <code>audit.add(s)</code> inside a lambda is fine when <code>audit</code> itself is never reassigned. Effectively final is about the variable, not the object.</li>
+    <li>Use a holder such as <code>AtomicInteger</code> when you truly need a counter — but first ask whether a stream operation (<code>count()</code>, <code>sum()</code>) gives the answer directly.</li>
+  </ul>
+
+  <h4><code>this</code> in a lambda vs in an anonymous class</h4>
+  <p>A lambda does not create a new scope. Inside it, <code>this</code> means the enclosing object, exactly as on the line before the lambda. Inside an anonymous class, <code>this</code> means the anonymous object itself.</p>
+  <pre data-title="ThisDemo.java"><code class="language-java">public class ThisDemo {
+    @Override
+    public String toString() {
+        return "ThisDemo object";
+    }
+
+    void run() {
+        Runnable lambda = () -&gt; System.out.println("lambda    -&gt; this = " + this);
+
+        Runnable anonymous = new Runnable() {
+            @Override
+            public void run() {
+                System.out.println("anonymous -&gt; this = " + this);
+            }
+
+            @Override
+            public String toString() {
+                return "anonymous Runnable object";
+            }
+        };
+
+        lambda.run();
+        anonymous.run();
+    }
+
+    public static void main(String[] args) {
+        new ThisDemo().run();
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">lambda    -&gt; this = ThisDemo object
+anonymous -&gt; this = anonymous Runnable object</code></pre>
+  <p>The same "no new scope" idea explains another rule: a lambda parameter cannot reuse the name of a local variable from the enclosing method. With <code>String name = "Ravi";</code> in scope, <code>name -&gt; name.length()</code> fails with <em>variable name is already defined in method main(String[])</em>. An anonymous class may shadow it.</p>
+
+  <h4>Lambda vs anonymous class</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Lambda</th><th>Anonymous class</th></tr></thead>
+    <tbody>
+      <tr><td>Can implement</td><td>Only a functional interface</td><td>Any interface (any number of methods) or a class</td></tr>
+      <tr><td><code>this</code> means</td><td>The enclosing object</td><td>The anonymous object</td></tr>
+      <tr><td>New scope</td><td>No — cannot redeclare enclosing locals</td><td>Yes — can shadow enclosing names</td></tr>
+      <tr><td>Own fields/state</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Compiled to</td><td>Private method + <code>invokedynamic</code></td><td>A separate <code>Outer$1.class</code> file</td></tr>
+      <tr><td>Captured locals</td><td>Final or effectively final</td><td>Final or effectively final (since Java 8)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Checked exceptions inside lambdas</h4>
+  <p>The interfaces in <code>java.util.function</code> do not declare any checked exceptions. So a lambda passed to <code>map</code> cannot let an <code>IOException</code> escape:</p>
+  <pre data-title="Does not compile"><code class="language-java">List&lt;String&gt; texts = paths.stream()
+        .map(p -&gt; Files.readString(p))      // readString throws IOException
+        .toList();</code></pre>
+  <pre class="out" data-title="javac"><code class="language-plaintext">error: unreported exception IOException; must be caught or declared to be thrown</code></pre>
+  <p>The clean fix is a small named method that converts the checked exception into an unchecked one. <code>UncheckedIOException</code> exists exactly for this.</p>
+  <pre data-title="Wrap and rethrow"><code class="language-java">static String readFile(Path path) {
+    try {
+        return Files.readString(path);
+    } catch (IOException e) {
+        throw new UncheckedIOException(e);   // keeps the original as the cause
+    }
+}
+
+List&lt;String&gt; texts = paths.stream()
+        .map(FileReport::readFile)            // method reference keeps the pipeline clean
+        .toList();</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules the compiler enforces</p>
+    <ul>
+      <li>A lambda needs a functional interface as its target type.</li>
+      <li>Captured local variables must be final or effectively final.</li>
+      <li>Give types to all parameters or to none: <code>(Integer a, b) -&gt; a + b</code> fails with <em>cannot mix implicitly-typed and explicitly-typed parameters</em>. Mixing <code>var</code> with explicit types fails too.</li>
+      <li>A lambda parameter or local cannot reuse a name already in scope in the enclosing method.</li>
+      <li>A block body that returns a value must return on every path.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Keep a lambda to one expression or a few lines. If it grows, move the logic to a named private method and pass a method reference.</li>
+      <li>Prefer an expression body over <code>{ return ...; }</code>, and leave out parameter types unless they make the code clearer.</li>
+      <li>Use meaningful parameter names in business code (<code>order -&gt; order.total()</code>); single letters are fine in tiny lambdas like <code>(a, b) -&gt; a + b</code>.</li>
+      <li>Do not use lambdas for side effects inside stream pipelines; return values instead.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>return</code> inside a lambda leaves only the lambda. In <code>list.forEach(s -&gt; { if (s.isEmpty()) return; print(s); })</code> it skips one element, like <code>continue</code>.</li>
+      <li>You cannot <code>break</code> out of <code>forEach</code>. Use a normal loop, or a short-circuiting stream operation such as <code>anyMatch</code> or <code>takeWhile</code>.</li>
+      <li><code>s -&gt; audit.add(s)</code> fits a <code>Consumer&lt;String&gt;</code> even though <code>add</code> returns <code>boolean</code>: when the body is a method call, the result may be discarded.</li>
+      <li>An exception thrown inside a lambda appears when the functional method runs — possibly much later, or on another thread. Stack traces show frames like <code>lambda$main$0</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: counting with a local variable inside forEach</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: does not compile (and is not functional style)</p><pre><code class="language-java">int emptyCount = 0;
+items.forEach(s -&gt; {
+    if (s.isEmpty()) {
+        emptyCount++;   // captured local is modified
+    }
+});</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: let the stream compute the value</p><pre><code class="language-java">long emptyCount = items.stream()
+        .filter(String::isEmpty)
+        .count();</code></pre></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Why must captured variables be effectively final?" and "Lambda vs anonymous class?"</p>
+    <ul>
+      <li>The lambda gets a copy of a local's value, because locals live on the stack and the lambda may outlive the method or run on another thread. Forbidding reassignment keeps the copy and the original identical and avoids data races on locals.</li>
+      <li>Fields are not copied — they are reached through the captured <code>this</code> reference — so they can be modified (but should not be, in streams).</li>
+      <li>Lambda vs anonymous class: lambdas implement only functional interfaces, have no state, share the enclosing scope (<code>this</code> is the outer object), and compile to a private method plus <code>invokedynamic</code> instead of a separate class file.</li>
+      <li>Target typing: a lambda's type is decided by the context; the same lambda can be a <code>Predicate</code> or a <code>Function</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-functional-interfaces">
+  <h3>Functional interfaces and the java.util.function package</h3>
+  <p class="tldr">A functional interface has exactly one abstract method; java.util.function gives you 43 ready-made ones, and Predicate, Function, Consumer and Supplier are the four you use every day.</p>
+
+  <p>A <strong>functional interface</strong> is an interface with exactly one abstract method — often called a <strong>SAM</strong> (single abstract method) type. Any lambda or method reference whose parameters and return type fit that method can be used as an instance of the interface. Interfaces you already know, such as <code>Runnable</code> (<code>void run()</code>), <code>Callable&lt;V&gt;</code> (<code>V call()</code>) and <code>Comparator&lt;T&gt;</code> (<code>int compare(T, T)</code>), are functional interfaces.</p>
+
+  <h4>What counts as "one abstract method"</h4>
+  <ul>
+    <li><strong>Default methods</strong> and <strong>static methods</strong> do not count. A functional interface can have many of them — <code>Function</code> has <code>andThen</code>, <code>compose</code> and <code>identity</code>.</li>
+    <li>Abstract methods that match public methods of <code>Object</code> (<code>equals</code>, <code>hashCode</code>, <code>toString</code>) do not count, because every implementing class already has them. That is why <code>Comparator</code>, which declares <code>boolean equals(Object)</code>, is still functional.</li>
+    <li>An interface that inherits one abstract method and declares no new one is also functional.</li>
+  </ul>
+
+  <h4>The <code>@FunctionalInterface</code> annotation</h4>
+  <p><code>@FunctionalInterface</code> is optional. Any interface with one abstract method works with lambdas. The annotation does two things: it documents your intent, and it makes the compiler fail if someone later adds a second abstract method.</p>
+  <pre data-title="PaymentGateway.java"><code class="language-java">@FunctionalInterface
+interface PaymentGateway {
+    void pay(long amount);
+    void refund(long amount);   // second abstract method
+}</code></pre>
+  <pre class="out" data-title="javac"><code class="language-plaintext">error: Unexpected @FunctionalInterface annotation
+  PaymentGateway is not a functional interface
+    multiple non-overriding abstract methods found in interface PaymentGateway</code></pre>
+
+  <h4>The core four</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Interface</th><th>Method</th><th>Shape</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><code>Predicate&lt;T&gt;</code></td><td><code>boolean test(T t)</code></td><td>T → boolean</td><td><code>filter</code>, validation rules, <code>removeIf</code></td></tr>
+      <tr><td><code>Function&lt;T, R&gt;</code></td><td><code>R apply(T t)</code></td><td>T → R</td><td><code>map</code>, converting entity → DTO</td></tr>
+      <tr><td><code>Consumer&lt;T&gt;</code></td><td><code>void accept(T t)</code></td><td>T → nothing</td><td><code>forEach</code>, <code>ifPresent</code>, logging</td></tr>
+      <tr><td><code>Supplier&lt;T&gt;</code></td><td><code>T get()</code></td><td>nothing → T</td><td><code>orElseGet</code>, lazy values, factories</td></tr>
+    </tbody>
+  </table></div>
+  <p>Memory trick: a <strong>Predicate</strong> answers yes/no, a <strong>Function</strong> transforms, a <strong>Consumer</strong> eats a value and returns nothing, a <strong>Supplier</strong> produces a value from nothing.</p>
+
+  <h4>The rest of the family</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Interface</th><th>Method</th><th>Shape</th><th>Where you meet it</th></tr></thead>
+    <tbody>
+      <tr><td><code>BiFunction&lt;T, U, R&gt;</code></td><td><code>R apply(T, U)</code></td><td>(T, U) → R</td><td><code>Map.replaceAll</code>, <code>Map.compute</code></td></tr>
+      <tr><td><code>BiConsumer&lt;T, U&gt;</code></td><td><code>void accept(T, U)</code></td><td>(T, U) → nothing</td><td><code>Map.forEach((k, v) -&gt; ...)</code></td></tr>
+      <tr><td><code>BiPredicate&lt;T, U&gt;</code></td><td><code>boolean test(T, U)</code></td><td>(T, U) → boolean</td><td>Two-argument checks, <code>Files.find</code></td></tr>
+      <tr><td><code>UnaryOperator&lt;T&gt;</code></td><td><code>T apply(T)</code></td><td>T → T</td><td><code>List.replaceAll</code>, <code>Stream.iterate</code></td></tr>
+      <tr><td><code>BinaryOperator&lt;T&gt;</code></td><td><code>T apply(T, T)</code></td><td>(T, T) → T</td><td><code>reduce</code>, the merge function of <code>toMap</code></td></tr>
+    </tbody>
+  </table></div>
+  <p><code>UnaryOperator&lt;T&gt;</code> extends <code>Function&lt;T, T&gt;</code>, and <code>BinaryOperator&lt;T&gt;</code> extends <code>BiFunction&lt;T, T, T&gt;</code>. They are just shorter names for "same type in, same type out".</p>
+
+  <h4>Primitive specializations — avoiding boxing</h4>
+  <p>Generics work only with objects, so a <code>Function&lt;Integer, Integer&gt;</code> <strong>boxes</strong> every <code>int</code> into an <code>Integer</code> object and <strong>unboxes</strong> it again. In a loop over millions of numbers this creates garbage and costs time. Primitive specializations work on <code>int</code>, <code>long</code> and <code>double</code> directly. Their names follow a pattern:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Name pattern</th><th>Meaning</th><th>Examples (method)</th></tr></thead>
+    <tbody>
+      <tr><td><code>IntXxx</code></td><td>Takes an <code>int</code></td><td><code>IntPredicate</code> (<code>test</code>), <code>IntConsumer</code> (<code>accept</code>), <code>IntFunction&lt;R&gt;</code> (<code>apply</code>)</td></tr>
+      <tr><td><code>ToIntXxx</code></td><td>Returns an <code>int</code></td><td><code>ToIntFunction&lt;T&gt;</code> (<code>applyAsInt</code>), <code>ToIntBiFunction&lt;T, U&gt;</code></td></tr>
+      <tr><td><code>IntToLongXxx</code></td><td>Takes <code>int</code>, returns <code>long</code></td><td><code>IntToLongFunction</code>, <code>IntToDoubleFunction</code></td></tr>
+      <tr><td><code>IntUnaryOperator</code>, <code>IntBinaryOperator</code></td><td><code>int</code> in, <code>int</code> out</td><td><code>applyAsInt(int)</code>, <code>applyAsInt(int, int)</code></td></tr>
+      <tr><td><code>IntSupplier</code>, <code>BooleanSupplier</code></td><td>Produces a primitive</td><td><code>getAsInt()</code>, <code>getAsBoolean()</code></td></tr>
+      <tr><td><code>ObjIntConsumer&lt;T&gt;</code></td><td>Takes an object and an <code>int</code></td><td><code>accept(T, int)</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>The same set exists for <code>Long</code> and <code>Double</code> (<code>LongPredicate</code>, <code>ToDoubleFunction</code>, <code>DoubleUnaryOperator</code>, …). Together with the generic ones, the package has 43 interfaces. Primitive streams (<code>IntStream</code>, <code>LongStream</code>, <code>DoubleStream</code>) use these, which is why <code>mapToInt(Employee::salary)</code> takes a <code>ToIntFunction</code>.</p>
+
+  <h4>Which interface do I need?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>You want to…</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td>Check a condition</td><td><code>Predicate&lt;T&gt;</code> / <code>IntPredicate</code></td></tr>
+      <tr><td>Convert A into B</td><td><code>Function&lt;A, B&gt;</code></td></tr>
+      <tr><td>Convert A into another A</td><td><code>UnaryOperator&lt;A&gt;</code></td></tr>
+      <tr><td>Combine two A values into one A</td><td><code>BinaryOperator&lt;A&gt;</code></td></tr>
+      <tr><td>Do something with a value, return nothing</td><td><code>Consumer&lt;T&gt;</code></td></tr>
+      <tr><td>Produce a value later, on demand</td><td><code>Supplier&lt;T&gt;</code></td></tr>
+      <tr><td>Work with two inputs</td><td><code>BiFunction</code>, <code>BiConsumer</code>, <code>BiPredicate</code></td></tr>
+      <tr><td>Work with <code>int</code>/<code>long</code>/<code>double</code> without boxing</td><td><code>IntPredicate</code>, <code>ToIntFunction</code>, <code>IntUnaryOperator</code>, …</td></tr>
+      <tr><td>Run code with no input and no result</td><td><code>Runnable</code> (in <code>java.lang</code>)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Composing functions</h4>
+  <p>Many functional interfaces have default methods that build a new function out of existing ones. This is <strong>composition</strong>: small, tested pieces snapped together.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Interface</th><th>Method</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td><code>Predicate</code></td><td><code>p.and(q)</code>, <code>p.or(q)</code>, <code>p.negate()</code></td><td>Logical AND / OR / NOT (AND and OR short-circuit)</td></tr>
+      <tr><td><code>Predicate</code></td><td><code>Predicate.not(p)</code> (Java 11)</td><td>Negation that works with method references</td></tr>
+      <tr><td><code>Function</code></td><td><code>f.andThen(g)</code></td><td>Run <code>f</code> first, then <code>g</code> on its result</td></tr>
+      <tr><td><code>Function</code></td><td><code>f.compose(g)</code></td><td>Run <code>g</code> first, then <code>f</code></td></tr>
+      <tr><td><code>Function</code></td><td><code>Function.identity()</code></td><td>A function that returns its input unchanged</td></tr>
+      <tr><td><code>Consumer</code></td><td><code>c1.andThen(c2)</code></td><td>Give the value to <code>c1</code>, then to <code>c2</code></td></tr>
+      <tr><td><code>BiFunction</code></td><td><code>bf.andThen(f)</code></td><td>Apply <code>f</code> to the result</td></tr>
+      <tr><td><code>BinaryOperator</code></td><td><code>BinaryOperator.minBy(cmp)</code>, <code>maxBy(cmp)</code></td><td>Pick the smaller / larger of two values</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Compose.java"><code class="language-java">import java.util.*;
+import java.util.function.*;
+import java.util.stream.*;
+
+public class Compose {
+    record User(String name, int age, String email) {}
+
+    public static void main(String[] args) {
+        // andThen vs compose: the order is the whole difference
+        Function&lt;Integer, Integer&gt; times2 = x -&gt; x * 2;
+        Function&lt;Integer, Integer&gt; plus3 = x -&gt; x + 3;
+        System.out.println(times2.andThen(plus3).apply(5));   // (5 * 2) + 3
+        System.out.println(times2.compose(plus3).apply(5));   // (5 + 3) * 2
+
+        Function&lt;String, String&gt; clean = ((Function&lt;String, String&gt;) String::trim)
+                .andThen(String::toLowerCase);
+        System.out.println("[" + clean.apply("  Ravi@Example.COM ") + "]");
+
+        // Predicate composition: build rules from small pieces
+        Predicate&lt;User&gt; isAdult = u -&gt; u.age() &gt;= 18;
+        Predicate&lt;User&gt; hasEmail = u -&gt; u.email() != null &amp;&amp; !u.email().isBlank();
+        Predicate&lt;User&gt; canRegister = isAdult.and(hasEmail);
+
+        List&lt;User&gt; users = List.of(
+                new User("Asha", 25, "asha@mail.in"),
+                new User("Rohan", 16, "rohan@mail.in"),
+                new User("Kiran", 30, " "));
+        System.out.println(users.stream().filter(canRegister).map(User::name).toList());
+        System.out.println(users.stream().filter(canRegister.negate())
+                .map(User::name).toList());
+        System.out.println(users.stream().filter(isAdult.or(hasEmail))
+                .map(User::name).toList());
+
+        List&lt;String&gt; words = List.of("java", " ", "", "spring");
+        System.out.println(words.stream()
+                .filter(Predicate.not(String::isBlank)).toList());
+
+        // identity(): "the element itself" as the map value
+        Map&lt;String, User&gt; byName = users.stream()
+                .collect(Collectors.toMap(User::name, Function.identity()));
+        System.out.println(byName.get("Asha"));
+
+        Consumer&lt;String&gt; log = s -&gt; System.out.println("LOG: " + s);
+        Consumer&lt;String&gt; audit = s -&gt; System.out.println("AUDIT: " + s);
+        log.andThen(audit).accept("payment 499");
+
+        BiFunction&lt;Integer, Integer, Integer&gt; multiply = (a, b) -&gt; a * b;
+        System.out.println(multiply.andThen(r -&gt; "Result = " + r).apply(6, 7));
+
+        BinaryOperator&lt;String&gt; longer =
+                BinaryOperator.maxBy(Comparator.comparingInt(String::length));
+        System.out.println(longer.apply("UPI", "NEFT"));
+
+        // Primitive specializations: no Integer objects created
+        IntPredicate even = n -&gt; n % 2 == 0;
+        ToIntFunction&lt;String&gt; length = String::length;
+        IntBinaryOperator max = Math::max;
+        System.out.println(even.test(10) + " " + length.applyAsInt("Swiggy") + " "
+                + max.applyAsInt(3, 9));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">13
+16
+[ravi@example.com]
+[Asha]
+[Rohan, Kiran]
+[Asha, Rohan, Kiran]
+[java, spring]
+User[name=Asha, age=25, email=asha@mail.in]
+LOG: payment 499
+AUDIT: payment 499
+Result = 42
+NEFT
+true 6 9</code></pre>
+  <p>Note the cast in the <code>clean</code> line: a method reference on its own has no type, so you cannot call <code>.andThen</code> on <code>String::trim</code> directly. Assign it to a typed variable first (<code>Function&lt;String, String&gt; trim = String::trim;</code>) or cast it, as shown.</p>
+
+  <h4>Writing your own functional interface</h4>
+  <p>Use the standard interfaces first. Write your own when you need a <strong>domain name</strong> that makes code clearer, <strong>more than two parameters</strong>, or a method that <strong>throws a checked exception</strong>. You can add default and static methods to make it composable:</p>
+  <pre data-title="DiscountPolicy.java"><code class="language-java">@FunctionalInterface
+public interface DiscountPolicy {
+    long apply(long amount);                       // the single abstract method
+
+    default DiscountPolicy then(DiscountPolicy next) {
+        return amount -&gt; next.apply(this.apply(amount));
+    }
+
+    static DiscountPolicy percent(int pct) {
+        return amount -&gt; amount - amount * pct / 100;
+    }
+
+    static DiscountPolicy flat(long off) {
+        return amount -&gt; Math.max(0, amount - off);
+    }
+}
+
+// Usage
+DiscountPolicy festive = DiscountPolicy.percent(10).then(DiscountPolicy.flat(100));
+System.out.println(festive.apply(2000));                  // 2000 → 1800 → 1700
+System.out.println(DiscountPolicy.flat(500).apply(300));  // never below 0 → 0</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">1700
+0</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: exactly one abstract method</p>
+    <p>A lambda can target an interface only if it has exactly one abstract method after ignoring default methods, static methods and public <code>Object</code> methods. Abstract classes never work as lambda targets, even with one abstract method.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Prefer the standard interfaces in method signatures; everyone knows what a <code>Predicate&lt;Order&gt;</code> is.</li>
+      <li>Put <code>@FunctionalInterface</code> on every interface you write to be used with lambdas.</li>
+      <li>Use primitive specializations (<code>IntPredicate</code>, <code>ToLongFunction</code>) in hot code paths and with primitive streams.</li>
+      <li>Name predicates as questions or adjectives (<code>isAdult</code>, <code>hasEmail</code>) so compositions read like sentences: <code>isAdult.and(hasEmail)</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Unboxing <code>null</code> throws <code>NullPointerException</code>: a <code>Function&lt;Integer, Integer&gt;</code> written as <code>x -&gt; x * 2</code> fails if it receives <code>null</code>.</li>
+      <li><code>p.and(q)</code> short-circuits: <code>q</code> is not evaluated when <code>p</code> is false. Order cheap or null-guarding checks first.</li>
+      <li><code>Supplier</code> has no composition methods; <code>Runnable</code> and <code>Callable</code> have none either.</li>
+      <li><code>Function&lt;T, Boolean&gt;</code> and <code>Predicate&lt;T&gt;</code> are different types; you cannot pass one where the other is expected, even if the lambda text is the same.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: mixing up andThen and compose</p>
+    <p><code>f.andThen(g)</code> reads left to right: f, then g. <code>f.compose(g)</code> runs <code>g</code> <em>first</em> — like maths notation f(g(x)). When in doubt, use <code>andThen</code>; it matches reading order and most people never need <code>compose</code>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a functional interface? Is @FunctionalInterface required?"</p>
+    <ul>
+      <li>An interface with exactly one abstract method; default, static and <code>Object</code>-method declarations do not count.</li>
+      <li>The annotation is optional; it documents intent and makes the compiler reject a second abstract method.</li>
+      <li>Name the core four with their methods: <code>Predicate.test</code>, <code>Function.apply</code>, <code>Consumer.accept</code>, <code>Supplier.get</code>.</li>
+      <li><code>UnaryOperator</code>/<code>BinaryOperator</code> are <code>Function</code>/<code>BiFunction</code> with all types the same.</li>
+      <li>Primitive specializations exist to avoid boxing cost and null-unboxing errors.</li>
+      <li>Older interfaces such as <code>Runnable</code>, <code>Callable</code> and <code>Comparator</code> are functional too, which is why lambdas work with threads and sorting.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,622 @@
+<article class="topic" id="m5-optional">
+  <h3>Optional: avoiding NullPointerException the right way</h3>
+  <p class="tldr">Optional&lt;T&gt; is a small container that holds either one value or nothing; use it as a method's return type to say "there may be no result", so callers must handle the empty case instead of discovering it as a NullPointerException.</p>
+
+  <p>A <code>NullPointerException</code> (NPE) happens when you use <code>null</code> as if it were an object: calling a method on it, reading a field, unboxing a null <code>Integer</code>, taking the length of a null array. The inventor of null references, Tony Hoare, called them his "billion-dollar mistake", and every Java developer has met the stack trace. Nulls come from everyday places: <code>Map.get</code> for a missing key, a database lookup that finds no row, a JSON field that was not sent, a field nobody assigned.</p>
+  <p>The old defence is a staircase of <code>if</code> checks. It works, hides the real logic, and you forget one check:</p>
+  <pre data-title="Null checks by hand"><code class="language-java">record Address(String city) {}
+record User(String name, Address address) {}
+
+static String cityOf(User user) {
+    String city = "UNKNOWN";
+    if (user != null) {
+        Address address = user.address();
+        if (address != null &amp;&amp; address.city() != null) {
+            city = address.city().toUpperCase();
+        }
+    }
+    return city;
+}</code></pre>
+  <p><code>java.util.Optional&lt;T&gt;</code> (Java 8) makes "might be missing" part of the type. A method that returns <code>Optional&lt;User&gt;</code> tells every caller, in the signature, that there may be no user — and the caller cannot reach the <code>User</code> without deciding what to do about the empty case. The JDK designers meant it for <strong>return types</strong>, not as a replacement for every nullable variable. Remember that when you read the rules below.</p>
+
+  <h4>Creating an Optional</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Factory</th><th>Use it when</th><th>If the argument is <code>null</code></th></tr></thead>
+    <tbody>
+      <tr><td><code>Optional.of(value)</code></td><td>You are sure the value exists</td><td>Throws <code>NullPointerException</code> immediately</td></tr>
+      <tr><td><code>Optional.ofNullable(value)</code></td><td>The value may be <code>null</code> (a map lookup, a legacy method)</td><td>Gives an empty Optional</td></tr>
+      <tr><td><code>Optional.empty()</code></td><td>You know there is no value</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Creating and printing"><code class="language-java">System.out.println(Optional.of("Ravi"));
+System.out.println(Optional.empty());
+System.out.println(Optional.ofNullable(null));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Optional[Ravi]
+Optional.empty
+Optional.empty</code></pre>
+
+  <h4>Getting the value out</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>What it does</th><th>When empty</th></tr></thead>
+    <tbody>
+      <tr><td><code>orElse(other)</code></td><td>The value, or <code>other</code></td><td>Returns <code>other</code></td></tr>
+      <tr><td><code>orElseGet(supplier)</code></td><td>The value, or whatever the supplier computes</td><td>Calls the supplier</td></tr>
+      <tr><td><code>orElseThrow(supplier)</code></td><td>The value, or throws the exception you supply</td><td>Throws it</td></tr>
+      <tr><td><code>orElseThrow()</code> (Java 10)</td><td>The value, or <code>NoSuchElementException</code></td><td>Throws</td></tr>
+      <tr><td><code>get()</code></td><td>The value — avoid it</td><td>Throws <code>NoSuchElementException: No value present</code></td></tr>
+      <tr><td><code>ifPresent(consumer)</code></td><td>Runs the consumer if there is a value</td><td>Does nothing</td></tr>
+      <tr><td><code>ifPresentOrElse(consumer, runnable)</code> (Java 9)</td><td>Consumer if present, runnable if empty</td><td>Runs the runnable</td></tr>
+      <tr><td><code>isPresent()</code>, <code>isEmpty()</code> (Java 11)</td><td>Tests for a value</td><td><code>false</code> / <code>true</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>orElse vs orElseGet: eager vs lazy</h4>
+  <p>The argument of <code>orElse</code> is a normal argument, so Java evaluates it <em>before</em> the call, whether or not the Optional has a value. <code>orElseGet</code> takes a lambda and runs it <em>only</em> when needed. Watch it happen:</p>
+  <pre data-title="OrElseDemo.java"><code class="language-java">static String expensiveDefault(String label) {
+    System.out.println("computing default for " + label);
+    return "DEFAULT";
+}
+
+public static void main(String[] args) {
+    Optional&lt;String&gt; present = Optional.of("Ravi");
+    Optional&lt;String&gt; empty = Optional.empty();
+
+    System.out.println(present.orElse(expensiveDefault("orElse, present")));
+    System.out.println(present.orElseGet(() -&gt; expensiveDefault("orElseGet, present")));
+    System.out.println(empty.orElseGet(() -&gt; expensiveDefault("orElseGet, empty")));
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">computing default for orElse, present
+Ravi
+Ravi
+computing default for orElseGet, empty
+DEFAULT</code></pre>
+  <p>Even though the Optional held "Ravi", <code>orElse</code> still computed the default. For a constant (<code>orElse("guest")</code>) that costs nothing. When the default is a method call, an object creation, a database query or a log line, use <code>orElseGet</code> — or you pay for it on every call, and any side effect happens every time.</p>
+
+  <h4>Transforming: map, flatMap and filter</h4>
+  <p>This is where Optional replaces the staircase. <code>map</code> applies a function to the value if there is one and wraps the result; on an empty Optional it does nothing and stays empty. <code>filter</code> turns a value into "empty" if it fails a test.</p>
+  <pre data-title="The null-check staircase as a chain"><code class="language-java">static String cityOf(User user) {
+    return Optional.ofNullable(user)
+            .map(User::address)          // null address  -&gt; empty
+            .map(Address::city)          // null city     -&gt; empty
+            .map(String::toUpperCase)
+            .orElse("UNKNOWN");
+}
+
+System.out.println(cityOf(new User("Asha", new Address("pune"))));
+System.out.println(cityOf(new User("Ravi", null)));
+System.out.println(cityOf(null));
+
+Optional&lt;String&gt; name = Optional.of("  Ravi ");
+System.out.println(name.map(String::trim).filter(s -&gt; s.length() &gt; 3));
+System.out.println(name.map(String::trim).filter(s -&gt; s.length() &gt; 4));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">PUNE
+UNKNOWN
+UNKNOWN
+Optional[Ravi]
+Optional.empty</code></pre>
+  <p>If the function you give to <code>map</code> returns <code>null</code>, the result is simply an empty Optional — that is why the chain above is null-safe at every step.</p>
+  <p><code>flatMap</code> is for a function that <em>already returns an Optional</em>. <code>map</code> would wrap it a second time and give you an <code>Optional&lt;Optional&lt;T&gt;&gt;</code>:</p>
+  <pre data-title="map vs flatMap"><code class="language-java">Function&lt;String, Optional&lt;Integer&gt;&gt; parse = s -&gt; {
+    try {
+        return Optional.of(Integer.parseInt(s));
+    } catch (NumberFormatException e) {
+        return Optional.empty();
+    }
+};
+System.out.println(Optional.of("42").map(parse));
+System.out.println(Optional.of("42").flatMap(parse));
+System.out.println(Optional.of("x").flatMap(parse));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Optional[Optional[42]]
+Optional[42]
+Optional.empty</code></pre>
+
+  <h4>More methods: or, stream, ifPresentOrElse and primitive Optionals</h4>
+  <pre data-title="Java 9 additions"><code class="language-java">// or: a fallback that is itself an Optional (lazy)
+Optional&lt;String&gt; fromCache = Optional.empty();
+System.out.println(fromCache.or(() -&gt; Optional.of("loaded from database")));
+
+// ifPresentOrElse: do one thing or the other
+Optional.of("Ravi").ifPresentOrElse(
+        n -&gt; System.out.println("Hello " + n),
+        () -&gt; System.out.println("Hello guest"));
+
+// stream(): 0 or 1 element, perfect for flattening a list of Optionals
+List&lt;Integer&gt; present = Stream.of(Optional.of(1), Optional.&lt;Integer&gt;empty(), Optional.of(3))
+        .flatMap(Optional::stream)
+        .toList();
+System.out.println(present);
+
+// OptionalInt, OptionalLong, OptionalDouble come from primitive streams
+OptionalInt biggest = IntStream.of(3, 9, 4).max();
+System.out.println(biggest + " " + biggest.getAsInt() + " " + IntStream.empty().max().orElse(-1));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Optional[loaded from database]
+Hello Ravi
+[1, 3]
+OptionalInt[9] 9 -1</code></pre>
+
+  <h4>Optional in Spring Data JPA</h4>
+  <p>You meet <code>Optional</code> constantly in Spring: <code>CrudRepository.findById(id)</code> returns <code>Optional&lt;T&gt;</code>, and so can any derived query that returns at most one row. List queries return an empty list, never <code>null</code>. More about repositories in <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>.</p>
+  <pre data-title="UserService.java (fragment)"><code class="language-java">public interface UserRepository extends JpaRepository&lt;User, Long&gt; {
+    Optional&lt;User&gt; findByEmail(String email);     // at most one row
+    boolean existsByEmail(String email);           // cheaper than findByEmail(...).isPresent()
+}
+
+@Service
+public class UserService {
+    private final UserRepository users;
+
+    public UserService(UserRepository users) {
+        this.users = users;
+    }
+
+    public User getById(Long id) {
+        return users.findById(id)
+                .orElseThrow(() -&gt; new UserNotFoundException(id));   // becomes a 404 in the API
+    }
+
+    public String displayName(String email) {
+        return users.findByEmail(email).map(User::getName).orElse("guest");
+    }
+}</code></pre>
+  <p>The pattern is always the same: ask the repository, then decide at once what "not found" means — a default value (<code>orElse</code>), an exception (<code>orElseThrow</code>), or "do nothing" (<code>ifPresent</code>).</p>
+
+  <h4>Using Optional correctly: the rules</h4>
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li><strong>Use <code>Optional</code> as a return type</strong> when "no result" is a normal outcome (a search, a lookup).</li>
+      <li><strong>Do not use it for fields.</strong> It is not <code>Serializable</code>, adds an extra object per field, and JPA and JSON libraries expect plain fields. Keep the field nullable and return <code>Optional</code> from the getter if you like.</li>
+      <li><strong>Do not use it for method parameters.</strong> Callers must wrap values for no benefit. Use an overloaded method, or accept a nullable parameter and document it.</li>
+      <li><strong>Do not use it for collections.</strong> Return an empty list, set or map instead of <code>Optional&lt;List&lt;T&gt;&gt;</code>.</li>
+      <li><strong>Never return <code>null</code> from a method whose return type is <code>Optional</code>.</strong> Return <code>Optional.empty()</code>.</li>
+      <li><strong>Never call <code>get()</code> without checking.</strong> Prefer <code>orElseThrow()</code>, which says clearly that you expect a value.</li>
+      <li><strong>Do not use <code>Optional.of(x)</code> when <code>x</code> can be <code>null</code>.</strong> Use <code>ofNullable</code>.</li>
+    </ul>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: isPresent() then get()</p><pre><code class="language-java">Optional&lt;User&gt; user = repo.findByEmail(email);
+if (user.isPresent()) {
+    return user.get().getName();
+} else {
+    return "guest";
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: one chain</p><pre><code class="language-java">return repo.findByEmail(email)
+        .map(User::getName)
+        .orElse("guest");</code></pre></div>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: Optional as field and parameter</p><pre><code class="language-java">class Order {
+    private Optional&lt;String&gt; coupon;
+    void apply(Optional&lt;String&gt; code) { ... }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: nullable field, Optional getter</p><pre><code class="language-java">class Order {
+    private String coupon;           // may be null
+    Optional&lt;String&gt; getCoupon() {
+        return Optional.ofNullable(coupon);
+    }
+}</code></pre></div>
+  </div>
+
+  <h4>Other ways to avoid NullPointerException</h4>
+  <p>Optional is one tool. Often a simpler habit removes the null altogether:</p>
+  <ul>
+    <li><strong>Return empty collections</strong> (<code>List.of()</code>, <code>Collections.emptyList()</code>) and empty strings where it makes sense, not <code>null</code>.</li>
+    <li><strong>Fail fast</strong> on bad input: <code>Objects.requireNonNull(name, "name must not be null")</code> throws an NPE with a clear message at the point of the mistake, not three calls later.</li>
+    <li><strong>Defaults:</strong> <code>Objects.requireNonNullElse(value, "default")</code> and <code>requireNonNullElseGet</code> (Java 9), <code>map.getOrDefault(key, 0)</code>.</li>
+    <li><strong>Compare safely:</strong> <code>"PAID".equals(status)</code> or <code>Objects.equals(a, b)</code> instead of <code>status.equals("PAID")</code>.</li>
+    <li><strong>Beware of unboxing:</strong> <code>int x = map.get("k");</code> throws an NPE if the key is missing, because it unboxes <code>null</code>.</li>
+    <li><strong>Nullability annotations</strong> (<code>@Nullable</code>, <code>@NonNull</code>) let your IDE and static-analysis tools find nulls before runtime.</li>
+  </ul>
+  <div class="co co-version">
+    <p class="co-t">Version note: helpful NullPointerException messages (Java 14; on by default since Java 15)</p>
+    <p>Modern Java tells you <em>which</em> expression was null. Instead of a bare <code>NullPointerException</code> on a long chain, you get a message like the one below. Read it first when you debug an NPE.</p>
+    <pre class="out" data-title="Exception message"><code class="language-plaintext">java.lang.NullPointerException: Cannot invoke "Address.city()" because the return value of "User.address()" is null</code></pre>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>Optional.of(null)</code> throws <code>NullPointerException</code>; <code>get()</code> and <code>orElseThrow()</code> on an empty Optional throw <code>NoSuchElementException: No value present</code>.</li>
+      <li><code>flatMap</code> with a function that returns <code>null</code> (instead of an Optional) throws <code>NullPointerException</code>.</li>
+      <li><code>Optional</code> is a <em>value-based</em> class: compare with <code>equals</code>, never <code>==</code>, and never synchronize on one. Two Optionals are equal when both are empty or both hold equal values.</li>
+      <li>A <code>stream.findFirst()</code> on a stream whose first element is <code>null</code> throws an NPE, because an Optional cannot hold null.</li>
+      <li><code>orElse(null)</code> is legal and sometimes needed at the boundary with old code that expects <code>null</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: wrapping a value only to unwrap it</p>
+    <p><code>Optional.ofNullable(name).orElse("guest")</code> for a single null check just creates an object for nothing. For one variable, <code>Objects.requireNonNullElse(name, "guest")</code> or a plain <code>name != null ? name : "guest"</code> is clearer. Use <code>Optional</code> when you chain <code>map</code>/<code>filter</code>, or when you return it.</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Name Optional-returning methods so the absence is obvious: <code>findByEmail</code>, <code>lookup</code>. Methods named <code>get...</code> usually promise a value.</li>
+      <li>Prefer <code>map</code>/<code>orElse</code>/<code>orElseThrow</code> chains over <code>isPresent()</code> plus <code>get()</code>.</li>
+      <li>Throw a specific, meaningful exception from <code>orElseThrow</code> (<code>UserNotFoundException</code>), not a generic <code>RuntimeException</code>.</li>
+      <li>For existence checks use <code>existsById</code> or <code>existsByEmail</code>; do not load the whole entity.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is Optional? Why not use it for fields? orElse vs orElseGet? map vs flatMap?"</p>
+    <ul>
+      <li>A container for zero or one value, meant mainly for <strong>return types</strong>, so absence is visible in the signature and callers must handle it.</li>
+      <li>Not for fields, parameters or collections: not <code>Serializable</code>, extra allocation, awkward for callers; return empty collections instead.</li>
+      <li><code>orElse(x)</code> evaluates <code>x</code> always; <code>orElseGet(supplier)</code> only when empty — use the lazy form for anything costly.</li>
+      <li><code>map</code> wraps the result of a normal function; <code>flatMap</code> is for a function that already returns an Optional, avoiding <code>Optional&lt;Optional&lt;T&gt;&gt;</code>.</li>
+      <li>Never call <code>get()</code> blindly; use <code>orElseThrow()</code>.</li>
+      <li>Spring Data: <code>findById</code> returns an Optional; typical code is <code>.orElseThrow(() -&gt; new NotFoundException(...))</code>.</li>
+      <li>Other NPE defences: <code>Objects.requireNonNull</code>, empty collections, <code>"literal".equals(x)</code>, helpful NPE messages (Java 14+).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-datetime-types">
+  <h3>Date and time API: LocalDate, LocalDateTime, Instant, Duration and Period</h3>
+  <p class="tldr">The java.time package (Java 8) replaces Date and Calendar with immutable, thread-safe types for exactly what you need — a date, a time, both, or a moment on the timeline — and every "change" returns a new object.</p>
+
+  <h4>Why Date and Calendar had to go</h4>
+  <ul>
+    <li><strong><code>java.util.Date</code> is mutable</strong> (<code>setTime</code>), so a shared <code>Date</code> can change under your feet. It is really a <em>moment</em>, but it prints in the JVM's default time zone, which confuses everyone. Its old constructors count years from 1900 and months from 0.</li>
+    <li><strong><code>Calendar</code> is verbose and mutable</strong>, and its months start at 0 (<code>Calendar.OCTOBER</code> is 9), a classic off-by-one bug source.</li>
+    <li><strong><code>SimpleDateFormat</code> is not thread-safe.</strong> Share one instance in a web server and you get corrupted dates under load, with no exception.</li>
+    <li><strong>No type for "just a date".</strong> People used <code>Date</code> with the time set to midnight, and time zones moved birthdays by a day.</li>
+  </ul>
+  <p>The <code>java.time</code> package (JSR-310, inspired by the Joda-Time library) fixes all of this: immutable and therefore thread-safe, one type per idea, months numbered 1–12, a fluent API, and ISO-8601 text formats by default.</p>
+
+  <h4>The types and when to use each</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>Holds</th><th>Example <code>toString()</code></th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td><code>LocalDate</code></td><td>A date, no time, no zone</td><td><code>2026-10-21</code></td><td>Birthdays, due dates, holidays</td></tr>
+      <tr><td><code>LocalTime</code></td><td>A time of day</td><td><code>18:30</code></td><td>Opening hours, alarms</td></tr>
+      <tr><td><code>LocalDateTime</code></td><td>Date and time, no zone</td><td><code>2026-10-21T18:30</code></td><td>A wall-clock reading. <em>Not</em> a moment in time</td></tr>
+      <tr><td><code>ZonedDateTime</code></td><td>Date, time and a region zone (with daylight-saving rules)</td><td><code>2026-10-21T18:30+05:30[Asia/Kolkata]</code></td><td>Showing or scheduling in a user's zone</td></tr>
+      <tr><td><code>OffsetDateTime</code></td><td>Date, time and a fixed offset from UTC</td><td><code>2026-10-21T18:30+05:30</code></td><td>Exchanging timestamps with databases and APIs</td></tr>
+      <tr><td><code>Instant</code></td><td>One point on the UTC timeline</td><td><code>2026-10-21T13:00:00Z</code></td><td>Timestamps: created at, logged at, paid at</td></tr>
+      <tr><td><code>Duration</code></td><td>An amount of time (hours, minutes, seconds)</td><td><code>PT8H30M</code></td><td>Timeouts, elapsed time</td></tr>
+      <tr><td><code>Period</code></td><td>An amount of calendar time (years, months, days)</td><td><code>P26Y9M6D</code></td><td>Age, "30-day trial"</td></tr>
+    </tbody>
+  </table></div>
+  <p>The next article covers zones, formatting and storage. This one covers the basic types and their arithmetic.</p>
+
+  <h4>Creating, reading and comparing</h4>
+  <p>Three ways to make one: <code>now()</code> (reads the system clock), <code>of(...)</code> (explicit values) and <code>parse(...)</code> (ISO text). The examples use fixed dates so the output never changes.</p>
+  <pre data-title="DateBasics.java"><code class="language-java">LocalDate d = LocalDate.of(2026, 10, 21);          // or LocalDate.of(2026, Month.OCTOBER, 21)
+LocalDate same = LocalDate.parse("2026-10-21");
+LocalDateTime meeting = LocalDateTime.of(2026, 10, 21, 18, 30);
+LocalTime opens = LocalTime.of(9, 5);
+
+System.out.println(d + " " + d.getDayOfWeek() + " " + d.getMonth());
+System.out.println(d.getDayOfYear() + " " + d.lengthOfMonth() + " " + d.isLeapYear());
+System.out.println(meeting + " " + opens + " " + opens.plusMinutes(70));
+System.out.println(d.equals(same) + " " + d.isBefore(d.plusDays(10)) + " " + d.isAfter(d.plusDays(10)));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">2026-10-21 WEDNESDAY OCTOBER
+294 31 false
+2026-10-21T18:30 09:05 10:15
+true true false</code></pre>
+  <p><code>toString()</code> leaves out zero seconds, so <code>18:30</code> means 18:30:00. Use <code>isBefore</code>, <code>isAfter</code> and <code>isEqual</code> to compare, since <code>&lt;</code> does not work on objects.</p>
+
+  <h4>Arithmetic and immutability</h4>
+  <p>Every <code>plus...</code>, <code>minus...</code> and <code>with...</code> method <strong>returns a new object</strong>. The original never changes.</p>
+  <pre data-title="Immutable arithmetic"><code class="language-java">LocalDate d = LocalDate.of(2026, 10, 21);
+LocalDate later = d.plusDays(10);
+System.out.println(d + " " + later);
+
+System.out.println(d.withDayOfMonth(1));
+System.out.println(d.plus(2, ChronoUnit.WEEKS) + " " + d.minusYears(1));
+System.out.println(d.with(TemporalAdjusters.lastDayOfMonth()));
+System.out.println(d.with(TemporalAdjusters.next(DayOfWeek.MONDAY)));
+System.out.println(d.with(TemporalAdjusters.firstDayOfNextMonth()));
+
+System.out.println(LocalDate.of(2026, 1, 31).plusMonths(1));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">2026-10-21 2026-10-31
+2026-10-01
+2026-11-04 2025-10-21
+2026-10-31
+2026-10-26
+2026-11-01
+2026-02-28</code></pre>
+  <p>The last line shows an edge case: there is no 31 February, so adding a month to 31 January gives the last valid day, 28 February — no exception. <code>TemporalAdjusters</code> (in <code>java.time.temporal</code>) covers common questions such as "last day of the month" or "next Monday".</p>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: ignoring the returned object</p>
+    <p>Because the types are immutable, <code>d.plusDays(5);</code> on its own line does nothing — the new date is thrown away. Assign it: <code>d = d.plusDays(5);</code>.</p>
+  </div>
+
+  <h4>How much time between two points?</h4>
+  <p>Three tools, for three kinds of answer:</p>
+  <ul>
+    <li><code>ChronoUnit.DAYS.between(a, b)</code> — one unit, as a plain <code>long</code>. Also <code>MONTHS</code>, <code>YEARS</code>, <code>HOURS</code>, and so on.</li>
+    <li><code>Period.between(dateA, dateB)</code> — years, months and days, for <em>dates</em>.</li>
+    <li><code>Duration.between(timeA, timeB)</code> — hours, minutes, seconds, for <em>times</em>, date-times and instants.</li>
+  </ul>
+  <pre data-title="between"><code class="language-java">LocalDate birth = LocalDate.of(2000, 1, 15);
+LocalDate today = LocalDate.of(2026, 10, 21);
+
+Period age = Period.between(birth, today);
+System.out.println(age + " -&gt; " + age.getYears() + " years, " + age.getMonths() + " months, "
+        + age.getDays() + " days");
+System.out.println(ChronoUnit.DAYS.between(today, LocalDate.of(2026, 12, 25)));
+System.out.println(ChronoUnit.MONTHS.between(birth, today));
+
+Duration shift = Duration.between(LocalTime.of(9, 15), LocalTime.of(17, 45));
+System.out.println(shift + " = " + shift.toMinutes() + " minutes = "
+        + shift.toHoursPart() + "h " + shift.toMinutesPart() + "m");
+System.out.println(Duration.ofMinutes(90) + " " + Duration.ofSeconds(3725) + " "
+        + Duration.ofDays(1) + " " + Period.ofWeeks(2));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">P26Y9M6D -&gt; 26 years, 9 months, 6 days
+65
+321
+PT8H30M = 510 minutes = 8h 30m
+PT1H30M PT1H2M5S PT24H P14D</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>Period</code></th><th><code>Duration</code></th></tr></thead>
+    <tbody>
+      <tr><td>Measures</td><td>Calendar amounts: years, months, days</td><td>Exact time: hours, minutes, seconds, nanoseconds</td></tr>
+      <tr><td>Works with</td><td><code>LocalDate</code> (and the date part of zoned values)</td><td><code>LocalTime</code>, <code>LocalDateTime</code>, <code>Instant</code>, <code>ZonedDateTime</code></td></tr>
+      <tr><td>A "day" is</td><td>A calendar day (23, 24 or 25 hours when clocks change)</td><td>Exactly 24 hours</td></tr>
+      <tr><td>Typical use</td><td>Age, subscription length, "due in 30 days"</td><td>Timeouts, session length, elapsed time</td></tr>
+      <tr><td><code>toString()</code></td><td><code>P1Y2M3D</code></td><td><code>PT1H30M</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Instant and Clock</h4>
+  <p><code>Instant</code> is a single point on the UTC timeline, counted from the Unix epoch (1970-01-01T00:00:00Z) with nanosecond precision. It has no time zone and no calendar, so it has no <code>plusMonths</code> — only exact amounts such as seconds, hours and days of 24 hours. It is the right type for "when did this happen".</p>
+  <pre data-title="Instant and a fixed Clock"><code class="language-java">Instant paidAt = Instant.parse("2026-10-21T13:00:00Z");
+System.out.println(paidAt.plus(Duration.ofHours(36)));
+System.out.println(paidAt.toEpochMilli());          // milliseconds since 1970
+
+// A Clock lets tests control "now"
+Clock fixed = Clock.fixed(paidAt, ZoneId.of("Asia/Kolkata"));
+System.out.println(LocalDate.now(fixed) + " " + LocalDateTime.now(fixed) + " " + Instant.now(fixed));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">2026-10-23T01:00:00Z
+1792587600000
+2026-10-21 2026-10-21T18:30 2026-10-21T13:00:00Z</code></pre>
+  <div class="co co-real">
+    <p class="co-t">In real projects: inject a Clock</p>
+    <p>Code that calls <code>LocalDate.now()</code> or <code>Instant.now()</code> directly is hard to test: the result changes every run. Declare a <code>Clock</code> bean (<code>Clock.systemUTC()</code> in production) and inject it into services; call <code>LocalDate.now(clock)</code>. In unit tests, pass <code>Clock.fixed(...)</code> and check coupon expiry, late fees or "valid for 7 days" rules on exact dates.</p>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>All <code>java.time</code> value types are immutable and thread-safe. Share them freely, including as <code>static final</code> constants.</li>
+      <li>Months are numbered 1–12 and days of the week are an enum (<code>DayOfWeek.MONDAY</code>). There is no zero-based month any more.</li>
+      <li><code>LocalDate</code>, <code>LocalTime</code> and <code>LocalDateTime</code> carry <strong>no time zone</strong>. They are not moments in time and cannot be compared across servers or users.</li>
+      <li><code>now()</code> uses the system clock and the JVM's default time zone. On a cloud server that is often UTC; on your laptop it is IST. Code that depends on the default behaves differently in each place.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>LocalDate.of(2026, 2, 30)</code> throws <code>DateTimeException: Invalid date 'FEBRUARY 30'</code>.</li>
+      <li>Asking a type for something it does not hold throws <code>UnsupportedTemporalTypeException</code>: <code>LocalDate.plus(1, ChronoUnit.HOURS)</code> → <code>Unsupported unit: Hours</code>; <code>Duration.between(dateA, dateB)</code> with two <code>LocalDate</code>s → <code>Unsupported unit: Seconds</code>; <code>Instant.plus(1, ChronoUnit.MONTHS)</code> → <code>Unsupported unit: Months</code>.</li>
+      <li><code>plusMonths</code> clamps to the last valid day of the month (31 January + 1 month = 28 February), and a month added in a leap year gives 29 February where valid.</li>
+      <li><code>Period.between</code> with the later date first gives negative values.</li>
+      <li><code>LocalDateTime.of(...)</code> has no idea of daylight saving: it never "skips" or repeats an hour. Zoned types do.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using LocalDateTime as a timestamp</p>
+    <p><code>LocalDateTime.of(2026, 10, 21, 10, 0)</code> is only "10:00 on the wall clock". Interpreted in Kolkata it is <code>04:30Z</code>; in UTC it is <code>10:00Z</code> — a gap of 5.5 hours. Save "when it happened" as an <code>Instant</code> (or an <code>OffsetDateTime</code>), and use <code>LocalDateTime</code> only for local readings such as "the shop opens at 10:00".</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Why java.time? LocalDate vs LocalDateTime vs ZonedDateTime vs Instant? Period vs Duration?"</p>
+    <ul>
+      <li>Old API: mutable, zero-based months, no date-only type, thread-unsafe <code>SimpleDateFormat</code>. New API: immutable, thread-safe, clear types, fluent.</li>
+      <li><code>LocalDate</code> date only; <code>LocalDateTime</code> date and time without a zone (not a moment); <code>ZonedDateTime</code> adds a region zone and daylight-saving rules; <code>Instant</code> is a UTC timeline point.</li>
+      <li><code>Period</code> is calendar-based (years, months, days); <code>Duration</code> is time-based (seconds and nanoseconds).</li>
+      <li><code>plusDays</code> returns a new object — immutability.</li>
+      <li>Testing: inject a <code>Clock</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-datetime-zones-format">
+  <h3>Time zones, formatting, parsing and legacy Date conversion</h3>
+  <p class="tldr">Keep moments as Instant (UTC) in your code and database, convert to a ZoneId only to show a time to a person, format and parse with the thread-safe DateTimeFormatter, and convert legacy Date objects through Instant.</p>
+
+  <h4>Zones and offsets</h4>
+  <p>A <strong>ZoneId</strong> is a region such as <code>Asia/Kolkata</code> or <code>America/New_York</code>. It carries the history and daylight-saving rules of that region. A <strong>ZoneOffset</strong> is only a fixed distance from UTC, such as <code>+05:30</code>. India has one zone, <code>Asia/Kolkata</code> (IST, UTC+05:30, no daylight saving).</p>
+  <pre data-title="Zone conversions"><code class="language-java">ZoneId kolkata = ZoneId.of("Asia/Kolkata");
+ZonedDateTime ist = ZonedDateTime.of(2026, 10, 21, 18, 30, 0, 0, kolkata);
+
+System.out.println(ist);
+System.out.println(ist.withZoneSameInstant(ZoneOffset.UTC));
+System.out.println(ist.withZoneSameInstant(ZoneId.of("America/New_York")));
+System.out.println(ist.withZoneSameLocal(ZoneId.of("America/New_York")));
+System.out.println(ist.toInstant());
+System.out.println(ist.toOffsetDateTime());</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">2026-10-21T18:30+05:30[Asia/Kolkata]
+2026-10-21T13:00Z
+2026-10-21T09:00-04:00[America/New_York]
+2026-10-21T18:30-04:00[America/New_York]
+2026-10-21T13:00:00Z
+2026-10-21T18:30+05:30</code></pre>
+  <p>Look at the third and fourth lines. <code>withZoneSameInstant</code> keeps the <em>moment</em> and changes the clock reading (18:30 in Kolkata is 09:00 in New York). <code>withZoneSameLocal</code> keeps the <em>clock reading</em> and therefore changes the moment — a different moment, 9.5 hours later. You almost always want <code>withZoneSameInstant</code>.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  I["Instant (UTC moment)"] -->|atZone| Z["ZonedDateTime"]
+  Z -->|toInstant| I
+  Z -->|toLocalDateTime| L["LocalDateTime"]
+  L -->|atZone| Z
+  Z -->|toOffsetDateTime| O["OffsetDateTime"]
+  O -->|toInstant| I
+</pre>
+    <figcaption>Moving between the main date-time types</figcaption>
+  </figure>
+
+  <h4>Daylight saving: gaps and overlaps</h4>
+  <p>When clocks jump forward, some local times never exist (a <em>gap</em>). When they fall back, some happen twice (an <em>overlap</em>). <code>ZonedDateTime</code> handles both, and <code>LocalDateTime</code> cannot.</p>
+  <pre data-title="America/New_York in 2026"><code class="language-java">ZoneId ny = ZoneId.of("America/New_York");
+
+// 8 March 2026: clocks jump from 02:00 to 03:00, so 02:30 does not exist
+System.out.println(ZonedDateTime.of(2026, 3, 8, 2, 30, 0, 0, ny));
+
+// 1 November 2026: 01:30 happens twice; the earlier one is the default
+ZonedDateTime overlap = ZonedDateTime.of(2026, 11, 1, 1, 30, 0, 0, ny);
+System.out.println(overlap + " | " + overlap.withLaterOffsetAtOverlap());
+
+// "One day later" vs "24 hours later" across the 8 March change
+ZonedDateTime before = ZonedDateTime.of(2026, 3, 7, 12, 0, 0, 0, ny);
+System.out.println(before.plus(Period.ofDays(1)) + " | " + before.plus(Duration.ofHours(24)));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">2026-03-08T03:30-04:00[America/New_York]
+2026-11-01T01:30-04:00[America/New_York] | 2026-11-01T01:30-05:00[America/New_York]
+2026-03-08T12:00-04:00[America/New_York] | 2026-03-08T13:00-04:00[America/New_York]</code></pre>
+  <p>The gap time moved forward to 03:30. <code>Period.ofDays(1)</code> keeps the same clock time (12:00 the next day), while <code>Duration.ofHours(24)</code> adds exact time (13:00, because that day had only 23 hours). Choose the one that matches the business rule: "same time tomorrow" or "24 hours from now".</p>
+
+  <h4>Formatting and parsing with DateTimeFormatter</h4>
+  <p><code>DateTimeFormatter</code> is immutable and thread-safe, so create it once, as a <code>static final</code> constant — the opposite of <code>SimpleDateFormat</code>. <code>format</code> turns a date-time into text; <code>parse</code> turns text into a date-time. The ready-made ISO constants (<code>ISO_LOCAL_DATE</code>, <code>ISO_OFFSET_DATE_TIME</code>, ...) match each type's default <code>toString()</code>, and the pattern letters give you everything else:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pattern</th><th>Meaning</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>yyyy</code> or <code>uuuu</code></td><td>Year (<code>uuuu</code> is safer in strict mode)</td><td>2026</td></tr>
+      <tr><td><code>MM</code>, <code>MMM</code>, <code>MMMM</code></td><td>Month: number, short name, full name</td><td>10, Oct, October</td></tr>
+      <tr><td><code>dd</code>, <code>d</code></td><td>Day of month, with or without a leading zero</td><td>05, 5</td></tr>
+      <tr><td><code>EEE</code>, <code>EEEE</code></td><td>Day of the week, short or full</td><td>Wed, Wednesday</td></tr>
+      <tr><td><code>HH</code>, <code>hh</code> with <code>a</code></td><td>Hour 0–23, or hour 1–12 with AM/PM</td><td>18, 06 PM</td></tr>
+      <tr><td><code>mm</code>, <code>ss</code>, <code>SSS</code></td><td>Minutes, seconds, milliseconds</td><td>30, 05, 000</td></tr>
+      <tr><td><code>XXX</code></td><td>Offset from UTC (<code>Z</code> for zero)</td><td>+05:30</td></tr>
+      <tr><td><code>z</code>, <code>VV</code></td><td>Zone name, zone id</td><td>IST, Asia/Kolkata</td></tr>
+      <tr><td><code>'T'</code></td><td>Literal text inside single quotes</td><td>T</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Formatting"><code class="language-java">LocalDateTime dt = LocalDateTime.of(2026, 10, 21, 18, 30, 5);
+ZonedDateTime zdt = dt.atZone(ZoneId.of("Asia/Kolkata"));
+
+System.out.println(dt.format(DateTimeFormatter.ofPattern("dd MMM yyyy", Locale.ENGLISH)));
+System.out.println(dt.format(DateTimeFormatter.ofPattern("EEEE, d MMMM uuuu", Locale.ENGLISH)));
+System.out.println(dt.format(DateTimeFormatter.ofPattern("dd-MM-yyyy hh:mm a", Locale.ENGLISH)));
+System.out.println(dt.format(DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss")));
+System.out.println(zdt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssXXX")));
+System.out.println(zdt.format(DateTimeFormatter.ofPattern("HH:mm z VV", Locale.ENGLISH)));
+System.out.println(zdt.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">21 Oct 2026
+Wednesday, 21 October 2026
+21-10-2026 06:30 PM
+21/10/2026 18:30:05
+2026-10-21T18:30:05+05:30
+18:30 IST Asia/Kolkata
+2026-10-21T18:30:05+05:30</code></pre>
+  <p>Always pass a <code>Locale</code> when the pattern prints words (month or day names, AM/PM). Without one, Java uses the JVM's default locale, and the same code prints different text on different machines.</p>
+  <pre data-title="Parsing and its errors"><code class="language-java">DateTimeFormatter dmy = DateTimeFormatter.ofPattern("dd/MM/yyyy");
+System.out.println(LocalDate.parse("21/10/2026", dmy));
+System.out.println(LocalDateTime.parse("2026-10-21T18:30"));     // ISO needs no formatter
+
+LocalDate.parse("2026-13-45");
+LocalDate.parse("21-10-2026");
+LocalDate.parse("21-10-2026", dmy);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">2026-10-21
+2026-10-21T18:30
+Exception in thread "main" java.time.format.DateTimeParseException:
+    Text '2026-13-45' could not be parsed: Invalid value for MonthOfYear (valid values 1 - 12): 13
+    Text '21-10-2026' could not be parsed at index 0
+    Text '21-10-2026' could not be parsed at index 2</code></pre>
+  <p>Each of the last three lines is a separate exception (shown together to save space). The index tells you where parsing stopped. For user input, catch <code>DateTimeParseException</code> and return a clear error, for example an HTTP 400 with "date must be dd/MM/yyyy".</p>
+  <div class="co co-exc">
+    <p class="co-t">Edge case: lenient (SMART) parsing silently repairs impossible dates</p>
+    <p>By default a formatter uses the <code>SMART</code> resolver. <code>LocalDate.parse("31/04/2026", dmy)</code> does <em>not</em> fail — April has 30 days, so you get <code>2026-04-30</code>. For input validation, switch to strict mode, which needs <code>uuuu</code> for the year:</p>
+    <pre data-title="Strict parsing"><code class="language-java">DateTimeFormatter strict = DateTimeFormatter.ofPattern("dd/MM/uuuu")
+        .withResolverStyle(ResolverStyle.STRICT);
+System.out.println(LocalDate.parse("30/04/2026", strict));
+LocalDate.parse("31/04/2026", strict);</code></pre>
+    <pre class="out" data-title="Output"><code class="language-plaintext">2026-04-30
+Exception in thread "main" java.time.format.DateTimeParseException:
+    Text '31/04/2026' could not be parsed: Invalid date 'APRIL 31'</code></pre>
+    <p>With <code>yyyy</code> instead of <code>uuuu</code>, strict mode fails even for valid dates, because year-of-era needs an era. Use <code>uuuu</code> with <code>STRICT</code>.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes in patterns: YYYY, mm and shared formatters</p>
+    <ul>
+      <li><strong><code>YYYY</code> is the week-based year, not the calendar year.</strong> <code>LocalDate.of(2025, 12, 29)</code> formatted with <code>YYYY-MM-dd</code> and <code>Locale.US</code> gives <code>2026-12-29</code>, because that week belongs to 2026. It looks fine for 360 days a year and fails around New Year. Use <code>yyyy</code> (or <code>uuuu</code>).</li>
+      <li><strong><code>mm</code> is minutes, <code>MM</code> is months.</strong> <code>dd/mm/yyyy</code> on a <code>LocalDateTime</code> prints the minutes where the month should be, without any error.</li>
+      <li><strong>Using <code>SimpleDateFormat</code> as a shared static field.</strong> It is not thread-safe. Replace it with a <code>static final DateTimeFormatter</code>.</li>
+    </ul>
+  </div>
+
+  <h4>Storing and exchanging timestamps: use UTC</h4>
+  <p>The rule used by most backend teams: <strong>store and pass around moments in UTC (<code>Instant</code>), and convert to a user's zone only at the edge, when you display them.</strong> UTC has no daylight saving, so every value is unambiguous, sorting and comparing just work, and moving the server to another region cannot change your data. Bugs of the "works on my laptop" kind usually come from code that relies on the default zone: the laptop runs in IST, the cloud server in UTC. Set the zone explicitly (<code>-Duser.timezone=UTC</code> for the JVM, and with Hibernate <code>spring.jpa.properties.hibernate.jdbc.time_zone=UTC</code>) and never call a method that silently uses the default.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>You need to store</th><th>Java type</th><th>PostgreSQL</th><th>MySQL</th></tr></thead>
+    <tbody>
+      <tr><td>A date: birthday, holiday, due date</td><td><code>LocalDate</code></td><td><code>date</code></td><td><code>DATE</code></td></tr>
+      <tr><td>A time of day: opening time</td><td><code>LocalTime</code></td><td><code>time</code></td><td><code>TIME</code></td></tr>
+      <tr><td>A moment that happened: created at, paid at</td><td><code>Instant</code> (or <code>OffsetDateTime</code> in UTC)</td><td><code>timestamptz</code> (timestamp with time zone)</td><td><code>TIMESTAMP</code>, or <code>DATETIME</code> holding UTC</td></tr>
+      <tr><td>A future appointment in a user's zone</td><td><code>LocalDateTime</code> plus a zone id column (or <code>ZonedDateTime</code>)</td><td><code>timestamp</code> plus a text column for the zone</td><td><code>DATETIME</code> plus a text column for the zone</td></tr>
+      <tr><td>Showing a time to a user</td><td>Convert <code>Instant</code> to <code>ZonedDateTime</code> in their zone, then format</td><td>—</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+  <p>Why the zone id for future appointments? Governments change daylight-saving rules. "10:00 on 5 November in Kolkata" must stay 10:00 local, so you keep the local time and the zone, and compute the instant when you need it. A moment that has already happened never changes, so UTC is enough.</p>
+  <div class="co co-note">
+    <p class="co-t">Database details</p>
+    <ul>
+      <li>PostgreSQL <code>timestamptz</code> stores UTC internally and shows values in the session's time zone. Plain <code>timestamp</code> stores no zone information at all.</li>
+      <li>MySQL <code>TIMESTAMP</code> is stored as UTC and converted using the session time zone, with a range that ends in 2038. <code>DATETIME</code> stores exactly what you give it, with no conversion and no zone.</li>
+      <li>With Spring Data JPA and a current Hibernate, entity fields of type <code>LocalDate</code>, <code>LocalDateTime</code>, <code>Instant</code>, <code>OffsetDateTime</code> and <code>ZonedDateTime</code> all work. Prefer <code>Instant</code> for audit columns such as <code>createdAt</code>.</li>
+      <li>Spring MVC parses <code>LocalDate</code> request parameters in ISO format by default; use <code>@DateTimeFormat(pattern = "dd-MM-yyyy")</code> on the parameter for another format.</li>
+    </ul>
+  </div>
+
+  <h4>Converting legacy Date, Calendar and java.sql types</h4>
+  <p>Old libraries and JDBC drivers still hand you <code>java.util.Date</code>, <code>Calendar</code> and <code>java.sql</code> types. Convert at the boundary, go through <code>Instant</code>, and keep <code>java.time</code> inside your code.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>From</th><th>To</th><th>Code</th></tr></thead>
+    <tbody>
+      <tr><td><code>java.util.Date</code></td><td><code>Instant</code></td><td><code>date.toInstant()</code></td></tr>
+      <tr><td><code>Instant</code></td><td><code>java.util.Date</code></td><td><code>Date.from(instant)</code></td></tr>
+      <tr><td><code>Date</code></td><td><code>LocalDateTime</code></td><td><code>date.toInstant().atZone(zone).toLocalDateTime()</code></td></tr>
+      <tr><td><code>java.sql.Date</code></td><td><code>LocalDate</code></td><td><code>sqlDate.toLocalDate()</code> and <code>java.sql.Date.valueOf(localDate)</code></td></tr>
+      <tr><td><code>java.sql.Timestamp</code></td><td><code>LocalDateTime</code></td><td><code>ts.toLocalDateTime()</code> and <code>Timestamp.valueOf(localDateTime)</code></td></tr>
+      <tr><td><code>Calendar</code></td><td><code>Instant</code></td><td><code>calendar.toInstant()</code></td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Legacy conversions"><code class="language-java">java.util.Date legacy = new java.util.Date(0L);
+Instant instant = legacy.toInstant();
+System.out.println(instant);
+System.out.println(Instant.ofEpochMilli(legacy.getTime())
+        .atZone(ZoneId.of("Asia/Kolkata")).toLocalDateTime());
+
+java.sql.Date sqlDate = java.sql.Date.valueOf(LocalDate.of(2026, 10, 21));
+java.sql.Timestamp ts = java.sql.Timestamp.valueOf(LocalDateTime.of(2026, 10, 21, 18, 30));
+System.out.println(sqlDate.toLocalDate() + " " + ts.toLocalDateTime());</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">1970-01-01T00:00:00Z
+1970-01-01T05:30
+2026-10-21 2026-10-21T18:30</code></pre>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>A zone is needed to turn an <code>Instant</code> into a date.</strong> <code>new GregorianCalendar(2026, 9, 21)</code> is midnight in the JVM's zone. On a machine in India, <code>calendar.toInstant().atZone(ZoneId.of("UTC")).toLocalDate()</code> gives <code>2026-10-20</code>, because midnight in Kolkata is 18:30 UTC the day before. Use the zone the value was created in, usually <code>ZoneId.systemDefault()</code>.</li>
+      <li>Do not use three-letter zone ids. <code>ZoneId.of("IST")</code> throws <code>ZoneRulesException: Unknown time-zone ID: IST</code> (IST could mean India, Israel or Ireland). Use region ids: <code>Asia/Kolkata</code>.</li>
+      <li><code>Instant</code>, <code>OffsetDateTime</code> and <code>ZonedDateTime</code> that denote the same moment are not all <code>equals</code>: two <code>ZonedDateTime</code> values with different zones are unequal even if they are the same instant. Compare with <code>toInstant().equals(...)</code>, or <code>isEqual</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Store moments as <code>Instant</code> / <code>timestamptz</code> in UTC; convert to a <code>ZoneId</code> only for display.</li>
+      <li>Exchange text in ISO-8601 (<code>2026-10-21T13:00:00Z</code>); let the front end format it for the user's locale.</li>
+      <li>Always give formatters an explicit <code>Locale</code> and keep them as <code>static final</code> constants.</li>
+      <li>Use region ids (<code>Asia/Kolkata</code>), never abbreviations (<code>IST</code>).</li>
+      <li>Do not use <code>Date</code>, <code>Calendar</code> or <code>SimpleDateFormat</code> in new code.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you handle time zones in a backend? What do you store in the database?"</p>
+    <ul>
+      <li>Store UTC (<code>Instant</code>, <code>timestamptz</code>); convert to the user's <code>ZoneId</code> at the edge; use ISO-8601 in APIs.</li>
+      <li><code>ZoneId</code> (region with rules) vs <code>ZoneOffset</code> (fixed). <code>withZoneSameInstant</code> vs <code>withZoneSameLocal</code>.</li>
+      <li>Never depend on the server's default zone; set it explicitly and inject a <code>Clock</code>.</li>
+      <li>Parsing: <code>DateTimeParseException</code>; strict resolver for validation. Formatting: <code>yyyy</code> not <code>YYYY</code>; <code>MM</code> vs <code>mm</code>.</li>
+      <li><code>DateTimeFormatter</code> is thread-safe; <code>SimpleDateFormat</code> is not.</li>
+      <li>Legacy: <code>Date.toInstant()</code> and <code>Date.from(instant)</code>.</li>
+    </ul>
+  </div>
+</article>

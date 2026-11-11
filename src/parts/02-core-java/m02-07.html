@@ -1,0 +1,590 @@
+<article class="topic" id="m2-object-class">
+  <h3>The Object class: toString, getClass and friends</h3>
+  <p class="tldr">Every class in Java extends <code>java.lang.Object</code>, so every object has <code>toString</code>, <code>equals</code>, <code>hashCode</code>, <code>getClass</code> and a few more methods; override <code>toString</code> in almost every class so that printing and logging show useful data.</p>
+
+  <p>If you write <code>class Account { }</code> and do not extend anything, the compiler silently adds <code>extends Object</code>. This is the root of the class tree (<a href="#m2-inheritance">inheritance</a>), and it is why a variable of type <code>Object</code> can hold anything, and why <code>List&lt;Object&gt;</code> accepts any element. The methods of <code>Object</code> are the minimum that all objects can do.</p>
+
+  <h4>The methods of Object</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Purpose</th><th>Override?</th></tr></thead>
+    <tbody>
+      <tr><td><code>String toString()</code></td><td>Text form of the object</td><td>Yes, nearly always</td></tr>
+      <tr><td><code>boolean equals(Object o)</code></td><td>Logical equality</td><td>For value types (<a href="#m2-equals-hashcode">equals and hashCode</a>)</td></tr>
+      <tr><td><code>int hashCode()</code></td><td>Number used by hash-based collections</td><td>Always together with <code>equals</code></td></tr>
+      <tr><td><code>Class&lt;?&gt; getClass()</code></td><td>The exact runtime class</td><td>No (final)</td></tr>
+      <tr><td><code>Object clone()</code></td><td>Field-by-field copy</td><td>Rarely (<a href="#m2-clone-copy">clone and copy</a>)</td></tr>
+      <tr><td><code>void finalize()</code></td><td>Old GC hook</td><td>Never; deprecated for removal</td></tr>
+      <tr><td><code>wait()</code>, <code>notify()</code>, <code>notifyAll()</code></td><td>Thread coordination on the object's monitor</td><td>No (final); see <a href="#m6">Module 6</a></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>toString(): the text form</h4>
+  <p>The default <code>toString()</code> returns the class name, an <code>@</code> and the hash code in hexadecimal, for example <code>Account@1b6d3586</code>. That is useless in a log. Whenever you print an object with <code>println</code>, concatenate it with a string, or the debugger or a logger shows it, Java calls <code>toString()</code> for you.</p>
+  <pre data-title="ToStringDemo.java"><code class="language-java">import java.util.List;
+
+class Plain { }
+
+class Account {
+    private final String number;
+    private final String holder;
+    private long balanceInPaise;
+
+    Account(String number, String holder, long balanceInPaise) {
+        this.number = number;
+        this.holder = holder;
+        this.balanceInPaise = balanceInPaise;
+    }
+
+    @Override
+    public String toString() {
+        return "Account{number=" + number + ", holder=" + holder
+             + ", balance=" + balanceInPaise / 100.0 + "}";
+    }
+}
+
+public class ToStringDemo {
+    public static void main(String[] args) {
+        System.out.println(new Plain());                       // default: Class@hash
+        Account a = new Account("SB1001", "Asha", 150000);
+        System.out.println(a);                                 // println calls toString()
+        System.out.println("Created " + a);                    // so does concatenation
+        System.out.println(List.of(a, new Account("SB1002", "Ravi", 5000)));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Plain@7a81197d
+Account{number=SB1001, holder=Asha, balance=1500.0}
+Created Account{number=SB1001, holder=Asha, balance=1500.0}
+[Account{number=SB1001, holder=Asha, balance=1500.0}, Account{number=SB1002, holder=Ravi, balance=50.0}]</code></pre>
+  <p>The hex number after <code>@</code> changes from run to run, so do not copy it into tests. Collections call <code>toString()</code> on each element, which is why the list prints properly.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">A good toString()</p>
+    <ul>
+      <li>Include the class name and the fields that identify the object: <code>Account{number=…}</code>. Your IDE generates this; records and Lombok's <code>@ToString</code> do it for you.</li>
+      <li><strong>Never include secrets</strong>: passwords, tokens, card numbers, Aadhaar. <code>toString()</code> ends up in logs.</li>
+      <li>Avoid fields that point back to a parent (a bidirectional JPA relationship). Two objects printing each other end in <code>StackOverflowError</code>. Avoid lazy-loaded collections for the same reason (extra queries).</li>
+      <li>Do not use <code>toString()</code> for program logic or parsing. It is for humans.</li>
+      <li>Keep it cheap; it may be called inside a log statement.</li>
+    </ul>
+  </div>
+
+  <h4>getClass(): the exact runtime class</h4>
+  <p><code>obj.getClass()</code> returns a <code>Class</code> object that describes the real class of <code>obj</code>, never its declared type. It is <code>final</code>. You can ask it for <code>getName()</code>, <code>getSimpleName()</code>, <code>getSuperclass()</code> and, through reflection, its methods and fields (the basis of Spring and Hibernate). A class literal <code>Account.class</code> gives the same kind of object without an instance.</p>
+  <pre data-title="GetClassDemo.java"><code class="language-java">Object o = "text";
+System.out.println(o.getClass().getName());          // java.lang.String
+System.out.println(o.getClass().getSimpleName());    // String
+Number n = Integer.valueOf(5);
+System.out.println(n.getClass() == Integer.class);   // true: exact class
+System.out.println(n instanceof Number);             // true: any subtype counts
+System.out.println(new int[0].getClass().getSimpleName());   // int[]</code></pre>
+  <p>The difference between <code>getClass() == X.class</code> (exact) and <code>instanceof</code> (any subtype) is the key to writing a correct <code>equals()</code> (see the table in <a href="#m2-casting-instanceof">casting and instanceof</a>).</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>String.valueOf(obj)</code> and <code>"" + obj</code> print <code>"null"</code> for a null reference, but <code>obj.toString()</code> throws <code>NullPointerException</code>. <code>Objects.toString(obj)</code> is the null-safe call.</li>
+      <li>On an interface-typed variable you can always call <code>Object</code>'s methods, because every interface type is also an <code>Object</code>.</li>
+      <li>An array's <code>toString()</code> is the default (<code>[I@6d06d69c</code>); use <code>Arrays.toString(arr)</code> or <code>Arrays.deepToString</code>.</li>
+      <li><code>getClass()</code> of a Spring or Hibernate proxy returns the generated proxy class, not your class. This breaks <code>getClass()</code>-based equality on JPA entities.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: Object class questions</p>
+    <ul>
+      <li><b>Which class is the parent of all classes?</b> <code>java.lang.Object</code>, even if you write no <code>extends</code>. An interface type has none, but its objects do.</li>
+      <li><b>Name the methods of Object.</b> <code>toString</code>, <code>equals</code>, <code>hashCode</code>, <code>getClass</code>, <code>clone</code>, <code>finalize</code>, <code>wait</code>, <code>notify</code>, <code>notifyAll</code>.</li>
+      <li><b>What does the default <code>toString()</code> print?</b> <code>ClassName@hexHashCode</code>.</li>
+      <li><b>What does <code>getClass()</code> return, and can you override it?</b> The exact runtime <code>Class</code>; no, it is final.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-equals-hashcode">
+  <h3>equals() and hashCode(): the contracts and a correct implementation</h3>
+  <p class="tldr">Override <code>equals</code> when two objects with the same data should count as equal, follow its five rules, and always override <code>hashCode</code> too so that equal objects return the same number; otherwise <code>HashMap</code> and <code>HashSet</code> silently misbehave.</p>
+
+  <p>The default <code>Object.equals()</code> is the same as <code>==</code>: two references are equal only if they point to the very same object. That is right for a <code>Thread</code> or a database connection, but wrong for a value such as money, a PAN number or an email address. Two <code>Money(100, "INR")</code> objects should be equal. So value classes override <code>equals</code>. The collections framework then relies on that (<a href="#m4">Module 4</a>; internals in <a href="#m7">Module 7</a>).</p>
+
+  <h4>== versus equals()</h4>
+  <pre data-title="EqualsBasics.java"><code class="language-java">String a = new String("hi");
+String b = new String("hi");
+System.out.println(a == b);          // false: two different objects
+System.out.println(a.equals(b));     // true: same characters
+
+Integer x = 127, y = 127;
+System.out.println(x == y);          // true: small values come from a cache
+Integer p = 1000, q = 1000;
+System.out.println(p == q);          // false: two objects
+System.out.println(p.equals(q));     // true</code></pre>
+  <p>For objects, <code>==</code> compares <em>identity</em> (the reference), and <code>equals()</code> compares <em>meaning</em>, if the class defines it. For primitives only <code>==</code> exists. Use <code>equals()</code> for objects, always.</p>
+
+  <h4>The equals contract</h4>
+  <p>The documentation of <code>Object.equals</code> lists five rules for non-null references:</p>
+  <ol class="steps">
+    <li><strong>Reflexive:</strong> <code>x.equals(x)</code> is true.</li>
+    <li><strong>Symmetric:</strong> <code>x.equals(y)</code> is true exactly when <code>y.equals(x)</code> is.</li>
+    <li><strong>Transitive:</strong> if <code>x.equals(y)</code> and <code>y.equals(z)</code>, then <code>x.equals(z)</code>.</li>
+    <li><strong>Consistent:</strong> repeated calls give the same answer while the objects are unchanged.</li>
+    <li><strong>Non-null:</strong> <code>x.equals(null)</code> is false (and never throws).</li>
+  </ol>
+
+  <h4>The hashCode contract</h4>
+  <ul>
+    <li>Called twice on an unchanged object in one run, it returns the same int.</li>
+    <li><strong>If <code>a.equals(b)</code> is true, then <code>a.hashCode() == b.hashCode()</code> must be true.</strong> This is the rule that matters.</li>
+    <li>Unequal objects <em>may</em> share a hash code (a collision), but fewer collisions mean a faster map.</li>
+  </ul>
+  <div class="co co-rule">
+    <p class="co-t">Rule: override equals and hashCode together</p>
+    <p>A <code>HashMap</code> first uses <code>hashCode()</code> to pick a bucket, then <code>equals()</code> to find the right key inside it. If equal objects have different hash codes, they land in different buckets and the map never even compares them.</p>
+  </div>
+
+  <h4>What goes wrong without hashCode</h4>
+  <pre data-title="Broken.java"><code class="language-java">import java.util.*;
+
+class Pan {
+    final String number;
+    Pan(String number) { this.number = number; }
+    @Override public boolean equals(Object o) {          // equals overridden...
+        return o instanceof Pan p &amp;&amp; number.equals(p.number);
+    }
+    // ...but no hashCode(): the identity hash from Object is used
+}
+
+public class Broken {
+    public static void main(String[] args) {
+        Set&lt;Pan&gt; set = new HashSet&lt;&gt;();
+        set.add(new Pan("ABCDE1234F"));
+        set.add(new Pan("ABCDE1234F"));
+        System.out.println(set.size());                               // expected 1
+        System.out.println(set.contains(new Pan("ABCDE1234F")));      // expected true
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (very likely)"><code class="language-plaintext">2
+false</code></pre>
+  <p>Each <code>Pan</code> gets its own identity-based hash code, so the two equal objects usually go to different buckets. "Usually" is the danger: sometimes they land in the same bucket and the bug disappears, which makes it hard to find.</p>
+
+  <h4>A correct implementation</h4>
+  <p>Use the same fields in both methods. Compare primitives with <code>==</code> (use <code>Double.compare</code> for <code>double</code>), objects with <code>Objects.equals</code> (null-safe), and build the hash with <code>Objects.hash</code>.</p>
+  <pre data-title="Customer.java"><code class="language-java">import java.util.*;
+
+public final class Customer {
+    private final long id;
+    private final String email;                  // part of equality
+    private String nickname;                     // NOT part of equality
+
+    public Customer(long id, String email, String nickname) {
+        this.id = id;
+        this.email = email;
+        this.nickname = nickname;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;                              // fast path, reflexive
+        if (o == null || getClass() != o.getClass()) return false;   // null and type check
+        Customer other = (Customer) o;
+        return id == other.id &amp;&amp; Objects.equals(email, other.email);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(id, email);                          // same fields as equals
+    }
+
+    @Override public String toString() { return "Customer{id=" + id + ", email=" + email + "}"; }
+
+    public static void main(String[] args) {
+        Customer a = new Customer(1, "asha@example.com", "A");
+        Customer b = new Customer(1, "asha@example.com", "Ash");
+        Set&lt;Customer&gt; set = new HashSet&lt;&gt;(List.of(a));
+        System.out.println(a.equals(b) + " " + (a.hashCode() == b.hashCode()));
+        System.out.println(set.contains(b));
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">true true
+true</code></pre>
+  <p>The five-step recipe is: same reference, then null and class check, then cast, then compare the significant fields. Java 16+ lets you shorten the check with pattern matching: <code>return o instanceof Customer c &amp;&amp; id == c.id &amp;&amp; Objects.equals(email, c.email);</code>. A <strong>record</strong> generates all three methods for you (<a href="#m2-records">records</a>).</p>
+
+  <h4>instanceof or getClass() inside equals?</h4>
+  <p>With <code>getClass()</code> a subclass instance never equals a parent instance, so symmetry and transitivity always hold. With <code>instanceof</code> a <code>ColorPoint</code> and a <code>Point</code> can be "equal" one way and not the other, which breaks symmetry. The safe choices are: use <code>getClass()</code>, or make the class <code>final</code> and use <code>instanceof</code>. Use <code>instanceof</code> with a non-final class only when the parent class defines equality for the whole hierarchy (as <code>AbstractList</code> does for all lists). Know that Hibernate proxies can make the <code>getClass()</code> approach fail for JPA entities, and a common choice there is equality on the id with a constant <code>hashCode</code>; the pitfalls are covered in the Spring Data JPA notes.</p>
+
+  <h4>Mutable keys</h4>
+  <pre data-title="MutableKey.java"><code class="language-java">Customer c = new Customer(1, "asha@example.com", "A");
+Set&lt;List&lt;String&gt;&gt; sets = new HashSet&lt;&gt;();
+List&lt;String&gt; key = new ArrayList&lt;&gt;(List.of("a"));
+sets.add(key);
+key.add("b");                                  // hash code changes after insertion
+System.out.println(sets.contains(key));        // false: wrong bucket now
+System.out.println(sets.size());               // 1, the entry is stuck in the old bucket</code></pre>
+  <p>If a field used in <code>hashCode</code> changes while the object sits in a <code>HashSet</code> or is a <code>HashMap</code> key, the object is lost. Use immutable keys: <code>String</code>, <code>Integer</code>, records, or your own immutable classes (<a href="#m2-immutability">immutability</a>).</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Float and double fields.</strong> Compare with <code>Double.compare(a, b) == 0</code>, not <code>==</code>, to handle <code>NaN</code> and <code>-0.0</code>. <code>Objects.hash</code> boxes the primitive, which is fine.</li>
+      <li><strong>Arrays in fields.</strong> Use <code>Arrays.equals</code> and <code>Arrays.hashCode</code>; <code>Objects.equals</code> on arrays compares references.</li>
+      <li><strong>Constant hashCode.</strong> <code>return 42;</code> is legal but turns a map into a linked list or tree. Never do it for performance-sensitive types.</li>
+      <li><strong>Consistency with compareTo.</strong> For sorted sets and maps, <code>compareTo</code> should return 0 exactly when <code>equals</code> is true, or <code>TreeSet</code> and <code>HashSet</code> will disagree.</li>
+      <li><strong>Overload instead of override.</strong> <code>boolean equals(Customer c)</code> is an overload; collections call <code>equals(Object)</code> and ignore it. <code>@Override</code> catches this at compile time.</li>
+      <li><code>hashCode()</code> values are not stable between JVM runs for objects with identity hashes; never store them in files or databases.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes to avoid</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: overload, and compare floats with ==</p><pre><code class="language-java">public boolean equals(Customer c) {        // overload, not override
+    return this.id == c.id;                // also NPE on null
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right</p><pre><code class="language-java">@Override
+public boolean equals(Object o) {
+    return o instanceof Customer c &amp;&amp; id == c.id;
+}
+@Override public int hashCode() { return Long.hashCode(id); }</code></pre></div>
+    </div>
+    <ul>
+      <li>Different fields in <code>equals</code> and <code>hashCode</code> (the hash uses a field that equals ignores).</li>
+      <li>Using a mutable or generated field (a database id that is null before saving) as the only equality basis.</li>
+      <li>Throwing an exception from <code>equals</code> on null or on a different type.</li>
+    </ul>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: let tools write it</p>
+    <p>Use the IDE generator (it uses <code>Objects.equals</code> and <code>Objects.hash</code>), a record, or Lombok's <code>@EqualsAndHashCode</code>. Then write one test that adds two equal objects to a <code>HashSet</code> and expects size 1. For tests there is also the EqualsVerifier library.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: the favourites</p>
+    <ul>
+      <li><b>What is the contract between equals and hashCode?</b> Equal objects must have equal hash codes. The reverse need not hold.</li>
+      <li><b>What if you override equals but not hashCode?</b> Hash collections fail to find equal objects. Show the <code>HashSet</code> duplicate example.</li>
+      <li><b>What if two different objects have the same hash code?</b> A collision. The map falls back to <code>equals()</code> to tell them apart; correctness is kept, only speed suffers.</li>
+      <li><b>== vs equals?</b> Identity vs logical equality; strings, wrappers and the Integer cache as examples.</li>
+      <li><b>Can a key change inside a HashMap?</b> Not safely; make keys immutable.</li>
+      <li>See also the full internals in <a href="#m7">Module 7</a>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-clone-copy">
+  <h3>clone(), shallow vs deep copy, and copy constructors</h3>
+  <p class="tldr">A copy can be shallow (the new object shares the inner objects with the original) or deep (everything is duplicated); <code>Object.clone()</code> is awkward and easy to get wrong, so use a copy constructor, a static factory or an immutable design instead.</p>
+
+  <p>Assigning <code>b = a</code> copies only the <em>reference</em>; both variables then point at one object. To get an independent object, you need a real copy. The question is how deep the copy goes.</p>
+
+  <h4>Shallow versus deep copy</h4>
+  <p>A <strong>shallow copy</strong> makes a new outer object, but its fields still point to the same inner objects as the original. A <strong>deep copy</strong> also duplicates the inner objects, recursively. Immutable inner objects (<code>String</code>, <code>Integer</code>, <code>LocalDate</code>) need no duplication.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Shallow copy                          Deep copy
+
+ original ──▶ [ name | tags ]          original ──▶ [ name | tags ]
+                       │                                       │
+ copy ─────▶ [ name | tags ]                                   ▼
+                       │                                  [ "a", "b" ]
+                       ▼
+                  [ "a", "b" ]         copy ─────▶ [ name | tags ]
+                (shared list)                                  │
+                                                               ▼
+                                                          [ "a", "b" ]
+                                                         (own list)
+</pre>
+    <figcaption>A shallow copy shares the inner list; a deep copy has its own</figcaption>
+  </figure>
+
+  <h4>clone() and the Cloneable interface</h4>
+  <p><code>Object.clone()</code> is <code>protected</code> and makes a field-by-field (shallow) copy, without calling any constructor. To use it you must: implement the marker interface <code>Cloneable</code> (otherwise <code>CloneNotSupportedException</code> is thrown), override <code>clone()</code> as <code>public</code> and call <code>super.clone()</code>. You may narrow the return type (covariant return, <a href="#m2-overriding">overriding</a>).</p>
+  <pre data-title="CloneDemo.java"><code class="language-java">import java.util.*;
+
+class Playlist implements Cloneable {
+    String name;
+    List&lt;String&gt; songs = new ArrayList&lt;&gt;();
+
+    Playlist(String name) { this.name = name; }
+
+    @Override
+    public Playlist clone() {
+        try {
+            Playlist copy = (Playlist) super.clone();      // shallow: songs is shared
+            copy.songs = new ArrayList&lt;&gt;(this.songs);      // fix it by hand: deep-ish copy
+            return copy;
+        } catch (CloneNotSupportedException e) {
+            throw new AssertionError(e);                   // cannot happen: we are Cloneable
+        }
+    }
+}
+
+public class CloneDemo {
+    public static void main(String[] args) {
+        Playlist a = new Playlist("Morning");
+        a.songs.add("Kun Faya Kun");
+        Playlist b = a.clone();
+        b.songs.add("Tum Hi Ho");
+        b.name = "Evening";
+        System.out.println(a.name + " " + a.songs);
+        System.out.println(b.name + " " + b.songs);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Morning [Kun Faya Kun]
+Evening [Kun Faya Kun, Tum Hi Ho]</code></pre>
+  <p>If you delete the line that copies <code>songs</code>, adding to <code>b</code> also changes <code>a</code>. And that is only one level; if the songs were mutable objects, you would have to clone them too.</p>
+
+  <h4>Why clone() is disliked</h4>
+  <ul>
+    <li>The <code>Cloneable</code> interface has no <code>clone()</code> method; it just flips a switch inside <code>Object.clone()</code>. This is a design mistake that Java keeps for compatibility.</li>
+    <li>It creates objects without running a constructor, so invariants set by constructors are bypassed.</li>
+    <li>It is shallow by default and every mutable field needs manual care.</li>
+    <li>It throws a checked exception you can never really get, and it does not work with <code>final</code> fields that need a new value.</li>
+    <li>Subclasses must also remember to call <code>super.clone()</code> correctly.</li>
+  </ul>
+  <p>One accepted use: <code>array.clone()</code> is a fast, correct shallow copy of an array (<code>int[] copy = arr.clone();</code>). For arrays of mutable objects remember it is shallow.</p>
+
+  <h4>Better: copy constructor and static factory</h4>
+  <p>A <strong>copy constructor</strong> takes an object of the same class and builds a new one. It is plain Java: it runs your validation, works with <code>final</code> fields, and makes it obvious what is copied deeply. A <strong>static factory</strong> such as <code>Playlist.copyOf(other)</code> does the same with a clearer name, like <code>List.copyOf</code>.</p>
+  <pre data-title="Copying.java"><code class="language-java">import java.util.*;
+
+class Address {
+    private String city;
+    Address(String city) { this.city = city; }
+    Address(Address other) { this.city = other.city; }        // copy constructor
+    void setCity(String c) { this.city = c; }
+    @Override public String toString() { return city; }
+}
+
+class Person {
+    private final String name;
+    private final Address address;                            // mutable inner object
+    private final List&lt;String&gt; phones;
+
+    Person(String name, Address address, List&lt;String&gt; phones) {
+        this.name = name;
+        this.address = new Address(address);                  // defensive copy in
+        this.phones = new ArrayList&lt;&gt;(phones);
+    }
+
+    Person(Person other) {                                    // deep copy constructor
+        this(other.name, other.address, other.phones);        // reuses the defensive copies
+    }
+
+    Address getAddress() { return new Address(address); }    // defensive copy out
+    @Override public String toString() { return name + " " + address + " " + phones; }
+}
+
+public class Copying {
+    public static void main(String[] args) {
+        Address home = new Address("Pune");
+        Person asha = new Person("Asha", home, List.of("98100"));
+        Person copy = new Person(asha);
+        home.setCity("Delhi");                 // does not affect either person
+        asha.getAddress().setCity("Goa");      // nor this
+        System.out.println(asha);
+        System.out.println(copy);
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Asha Pune [98100]
+Asha Pune [98100]</code></pre>
+  <p>The same defensive-copy habit protects encapsulation (<a href="#m2-encapsulation">encapsulation</a>). Besides these, other copy routes exist: serialization (slow and fragile), JSON mapping through Jackson (convenient for tests), the <code>new ArrayList&lt;&gt;(other)</code> constructors of collections, <code>List.copyOf</code> (an unmodifiable copy; the elements are not copied), and libraries such as MapStruct for DTO copies. Best of all is to share immutable objects so that no copy is needed (<a href="#m2-immutability">immutability</a>).</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Collection copy constructors and <code>List.copyOf</code> are shallow: the new list holds the same element objects.</li>
+      <li><code>Arrays.copyOf</code> and <code>array.clone()</code> are shallow for object arrays; a 2D array needs a loop (or <code>clone</code> per row).</li>
+      <li>A cloned <code>HashMap</code> or <code>ArrayList</code> (they implement <code>clone()</code>) is also a shallow copy.</li>
+      <li>Records cannot be cloned in the usual sense, but they are immutable; copy a record by building a new one, for example <code>new Point(p.x(), 5)</code>.</li>
+      <li>Calling <code>clone()</code> on a class that is not <code>Cloneable</code> gives <code>CloneNotSupportedException</code> at run time.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention</p>
+    <p>Prefer: immutable class, then copy constructor or static factory, then <code>clone()</code> only for arrays or when a library demands it. This is the advice of <em>Effective Java</em> and of most style guides.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: copy questions</p>
+    <ul>
+      <li><b>Shallow vs deep copy?</b> Shared inner objects vs fully duplicated ones. Draw the two diagrams.</li>
+      <li><b>Why is <code>clone()</code> considered broken?</b> Marker interface without the method, bypasses constructors, shallow by default, checked exception.</li>
+      <li><b>What do you use instead?</b> Copy constructor, static factory, or immutable objects.</li>
+      <li><b>What does <code>Cloneable</code> do?</b> It only allows <code>Object.clone()</code> to work; without it you get <code>CloneNotSupportedException</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-composition-over-inheritance">
+  <h3>Composition vs inheritance: has-a, is-a and delegation</h3>
+  <p class="tldr">Inheritance models "is-a" and binds a child tightly to its parent's internals; composition models "has-a" by holding another object and forwarding calls to it, and is usually the safer, more flexible way to reuse code.</p>
+
+  <p>Beginners often use <code>extends</code> whenever two classes share code. That couples the child to every detail of the parent: when the parent changes, children can break. The other tool is <strong>composition</strong>: a class keeps a <em>field</em> that refers to another object and uses it. The classic advice from <em>Effective Java</em> and the Gang of Four book is <strong>"favor composition over inheritance"</strong>.</p>
+
+  <h4>Association, aggregation and composition</h4>
+  <p>"Has-a" relationships come in three strengths. UML (the common diagram language) names them like this:</p>
+  <dl class="terms">
+    <dt>Association</dt><dd>One object knows or uses another: a <code>Customer</code> places <code>Order</code>s; a <code>Teacher</code> teaches <code>Student</code>s. Both live on their own. Drawn as a plain line or arrow.</dd>
+    <dt>Aggregation</dt><dd>A weak "whole-part": a <code>Department</code> has <code>Employee</code>s, but an employee exists without the department and may move to another. Hollow diamond.</dd>
+    <dt>Composition</dt><dd>A strong "whole-part": a <code>House</code> has <code>Room</code>s; the rooms are created by and die with the house, and belong to no other. Filled diamond.</dd>
+  </dl>
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class Customer
+  class Order
+  class Department
+  class Employee
+  class House
+  class Room
+  Customer "1" --> "*" Order : places
+  Department "1" o-- "*" Employee : aggregation
+  House "1" *-- "*" Room : composition
+</pre>
+    <figcaption>Association, aggregation (hollow diamond) and composition (filled diamond)</figcaption>
+  </figure>
+  <p>In code the difference is about lifetime and ownership. In composition the whole creates the parts and does not hand them out. In aggregation the parts are passed in and may live on.</p>
+  <pre data-title="Relations.java"><code class="language-java">import java.util.*;
+
+class Room {
+    final String name;
+    Room(String name) { this.name = name; }
+}
+
+class House {                                           // composition
+    private final List&lt;Room&gt; rooms = new ArrayList&lt;&gt;();
+    House(String... roomNames) {
+        for (String n : roomNames) rooms.add(new Room(n));   // House creates and owns the rooms
+    }
+    int roomCount() { return rooms.size(); }
+}
+
+class Employee { final String name; Employee(String n) { name = n; } }
+
+class Department {                                      // aggregation
+    private final List&lt;Employee&gt; staff = new ArrayList&lt;&gt;();
+    void add(Employee e) { staff.add(e); }              // employees come from outside
+    int size() { return staff.size(); }
+}
+
+public class Relations {
+    public static void main(String[] args) {
+        System.out.println(new House("Hall", "Kitchen").roomCount());
+        Employee asha = new Employee("Asha");
+        Department hr = new Department(), it = new Department();
+        hr.add(asha);
+        it.add(asha);                                   // the same employee in two departments
+        System.out.println(hr.size() + " " + it.size());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">2
+1 1</code></pre>
+
+  <h4>The fragile base class problem</h4>
+  <p>Inheritance breaks <a href="#m2-encapsulation">encapsulation</a>: a subclass depends on <em>how</em> the parent works, not only on what it promises. Here is the well-known example. We want a <code>HashSet</code> that counts how many elements were ever added.</p>
+  <pre data-title="CountingSet.java"><code class="language-java">import java.util.*;
+
+class CountingSet&lt;E&gt; extends HashSet&lt;E&gt; {          // inheritance
+    private int added = 0;
+
+    @Override public boolean add(E e) { added++; return super.add(e); }
+
+    @Override public boolean addAll(Collection&lt;? extends E&gt; c) {
+        added += c.size();
+        return super.addAll(c);          // HashSet.addAll calls add() for each element!
+    }
+    int getAdded() { return added; }
+}
+
+public class CountingDemo {
+    public static void main(String[] args) {
+        CountingSet&lt;String&gt; s = new CountingSet&lt;&gt;();
+        s.addAll(List.of("a", "b", "c"));
+        System.out.println(s.getAdded());     // we expect 3
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">6</code></pre>
+  <p>The parent's <code>addAll</code> internally calls <code>add</code> for each element, which the subclass has also overridden, so each element is counted twice. If a future JDK changed <code>addAll</code> not to call <code>add</code>, the answer would change again. The child is at the mercy of the parent's private implementation. That is the <strong>fragile base class problem</strong>. Other costs of inheritance: the child exposes the parent's whole API (a <code>CountingSet</code> also offers <code>remove</code> and <code>clear</code>); the relation is fixed at compile time; and Java allows one parent only.</p>
+
+  <h4>The fix: composition and delegation</h4>
+  <p>Hold a set as a private field and <strong>delegate</strong> (forward) the calls to it. You decide which methods to expose, and the wrapped set can be any <code>Set</code>.</p>
+  <pre data-title="CountingSet2.java"><code class="language-java">import java.util.*;
+
+class CountingSet2&lt;E&gt; {
+    private final Set&lt;E&gt; inner;                     // has-a, typed by the interface
+    private int added = 0;
+
+    CountingSet2(Set&lt;E&gt; inner) { this.inner = inner; }
+
+    boolean add(E e) { added++; return inner.add(e); }
+
+    boolean addAll(Collection&lt;? extends E&gt; c) {
+        boolean changed = false;
+        for (E e : c) changed |= add(e);              // our own loop: no hidden double count
+        return changed;
+    }
+    int getAdded() { return added; }
+    int size() { return inner.size(); }
+}
+
+public class CountingDemo2 {
+    public static void main(String[] args) {
+        CountingSet2&lt;String&gt; s = new CountingSet2&lt;&gt;(new TreeSet&lt;&gt;());   // swap to LinkedHashSet freely
+        s.addAll(List.of("a", "b", "c"));
+        System.out.println(s.getAdded() + " " + s.size());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">3 3</code></pre>
+  <p>If you must also be a <code>Set</code>, implement the <code>Set</code> interface and delegate (the "forwarding class" or wrapper pattern; Guava's <code>ForwardingSet</code> exists for this).</p>
+
+  <h4>A second refactoring: behaviour as a component</h4>
+  <p>Suppose you model vehicles and start with <code>Car extends Engine</code> because a car "uses" an engine. A car is not an engine. Worse, an electric car now inherits petrol-engine methods. Make the engine a component:</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: inheritance for reuse</p><pre><code class="language-java">class Engine { void start() { /* ... */ } }
+class Car extends Engine { }          // "a car is an engine"?</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: composition and an interface</p><pre><code class="language-java">interface Engine { void start(); }
+class PetrolEngine implements Engine { public void start() { /* ... */ } }
+class ElectricMotor implements Engine { public void start() { /* ... */ } }
+
+class Car {
+    private final Engine engine;       // chosen at construction time
+    Car(Engine engine) { this.engine = engine; }
+    void start() { engine.start(); }   // delegation
+}</code></pre></div>
+  </div>
+  <p>Now you can build a <code>new Car(new ElectricMotor())</code> or swap the engine in a test. This is the idea behind the <strong>Strategy</strong> pattern and behind dependency injection in Spring: an <code>OrderService</code> is <em>composed</em> of a repository and a payment client, it does not extend them (<a href="#m2-abstraction">abstraction</a>, <a href="08-system-design.html#m2">Design patterns</a>).</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Question</th><th>Inheritance</th><th>Composition</th></tr></thead>
+    <tbody>
+      <tr><td>Relationship</td><td>is-a</td><td>has-a / uses-a</td></tr>
+      <tr><td>Coupling</td><td>Tight, to the parent's internals</td><td>Loose, to a public interface</td></tr>
+      <tr><td>When is it fixed?</td><td>Compile time</td><td>Can change at run time (swap the field)</td></tr>
+      <tr><td>Reuse</td><td>One parent only</td><td>As many components as you like</td></tr>
+      <tr><td>Testing</td><td>Hard to isolate the parent</td><td>Easy: pass a fake component</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-conv">
+    <p class="co-t">When inheritance is still the right tool</p>
+    <ul>
+      <li>There is a true is-a relation that passes the Liskov test: a child can be used wherever the parent is expected, without surprises (a <code>Square</code> that extends a mutable <code>Rectangle</code> fails this).</li>
+      <li>The parent was <em>designed</em> and documented for extension (<code>AbstractList</code>, abstract classes with Template Methods).</li>
+      <li>Both classes are in the same package or project, so you control both.</li>
+      <li>Otherwise, make classes <code>final</code> or use interfaces plus composition. "Design and document for inheritance, or else prohibit it."</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes to avoid</p>
+    <ul>
+      <li>Extending a class only to reuse one method (<code>Stack extends Vector</code> in the JDK is the famous regret: a stack that lets you insert in the middle).</li>
+      <li>Making a domain object extend a utility or framework class, such as <code>class Order extends ArrayList&lt;Item&gt;</code>. Keep a <code>List&lt;Item&gt;</code> field instead.</li>
+      <li>Deep hierarchies of more than two or three levels. They are hard to follow and to change.</li>
+      <li>Aggregation where a part is shared and mutated by many owners without clear ownership.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: composition vs inheritance</p>
+    <ul>
+      <li>Give the sentence: "Favor composition over inheritance because inheritance couples the child to the parent's implementation, and composition lets me swap behaviour at run time."</li>
+      <li>Explain the three has-a levels (association, aggregation, composition) with ownership and lifetime.</li>
+      <li>Show the fragile base class with the <code>HashSet.addAll</code> counter.</li>
+      <li>Name patterns that use composition: Strategy, Decorator, Adapter; and Spring DI.</li>
+      <li>Admit the limits: inheritance is fine for real is-a with designed-for-extension parents.</li>
+    </ul>
+  </div>
+</article>

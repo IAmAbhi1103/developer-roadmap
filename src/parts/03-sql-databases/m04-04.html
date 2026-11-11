@@ -1,0 +1,566 @@
+<article class="topic" id="m4-audit-soft-delete">
+  <h3>Audit columns and soft delete</h3>
+  <p class="tldr">Audit columns (<code>created_at</code>, <code>updated_at</code>, <code>created_by</code>) record
+  who changed a row and when; soft delete marks a row as deleted with <code>deleted_at</code> instead of
+  removing it, which brings extra work for uniqueness, queries and privacy.</p>
+
+  <h4>Audit columns</h4>
+  <p>Almost every business table carries the same small set of columns. They answer support questions ("when did
+  this order change?"), help debugging, and feed incremental data loads.</p>
+<pre data-title="Audit columns with a trigger for updated_at"><code class="language-sql">CREATE TABLE restaurants (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name       TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by BIGINT REFERENCES users (id),
+    updated_by BIGINT REFERENCES users (id)
+);
+
+CREATE FUNCTION set_updated_at() RETURNS trigger AS $$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_restaurants_updated_at
+BEFORE UPDATE ON restaurants
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();</code></pre>
+  <p>MySQL can do the same in the column itself:
+  <code>updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP</code>.
+  PostgreSQL has no such clause, so use a trigger or set the value in the application. In Spring Data JPA, the
+  annotations <code>@CreatedDate</code>, <code>@LastModifiedDate</code>, <code>@CreatedBy</code> and
+  <code>@LastModifiedBy</code> fill these columns for you when auditing is enabled
+  (<a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>).</p>
+  <ul>
+    <li><code>created_at</code> never changes after insert. Give it <code>DEFAULT now()</code> and
+    <code>NOT NULL</code>.</li>
+    <li><code>updated_at</code> changes on each update. Keep it <code>NOT NULL</code> too, starting equal to
+    <code>created_at</code>, so you never have to handle <code>NULL</code>.</li>
+    <li><code>created_by</code> / <code>updated_by</code> point to the user (or a service account). Many teams
+    skip them on small tables.</li>
+  </ul>
+  <p>Audit columns say <em>when</em> and <em>who</em>, but not <em>what</em> changed. For a full history
+  (compliance, payments), add a separate <code>*_history</code> table filled by a trigger or by the
+  application, or use change data capture. A column <code>updated_at</code> is not a history.</p>
+
+  <h4>Soft delete</h4>
+  <p>A <strong>hard delete</strong> runs <code>DELETE</code> and the row is gone. A <strong>soft
+  delete</strong> keeps the row and marks it:</p>
+<pre data-title="Soft delete with deleted_at"><code class="language-sql">ALTER TABLE menu_items ADD COLUMN deleted_at TIMESTAMPTZ;   -- NULL means "alive"
+
+-- "Delete"
+UPDATE menu_items SET deleted_at = now() WHERE id = 5 AND deleted_at IS NULL;
+
+-- Every normal read must filter
+SELECT id, name FROM menu_items WHERE restaurant_id = 3 AND deleted_at IS NULL;
+
+-- Restore
+UPDATE menu_items SET deleted_at = NULL WHERE id = 5;</code></pre>
+  <p>Use <code>deleted_at</code> rather than a boolean <code>is_deleted</code>: it also tells you when. A
+  timestamp is just as easy to filter, and it can be used to purge old rows later.</p>
+  <p>Soft delete is useful when history must survive (an order that references a deleted menu item), when users
+  may undo, or when you must keep records for legal reasons. But it has real costs:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Pitfall</th><th>What happens</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>Forgotten filter</td><td>One query without <code>deleted_at IS NULL</code> shows deleted data</td>
+      <td>A view, or Hibernate's <code>@SQLRestriction</code> / <code>@SoftDelete</code> (Hibernate 6.4+)</td></tr>
+      <tr><td>Unique constraints</td><td>A deleted user keeps the email, so a new sign-up with it fails</td>
+      <td>Partial unique index, below</td></tr>
+      <tr><td>Foreign keys</td><td>Child rows still point at a "deleted" parent</td><td>Decide what a deleted
+      parent means for its children</td></tr>
+      <tr><td>Growth</td><td>Tables grow forever; indexes carry dead rows</td><td>Archive or purge old rows</td></tr>
+      <tr><td>Privacy law</td><td>"Delete my data" requests need real removal or anonymising</td><td>Anonymise
+      personal columns, or hard-delete after a period</td></tr>
+    </tbody>
+  </table></div>
+<pre data-title="Unique only among live rows (PostgreSQL partial index)"><code class="language-sql">CREATE UNIQUE INDEX uq_users_email_live
+    ON users (email)
+    WHERE deleted_at IS NULL;
+
+-- A view so that application code cannot forget the filter
+CREATE VIEW live_menu_items AS
+SELECT * FROM menu_items WHERE deleted_at IS NULL;</code></pre>
+  <p>MySQL has no partial indexes; a common workaround is a unique index on <code>(email, deleted_at)</code>,
+  which works only if <code>deleted_at</code> is never <code>NULL</code> for live rows. Some teams store a
+  sentinel date instead. That is one reason to avoid soft delete on tables where hard delete is acceptable.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: soft delete only where you need it</p>
+    <p>Use it for business records you may need to show or restore (users, products, orders). Do not use it
+    for link rows, sessions or temporary data; delete those for real. Keep the filter in one place (a view or a
+    framework setting).</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "delete" that cascades into soft-deleted data</p>
+    <p>A soft delete runs <code>UPDATE</code>, so <code>ON DELETE CASCADE</code> never fires. If a restaurant
+    is soft-deleted, its menu items are still "alive" unless you update them too or filter through the parent.
+    Decide the rule and test it.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Soft vs hard delete?</b> Soft keeps the row with a marker (history, undo), but needs filters,
+      partial unique indexes and a purge plan. Hard removes it.</li>
+      <li><b>Why <code>deleted_at</code> not <code>is_deleted</code>?</b> It records when, and works as the
+      purge-date input.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-status-money-time-json">
+  <h3>Status columns, money, timestamps and JSONB</h3>
+  <p class="tldr">Model a status as a text column with a <code>CHECK</code> (or a lookup table when it needs
+  data), money as <code>NUMERIC</code> or integer paise, time as UTC <code>TIMESTAMPTZ</code>, and use
+  <code>JSONB</code> only for flexible data you do not join on.</p>
+
+  <h4>Status: text + CHECK, lookup table, or ENUM</h4>
+  <p>An order moves through PLACED, ACCEPTED, PREPARING, OUT_FOR_DELIVERY, DELIVERED or CANCELLED. Three
+  ways to store it:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Text + <code>CHECK</code></th><th>Lookup table + FK</th><th>Database <code>ENUM</code></th></tr></thead>
+    <tbody>
+      <tr><td>Add a value</td><td>Alter the constraint</td><td><code>INSERT</code> a row</td><td><code>ALTER TYPE … ADD VALUE</code></td></tr>
+      <tr><td>Remove or rename a value</td><td>Alter the constraint, update rows</td><td>Update rows and FK</td><td>Hard
+      (PostgreSQL cannot drop a value)</td></tr>
+      <tr><td>Extra data per status (label, sort order, is_final)</td><td>No</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Readable in queries</td><td>Yes</td><td>Yes with a join, or text key</td><td>Yes</td></tr>
+      <tr><td>Works the same in MySQL</td><td>Yes (8.0.16+ enforces CHECK)</td><td>Yes</td><td>MySQL has its own
+      <code>ENUM</code> syntax</td></tr>
+    </tbody>
+  </table></div>
+<pre data-title="Three ways to model status"><code class="language-sql">-- 1. Text with CHECK: simple, my default for small fixed lists
+status TEXT NOT NULL DEFAULT 'PLACED'
+    CONSTRAINT ck_orders_status CHECK (status IN
+        ('PLACED','ACCEPTED','PREPARING','OUT_FOR_DELIVERY','DELIVERED','CANCELLED'))
+
+-- 2. Lookup table: when statuses carry data or are edited by admins
+CREATE TABLE order_statuses (
+    code     TEXT PRIMARY KEY,           -- natural key is fine here
+    label    TEXT NOT NULL,
+    is_final BOOLEAN NOT NULL DEFAULT false
+);
+status TEXT NOT NULL DEFAULT 'PLACED' REFERENCES order_statuses (code)
+
+-- 3. PostgreSQL ENUM type
+CREATE TYPE order_status AS ENUM ('PLACED','ACCEPTED','DELIVERED','CANCELLED');
+status order_status NOT NULL DEFAULT 'PLACED'</code></pre>
+  <p>Rule of thumb: text with <code>CHECK</code> for short fixed lists, a lookup table when the list changes at
+  runtime or has attributes, and avoid <code>ENUM</code> when values may be renamed or removed. Do not store
+  status as a bare number (<code>status = 3</code>): nobody remembers what 3 means. In JPA, use
+  <code>@Enumerated(EnumType.STRING)</code>, never <code>ORDINAL</code>, because reordering the Java enum would
+  silently change the meaning of stored data. The legal transitions (PLACED → ACCEPTED, but never
+  DELIVERED → PLACED) are business rules; enforce them in the service, or with a trigger if many writers exist.</p>
+
+  <h4>Money</h4>
+  <p>Never store money in <code>FLOAT</code> or <code>DOUBLE</code>. Binary floating point cannot represent
+  0.1 exactly, and errors add up.</p>
+<pre data-title="Why not float"><code class="language-sql">SELECT 0.1::double precision + 0.2::double precision AS float_sum,
+       0.1::numeric + 0.2::numeric AS numeric_sum;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">      float_sum      | numeric_sum
+---------------------+-------------
+ 0.30000000000000004 |         0.3</code></pre>
+  <p>Two good options:</p>
+  <ul>
+    <li><strong><code>NUMERIC(12,2)</code></strong> (also <code>DECIMAL</code>): exact decimals; 12 digits in
+    total, 2 after the point. Readable, and correct. In Java it maps to <code>BigDecimal</code>.</li>
+    <li><strong>Integer minor units</strong>: store paise as <code>BIGINT</code> (₹250.50 is
+    <code>25050</code>). Fast, exact, no rounding surprises, and it maps to a Java <code>long</code>. Payment
+    gateways like Razorpay also speak in paise. The column name should say so:
+    <code>amount_paise</code>.</li>
+  </ul>
+  <p>Add a <code>CHECK (amount_paise &gt;= 0)</code> where negatives make no sense, and a
+  <code>currency</code> column (<code>CHAR(3)</code>, ISO code) when more than one currency is possible. Decide
+  the rounding rule for tax and discounts once, and apply it in one place.</p>
+
+  <h4>Timestamps: store UTC with TIMESTAMPTZ</h4>
+  <p>In PostgreSQL <code>TIMESTAMPTZ</code> (timestamp with time zone) stores one exact instant, internally in
+  UTC, and shows it in the session's time zone. <code>TIMESTAMP</code> (without time zone) stores a
+  calendar-and-clock reading with no zone, which is ambiguous the moment two servers or two users are in
+  different zones, or when clocks change.</p>
+<pre data-title="TIMESTAMPTZ vs TIMESTAMP"><code class="language-sql">SET TIME ZONE 'Asia/Kolkata';
+SELECT TIMESTAMPTZ '2026-11-10 09:00:00+00' AS tz_value;
+SET TIME ZONE 'UTC';
+SELECT TIMESTAMPTZ '2026-11-10 09:00:00+00' AS tz_value;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">        tz_value
+------------------------
+ 2026-11-10 14:30:00+05:30
+
+        tz_value
+------------------------
+ 2026-11-10 09:00:00+00</code></pre>
+  <p>Same instant, shown in two zones. Use <code>TIMESTAMPTZ</code> for "when did it happen" (created_at, paid_at).
+  Use <code>DATE</code> for a calendar date with no time (date of birth) and <code>TIME</code> sparingly (opening
+  hours). In MySQL, <code>TIMESTAMP</code> is converted to UTC and back, while <code>DATETIME</code> stores the
+  literal value; set the connection and server time zone explicitly. In Java use <code>Instant</code> or
+  <code>OffsetDateTime</code>, and convert to the user's zone only when displaying.</p>
+
+  <h4>JSONB: flexible data inside a relational table</h4>
+  <p>PostgreSQL's <code>JSONB</code> stores JSON in a binary form that can be indexed and queried. It is
+  useful for data whose shape varies or that you only read as a whole.</p>
+<pre data-title="JSONB for variable attributes"><code class="language-sql">CREATE TABLE menu_items (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name        TEXT NOT NULL,
+    price_paise BIGINT NOT NULL,
+    attributes  JSONB NOT NULL DEFAULT '{}'
+);
+INSERT INTO menu_items (name, price_paise, attributes) VALUES
+    ('Paneer Tikka', 22000, '{"spice": "medium", "allergens": ["milk"], "vegetarian": true}');
+
+SELECT name FROM menu_items WHERE attributes @&gt; '{"vegetarian": true}';   -- containment
+SELECT name, attributes -&gt;&gt; 'spice' AS spice FROM menu_items;           -- text value
+
+CREATE INDEX idx_menu_items_attributes ON menu_items USING gin (attributes);</code></pre>
+  <div class="pc">
+    <div class="pc-pro"><p class="pc-t">Good uses</p><ul>
+      <li>Optional, varying attributes (product specs per category)</li>
+      <li>Raw third-party payloads (a payment gateway response) kept for debugging</li>
+      <li>User preferences and settings</li>
+    </ul></div>
+    <div class="pc-con"><p class="pc-t">Bad uses</p><ul>
+      <li>Data you join, filter, sort or aggregate on all the time: make real columns</li>
+      <li>Anything needing foreign keys or constraints</li>
+      <li>"I did not want to design the schema"</li>
+    </ul></div>
+  </div>
+  <p>A good compromise: real columns for the stable core (name, price) and one <code>JSONB</code> column for the
+  long tail. If a JSON key becomes important to queries, promote it to a column. In MySQL the type is
+  <code>JSON</code>, with different functions.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: never use floating point for money, never TIMESTAMP without zone for events</p>
+    <p>Money is <code>NUMERIC</code> or integer minor units. Events are <code>TIMESTAMPTZ</code> in UTC. Show
+    local time only in the UI.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: storing status as a free-text string with no constraint</p>
+    <p>Without a <code>CHECK</code> or lookup, <code>'Delivered'</code>, <code>'DELIVERED'</code> and
+    <code>'delivred'</code> all get in, and reports silently miss rows. Constrain it.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>How do you store money?</b> <code>NUMERIC(p,s)</code> or integer paise; never float; keep currency
+      in a column.</li>
+      <li><b>TIMESTAMP vs TIMESTAMPTZ?</b> TZ stores an exact instant (UTC internally); plain TIMESTAMP has no zone
+      and is ambiguous.</li>
+      <li><b>When use JSONB?</b> Flexible, rarely joined data; index with GIN; not for core relational facts.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-hierarchy-polymorphic-tenancy">
+  <h3>Hierarchies, polymorphic associations and multi-tenancy</h3>
+  <p class="tldr">Store a tree with a self-referencing <code>parent_id</code> (adjacency list) and read it with
+  a recursive query; avoid polymorphic <code>(type, id)</code> foreign keys by using one real foreign key per
+  target; and for multi-tenancy put a <code>tenant_id</code> on every table.</p>
+
+  <h4>Hierarchical data: the adjacency list</h4>
+  <p>Categories, org charts, comment threads and folders are trees. The simplest model is a row that points at
+  its parent:</p>
+<pre data-title="menu_categories as an adjacency list"><code class="language-sql">CREATE TABLE menu_categories (
+    id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name      TEXT NOT NULL,
+    parent_id BIGINT REFERENCES menu_categories (id),   -- NULL for the root
+    CHECK (parent_id &lt;&gt; id)
+);
+CREATE INDEX idx_menu_categories_parent_id ON menu_categories (parent_id);
+
+INSERT INTO menu_categories (name, parent_id) VALUES
+    ('Food', NULL), ('Starters', 1), ('Mains', 1), ('Veg Starters', 2);
+
+-- All descendants of "Food" with their depth
+WITH RECURSIVE tree AS (
+    SELECT id, name, parent_id, 0 AS depth FROM menu_categories WHERE id = 1
+    UNION ALL
+    SELECT c.id, c.name, c.parent_id, t.depth + 1
+    FROM menu_categories c
+    JOIN tree t ON c.parent_id = t.id
+)
+SELECT repeat('  ', depth) || name AS category, depth FROM tree ORDER BY depth, id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">   category    | depth
+---------------+-------
+ Food          |     0
+   Starters    |     1
+   Mains       |     1
+     Veg Starters |     2
+(4 rows)</code></pre>
+  <p>Recursive CTEs are covered in <a href="#m3">Module 3</a>. The adjacency list is simple to insert and move
+  (change one <code>parent_id</code>) and enforces the parent with a foreign key. Reading a whole subtree needs a
+  recursive query, which is fine for modest trees. Alternatives exist for read-heavy trees:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Model</th><th>Idea</th><th>Trade-off</th></tr></thead>
+    <tbody>
+      <tr><td>Adjacency list</td><td><code>parent_id</code></td><td>Simple writes; subtree needs recursion</td></tr>
+      <tr><td>Materialized path</td><td>Store <code>'/1/2/4/'</code> (or PostgreSQL <code>ltree</code>)</td>
+      <td>Fast subtree with <code>LIKE</code>; moving a node rewrites many paths</td></tr>
+      <tr><td>Closure table</td><td>A table of every (ancestor, descendant, depth) pair</td><td>Fast reads of any
+      relation; more rows and more write work</td></tr>
+      <tr><td>Nested sets</td><td>Left/right numbers per node</td><td>Fast subtree reads; very costly inserts</td></tr>
+    </tbody>
+  </table></div>
+  <p>Start with an adjacency list. Move to another model only if recursion measurably hurts. Guard against
+  cycles (A is parent of B and B of A): the recursive query would loop forever, so add a depth limit
+  (<code>WHERE t.depth &lt; 20</code>) or validate in the service.</p>
+
+  <h4>Polymorphic associations: avoid them</h4>
+  <p>A <strong>polymorphic association</strong> is one reference that can point to several tables, for
+  example a comment that belongs to either a restaurant or a menu item:</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: type + id, no foreign key possible</p><pre><code class="language-sql">CREATE TABLE reviews (
+    id          BIGINT PRIMARY KEY,
+    target_type TEXT NOT NULL,   -- 'restaurant' or 'menu_item'
+    target_id   BIGINT NOT NULL, -- which table? the database cannot check
+    stars       INT NOT NULL
+);</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: one nullable FK per target + CHECK</p><pre><code class="language-sql">CREATE TABLE reviews (
+    id            BIGINT PRIMARY KEY,
+    restaurant_id BIGINT REFERENCES restaurants (id),
+    menu_item_id  BIGINT REFERENCES menu_items (id),
+    stars         INT NOT NULL,
+    CHECK (num_nonnulls(restaurant_id, menu_item_id) = 1)  -- exactly one
+);</code></pre></div>
+  </div>
+  <p>The first design cannot have a real foreign key, so orphan rows appear when targets are deleted, and no
+  cascade works. The second keeps integrity at the cost of one column per target. Other fixes: separate
+  tables (<code>restaurant_reviews</code>, <code>menu_item_reviews</code>), or a common parent table that both
+  targets share a key with. Frameworks such as Rails use <code>type + id</code> (and JPA's
+  <code>@Any</code> exists), but integrity then lives in application code only.</p>
+
+  <h4>Multi-tenancy in brief</h4>
+  <p>A <strong>multi-tenant</strong> system serves many customers (tenants), such as many restaurant chains using
+  one SaaS billing product. Three layouts, from cheapest to most isolated:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Model</th><th>How</th><th>Good for</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>Shared tables</td><td><code>tenant_id</code> column on every table</td><td>Many small tenants</td>
+      <td>A missing filter leaks data; noisy neighbours</td></tr>
+      <tr><td>Schema per tenant</td><td>One PostgreSQL schema each</td><td>Dozens to hundreds of tenants</td>
+      <td>Migrations run per schema</td></tr>
+      <tr><td>Database per tenant</td><td>Separate database</td><td>Few large or regulated tenants</td>
+      <td>Most operational work: backups, migrations, connections</td></tr>
+    </tbody>
+  </table></div>
+<pre data-title="Shared tables with tenant_id"><code class="language-sql">CREATE TABLE invoices (
+    tenant_id  BIGINT NOT NULL REFERENCES tenants (id),
+    id         BIGINT GENERATED ALWAYS AS IDENTITY,
+    number     TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, id),
+    CONSTRAINT uq_invoices_number UNIQUE (tenant_id, number)   -- unique per tenant
+);
+CREATE INDEX idx_invoices_tenant ON invoices (tenant_id, id);
+
+ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;               -- PostgreSQL
+CREATE POLICY tenant_isolation ON invoices
+    USING (tenant_id = current_setting('app.tenant_id')::bigint);</code></pre>
+  <p>Put <code>tenant_id</code> first in indexes and unique constraints, and in every query. PostgreSQL
+  <em>row level security</em> makes the database enforce the filter even if a query forgets it.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: prefer real foreign keys over clever generic ones</p>
+    <p>A foreign key is the cheapest, strongest check you have. Give up generality before giving up a foreign
+    key.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A recursive CTE on a cyclic graph never ends on <code>UNION ALL</code>; use <code>UNION</code> or a
+      depth limit.</li>
+      <li>With shared tables, a global <code>UNIQUE (email)</code> is usually wrong: two tenants may both have
+      <code>admin@shop.com</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>How do you store a category tree?</b> <code>parent_id</code> self-reference, read with a recursive
+      CTE; mention closure table or <code>ltree</code> for heavy reads.</li>
+      <li><b>Why avoid polymorphic associations?</b> No foreign key, so no integrity or cascade.</li>
+      <li><b>Multi-tenancy options?</b> Shared table + <code>tenant_id</code>, schema per tenant, database per
+      tenant; pick by tenant count and isolation needs.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-naming-conventions">
+  <h3>Naming conventions</h3>
+  <p class="tldr">Pick one simple, predictable style (lowercase snake_case, <code>id</code> primary keys,
+  <code>customer_id</code> foreign keys, prefixed constraint and index names), write it down, and apply it
+  everywhere.</p>
+
+  <h4>Why it matters</h4>
+  <p>Names are the user interface of a schema. A predictable name lets a new developer guess a column, and it
+  makes error messages self-explaining ("violates foreign key constraint fk_orders_customer"). The exact style
+  matters less than being consistent. Module 1 already covered SQL style in
+  <a href="#m1-sql-style">SQL style</a>; this is the design side.</p>
+
+  <h4>The conventions</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Item</th><th>Convention</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Case and words</td><td>lowercase <code>snake_case</code>; no spaces; ASCII</td>
+      <td><code>order_items</code>, not <code>OrderItems</code></td></tr>
+      <tr><td>Table name</td><td>Plural nouns <em>or</em> singular: choose one for the whole schema</td>
+      <td><code>orders</code> (plural, common in Spring projects)</td></tr>
+      <tr><td>Primary key</td><td><code>id</code></td><td><code>orders.id</code></td></tr>
+      <tr><td>Foreign key column</td><td>Singular parent name + <code>_id</code></td><td><code>orders.customer_id</code></td></tr>
+      <tr><td>Role-named foreign keys</td><td>The role + <code>_id</code> when one table is referenced twice</td>
+      <td><code>pickup_address_id</code>, <code>drop_address_id</code></td></tr>
+      <tr><td>Join table</td><td>Business noun, or both names</td><td><code>order_items</code>, <code>user_roles</code></td></tr>
+      <tr><td>Booleans</td><td><code>is_</code> / <code>has_</code> prefix</td><td><code>is_active</code>, <code>has_gst</code></td></tr>
+      <tr><td>Timestamps and dates</td><td><code>_at</code> for instants, <code>_on</code> / <code>_date</code> for dates</td>
+      <td><code>created_at</code>, <code>enrolled_on</code></td></tr>
+      <tr><td>Units in names</td><td>Put the unit in the name</td><td><code>amount_paise</code>, <code>weight_grams</code></td></tr>
+      <tr><td>Constraints</td><td>Prefix + table + column(s)</td><td><code>pk_orders</code>, <code>fk_orders_customer</code>,
+      <code>uq_users_email</code>, <code>ck_orders_status</code></td></tr>
+      <tr><td>Indexes</td><td><code>idx_&lt;table&gt;_&lt;columns&gt;</code></td><td><code>idx_orders_customer_id</code></td></tr>
+    </tbody>
+  </table></div>
+<pre data-title="Named constraints make errors readable"><code class="language-sql">CREATE TABLE payments (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY,
+    order_id     BIGINT NOT NULL,
+    amount_paise BIGINT NOT NULL,
+    is_refunded  BOOLEAN NOT NULL DEFAULT false,
+    paid_at      TIMESTAMPTZ,
+    CONSTRAINT pk_payments PRIMARY KEY (id),
+    CONSTRAINT fk_payments_order FOREIGN KEY (order_id) REFERENCES orders (id),
+    CONSTRAINT ck_payments_amount CHECK (amount_paise &gt; 0)
+);
+CREATE INDEX idx_payments_order_id ON payments (order_id);
+
+INSERT INTO payments (order_id, amount_paise) VALUES (1, -5);
+-- ERROR:  new row for relation "payments" violates check constraint "ck_payments_amount"</code></pre>
+
+  <h4>Names to avoid</h4>
+  <ul>
+    <li><strong>Reserved or risky words:</strong> <code>user</code>, <code>order</code>, <code>group</code>,
+    <code>table</code>, <code>desc</code>, <code>end</code>, <code>references</code>. In PostgreSQL
+    <code>user</code> is reserved and needs quotes, which is why you see <code>users</code> and
+    <code>orders</code> (plural) in most schemas. Check the database's keyword list when in doubt.</li>
+    <li><strong>Quoted mixed-case names</strong> (<code>"OrderItems"</code>): PostgreSQL folds unquoted names to
+    lowercase, so you would have to quote them forever.</li>
+    <li><strong>Vague names:</strong> <code>data</code>, <code>value</code>, <code>type</code>,
+    <code>flag</code>, <code>temp</code>. Say what it is: <code>delivery_instructions</code>.</li>
+    <li><strong>Type or table prefixes:</strong> <code>tbl_orders</code>, <code>order_order_date</code>.
+    The type is visible in the schema.</li>
+    <li><strong>Abbreviations nobody knows:</strong> <code>cust_nm</code>. Disk is cheap; clarity is not.</li>
+  </ul>
+
+  <h4>Mapping to Java</h4>
+  <p>Spring Boot's default naming strategy maps <code>createdAt</code> in an entity to the column
+  <code>created_at</code> and <code>OrderItem</code> to <code>order_item</code>, so snake_case columns work
+  without extra configuration. If your table is <code>order_items</code>, add
+  <code>@Table(name = "order_items")</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: PostgreSQL limits identifiers to 63 bytes</p>
+    <p>Longer names are cut silently, which can make two long index names collide. Keep index and constraint
+    names short but meaningful. MySQL's limit is 64 characters.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: write the naming rules down</p>
+    <p>One short page in the repository ("tables plural, ids <code>id</code>, FKs <code>x_id</code>") ends
+    arguments and keeps migrations consistent when ten people add tables.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>Interviewers look for consistency and reasons: plural vs singular is a choice; avoiding reserved words,
+    naming FKs after the parent, and naming constraints so errors are readable are the points that show
+    experience.</p>
+  </div>
+</article>
+
+<article class="topic" id="m4-data-types">
+  <h3>Choosing data types</h3>
+  <p class="tldr">Pick the smallest type that is correct for the data and its future: <code>BIGINT</code> ids,
+  <code>NUMERIC</code> or paise for money, <code>TEXT</code> for names and phone numbers, <code>TIMESTAMPTZ</code>
+  for instants, <code>BOOLEAN</code> for flags, and a URL (not the file) for files.</p>
+
+  <h4>A guide table</h4>
+  <p>The type is a constraint: it stops wrong data and decides storage and speed. Module 1 lists every type;
+  see <a href="#m1-data-types">Data types</a>. This table says what to <em>pick</em> for common design needs.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Data</th><th>Use</th><th>Why / avoid</th></tr></thead>
+    <tbody>
+      <tr><td>Primary and foreign ids</td><td><code>BIGINT</code> (identity) or <code>UUID</code></td>
+      <td>Avoid <code>INT</code> for growing tables</td></tr>
+      <tr><td>Money</td><td><code>NUMERIC(12,2)</code> or <code>BIGINT</code> paise</td><td>Never <code>FLOAT</code></td></tr>
+      <tr><td>Quantity, counts</td><td><code>INT</code> (or <code>SMALLINT</code> for tiny ranges)</td>
+      <td>Add a <code>CHECK</code> for ranges</td></tr>
+      <tr><td>Names, titles, addresses</td><td><code>TEXT</code> (PostgreSQL), <code>VARCHAR(n)</code> in MySQL</td>
+      <td>In PostgreSQL <code>VARCHAR(n)</code> is no faster than <code>TEXT</code>; use a limit only when a
+      rule demands it</td></tr>
+      <tr><td>Email</td><td><code>TEXT</code> + <code>UNIQUE</code> (store lowercase)</td><td>Use a <code>CHECK</code>
+      or app validation for the format</td></tr>
+      <tr><td>Phone number</td><td><code>TEXT</code> in E.164 form (<code>+919812345678</code>)</td>
+      <td>Not a number: leading zeros, <code>+</code>, no arithmetic</td></tr>
+      <tr><td>Pincode, PAN, IFSC, account no.</td><td><code>TEXT</code> / <code>CHAR(n)</code></td>
+      <td>Identifiers, not quantities; may start with 0</td></tr>
+      <tr><td>Instant in time</td><td><code>TIMESTAMPTZ</code></td><td>Plain <code>TIMESTAMP</code> is ambiguous</td></tr>
+      <tr><td>Date only (birth date)</td><td><code>DATE</code></td><td>No time part to invent</td></tr>
+      <tr><td>Duration</td><td><code>INTERVAL</code> or integer seconds/minutes</td><td>Name the unit in a
+      column such as <code>prep_minutes</code></td></tr>
+      <tr><td>Flag</td><td><code>BOOLEAN</code> <code>NOT NULL DEFAULT false</code></td><td>Avoid <code>'Y'/'N'</code>
+      and <code>0/1</code> (MySQL <code>TINYINT(1)</code> is its boolean)</td></tr>
+      <tr><td>Fixed set of values</td><td><code>TEXT</code> + <code>CHECK</code>, or lookup table</td>
+      <td>See status columns</td></tr>
+      <tr><td>Latitude / longitude</td><td><code>NUMERIC(9,6)</code> or <code>DOUBLE PRECISION</code>, or PostGIS
+      <code>geography</code></td><td>Floating point is acceptable for coordinates</td></tr>
+      <tr><td>Long text (reviews, notes)</td><td><code>TEXT</code></td><td>MySQL: <code>TEXT</code> /
+      <code>MEDIUMTEXT</code></td></tr>
+      <tr><td>Flexible attributes</td><td><code>JSONB</code></td><td>Not for core relational data</td></tr>
+      <tr><td>Files and images</td><td><code>TEXT</code> holding a URL or object-store key (S3)</td>
+      <td>Not <code>BYTEA</code>/<code>BLOB</code> blobs</td></tr>
+      <tr><td>Passwords</td><td><code>TEXT</code> holding a salted hash (bcrypt/Argon2)</td><td>Never plain text</td></tr>
+      <tr><td>IP address</td><td><code>INET</code> (PostgreSQL)</td><td>Validates and compares correctly</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Why not store files in the database?</h4>
+  <p>A 2 MB photo inside a row inflates the table, slows backups and replication, and fills the buffer cache
+  with bytes you rarely query. The database is good at structured data; object storage (S3, Azure Blob) is good at
+  files and serves them cheaply through a CDN. Store the object key or URL, plus metadata (content type, size,
+  checksum), and keep the file elsewhere. A tiny icon (a few KB) in a column is acceptable.</p>
+
+  <h4>Size and range thinking</h4>
+  <ul>
+    <li><code>SMALLINT</code> holds up to 32,767; <code>INT</code> up to about 2.1 billion;
+    <code>BIGINT</code> up to about 9.2 quintillion.</li>
+    <li>Every byte is repeated in each row, each index entry and each foreign key. Shave bytes on huge tables
+    (use <code>SMALLINT</code> for a status code on a billion-row log), not on small ones.</li>
+    <li>Enforce what the type cannot: <code>CHECK (quantity &gt; 0)</code>, <code>CHECK (stars BETWEEN 1 AND 5)</code>,
+    <code>NOT NULL</code>.</li>
+  </ul>
+
+  <h4>NULL or a default?</h4>
+  <p>Make a column <code>NOT NULL</code> unless "unknown or not applicable" is a real state. A nullable column
+  forces three-valued logic into every query (<code>x = NULL</code> is never true; see
+  <a href="#m1-null-logic">NULL logic</a>). Use <code>NULL</code> for "we do not know" (a delivery time not yet
+  set), and a real default for "zero by default" (<code>rating_count INT NOT NULL DEFAULT 0</code>).</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: a phone number or pincode as a number</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong</p><pre><code class="language-sql">phone   BIGINT,   -- 0 and + lost; 91 prefix ambiguous
+pincode INT       -- 011001 becomes 11001</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right</p><pre><code class="language-sql">phone   TEXT CHECK (phone ~ '^\+[0-9]{8,15}$'),
+pincode CHAR(6) CHECK (pincode ~ '^[0-9]{6}$')</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-version">
+    <p class="co-t">PostgreSQL vs MySQL</p>
+    <p>MySQL needs a length for <code>VARCHAR(n)</code> and has <code>TINYINT</code>, <code>DATETIME</code> and
+    <code>ENUM</code>; PostgreSQL has real <code>BOOLEAN</code>, <code>TIMESTAMPTZ</code>, <code>UUID</code>,
+    <code>JSONB</code>, arrays and range types. Regex <code>CHECK</code> as shown uses PostgreSQL's
+    <code>~</code>; MySQL uses <code>REGEXP</code>.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Which type for a phone number?</b> Text, in E.164 form; it is an identifier.</li>
+      <li><b>Where do you keep images?</b> In object storage; the table keeps the URL or key.</li>
+      <li><b>VARCHAR(255) or TEXT?</b> In PostgreSQL they perform the same; use a length only for a real rule.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,420 @@
+<div class="mintro">
+  <p>Modules 1–3 gave you the daily loop: commit, push, branch, merge and pull request. That is enough for most days. This module is for the days when things get complicated: your branch history is messy, you started work on the wrong branch, a bad commit is already on <code>main</code>, or "I lost my commit!". Professional developers are calm in these situations because they know the tools — and, more importantly, they know which tools rewrite history and which do not.</p>
+  <p>The big idea of the module: Git almost never loses committed work. Commits stay in the object database for weeks even after a branch is deleted or a reset, and the <strong>reflog</strong> remembers where you were. You also learn the golden rule — never rewrite history that other people already have — and the safe tools for the shared case (<code>git revert</code>). The module ends with GitHub features teams use every day: issues, branch protection, CODEOWNERS and a first look at GitHub Actions.</p>
+  <p>Everything here builds on <a href="#m3">Module 3</a>. Use it when needed; you do not have to memorise it in week one. You will meet it in interviews quickly, though.</p>
+  <ul>
+    <li>Explain <code>rebase</code> vs <code>merge</code>, rebase a branch safely and use <code>--force-with-lease</code>.</li>
+    <li>Clean up a branch with <code>git rebase -i</code> (squash, reword, fixup, drop, reorder).</li>
+    <li>Park unfinished work with <code>git stash</code> and bring it back.</li>
+    <li>Copy a commit between branches with <code>git cherry-pick</code>.</li>
+    <li>Choose between <code>reset --soft/--mixed/--hard</code> and <code>revert</code>, and explain why <code>reset --hard</code> is risky.</li>
+    <li>Recover "lost" commits and deleted branches with <code>git reflog</code>.</li>
+    <li>Create tags and releases with semantic versions such as <code>v1.2.0</code>.</li>
+    <li>Use <code>bisect</code>, <code>blame</code>, <code>clean</code>, <code>log -S</code>, worktrees, hooks and LFS at a basic level.</li>
+    <li>Follow a recovery playbook for the common Git disasters.</li>
+    <li>Set up issues, branch protection, CODEOWNERS, a tiny GitHub Actions workflow and Dependabot.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m4-rebase">
+  <h3>git rebase: replaying commits on a new base</h3>
+  <p class="tldr"><code>git rebase main</code> takes the commits of your branch and replays them on top of the latest <code>main</code>, giving a straight-line history; it creates new commits, so never rebase commits that other people already have.</p>
+
+  <p>You branched from <code>main</code> a few days ago. Since then <code>main</code> moved on. You want your branch to include those new commits. In Module 3 you did <code>git merge main</code>, which adds a merge commit. <strong>Rebase</strong> is the other way: it changes the <em>base</em> your branch grows from, so it looks as if you had started your work from the newest <code>main</code>.</p>
+
+  <h4 id="m4-rebase-how">How rebase works</h4>
+  <p>Before rebase, the branches have diverged:</p>
+  <figure class="fig">
+<pre class="mermaid">
+gitGraph
+  commit id: "M1"
+  commit id: "M2"
+  branch feature
+  commit id: "F1"
+  commit id: "F2"
+  checkout main
+  commit id: "M3"
+  commit id: "M4"
+</pre>
+    <figcaption>Before: feature started from M2, and main has since gained M3 and M4</figcaption>
+  </figure>
+  <p>You run <code>git switch feature</code> and then <code>git rebase main</code>. Git does the following:</p>
+  <ol class="steps">
+    <li>Finds the commits that are on your branch but not on <code>main</code>: F1 and F2.</li>
+    <li>Saves each of them as a patch (the change it made).</li>
+    <li>Moves your branch to the tip of <code>main</code> (M4).</li>
+    <li>Applies the patches one by one on top, creating <strong>new commits</strong> F1' and F2'.</li>
+  </ol>
+  <figure class="fig">
+<pre class="mermaid">
+gitGraph
+  commit id: "M1"
+  commit id: "M2"
+  commit id: "M3"
+  commit id: "M4"
+  branch feature
+  commit id: "F1 copy"
+  commit id: "F2 copy"
+</pre>
+    <figcaption>After: the feature commits are copies (new ids) on top of M4; the old F1 and F2 are no longer on any branch</figcaption>
+  </figure>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git switch feature/discount
+$ git rebase main
+Successfully rebased and updated refs/heads/feature/discount.
+$ git log --oneline --graph
+* 5d1e7c2 Add discount tests
+* b83fa90 Add discount before GST
+* 7e3c1d4 Update tax rate (this is main's latest commit)
+* 1a9b2f6 Add PriceCalculator</code></pre>
+  <p>The history is a straight line. The content is the same as a merge would give, but the commits F1' and F2' have different ids from F1 and F2, because a commit id depends on its parent. That single fact explains the golden rule below.</p>
+
+  <h4 id="m4-rebase-vs-merge">Rebase vs merge</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>git merge main</code></th><th><code>git rebase main</code></th></tr></thead>
+    <tbody>
+      <tr><td>Result</td><td>A merge commit with two parents</td><td>Straight line, no merge commit</td></tr>
+      <tr><td>Existing commits</td><td>Unchanged</td><td>Replaced by new copies (new ids)</td></tr>
+      <tr><td>History</td><td>True record of what happened, including side branches</td><td>Clean and linear, but it looks as if work was done in sequence</td></tr>
+      <tr><td>Conflicts</td><td>Resolve once</td><td>May resolve per replayed commit</td></tr>
+      <tr><td>Safe on shared branches?</td><td>Yes</td><td>No — rewrites history</td></tr>
+      <tr><td>Undo</td><td><code>git reset --hard ORIG_HEAD</code> or revert</td><td><code>git rebase --abort</code> (during) or <code>git reflog</code> (after)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Neither is "right". Use merge when history truth and safety matter or when the branch is shared. Use rebase to update <em>your own private</em> branch before the pull request, so the PR looks tidy and the final merge can be fast-forward or squash.</p>
+
+  <h4 id="m4-rebase-golden">The golden rule</h4>
+  <div class="co co-rule">
+    <p class="co-t">Rule: never rebase commits that other people already have</p>
+    <p>Rebase makes new commits and abandons the old ones. If a teammate has already based work on your old commits (they pulled your branch, or you pushed it and they built on it), their history now contains commits that no longer exist in yours. When they pull, Git sees two versions of the same work and creates duplicates and confusing conflicts. Rebase only commits that exist <strong>only on your machine</strong>, or on a branch only you use — even if you pushed it as a PR branch.</p>
+  </div>
+  <p>Never rebase <code>main</code>, <code>develop</code> or any shared branch.</p>
+
+  <h4 id="m4-rebase-workflow">The rebase workflow, including conflicts</h4>
+  <pre data-title="Update your private branch with rebase"><code class="language-bash">git fetch origin                     # get the latest main from GitHub
+git switch feature/discount
+git rebase origin/main               # replay your commits on the new main
+# ...tests...
+git push --force-with-lease          # needed if the branch was pushed before</code></pre>
+  <p>If both sides changed the same lines, rebase stops at the commit that clashes:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git rebase origin/main
+Auto-merging src/main/java/com/acme/crm/PriceCalculator.java
+CONFLICT (content): Merge conflict in src/main/java/com/acme/crm/PriceCalculator.java
+error: could not apply b83fa90... Add discount before GST
+hint: Resolve all conflicts manually, mark them as resolved with
+hint: "git add/rm &lt;conflicted_files&gt;", then run "git rebase --continue".
+hint: You can instead skip this commit: run "git rebase --skip".
+hint: To abort and get back to the state before "git rebase", run
+hint: "git rebase --abort".</code></pre>
+  <ol class="steps">
+    <li>Open the conflicted file, fix the markers (same as in <a href="#m3-merge-conflicts">merge conflicts</a>).</li>
+    <li><code>git add &lt;file&gt;</code> — do <em>not</em> run <code>git commit</code>.</li>
+    <li><code>git rebase --continue</code> — Git commits the fixed patch and replays the next one. More conflicts may come; repeat.</li>
+    <li>Changed your mind? <code>git rebase --abort</code> returns you to exactly where you started.</li>
+    <li>If a commit becomes empty or unwanted: <code>git rebase --skip</code> drops it.</li>
+  </ol>
+  <div class="co co-exc">
+    <p class="co-t">Exception: ours and theirs swap in a rebase</p>
+    <p>While a rebase is replaying your commits onto <code>main</code>, Git is standing on <code>main</code>. So <strong>ours</strong> (the <code>HEAD</code> side of the markers) is the branch you are rebasing <em>onto</em> (<code>main</code>), and <strong>theirs</strong> is <em>your</em> commit being replayed. This is the opposite of a merge. <code>git status</code> says <em>rebase in progress</em>, and the IDE shows the "Continue Rebase" action.</p>
+  </div>
+
+  <h4 id="m4-rebase-pull">git pull --rebase</h4>
+  <p>A normal <code>git pull</code> is <code>fetch</code> plus <code>merge</code>, and when your local branch has commits that the remote lacks, it creates a merge commit just for "syncing". <code>git pull --rebase</code> is <code>fetch</code> plus <code>rebase</code>: your unpushed commits are replayed on top of what you fetched.</p>
+  <pre data-title="Pull without a noise merge commit"><code class="language-bash">git pull --rebase
+git config --global pull.rebase true     # make it the default
+git config --global rebase.autoStash true  # stash and unstash dirty files automatically</code></pre>
+  <p>This is safe because the commits being rebased are your own unpushed ones.</p>
+
+  <h4 id="m4-rebase-force">Pushing after a rebase: --force-with-lease</h4>
+  <p>If you already pushed the branch, a rebase changes its commits, and a normal <code>git push</code> is rejected as <em>non-fast-forward</em> because the remote has the old versions. You must force the push, and you should do it in the safe way:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>git push --force</code></td><td>Overwrites the remote branch no matter what. If a teammate pushed a commit there meanwhile, it is destroyed without a warning.</td></tr>
+      <tr><td><code>git push --force-with-lease</code></td><td>Overwrites only if the remote branch is still at the commit you last fetched. If someone else pushed, Git refuses and tells you. Safe default.</td></tr>
+    </tbody>
+  </table></div>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git push
+ ! [rejected]        feature/discount -&gt; feature/discount (non-fast-forward)
+$ git push --force-with-lease
++ 9d4e7f0...5d1e7c2 feature/discount -&gt; feature/discount (forced update)</code></pre>
+  <p>The line starts with <code>+</code> to mark a forced update. Many teams forbid force pushes on <code>main</code> and allow them on personal feature branches. Note: <code>--force-with-lease</code> is protected only by what you have fetched; running <code>git fetch</code> just before can quietly defeat the check, so do not fetch and push blindly in a script.</p>
+
+  <h4 id="m4-rebase-onto">Other useful forms</h4>
+  <ul>
+    <li><code>git rebase --onto main old-base feature</code> — move only the commits after <code>old-base</code> onto <code>main</code>. Used when you branched a feature off another feature branch whose PR was squash-merged.</li>
+    <li><code>git rebase -i</code> — interactive: edit the commit list (<a href="#m4-interactive-rebase">next article</a>).</li>
+    <li><code>git rebase --abort</code> / <code>--continue</code> / <code>--skip</code> — the three exits.</li>
+    <li><code>git rebase --rebase-merges</code> — keep merge commits instead of flattening them (rare).</li>
+  </ul>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: rebasing a shared branch</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: rebase main, or a branch teammates use</p><pre><code class="language-bash">git switch main
+git rebase feature/x
+git push --force</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: rebase your private branch onto main</p><pre><code class="language-bash">git switch feature/x
+git rebase origin/main
+git push --force-with-lease</code></pre></div>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: you can always get back</p>
+    <p>Before a risky rebase, mark the spot: <code>git branch backup-before-rebase</code>. After the rebase the backup branch still points to the old commits. If the result is bad, <code>git reset --hard backup-before-rebase</code>. Or use the <a href="#m4-reflog">reflog</a>, which remembers <code>ORIG_HEAD</code> as well.</p>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>Teams that squash-merge PRs rarely need to rebase for history reasons. They still use <code>git pull --rebase</code> every day and rebase a feature branch before review if the team likes a linear PR. Some teams ban rebase after the PR is opened, because it hides what changed since review.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Merge vs rebase?"</p>
+    <ul>
+      <li>Merge joins two lines with a merge commit and keeps history as it happened; rebase replays your commits on a new base, giving linear history with new commit ids.</li>
+      <li>Rebase rewrites history, so never rebase shared commits; use it on your own feature branch.</li>
+      <li>After rebasing a pushed branch, use <code>--force-with-lease</code>, not <code>--force</code>.</li>
+      <li>Conflicts in rebase are resolved per commit with <code>--continue</code>; <code>--abort</code> cancels.</li>
+      <li>Mention <code>git pull --rebase</code> and that ours/theirs are swapped.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-interactive-rebase">
+  <h3>Interactive rebase: tidy your commits before review</h3>
+  <p class="tldr"><code>git rebase -i HEAD~4</code> opens a list of your last four commits so you can reword, squash, fixup, drop, reorder or edit them before you share the branch.</p>
+
+  <p>While you work, your commits look like a diary: "wip", "fix typo", "oops", "address comments". Nobody wants these in <code>main</code>. <strong>Interactive rebase</strong> lets you rewrite the last few commits — combine them, rename them, remove them, change their order — and so turn the diary into a clean story. Do it before you open the PR, or before you merge, only on commits that nobody else has built on.</p>
+
+  <h4 id="m4-interactive-rebase-start">Starting</h4>
+  <p>Say these are your last four commits:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git log --oneline -4
+e41f09a wip
+9c2d7b1 fix typo
+3b8a6e0 Add AuthService
+17d5c42 Add LoginRequest record</code></pre>
+  <p>Start the rebase for the last four commits. <code>HEAD~4</code> means "four commits before HEAD" and is the commit <em>just before</em> the ones you want to edit:</p>
+  <pre data-title="Start"><code class="language-bash">git rebase -i HEAD~4
+git rebase -i main            # or: every commit of the branch since it left main</code></pre>
+  <p>Git opens your editor with a <strong>todo list</strong>. Note the order: <strong>oldest commit first</strong>, the reverse of <code>git log</code>.</p>
+  <pre data-title="The todo list (edit the first word of each line)"><code class="language-plaintext">pick 17d5c42 Add LoginRequest record
+pick 3b8a6e0 Add AuthService
+pick 9c2d7b1 fix typo
+pick e41f09a wip
+
+# Commands:
+# p, pick   = use commit
+# r, reword = use commit, but edit the commit message
+# e, edit   = use commit, but stop for amending
+# s, squash = use commit, but meld into previous commit
+# f, fixup  = like "squash", but discard this commit's log message
+# d, drop   = remove commit
+# x, exec   = run command (the rest of the line) using shell</code></pre>
+  <p>You change the word at the start of a line, save and close the editor, and Git replays the commits following your instructions.</p>
+
+  <h4 id="m4-interactive-rebase-commands">The commands</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>What it does</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><code>pick</code></td><td>Keep the commit as it is</td><td>Default</td></tr>
+      <tr><td><code>reword</code></td><td>Keep the changes, stop to let you edit the message</td><td>Fix a poor message</td></tr>
+      <tr><td><code>edit</code></td><td>Stop after applying the commit so you can change files or split it</td><td>Split a big commit, or fix something in an old commit</td></tr>
+      <tr><td><code>squash</code></td><td>Merge into the commit above; combine the messages</td><td>Join "fix typo" into the commit it fixes</td></tr>
+      <tr><td><code>fixup</code></td><td>Like squash, but throw away this commit's message</td><td>Join a tiny fix without a message to edit</td></tr>
+      <tr><td><code>drop</code></td><td>Delete the commit completely (or delete the line)</td><td>Remove debug or wip commits</td></tr>
+      <tr><td><code>exec</code></td><td>Run a shell command after a commit, such as <code>exec ./mvnw test</code></td><td>Check that every commit still builds</td></tr>
+    </tbody>
+  </table></div>
+  <p>Changing the order of the lines changes the order of the commits. A commit can only be squashed into the one <em>above</em> it in the list.</p>
+
+  <h4 id="m4-interactive-rebase-example">Example: squash and reword</h4>
+  <p>Goal: one commit for "Add AuthService" that includes the typo fix, no "wip", and a better first message. Edit the todo list like this:</p>
+  <pre data-title="Edited todo list"><code class="language-plaintext">reword 17d5c42 Add LoginRequest record
+pick 3b8a6e0 Add AuthService
+fixup 9c2d7b1 fix typo
+drop e41f09a wip</code></pre>
+  <p>Save and close. Git stops for the <code>reword</code> and opens the message editor; you change it to <code>feat(auth): add LoginRequest record</code>, save, and the rebase finishes:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">[detached HEAD 6a1f3de] feat(auth): add LoginRequest record
+ Date: Mon Nov 9 11:02:44 2026 +0530
+ 1 file changed, 6 insertions(+)
+Successfully rebased and updated refs/heads/feature/12-login-endpoint.
+$ git log --oneline -2
+a94c0e8 Add AuthService
+6a1f3de feat(auth): add LoginRequest record</code></pre>
+  <p>Two commits remain instead of four, and the commit ids changed. If you pushed the branch before, finish with <code>git push --force-with-lease</code>.</p>
+
+  <h4 id="m4-interactive-rebase-edit">Using edit to split a commit</h4>
+  <p>Mark a commit <code>edit</code>. The rebase stops right after applying it. Then:</p>
+  <pre data-title="Split one commit into two"><code class="language-bash">git reset HEAD~1              # undo the commit, keep the changes in the working folder
+git add -p                    # stage the first part
+git commit -m "refactor: extract JwtService"
+git add .                     # stage the rest
+git commit -m "feat: add login endpoint"
+git rebase --continue</code></pre>
+
+  <h4 id="m4-interactive-rebase-autosquash">Fixup commits and --autosquash</h4>
+  <p>While you work you often notice a mistake in an earlier commit. Instead of a vague "fix" commit, mark it as a fix for that commit:</p>
+  <pre data-title="Create a fixup commit and apply it automatically"><code class="language-bash">git commit --fixup 3b8a6e0                 # message becomes: fixup! Add AuthService
+git rebase -i --autosquash main            # fixup lines are moved and marked for you
+git config --global rebase.autoSquash true # always do this</code></pre>
+  <p>With <code>--autosquash</code> Git moves each <code>fixup!</code> commit directly under its target and sets it to <code>fixup</code>. You only check the list and save. This is the cleanest way to respond to review comments if your team is fine with rewriting the PR branch. (<code>git commit --squash &lt;commit&gt;</code> does the same but keeps the message for editing.)</p>
+
+  <h4 id="m4-interactive-rebase-exits">When it goes wrong</h4>
+  <ul>
+    <li><code>git rebase --abort</code> — cancels and returns to the state before you started.</li>
+    <li><code>git rebase --edit-todo</code> — change the todo list during a stopped rebase.</li>
+    <li>Deleting all lines in the todo file (empty file) aborts the rebase.</li>
+    <li>Finished already but unhappy? <code>git reflog</code> shows where the branch was before, and <code>git reset --hard HEAD@{1}</code> style recovery brings it back (<a href="#m4-reflog">reflog</a>).</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Only rewrite commits that are not shared with others.</li>
+      <li>After an interactive rebase on a pushed branch, push with <code>--force-with-lease</code>.</li>
+      <li>Squashing across a merge commit does not work well: interactive rebase flattens merges unless you use <code>--rebase-merges</code>. Rebase branches that contain only normal commits.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>If you drop a commit that later commits depend on, you will get conflicts when replaying them.</li>
+      <li>The first line cannot be <code>squash</code> or <code>fixup</code> (nothing above it): Git reports <em>cannot 'squash' without a previous commit</em>.</li>
+      <li>Wrongly set editor? Use <code>git config --global core.editor "code --wait"</code> for VS Code.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Tidy before opening a PR, not after the first review.</li>
+      <li>Commits that remain should each build and have a clear message.</li>
+      <li>If your team squash-merges, tidying individual commits is optional; the PR title matters more.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you squash commits?"</p>
+    <ul>
+      <li><code>git rebase -i HEAD~N</code> (or <code>-i main</code>), change <code>pick</code> to <code>squash</code>/<code>fixup</code> on the later commits, save, edit the final message.</li>
+      <li>Alternative: <code>git reset --soft HEAD~N</code> then one new commit.</li>
+      <li>On GitHub, "Squash and merge" does it at merge time.</li>
+      <li>Warn that it rewrites history: use only on unshared commits; push with <code>--force-with-lease</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m4-stash">
+  <h3>git stash: park unfinished work</h3>
+  <p class="tldr"><code>git stash</code> saves your uncommitted changes on a shelf and gives you a clean working folder, so you can switch branches and come back later with <code>git stash pop</code>.</p>
+
+  <p>You are in the middle of a feature when your lead says "urgent bug on <code>main</code>, please fix now". Your files are half-edited, not ready for a commit. You cannot switch branches easily with dirty files. <strong>Stash</strong> solves this: it takes your uncommitted changes (to tracked files), stores them in a stack, and restores the folder to the last commit.</p>
+
+  <h4 id="m4-stash-basic">The basic flow</h4>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git status -s
+ M src/main/java/com/acme/crm/OrderService.java
+$ git stash push -m "wip: order cancel logic"
+Saved working directory and index state On feature/cancel: wip: order cancel logic
+$ git status -s
+$ git switch main
+$ git switch -c hotfix/null-cart
+# ...fix the bug, commit, push, open PR...
+$ git switch feature/cancel
+$ git stash pop
+On branch feature/cancel
+Changes not staged for commit:
+	modified:   src/main/java/com/acme/crm/OrderService.java
+Dropped refs/stash@{0} (3f9d2a1c...)</code></pre>
+  <p>Plain <code>git stash</code> works too, but <code>git stash push -m "text"</code> gives the entry a name. Without a message you get something like <code>WIP on feature/cancel: 4b7e1a2 Add cancel endpoint</code>, which is hard to tell apart later.</p>
+
+  <h4 id="m4-stash-commands">Commands</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>git stash push -m "msg"</code></td><td>Stash tracked changes (staged and unstaged) with a name</td></tr>
+      <tr><td><code>git stash push -u</code></td><td>Also stash <em>untracked</em> files (new files not yet added)</td></tr>
+      <tr><td><code>git stash push -a</code></td><td>Also stash ignored files (<code>--all</code>); rarely needed</td></tr>
+      <tr><td><code>git stash push -- path/File.java</code></td><td>Stash only the listed paths</td></tr>
+      <tr><td><code>git stash push -p</code></td><td>Choose hunks interactively</td></tr>
+      <tr><td><code>git stash list</code></td><td>Show all stash entries: <code>stash@{0}</code> is the newest</td></tr>
+      <tr><td><code>git stash show -p stash@{1}</code></td><td>Show the diff of an entry (without <code>-p</code> a file summary)</td></tr>
+      <tr><td><code>git stash apply [stash@{n}]</code></td><td>Restore the changes and <em>keep</em> the entry</td></tr>
+      <tr><td><code>git stash pop [stash@{n}]</code></td><td>Restore the changes and <em>remove</em> the entry</td></tr>
+      <tr><td><code>git stash drop [stash@{n}]</code></td><td>Delete one entry</td></tr>
+      <tr><td><code>git stash clear</code></td><td>Delete all entries</td></tr>
+      <tr><td><code>git stash branch new-branch [stash@{n}]</code></td><td>Create a branch from the commit where you stashed, apply the entry and drop it</td></tr>
+    </tbody>
+  </table></div>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git stash list
+stash@{0}: On feature/cancel: wip: order cancel logic
+stash@{1}: On main: try new retry settings
+$ git stash show -p stash@{1}
+diff --git a/src/main/resources/application.properties ...
+-retry.max=3
++retry.max=5</code></pre>
+
+  <h4 id="m4-stash-untracked">Untracked files need -u</h4>
+  <p>By default stash ignores files that Git does not know yet. If your work includes a brand-new file, a plain stash leaves it in the folder:</p>
+  <pre class="out" data-title="Terminal"><code class="language-shell">$ git stash push -m "wip"
+$ git status -s
+?? CancelOrderRequest.java        # still here: untracked files are not stashed
+$ git stash push -u -m "wip with new files"</code></pre>
+
+  <h4 id="m4-stash-apply-pop">apply vs pop</h4>
+  <p><code>pop</code> = <code>apply</code> + <code>drop</code>. Prefer <code>apply</code> when you are not sure the result will be clean: you keep the entry until you are happy, then <code>git stash drop</code>. If <code>pop</code> hits a conflict, Git does <em>not</em> drop the entry (so your work is still safe); resolve the conflict, then drop it yourself. You can also apply a stash on a different branch from the one it came from.</p>
+
+  <h4 id="m4-stash-branch">Stash into a new branch</h4>
+  <p>If popping gives conflicts because the branch moved on, or you realise the work deserves its own branch:</p>
+  <pre data-title="Turn a stash into a branch"><code class="language-bash">git stash branch feature/cancel-v2 stash@{0}</code></pre>
+
+  <h4 id="m4-stash-vs-wip">Stash vs a WIP commit</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Stash</th><th>WIP commit</th></tr></thead>
+    <tbody>
+      <tr><td>Best for</td><td>A short pause (minutes, hours)</td><td>Longer pauses, or work you want on GitHub</td></tr>
+      <tr><td>Visible in branches / log</td><td>No — separate stack</td><td>Yes</td></tr>
+      <tr><td>Can be pushed (backup)</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Easy to forget</td><td>Yes — list gets long</td><td>Less so</td></tr>
+      <tr><td>Clean-up</td><td><code>pop</code> / <code>drop</code></td><td><code>git reset HEAD~1</code> or squash it later</td></tr>
+    </tbody>
+  </table></div>
+  <p>A good habit: for anything that will wait overnight, make a commit <code>wip: cancel order</code> on your feature branch. Later, <code>git reset HEAD~1</code> or an interactive rebase removes it again.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Always give a stash a message with <code>-m</code>.</li>
+      <li>Stash does not include untracked files unless you use <code>-u</code>.</li>
+      <li>Stashes are local; they are not pushed and they are not tied to the branch (you can apply them anywhere).</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>No local changes to save</code> — nothing to stash (or only untracked files without <code>-u</code>).</li>
+      <li><code>git stash pop</code> with conflicts prints <em>CONFLICT</em> and keeps the stash; resolve, <code>git add</code> and <code>git stash drop</code>.</li>
+      <li><code>git stash clear</code> and <code>git stash drop</code> are hard to undo, but the commit objects remain for a while; <code>git fsck --unreachable --no-reflogs</code> can find them. Do not rely on it.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Forgetting stashes for weeks; <code>git stash list</code> grows and nobody remembers what they hold.</li>
+      <li>Stashing without <code>-u</code> and wondering why the new file is still there (or lost on a branch switch).</li>
+      <li>Using <code>git stash pop</code> on the wrong branch and creating a mess.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is git stash and when do you use it?"</p>
+    <ul>
+      <li>It saves uncommitted changes to a stack and cleans the working folder, so you can switch tasks.</li>
+      <li><code>pop</code> restores and removes; <code>apply</code> restores and keeps; <code>-u</code> includes untracked files.</li>
+      <li>Use it for short interruptions; use a WIP commit or a branch for longer work.</li>
+    </ul>
+  </div>
+</article>

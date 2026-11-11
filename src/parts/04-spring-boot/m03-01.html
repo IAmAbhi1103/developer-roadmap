@@ -1,0 +1,526 @@
+<div class="mintro">
+  <p>Almost every backend job means reading and writing a relational database. In Spring Boot you do this with <strong>Spring Data JPA</strong>, which sits on top of JPA and Hibernate. This module explains the layers from the bottom up: what JDBC does, what an ORM adds, how Hibernate tracks your objects, how entities and relationships are mapped, and how to stop the classic performance traps (the N+1 problem, lazy-loading errors, wrong transaction boundaries).</p>
+  <p>It builds on <a href="#m1">module 1</a> (beans, proxies, AOP — <code>@Transactional</code> is a proxy) and <a href="#m2">module 2</a> (the layered Product CRUD API, DTOs, pagination). The SQL itself — indexes, isolation levels, locking, how a database works inside — is in <a href="03-sql-databases.html#m4">SQL · Module 4</a>, <a href="03-sql-databases.html#m5">Module 5</a> and <a href="03-sql-databases.html#m6">Module 6</a>. Here we use that knowledge from Java. The running example is the job-portal project: <code>User</code>, <code>Company</code>, <code>Job</code> and <code>Application</code>.</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>Explain ORM, JPA, Hibernate and Spring Data JPA and how they relate.</li>
+    <li>Describe the persistence context, entity states, dirty checking and flush.</li>
+    <li>Map entities correctly (ids, columns, enums, embeddables) and write safe <code>equals</code>/<code>hashCode</code>.</li>
+    <li>Write repositories, derived queries, <code>@Query</code>, projections and Specifications.</li>
+    <li>Model one-to-many, many-to-one, many-to-many and one-to-one with the right owning side and cascade.</li>
+    <li>Find and fix N+1 queries and <code>LazyInitializationException</code>.</li>
+    <li>Use <code>@Transactional</code> with correct propagation and rollback rules, and avoid the self-invocation trap.</li>
+    <li>Protect data with optimistic and pessimistic locking, add audit fields, and manage the schema with Flyway.</li>
+    <li>Configure the datasource, HikariCP, SQL logging and batch inserts for PostgreSQL or MySQL.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m3-orm-jpa-hibernate">
+  <h3>ORM, JPA, Hibernate and Spring Data: how they relate</h3>
+  <p class="tldr">An ORM maps Java objects to database rows; JPA is the standard API for that, Hibernate is the engine that implements it, and Spring Data JPA is a thin layer on top that writes repository code for you.</p>
+
+  <h4>The problem: the object–relational mismatch</h4>
+  <p>Java stores data as <strong>objects</strong>: nested, linked by references, with inheritance and collections. A relational database stores <strong>rows in tables</strong>: flat, linked by foreign keys, with no inheritance and no collections inside a row. Moving data between the two is tedious and full of small differences. This gap is called the <strong>object–relational impedance mismatch</strong>.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Object world</th><th>Relational world</th><th>What goes wrong by hand</th></tr></thead>
+    <tbody>
+      <tr><td>Reference to another object</td><td>Foreign key column</td><td>You write joins and rebuild the graph yourself</td></tr>
+      <tr><td>A <code>List&lt;Job&gt;</code> inside <code>Company</code></td><td>Rows in <code>job</code> with <code>company_id</code></td><td>One-to-many is not a column</td></tr>
+      <tr><td>Inheritance</td><td>No such thing</td><td>You must choose a table layout</td></tr>
+      <tr><td>Identity: <code>==</code> / <code>equals</code></td><td>Primary key</td><td>Two objects, one row</td></tr>
+      <tr><td><code>camelCase</code>, <code>Instant</code>, enums</td><td><code>snake_case</code>, <code>timestamptz</code>, text/int</td><td>Conversion code in every query</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The layers, from bottom to top</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A["Your service code"] --> B["Spring Data JPA: repository interfaces"]
+  B --> C["JPA API: EntityManager, JPQL"]
+  C --> D["Hibernate ORM: the implementation"]
+  D --> E["JDBC API: Connection, PreparedStatement"]
+  E --> F["JDBC driver (PostgreSQL, MySQL)"]
+  F --> G[("Database")]
+</pre>
+  <figcaption>Each layer hides the one below it. Your code usually touches only the top two.</figcaption>
+  </figure>
+
+  <dl class="terms">
+    <dt>JDBC</dt><dd>The low-level Java API: open a <code>Connection</code>, prepare a statement, set parameters, loop over a <code>ResultSet</code>, map columns to fields, close everything. Reliable, but 20 lines for one query.</dd>
+    <dt>JdbcTemplate / JdbcClient</dt><dd>Spring helpers over JDBC. They manage connections, close resources and convert exceptions; you still write the SQL and the row mapping.</dd>
+    <dt>ORM (Object-Relational Mapping)</dt><dd>A technique and a kind of library that maps classes to tables and objects to rows, and generates SQL for you.</dd>
+    <dt>JPA (Jakarta Persistence API)</dt><dd>A <strong>specification</strong>: the annotations (<code>@Entity</code>, <code>@Id</code>, <code>@OneToMany</code>), the <code>EntityManager</code> interface and the JPQL query language. It is only interfaces and rules, no code that runs. Packages start with <code>jakarta.persistence</code> (older code uses <code>javax.persistence</code>).</dd>
+    <dt>Hibernate</dt><dd>The most-used JPA <strong>implementation</strong> (also called a provider). It does the real work: tracks changes, generates SQL, caches, lazy-loads. Spring Boot uses it by default. It also has features beyond JPA (<code>@BatchSize</code>, <code>@CreationTimestamp</code>, statistics).</dd>
+    <dt>Spring Data JPA</dt><dd>A Spring module that generates repository implementations from interfaces, so <code>findByEmail(String email)</code> becomes a query. It does not replace Hibernate; it calls the <code>EntityManager</code> for you.</dd>
+  </dl>
+  <p>Analogy: JPA is like the JDBC idea of "a standard"; Hibernate is like the PostgreSQL driver — one of several implementations (EclipseLink is another). You write to the standard, and run on the implementation.</p>
+
+  <h4>One query at three levels</h4>
+  <pre data-title="The same lookup at each level"><code class="language-java">// 1. Plain JDBC (about 20 lines in real code)
+try (Connection c = dataSource.getConnection();
+     PreparedStatement ps = c.prepareStatement(
+             "SELECT id, name, email FROM app_user WHERE email = ?")) {
+    ps.setString(1, email);
+    try (ResultSet rs = ps.executeQuery()) {
+        if (rs.next()) {
+            return Optional.of(new User(rs.getLong("id"),
+                    rs.getString("name"), rs.getString("email")));
+        }
+        return Optional.empty();
+    }
+}
+
+// 2. Spring JdbcClient (Spring Framework 6.1+): SQL stays, plumbing goes
+Optional&lt;User&gt; user = jdbcClient
+        .sql("SELECT id, name, email FROM app_user WHERE email = :email")
+        .param("email", email)
+        .query(User.class)
+        .optional();
+
+// 3. Spring Data JPA: no SQL, no mapping
+public interface UserRepository extends JpaRepository&lt;User, Long&gt; {
+    Optional&lt;User&gt; findByEmail(String email);
+}</code></pre>
+
+  <h4>When JdbcTemplate / JdbcClient is the better tool</h4>
+  <p>JPA is excellent for loading and saving object graphs with business rules. It is a poor fit for some jobs. Use <code>JdbcTemplate</code> or <code>JdbcClient</code> (they live in <code>spring-boot-starter-jdbc</code>, which JPA already pulls in) when:</p>
+  <ul>
+    <li>You run <strong>reports and analytics</strong> with window functions, CTEs, many joins and aggregations. Plain SQL is clearer than JPQL.</li>
+    <li>You do <strong>bulk operations</strong> on millions of rows (<code>INSERT ... SELECT</code>, big updates).</li>
+    <li>The data has <strong>no useful object model</strong>: a read-only dashboard row, an export file.</li>
+    <li>You need database-specific features (PostgreSQL <code>jsonb</code> operators, full-text search) and want full control.</li>
+  </ul>
+  <p>Mixing is normal: JPA for the write model, <code>JdbcClient</code> for a few heavy read queries. Both can join the same <code>@Transactional</code> transaction because they share one <code>DataSource</code> connection.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>JDBC / JdbcClient</th><th>Spring Data JPA (Hibernate)</th></tr></thead>
+    <tbody>
+      <tr><td>You write</td><td>SQL and row mapping</td><td>Entities and repository interfaces</td></tr>
+      <tr><td>Strength</td><td>Full control, predictable SQL, fast for reports</td><td>Productivity, change tracking, relationships</td></tr>
+      <tr><td>Weakness</td><td>Boilerplate, no object graph</td><td>Hidden SQL, N+1, learning curve</td></tr>
+      <tr><td>Best for</td><td>Reporting, bulk, simple tables</td><td>Business entities with rules and relations</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>What the starter gives you</h4>
+  <p>Add <code>spring-boot-starter-data-jpa</code> and a database driver. Boot then auto-configures a <code>DataSource</code> (with HikariCP), a JPA <code>EntityManagerFactory</code> built by Hibernate, a transaction manager, and repository scanning. You write no XML and no <code>persistence.xml</code>. Setup details are in <a href="#m3-datasource-hikari">datasource and HikariCP</a>.</p>
+
+  <div class="co co-version">
+    <p class="co-t">Boot 3.x vs 4.x</p>
+    <p>Spring Boot 3.x uses Hibernate ORM 6.x and Jakarta Persistence 3.1; Spring Boot 4.x moves to Hibernate ORM 7.x. The annotations in these notes (<code>@Entity</code>, <code>@ManyToOne</code>, <code>@Version</code>, <code>@Transactional</code>) and the Spring Data repository style are the same in both. Where something differs, a version note says so. Always keep <code>jakarta.persistence.*</code> imports; <code>javax.persistence</code> stops working from Boot 3.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: thinking JPA hides the database</p>
+    <p>JPA hides the <em>syntax</em>, not the database. Every repository call becomes SQL, and bad mappings give slow SQL. Learn to read the SQL log (<a href="#m3-datasource-hikari">SQL logging</a>) from day one, and keep your SQL skills sharp (<a href="03-sql-databases.html#m4">SQL · Module 4</a>).</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is the difference between JPA, Hibernate and Spring Data JPA?" Strong answer: JPA is the specification (interfaces and annotations); Hibernate is an implementation that generates SQL and manages entities; Spring Data JPA is an abstraction on top that creates repository implementations from interfaces and uses JPA underneath. Add one sentence on the mismatch problem and one on when you would pick <code>JdbcTemplate</code> instead.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-persistence-context">
+  <h3>Persistence context, entity states and dirty checking</h3>
+  <p class="tldr">The persistence context is Hibernate's per-transaction workspace that tracks every loaded entity; entities in it are "managed", and any change to them is written to the database at flush time without a <code>save()</code> call.</p>
+
+  <p>Hibernate does not run SQL the moment you call a setter or <code>persist</code>. It keeps a <strong>persistence context</strong> (also called the <strong>first-level cache</strong> or session): a map from <em>(entity type, id)</em> to the entity object, plus a snapshot of the data as it was loaded. Within one transaction there is one <code>EntityManager</code> and one persistence context. In a Spring Boot app, this context lives as long as the transaction (see <a href="#m3-transactional">@Transactional</a>).</p>
+
+  <h4>The four entity states</h4>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Transient: new Job()
+  Transient --> Managed: persist(job)
+  Managed --> Removed: remove(job)
+  Removed --> Managed: persist(job)
+  Removed --> [*]: flush and commit
+  Managed --> Detached: detach, clear, close
+  Detached --> Managed: merge(job) returns a copy
+  [*] --> Managed: find, query
+</pre>
+  <figcaption>The life cycle of an entity instance in JPA</figcaption>
+  </figure>
+  <dl class="terms">
+    <dt>Transient (new)</dt><dd>Created with <code>new</code>, not known to any persistence context, no row in the database (yet).</dd>
+    <dt>Managed (persistent)</dt><dd>Attached to the persistence context. Hibernate watches it. Entities returned by <code>find</code> or by a query are managed. Anything you change is saved at flush.</dd>
+    <dt>Detached</dt><dd>Has an id and may have a row, but the persistence context that loaded it is closed or cleared. Changes are not tracked. This is the state of an entity after the service method returns.</dd>
+    <dt>Removed</dt><dd>Managed entity scheduled for deletion; the <code>DELETE</code> is sent at flush.</dd>
+  </dl>
+
+  <h4>Dirty checking: no save() needed</h4>
+  <p>When Hibernate loads an entity, it keeps a copy of the loaded values. At flush it compares each managed entity with its snapshot. If a field differs, the entity is <strong>dirty</strong> and Hibernate issues an <code>UPDATE</code>. This is <strong>automatic dirty checking</strong>.</p>
+  <pre data-title="JobService.java"><code class="language-java">@Transactional
+public void changeSalary(Long jobId, BigDecimal newMax) {
+    Job job = jobRepository.findById(jobId).orElseThrow();   // managed
+    job.setSalaryMax(newMax);                                // just a setter
+    // no save() call. At commit Hibernate sees the difference and runs:
+    // update job set salary_max=?, ... where id=?
+}</code></pre>
+  <p>Calling <code>save()</code> here is harmless (the entity is already managed) but useless. The same code <em>without</em> <code>@Transactional</code> does nothing: <code>findById</code> returns a detached entity once the repository's own tiny transaction ends, and no one flushes the change.</p>
+
+  <h4>Flush: when SQL is really sent</h4>
+  <p><strong>Flush</strong> means "synchronise the persistence context with the database": send the pending <code>INSERT</code>, <code>UPDATE</code> and <code>DELETE</code> statements. It does <em>not</em> commit. With the default <code>FlushModeType.AUTO</code>, a flush happens:</p>
+  <ul>
+    <li>before the transaction <strong>commits</strong>;</li>
+    <li>before a <strong>query</strong> that could be affected by pending changes (so the query sees them);</li>
+    <li>when you call <code>flush()</code> / <code>saveAndFlush()</code> yourself.</li>
+  </ul>
+  <p>So SQL runs <em>late</em>. A constraint violation (duplicate email) often appears at commit, outside the line that caused it. Call <code>saveAndFlush</code> or <code>flush()</code> when you need the error right there. Exception: with <code>GenerationType.IDENTITY</code>, <code>persist</code> runs the <code>INSERT</code> immediately, because the database must generate the id (see <a href="#m3-id-ddl">ID strategies</a>).</p>
+
+  <h4>The first-level cache</h4>
+  <pre data-title="Same id twice in one transaction"><code class="language-java">@Transactional
+public void demo() {
+    Job a = jobRepository.findById(1L).get();   // SELECT ... where id=1
+    Job b = jobRepository.findById(1L).get();   // no SQL: served from the context
+    System.out.println(a == b);                 // true: the very same object
+}</code></pre>
+  <p>Within one persistence context, one row is one object. This guarantees identity (<code>a == b</code>) and saves queries, but only for lookups by id. A JPQL or derived query always goes to the database (it then returns the already-managed instance for rows it has seen). The cache lives and dies with the transaction; it is not shared between requests.</p>
+
+  <h4>EntityManager basics</h4>
+  <p>The <code>EntityManager</code> is the JPA API behind every repository. You rarely use it directly, but you should know its methods, and you can inject it with <code>@PersistenceContext</code> (or constructor injection) for custom code.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>persist(e)</code></td><td>Makes a <em>new</em> entity managed; INSERT at flush (or now for IDENTITY). Returns void; <code>e</code> itself becomes managed.</td></tr>
+      <tr><td><code>find(Class, id)</code></td><td>Loads by id (SELECT unless cached); <code>null</code> if missing.</td></tr>
+      <tr><td><code>getReference(Class, id)</code></td><td>Returns a lazy proxy with the id, no SELECT; fails later if the row is missing.</td></tr>
+      <tr><td><code>merge(e)</code></td><td>Copies state of a detached/new object onto a managed copy and returns that copy.</td></tr>
+      <tr><td><code>remove(e)</code></td><td>Schedules DELETE of a managed entity.</td></tr>
+      <tr><td><code>flush()</code></td><td>Sends pending SQL now.</td></tr>
+      <tr><td><code>detach(e)</code> / <code>clear()</code></td><td>Stops tracking one entity / all entities.</td></tr>
+      <tr><td><code>refresh(e)</code></td><td>Reloads the entity from the database, discarding in-memory changes.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>persist vs merge, and how save() chooses</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>persist</code></th><th><code>merge</code></th></tr></thead>
+    <tbody>
+      <tr><td>Input</td><td>A transient entity</td><td>A detached or transient entity</td></tr>
+      <tr><td>Your object becomes managed?</td><td>Yes, the same instance</td><td>No: the <em>returned</em> copy is managed</td></tr>
+      <tr><td>SQL</td><td>INSERT</td><td>SELECT first (to load the current state), then INSERT or UPDATE</td></tr>
+      <tr><td>Use</td><td>New data</td><td>Re-attaching changed data</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>repository.save(entity)</code> in <code>SimpleJpaRepository</code> is basically:</p>
+  <pre data-title="What save() does (simplified)"><code class="language-java">@Transactional
+public &lt;S extends T&gt; S save(S entity) {
+    if (entityInformation.isNew(entity)) {
+        em.persist(entity);
+        return entity;
+    } else {
+        return em.merge(entity);      // extra SELECT, returns a different object
+    }
+}</code></pre>
+  <p><code>isNew</code> is true when the entity has a <code>@Version</code> attribute of a wrapper type that is <code>null</code>, otherwise when the <code>@Id</code> is <code>null</code> (or <code>0</code> for a primitive id). Consequences:</p>
+  <ul>
+    <li>With a generated id, <code>new Job()</code> has id <code>null</code> → <code>persist</code> → one INSERT. Good.</li>
+    <li>With an id <em>you assign</em> (a UUID you made, a business code), the id is never null, so <code>save</code> thinks the entity is old and calls <code>merge</code>: a useless SELECT before every insert. Fix: add a <code>@Version Long version</code> field, or implement <code>Persistable&lt;ID&gt;</code> with an <code>isNew()</code> method.</li>
+    <li>Always use the <strong>return value</strong> of <code>save</code>: <code>job = repo.save(job)</code>. After a merge, your original object is not the managed one.</li>
+  </ul>
+
+  <h4>findById vs getReferenceById</h4>
+  <pre data-title="Attach a Job to an Application without loading it"><code class="language-java">@Transactional
+public void apply(Long jobId, Long userId, String coverLetter) {
+    Application app = new Application();
+    app.setJob(jobRepository.getReferenceById(jobId));    // proxy, no SELECT
+    app.setApplicant(userRepository.getReferenceById(userId));
+    app.setCoverLetter(coverLetter);
+    applicationRepository.save(app);   // insert into application (job_id, user_id, ...)
+}</code></pre>
+  <p><code>findById</code> returns <code>Optional</code> and runs a SELECT (unless cached). <code>getReferenceById</code> (the new name for the old <code>getById</code>) returns a proxy holding only the id, so you can set a foreign key without loading the whole row. If the row does not exist you get an <code>EntityNotFoundException</code> later, when the proxy is first used, or a foreign-key error at flush. Use it when you only need the id; use <code>findById</code> when you must validate existence or read data.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Changes to a managed entity are saved at flush; changes to a detached entity are lost unless you <code>merge</code>/<code>save</code> it.</li>
+      <li>Entity state is only tracked inside a transaction (an open persistence context). Put <code>@Transactional</code> on the service method that changes entities.</li>
+      <li>Use the object returned by <code>save</code>/<code>merge</code>, not the one you passed in.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>PersistentObjectException: detached entity passed to persist</code> — you called <code>persist</code> on an object that already has an id. Use <code>merge</code> (or let <code>save</code> decide).</li>
+      <li><code>EntityNotFoundException</code> — a <code>getReference</code> proxy points to a missing row.</li>
+      <li><code>TransientObjectException</code> / <code>TransientPropertyValueException</code> — a managed entity references a transient one that is not persisted and has no cascade.</li>
+      <li>A big loop that loads thousands of entities grows the persistence context (memory + slow dirty checking). For batch jobs, process in chunks and call <code>flush()</code> then <code>clear()</code>.</li>
+      <li>Setting a managed field and then throwing a checked exception: the change is still flushed on commit if the transaction does not roll back (see <a href="#m3-transactional">rollback rules</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: expecting an update without a transaction</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: entity is detached, change is lost</p><pre><code class="language-java">public void rename(Long id, String name) {      // no @Transactional
+    Company c = companyRepository.findById(id).orElseThrow();
+    c.setName(name);                             // nothing saves this
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: transaction + dirty checking</p><pre><code class="language-java">@Transactional
+public void rename(Long id, String name) {
+    Company c = companyRepository.findById(id).orElseThrow();
+    c.setName(name);                             // UPDATE at commit
+}</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is dirty checking?" At flush Hibernate compares each managed entity with the snapshot taken at load time and issues UPDATEs for changed ones. Follow-ups: "Why does my change not save?" (not in a transaction, entity detached), "When does Hibernate send SQL?" (flush: commit, before queries, explicit flush), "What is the first-level cache?" (per-transaction identity map, only for lookups by id), "persist vs merge?" (see the table).</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-entities">
+  <h3>Entities and mappings: @Entity, @Id, @Column and friends</h3>
+  <p class="tldr">An entity is a plain Java class marked <code>@Entity</code> with an <code>@Id</code> and a protected no-arg constructor; annotations such as <code>@Table</code>, <code>@Column</code>, <code>@Enumerated</code> and <code>@Embedded</code> describe how fields map to columns.</p>
+
+  <h4>The rules for an entity class</h4>
+  <div class="co co-rule">
+    <p class="co-t">Rules for entities (JPA spec)</p>
+    <ul>
+      <li>Annotate the class with <code>@Entity</code> (<code>jakarta.persistence.Entity</code>).</li>
+      <li>It needs an <code>@Id</code> field (or <code>@EmbeddedId</code>/<code>@IdClass</code> for composite keys).</li>
+      <li>It needs a <strong>no-argument constructor</strong>, <code>public</code> or <code>protected</code>. <code>protected</code> is the professional choice: Hibernate can use it, your code cannot create half-built objects.</li>
+      <li>The class must <strong>not be <code>final</code></strong>, and persistent methods must not be final, because Hibernate creates proxy subclasses for lazy loading.</li>
+      <li>Fields (or getters) must not be <code>final</code>/<code>static</code> to be persisted. Java records cannot be entities (they are final and immutable); records are good as DTOs and embeddables.</li>
+    </ul>
+  </div>
+
+  <h4>A first complete entity</h4>
+  <pre data-title="User.java (Project 2)"><code class="language-java">package com.example.jobs.user;
+
+import jakarta.persistence.*;
+import java.time.Instant;
+
+@Entity
+@Table(name = "app_user",                       // "user" is a reserved word in PostgreSQL
+       uniqueConstraints = @UniqueConstraint(name = "uk_user_email", columnNames = "email"))
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, length = 80)
+    private String name;
+
+    @Column(nullable = false, length = 150)
+    private String email;
+
+    @Column(name = "password_hash", nullable = false, length = 100)
+    private String passwordHash;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 20)
+    private Role role;                           // enum Role { CANDIDATE, RECRUITER, ADMIN }
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    protected User() { }                         // for JPA only
+
+    public User(String name, String email, String passwordHash, Role role) {
+        this.name = name;
+        this.email = email;
+        this.passwordHash = passwordHash;
+        this.role = role;
+    }
+
+    // getters; setters only where the business needs to change the field
+}</code></pre>
+
+  <h4>Mapping annotations</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation</th><th>Purpose</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>@Entity</code></td><td>Marks a persistent class</td><td>Entity name defaults to the class name; used in JPQL</td></tr>
+      <tr><td><code>@Table(name, schema, uniqueConstraints, indexes)</code></td><td>Table name and constraints</td><td>Default: class name converted by the naming strategy (<code>JobPosting</code> → <code>job_posting</code> in Boot)</td></tr>
+      <tr><td><code>@Id</code></td><td>Primary key</td><td>Use a wrapper type (<code>Long</code>) so "new" can be <code>null</code></td></tr>
+      <tr><td><code>@Column</code></td><td>Column details</td><td><code>name</code>, <code>nullable</code>, <code>unique</code>, <code>length</code> (strings, default 255), <code>precision</code>/<code>scale</code> (decimals), <code>updatable</code>, <code>insertable</code>, <code>columnDefinition</code></td></tr>
+      <tr><td><code>@Enumerated</code></td><td>How an enum is stored</td><td>Always <code>EnumType.STRING</code></td></tr>
+      <tr><td><code>@Transient</code></td><td>Field is not persisted</td><td>For computed or cached values</td></tr>
+      <tr><td><code>@Lob</code></td><td>Large object (CLOB/BLOB)</td><td>For big text or bytes; avoid loading it by default</td></tr>
+      <tr><td><code>@Embedded</code> / <code>@Embeddable</code></td><td>Value object stored in the owner's table</td><td>See below</td></tr>
+      <tr><td><code>@Temporal</code></td><td>Only for <code>java.util.Date</code></td><td>Not needed for <code>Instant</code>, <code>LocalDate</code>, <code>LocalDateTime</code></td></tr>
+      <tr><td><code>@Version</code></td><td>Optimistic locking column</td><td><a href="#m3-locking">Locking</a></td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Naming.</strong> Spring Boot's default naming strategy turns <code>createdAt</code> into <code>created_at</code> and <code>JobPosting</code> into <code>job_posting</code>, so <code>@Column(name = "created_at")</code> is optional. Writing it explicitly is still common because it makes the mapping obvious and independent of the strategy.</p>
+  <p><strong>Length and precision.</strong> <code>@Column(length = 80)</code> only affects the DDL that Hibernate generates and gives you no runtime validation. Use Bean Validation (<code>@Size</code>) for the check and keep both in sync with the migration. Money must be <code>BigDecimal</code> with <code>precision</code> and <code>scale</code>, for example <code>@Column(precision = 12, scale = 2)</code>; never <code>double</code>.</p>
+
+  <h4>Enums: STRING, never ORDINAL</h4>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: ORDINAL (the default!)</p><pre><code class="language-java">@Enumerated            // same as EnumType.ORDINAL
+private Role role;     // stores 0, 1, 2
+// Insert a new constant in the middle of the enum
+// and every stored number now means a different role.</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: STRING</p><pre><code class="language-java">@Enumerated(EnumType.STRING)
+@Column(nullable = false, length = 20)
+private Role role;     // stores 'CANDIDATE', 'RECRUITER'</code></pre></div>
+  </div>
+  <p>Renaming a constant still breaks stored data, so treat enum names as part of your schema. A database <code>CHECK</code> constraint or native enum type can protect the values.</p>
+
+  <h4>Embedded value objects</h4>
+  <p>A <strong>value object</strong> has no identity of its own, only values (an address, a money amount, a salary range). Mark the class <code>@Embeddable</code> and use it with <code>@Embedded</code>: its fields become columns of the owner's table.</p>
+  <pre data-title="SalaryRange.java and its use in Job"><code class="language-java">@Embeddable
+public class SalaryRange {
+    @Column(name = "salary_min", precision = 12, scale = 2)
+    private BigDecimal min;
+    @Column(name = "salary_max", precision = 12, scale = 2)
+    private BigDecimal max;
+
+    protected SalaryRange() { }
+    public SalaryRange(BigDecimal min, BigDecimal max) { this.min = min; this.max = max; }
+    // getters; equals/hashCode on both fields
+}
+
+@Entity
+public class Job {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Embedded
+    private SalaryRange salary;          // columns salary_min, salary_max in table job
+}</code></pre>
+  <p>If you embed the same type twice (home and office address), rename columns with <code>@AttributeOverride</code>. If all embedded columns are null, Hibernate loads the embedded field as <code>null</code>, so guard for that.</p>
+
+  <h4>equals and hashCode for entities</h4>
+  <p>Entities go into <code>Set</code>s and maps, and Hibernate compares them, so <code>equals</code>/<code>hashCode</code> matter. The three obvious choices all have a catch:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Choice</th><th>Problem</th></tr></thead>
+    <tbody>
+      <tr><td>Do not override (identity)</td><td>Fine inside one persistence context. Breaks when the same row is loaded in two contexts, or compared with a detached copy.</td></tr>
+      <tr><td>All fields (Lombok <code>@Data</code>)</td><td>Hash changes when a field changes; touches lazy collections; can loop forever on bidirectional links.</td></tr>
+      <tr><td>Generated <code>id</code></td><td>The id is <code>null</code> before the first save, so the hash changes when the entity is persisted. An entity inside a <code>HashSet</code> gets "lost".</td></tr>
+      <tr><td>Business key (email, ISBN)</td><td>Best when you have a stable unique natural key; not always available.</td></tr>
+    </tbody>
+  </table></div>
+  <p>A safe, widely used pattern: <strong>equal only when both ids are non-null and equal; hash code constant per class</strong>. A constant hash code is fine because it only costs performance in huge sets of entities, which you rarely keep.</p>
+  <pre data-title="Safe id-based equals/hashCode"><code class="language-java">import org.hibernate.Hibernate;
+
+@Override
+public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || Hibernate.getClass(this) != Hibernate.getClass(o)) return false;
+    Job other = (Job) o;
+    return id != null &amp;&amp; id.equals(other.id);   // two new objects are never equal
+}
+
+@Override
+public int hashCode() {
+    return Hibernate.getClass(this).hashCode();     // same for all Job instances
+}</code></pre>
+  <p><code>Hibernate.getClass</code> unwraps a lazy proxy, so <code>proxy.equals(real)</code> works. Never use <code>getClass() != o.getClass()</code> with proxies, and never read fields directly on the other object (<code>other.id</code> on a proxy is <code>null</code>; use <code>other.getId()</code> when the other side may be a proxy). If your entity has a real business key, use it in both methods instead.</p>
+
+  <h4>Lombok and entities</h4>
+  <p>Lombok is popular but dangerous on entities. <code>@Data</code> generates <code>equals</code>/<code>hashCode</code>/<code>toString</code> over all fields, which causes the problems above plus <code>StackOverflowError</code> when <code>Company.toString()</code> prints its jobs and each <code>Job.toString()</code> prints its company. Use <code>@Getter</code> (and selective <code>@Setter</code>), <code>@NoArgsConstructor(access = AccessLevel.PROTECTED)</code>, and if you want <code>toString</code>, exclude relationships: <code>@ToString(exclude = {"jobs"})</code> or write it by hand with only basic fields.</p>
+
+  <h4>Design habits that pay off</h4>
+  <ul>
+    <li>Keep setters out where a method with a business name is clearer: <code>job.close()</code>, <code>user.changeEmail(...)</code>.</li>
+    <li>Use <code>Instant</code> (UTC) for timestamps, <code>LocalDate</code> for dates, <code>BigDecimal</code> for money.</li>
+    <li>Keep entities separate from DTOs (<a href="#m2">module 2</a>).</li>
+    <li>Table names: avoid reserved words (<code>user</code>, <code>order</code>, <code>group</code>); use <code>app_user</code>, <code>orders</code>, etc.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>InstantiationException: No default constructor for entity</code> / <code>HibernateException</code> — the entity has no no-arg constructor.</li>
+      <li><code>org.hibernate.AnnotationException</code> or <code>MappingException</code> at startup — missing <code>@Id</code>, bad <code>mappedBy</code>, unknown column type.</li>
+      <li>A field holding a lazy proxy compares unequal with <code>==</code>; use <code>equals</code> as above.</li>
+      <li>Inheritance (<code>@Inheritance</code>, <code>@MappedSuperclass</code>) exists; for a shared base with <code>id</code> and audit columns use <code>@MappedSuperclass</code> (see <a href="#m3-auditing">auditing</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Why does an entity need a no-arg constructor and why can't it be final?" Hibernate instantiates entities by reflection and creates subclass proxies for lazy loading. "Why EnumType.STRING?" Ordinal values shift when the enum changes. "How do you write equals/hashCode for an entity?" Explain why all-field equals and generated-id hash codes are unsafe, then show the id-null-safe pattern or a business key.</p>
+  </div>
+</article>
+
+<article class="topic" id="m3-id-ddl">
+  <h3>ID generation strategies and ddl-auto</h3>
+  <p class="tldr">IDENTITY, SEQUENCE and UUID decide who creates primary keys and whether JDBC batching works; <code>spring.jpa.hibernate.ddl-auto</code> decides whether Hibernate touches your schema, and in production it should be <code>validate</code> or <code>none</code>.</p>
+
+  <h4>@GeneratedValue strategies</h4>
+  <pre data-title="Where the strategy goes"><code class="language-java">@Id
+@GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "job_seq")
+@SequenceGenerator(name = "job_seq", sequenceName = "job_seq", allocationSize = 50)
+private Long id;</code></pre>
+  <dl class="terms">
+    <dt>IDENTITY</dt><dd>Uses an auto-increment column (<code>BIGSERIAL</code> / <code>GENERATED ... AS IDENTITY</code> in PostgreSQL, <code>AUTO_INCREMENT</code> in MySQL). The database creates the id during <code>INSERT</code>, so Hibernate must run the INSERT <em>immediately</em> on <code>persist</code> to learn the id. Result: simple, but <strong>JDBC insert batching is disabled</strong>.</dd>
+    <dt>SEQUENCE</dt><dd>Uses a database sequence object. Hibernate asks the sequence for a number <em>before</em> the INSERT, so it can delay and batch inserts. Supported by PostgreSQL, Oracle, H2, SQL Server and MariaDB; <strong>not by MySQL</strong>, where Hibernate falls back to a table-like emulation or you use IDENTITY.</dd>
+    <dt>UUID</dt><dd><code>GenerationType.UUID</code> (JPA 3.1) generates a random UUID in Java; the field type is <code>java.util.UUID</code>. No database round trip, ids are globally unique and safe to expose, but they are 16 bytes and random, so B-tree indexes fragment and are bigger than a <code>bigint</code>.</dd>
+    <dt>AUTO</dt><dd>Lets the provider choose. In Hibernate 6+ it picks <code>SEQUENCE</code> for numeric ids on databases that support sequences, <code>UUID</code> for <code>UUID</code> fields, and IDENTITY or a table emulation elsewhere. Convenient for demos, but explicit is better in real code.</dd>
+    <dt>TABLE</dt><dd>Keeps ids in a helper table. Slow because of locking; almost never used.</dd>
+  </dl>
+
+  <h4>allocationSize: why SEQUENCE is faster</h4>
+  <p>With <code>allocationSize = 50</code> (the default for sequence generators), Hibernate calls the sequence once, gets a value like <code>1000</code>, and hands out the next 50 ids (951–1000 or 1000–1049, depending on the optimizer) from memory. One sequence call per 50 inserts. The database sequence must use the <em>same increment</em> (<code>INCREMENT BY 50</code>); if they differ, Hibernate warns or generates duplicates. A Flyway migration should create it:</p>
+  <pre data-title="Matching sequence in SQL (PostgreSQL)"><code class="language-sql">CREATE SEQUENCE job_seq START WITH 1 INCREMENT BY 50;</code></pre>
+  <p>Side effect: ids have gaps after restarts (unused ids of a block are lost). That is normal; never rely on gap-free ids.</p>
+
+  <h4>Comparison</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>IDENTITY</th><th>SEQUENCE</th><th>UUID</th></tr></thead>
+    <tbody>
+      <tr><td>Who makes the id</td><td>Database, at INSERT</td><td>Sequence, before INSERT</td><td>Java, at persist</td></tr>
+      <tr><td>Insert batching</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Round trips</td><td>1 per insert</td><td>1 per 50 ids</td><td>None</td></tr>
+      <tr><td>MySQL support</td><td>Yes (default choice)</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Index size / order</td><td>8 bytes, ordered</td><td>8 bytes, ordered</td><td>16 bytes, random</td></tr>
+      <tr><td>Safe to expose in URLs</td><td>Guessable</td><td>Guessable</td><td>Not guessable</td></tr>
+    </tbody>
+  </table></div>
+  <p>Practical guidance: PostgreSQL + heavy inserts → <code>SEQUENCE</code>; MySQL → <code>IDENTITY</code>; distributed or public ids → <code>UUID</code> (or a time-ordered UUID/ULID if index locality matters). For small CRUD apps like the Product example in <a href="#m2">module 2</a>, <code>IDENTITY</code> is perfectly fine.</p>
+
+  <h4>spring.jpa.hibernate.ddl-auto</h4>
+  <p>Hibernate can read your entities and create or change tables. The property <code>spring.jpa.hibernate.ddl-auto</code> controls it:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Value</th><th>What Hibernate does at startup</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td><code>none</code></td><td>Nothing</td><td>Production (schema from Flyway)</td></tr>
+      <tr><td><code>validate</code></td><td>Compares entities with the schema; fails startup on a mismatch (missing table/column, wrong type). Changes nothing.</td><td>Production, staging, CI</td></tr>
+      <tr><td><code>update</code></td><td>Adds missing tables/columns. Never drops or renames, never migrates data.</td><td>Quick learning only</td></tr>
+      <tr><td><code>create</code></td><td>Drops and recreates the schema on every start</td><td>Throwaway local runs</td></tr>
+      <tr><td><code>create-drop</code></td><td>Like <code>create</code>, and drops the schema when the app stops</td><td>Tests with an in-memory DB</td></tr>
+    </tbody>
+  </table></div>
+  <p>Boot's default is <code>create-drop</code> for an embedded database (H2) with no schema manager, and <code>none</code> for a real database. Do not rely on defaults: set the value explicitly in each profile.</p>
+  <pre data-title="application-prod.properties"><code class="language-properties">spring.jpa.hibernate.ddl-auto=validate
+spring.flyway.enabled=true</code></pre>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: update (or create) in production</p>
+    <ul>
+      <li><code>update</code> cannot rename a column (it adds a new empty one), cannot change a type safely, never removes anything, and gives you no history or review of what changed.</li>
+      <li><code>create</code> or <code>create-drop</code> on a production URL deletes every row at startup. This has happened to real companies.</li>
+      <li>Use versioned migrations instead (<a href="#m3-flyway">Flyway</a>) and let Hibernate only <code>validate</code>. Hibernate-generated DDL is also not tuned: no indexes beyond keys and uniques you declared, default <code>varchar(255)</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: see the DDL without running it</p>
+    <p>For a first draft of a migration, run once with <code>ddl-auto=create</code> on a throwaway local database and copy the SQL from the log, or use Hibernate's schema generation properties. Then review it by hand, add indexes and constraint names, and commit it as <code>V1__init.sql</code>.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>SchemaManagementException: Schema-validation: missing column [x] in table [y]</code> — <code>validate</code> found an entity field with no column.</li>
+      <li><code>Schema-validation: wrong column type</code> — for example entity <code>String</code> versus <code>text</code>, or <code>Long</code> versus <code>integer</code>. Fix the migration or the mapping.</li>
+      <li><code>IDENTITY</code> inserts with <code>hibernate.jdbc.batch_size</code> set: Hibernate silently does not batch them.</li>
+      <li>Sequence increment mismatch: duplicate-key errors or a warning about <code>allocationSize</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"IDENTITY vs SEQUENCE?" Mention who generates the id, the early INSERT, and that only SEQUENCE allows batch inserts; mention <code>allocationSize</code> and gaps. "What ddl-auto do you use in production?" <code>validate</code> or <code>none</code> with Flyway, and explain why <code>update</code> is unsafe.</p>
+  </div>
+</article>

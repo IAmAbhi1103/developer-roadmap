@@ -1,0 +1,609 @@
+<article class="topic" id="m6-unique-ids">
+  <h3>Unique ID generation: auto-increment, UUID, Snowflake, ticket servers</h3>
+  <p class="tldr">A distributed system needs IDs that are unique without asking one central database for
+  each; the main options are UUIDs (simple, 128 bits, v7 is time-sortable), Snowflake-style 64-bit IDs
+  (timestamp + machine id + sequence) and range-allocating ticket servers.</p>
+
+  <h4>Why auto-increment stops working</h4>
+  <p>A database <code>AUTO_INCREMENT</code> or sequence is perfect on one database. At scale it has
+  problems:</p>
+  <ul>
+    <li><strong>Single point of failure and bottleneck.</strong> Every insert asks one node for the next
+    number. After sharding (<a href="#m5">Module 5</a>) each shard would produce the same numbers and the
+    IDs collide.</li>
+    <li><strong>Multi-leader or multi-region writes</strong> need a scheme, such as "server 1 uses odd
+    numbers, server 2 uses even" (step = number of servers), which breaks when you add a server.</li>
+    <li><strong>Guessable.</strong> <code>/orders/1001</code>, <code>/orders/1002</code> lets anyone count your
+    orders and probe other users' data.</li>
+    <li><strong>Needs a database round trip</strong> before you can even build the object.</li>
+  </ul>
+  <p>What you usually want from an ID: unique, generated without coordination, small (fits in 64 bits for
+  fast indexes), roughly <strong>sortable by time</strong> (so a B-tree index appends at the end instead of
+  inserting randomly), and highly available.</p>
+
+  <h4>UUID</h4>
+  <p>A <strong>UUID</strong> is a 128-bit identifier written as 32 hex digits with dashes, for example
+  <code>550e8400-e29b-41d4-a716-446655440000</code>. Any node can create one with no coordination.</p>
+  <ul>
+    <li><strong>UUID v4:</strong> 122 random bits (6 bits mark the version and variant). Collision chance is
+    negligible: you would need to generate roughly 2.7 × 10<sup>18</sup> (2.7 quintillion) IDs for a 50%
+    chance of one collision (approximate birthday-bound maths). Downside: fully random, so as a primary key
+    it scatters inserts across the whole index, causing page splits and poor cache use. It is also 16 bytes,
+    twice a <code>BIGINT</code>.</li>
+    <li><strong>UUID v7:</strong> the first 48 bits are a Unix timestamp in milliseconds, followed by version
+    bits and about 74 random bits. IDs created later sort later, so inserts are mostly appends and indexes
+    stay compact. It keeps the "no coordination" benefit. Prefer v7 for new primary keys when you want UUIDs
+    (check that your language and database libraries support it; Java's standard
+    <code>UUID.randomUUID()</code> makes v4).</li>
+  </ul>
+  <pre data-title="UuidDemo.java"><code class="language-java">import java.util.UUID;
+
+public class UuidDemo {
+    public static void main(String[] args) {
+        UUID id = UUID.randomUUID();            // version 4
+        System.out.println(id);
+        System.out.println(id.version());       // 4
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (example)"><code class="language-plaintext">3b241101-e2bb-4255-8caf-4136c566a962
+4</code></pre>
+
+  <h4>Snowflake-style IDs</h4>
+  <p>Twitter's Snowflake design (widely copied) builds a 64-bit integer from three parts, so each machine
+  can generate IDs alone and they still sort by time.</p>
+  <figure class="fig">
+<pre class="diagram">
+ 1 bit     41 bits                 10 bits        12 bits
+┌─────┬──────────────────────┬──────────────┬──────────────┐
+│  0  │ timestamp (ms since  │  machine id  │  sequence    │
+│sign │ custom epoch)        │  (0..1023)   │  (0..4095)   │
+└─────┴──────────────────────┴──────────────┴──────────────┘
+  63            62..22              21..12          11..0
+</pre>
+    <figcaption>Snowflake layout: 1 + 41 + 10 + 12 = 64 bits</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Sign bit (1):</strong> always 0, so the number is a positive signed 64-bit
+    <code>long</code> in Java.</li>
+    <li><strong>Timestamp (41 bits):</strong> milliseconds since a custom epoch (for example the day your
+    company started), not 1970. Counting the capacity: 2<sup>41</sup> = 2,199,023,255,552 ms. One year is
+    about 365.25 × 24 × 3600 × 1000 = 31,557,600,000 ms. So 2,199,023,255,552 ÷ 31,557,600,000 ≈
+    <strong>69.7 years</strong> of IDs from the epoch.</li>
+    <li><strong>Machine id (10 bits):</strong> 2<sup>10</sup> = <strong>1,024</strong> distinct generators
+    (some designs split it as 5 bits datacentre + 5 bits worker).</li>
+    <li><strong>Sequence (12 bits):</strong> 2<sup>12</sup> = <strong>4,096</strong> IDs per machine per
+    millisecond. That is 4,096 × 1,000 = 4,096,000 (about 4.1 million) IDs per second per machine, and
+    across 1,024 machines about 4.2 billion per second.</li>
+  </ul>
+  <p>If more than 4,096 IDs are needed within one millisecond, the generator waits for the next
+  millisecond. When the millisecond changes, the sequence resets to 0.</p>
+  <pre data-title="SnowflakeGenerator.java"><code class="language-java">public final class SnowflakeGenerator {
+    private static final long EPOCH = 1_700_000_000_000L;   // custom epoch in ms
+    private static final long MACHINE_BITS = 10, SEQ_BITS = 12;
+    private static final long MAX_SEQ = (1L &lt;&lt; SEQ_BITS) - 1;    // 4095
+
+    private final long machineId;                            // 0..1023
+    private long lastTimestamp = -1L;
+    private long sequence = 0L;
+
+    public SnowflakeGenerator(long machineId) {
+        if (machineId &lt; 0 || machineId &gt;= (1L &lt;&lt; MACHINE_BITS)) {
+            throw new IllegalArgumentException("machineId must be 0..1023");
+        }
+        this.machineId = machineId;
+    }
+
+    public synchronized long nextId() {
+        long now = System.currentTimeMillis();
+        if (now &lt; lastTimestamp) {
+            throw new IllegalStateException("Clock moved backwards by "
+                + (lastTimestamp - now) + " ms");
+        }
+        if (now == lastTimestamp) {
+            sequence = (sequence + 1) &amp; MAX_SEQ;
+            if (sequence == 0) {                              // sequence used up
+                while ((now = System.currentTimeMillis()) &lt;= lastTimestamp) { }
+            }
+        } else {
+            sequence = 0;
+        }
+        lastTimestamp = now;
+        return ((now - EPOCH) &lt;&lt; (MACHINE_BITS + SEQ_BITS))
+             | (machineId &lt;&lt; SEQ_BITS)
+             | sequence;
+    }
+}</code></pre>
+  <p>The shifts: timestamp moves left by 10 + 12 = 22 bits, the machine id left by 12 bits, the sequence
+  stays in the lowest 12 bits. To read the time back: <code>(id &gt;&gt; 22) + EPOCH</code>.</p>
+
+  <h4>Clock skew: the weak point</h4>
+  <p>Snowflake trusts the machine clock. Clocks drift, and NTP (the time-sync service) can step a clock
+  <em>backwards</em>. If it does, the generator could produce an ID it already produced, or a smaller one.
+  Defences: refuse to generate (throw, as above) or wait until the clock catches up if the jump is small;
+  keep the last timestamp on disk so a restart cannot go back in time; use a slewing clock instead of
+  stepping; alert on skew. Also, <strong>machine ids must be unique</strong>: assign them from a
+  coordination service (ZooKeeper, etcd) or from the pod's ordinal in a StatefulSet. Two generators with the
+  same machine id will eventually collide.</p>
+
+  <h4>Ticket servers and range allocation</h4>
+  <p>A <strong>ticket server</strong> is a small, highly available database or service that hands out
+  numbers. To avoid one network call per ID, each app server asks for a <strong>range</strong>: "give me
+  1,000 IDs". The ticket server does <code>UPDATE counter SET next = next + 1000</code> and returns
+  <code>[next, next+999]</code>. The app serves those IDs from memory, and asks for a new range when they run
+  out. Run two ticket servers with odd/even steps or in different ranges for availability. IDs are small,
+  sequential per server and almost sortable. The cost: if an app server crashes, the unused part of its range
+  is lost (gaps are fine), and the ticket server is a dependency (cache a large range to ride out short
+  outages). The URL shortener in <a href="#m7-url-shortener">Module 7</a> uses this idea.</p>
+
+  <h4>ULID (brief)</h4>
+  <p><strong>ULID</strong> is a 128-bit ID with a 48-bit millisecond timestamp and 80 random bits, written as 26
+  characters in Crockford base32 (URL-safe, case-insensitive, sorts correctly as text). It is very close to
+  UUID v7 in spirit; pick whichever your tooling supports.</p>
+
+  <h4>Comparison</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Scheme</th><th>Size</th><th>Sortable by time</th><th>Coordination</th><th>Weakness</th></tr></thead>
+    <tbody>
+      <tr><td>DB auto-increment</td><td>64 bit</td><td>Yes</td><td>Central DB</td><td>Bottleneck, guessable, shard clashes</td></tr>
+      <tr><td>UUID v4</td><td>128 bit</td><td>No</td><td>None</td><td>Random index inserts, big</td></tr>
+      <tr><td>UUID v7 / ULID</td><td>128 bit</td><td>Yes (ms)</td><td>None</td><td>Big; order only per ms</td></tr>
+      <tr><td>Snowflake</td><td>64 bit</td><td>Yes (ms)</td><td>Unique machine ids</td><td>Clock skew, machine-id management</td></tr>
+      <tr><td>Ticket server with ranges</td><td>64 bit</td><td>Roughly</td><td>Ticket server</td><td>Dependency, gaps on crash</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exception: sortable IDs leak information</p>
+    <p>A time-sortable ID reveals when something was created and, for sequential ones, how many exist. If
+    that matters (public order numbers), expose a separate random public id or use v4 for external
+    identifiers and keep the sortable id internal.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Random UUID v4 as a clustered primary key on a huge table.</li>
+      <li>Giving two Snowflake generators the same machine id (copy-pasted config).</li>
+      <li>Ignoring a backwards clock jump.</li>
+      <li>Sending a 64-bit Snowflake id to JavaScript as a JSON number: JavaScript numbers are exact only up
+      to 2<sup>53</sup> − 1, so send it as a string.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>State requirements first: unique, no coordination, sortable, 64 bit.</li>
+      <li>Draw the 1/41/10/12 layout and do the maths: 69.7 years, 1,024 machines, 4,096 per ms.</li>
+      <li>Name clock skew as the main risk and ticket servers as the alternative.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-observability">
+  <h3>Observability: logs, metrics and traces</h3>
+  <p class="tldr">Observability lets you understand what a running system is doing from the outside using
+  three signals: structured logs (what happened), metrics (how much and how fast) and distributed traces
+  (where a request spent time across services), tied together by correlation ids.</p>
+
+  <h4>Why it matters more in distributed systems</h4>
+  <p>In a monolith you read one log file and one stack trace. With ten services, one user click touches six of
+  them on different machines. Without tooling you cannot answer "why was this request slow?" or "which
+  service failed?". <strong>Monitoring</strong> tells you something is wrong (known problems);
+  <strong>observability</strong> lets you ask new questions about unknown problems. For infrastructure
+  monitoring tools and dashboards see <a href="07-devops.html#m6">DevOps · Module 6</a>; this article is the
+  design view.</p>
+
+  <h4>Signal 1: logs</h4>
+  <p>A <strong>log</strong> is a record of one event. Make logs <strong>structured</strong> (JSON with fields),
+  not free text, so a tool can search and filter them. Send them from all instances to a central store
+  (an ELK/OpenSearch stack, Loki, a cloud logging service).</p>
+  <pre data-title="log line" class="out"><code class="language-json">{"ts":"2026-11-11T09:30:12.481Z","level":"ERROR","service":"payment",
+ "traceId":"4bf92f3577b34da6a3ce929d0e0e4736","orderId":42,
+ "msg":"card network timeout","timeoutMs":1000}</code></pre>
+  <ul>
+    <li><strong>Correlation id (request id / trace id):</strong> generate it at the edge, pass it in an HTTP
+    header to every downstream call and message, and put it in every log line. Searching one id shows the
+    whole story across services. In Java it lives in the logging <em>MDC</em> (mapped diagnostic context).</li>
+    <li>Use log levels properly: ERROR for things that need a human, WARN for odd but handled, INFO for
+    business events, DEBUG off in production.</li>
+    <li><strong>Never log secrets or personal data</strong> (passwords, card numbers, tokens).</li>
+    <li>Logs are expensive at volume; sample noisy ones and set retention.</li>
+  </ul>
+
+  <h4>Signal 2: metrics</h4>
+  <p>A <strong>metric</strong> is a number measured over time, cheap to store and fast to query. The three
+  basic types:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Type</th><th>What it is</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Counter</td><td>Only goes up (resets on restart); you look at its rate</td><td><code>http_requests_total</code>, errors</td></tr>
+      <tr><td>Gauge</td><td>Goes up and down; a current value</td><td>Queue length, memory in use, active connections</td></tr>
+      <tr><td>Histogram</td><td>Counts observations in buckets, gives percentiles</td><td>Request latency: p50, p95, p99</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Use percentiles, not averages, for latency.</strong> If 99 requests take 50 ms and one takes
+  5,000 ms, the average is (99 × 50 + 5,000) ÷ 100 = 99.5 ms and looks fine, while p99 shows the bad tail
+  that real users feel. Metrics also carry <em>labels</em> (service, endpoint, status), but never use
+  unbounded values such as user ids as labels; the number of time series explodes.</p>
+  <p>Two checklists decide which metrics to build first:</p>
+  <ul>
+    <li><strong>RED</strong> for request-driven services: <strong>R</strong>ate (requests per second),
+    <strong>E</strong>rrors (failed requests per second or percent), <strong>D</strong>uration (latency
+    percentiles).</li>
+    <li><strong>USE</strong> for resources (CPU, disk, a connection pool, a queue): <strong>U</strong>tilisation
+    (percent busy), <strong>S</strong>aturation (queued work waiting), <strong>E</strong>rrors.</li>
+  </ul>
+  <p>Google's SRE book names four <em>golden signals</em>: latency, traffic, errors, saturation, which cover
+  both. Spring Boot Actuator with Micrometer exposes these metrics to Prometheus; Grafana draws dashboards
+  (<a href="04-spring-boot.html#m6">Spring Boot · Module 6</a>).</p>
+
+  <h4>Signal 3: distributed traces</h4>
+  <p>A <strong>trace</strong> follows one request across all services. It is made of <strong>spans</strong>;
+  a span is one timed unit of work (an HTTP call, a SQL query, a message handler) with a start, a duration, a
+  parent span and attributes. All spans of one request share a <strong>trace id</strong>.</p>
+  <figure class="fig">
+<pre class="diagram">
+ trace 4bf9...  total 420 ms
+ |-- gateway           [=====================================] 420 ms
+ |   |-- order-service   [==========================]            300 ms
+ |   |   |-- SQL insert    [==]                                    30 ms
+ |   |   |-- payment-svc     [==================]                  210 ms
+ |   |   |   '-- card API      [===============]                  180 ms
+ |   |-- email-svc (async)                         [====]          40 ms
+</pre>
+    <figcaption>A trace waterfall: the card API call is the biggest slice, so that is where to look</figcaption>
+  </figure>
+  <p><strong>Context propagation</strong> is how the trace id travels: the caller adds a header to the
+  outgoing HTTP call (the W3C <code>traceparent</code> header is the standard) or to the message, and the
+  callee continues the same trace with a new child span. <strong>OpenTelemetry</strong> is the open standard
+  and set of libraries for creating and exporting traces, metrics and logs; Jaeger and Zipkin are common
+  trace viewers. Tracing every request is costly, so systems <strong>sample</strong> (for example 1% of
+  requests, plus all errors and slow ones).</p>
+
+  <h4>Alerting and dashboards</h4>
+  <ul>
+    <li><strong>Alert on symptoms, not causes.</strong> Page a human when users are hurt: error rate above 2%
+    for 5 minutes, p99 latency above the SLO. "CPU is 85%" is a cause; it may be harmless. Use cause metrics
+    on dashboards to diagnose.</li>
+    <li>Tie alerts to an <strong>SLO</strong> (service level objective), for example "99.9% of requests
+    succeed in 30 days". 99.9% allows about 43 minutes of downtime a month (30 × 24 × 60 × 0.001 = 43.2
+    minutes). Alert when the error budget burns too fast.</li>
+    <li>Every alert needs an owner and a runbook (what to check first). Too many noisy alerts train people to
+    ignore them.</li>
+    <li>A good dashboard has one screen per service: RED metrics on top, dependencies below, then resources.
+    Add deploy markers so you see "latency rose right after the 14:05 release".</li>
+  </ul>
+
+  <h4>How the three fit together</h4>
+  <p>A typical investigation: an <em>alert</em> (metric) says p99 checkout latency is high → the
+  <em>dashboard</em> narrows it to the payment service → a <em>trace</em> shows the card API span is slow →
+  <em>logs</em> filtered by that trace id show the timeout error. Metrics tell you <em>that</em>, traces tell
+  you <em>where</em>, logs tell you <em>why</em>.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Plain-text logs with no correlation id.</li>
+      <li>Alerting on averages or on every CPU spike.</li>
+      <li>High-cardinality metric labels (user id, full URL with ids).</li>
+      <li>Logging request bodies with passwords or card data.</li>
+      <li>Adding observability only after the first big outage.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Name the three pillars and what question each answers.</li>
+      <li>Mention correlation ids, RED/USE, percentiles over averages, and trace propagation.</li>
+      <li>In every HLD answer, finish with "I would add metrics, alerts on the SLO, and tracing".</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-coordination">
+  <h3>Coordination basics: leader election, locks, consensus, heartbeats</h3>
+  <p class="tldr">Some tasks need exactly one node in charge or exclusive access; distributed systems do this
+  with leader election and locks built on consensus services, but locks need leases and fencing tokens
+  because processes pause and clocks lie.</p>
+
+  <h4>Why coordination is needed</h4>
+  <p>Many designs have jobs that must run on only one node at a time: a scheduler that sends the daily
+  report, a primary database that accepts writes, a cleanup task, the single consumer of a partition. If
+  two nodes both think they are in charge (<strong>split brain</strong>), you get double reports or
+  corrupted data. This article is intuition only; the full theory is a university course.</p>
+
+  <h4>Heartbeats and failure detection</h4>
+  <p>How do you know a node is dead? You cannot, exactly: a silent node may be dead, slow or cut off by the
+  network. Systems use <strong>heartbeats</strong>: each node sends a small "I am alive" message every second
+  or so. If the others see nothing for a timeout (say 10 seconds), they suspect the node has failed. Short
+  timeout: fast failover but false alarms during a pause. Long timeout: fewer false alarms but a long outage.
+  <strong>Gossip</strong> spreads this knowledge without a central watcher: each node regularly tells a few
+  random peers what it knows about the others, and news reaches the whole cluster in about log(N) rounds.
+  Cassandra and many membership systems use gossip.</p>
+
+  <h4>Leader election</h4>
+  <p>A <strong>leader</strong> (primary, master) makes decisions or accepts writes; the <strong>followers</strong>
+  copy it and wait. When the leader dies, the followers hold an <strong>election</strong> to pick a new one.
+  The rules must guarantee at most one leader at a time. Practical ways:</p>
+  <ul>
+    <li>Use a coordination service (ZooKeeper, etcd, Consul): nodes try to create the same key; the one that
+    succeeds is the leader and keeps it alive with a lease; if it stops renewing, the key expires and others
+    compete again.</li>
+    <li>Use the database: <code>UPDATE leader SET owner = ?, expires = ? WHERE expires &lt; now()</code>, and
+    check the row count. Fine for small systems.</li>
+    <li>Use the consensus built into the product (Kafka's controller, Redis Sentinel, PostgreSQL managers
+    such as Patroni).</li>
+  </ul>
+
+  <h4>Distributed locks</h4>
+  <p>A <strong>distributed lock</strong> gives exclusive access to a resource across processes. A simple
+  Redis version: <code>SET lock:report token NX PX 30000</code> (set only if missing, expire in 30 s). Release
+  only if the stored token is yours. The expiry is the <strong>lease</strong>: it exists so a crashed holder
+  does not block everyone forever.</p>
+  <h4>Why distributed locks are hard</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant A as Client A
+  participant L as Lock service
+  participant S as Storage
+  participant B as Client B
+  A->>L: acquire lock
+  L-->>A: granted, lease 30 s
+  Note over A: long GC pause for 40 s
+  Note over L: lease expires
+  B->>L: acquire lock
+  L-->>B: granted
+  B->>S: write value 2
+  A->>S: write value 1 (A thinks it still holds the lock)
+</pre>
+    <figcaption>Client A paused past its lease; both clients now believe they hold the lock</figcaption>
+  </figure>
+  <p>A process can freeze (garbage collection, a stalled VM, a slow network) after it acquired the lock and
+  wake up <em>after</em> the lease expired, still believing it is the owner. Clocks across machines are not
+  perfectly in sync either, so "my lease is still valid" cannot be trusted.</p>
+  <p>The fix is a <strong>fencing token</strong>: the lock service gives a number that increases with each
+  grant (A gets 33, later B gets 34). Every write to the storage includes the token, and the storage rejects
+  any write with a token lower than one it has already seen. When A wakes up and writes with token 33 after
+  B wrote with 34, the storage refuses. The protection lives in the resource, not in the lock.</p>
+  <ul>
+    <li>If the work is idempotent, you may not need a lock at all.</li>
+    <li>Prefer database row locks or unique constraints when the data is already in one database.</li>
+    <li>For efficiency-only locks (avoid duplicate work), a simple Redis lock is acceptable. For
+    correctness-critical locks, use a consensus-backed service with fencing.</li>
+  </ul>
+
+  <h4>Consensus and Raft in one paragraph</h4>
+  <p><strong>Consensus</strong> is getting several nodes to agree on one value even when some nodes crash
+  and messages are delayed. <strong>Raft</strong> (used by etcd, Consul and others) does it by electing one
+  leader per term. Clients send writes to the leader; the leader appends the entry to its log and copies it
+  to followers; once a <strong>majority (quorum)</strong> has stored it, the entry is committed and applied.
+  If the leader fails, a follower whose timer expires asks for votes; a candidate needs a majority, and only
+  a node with an up-to-date log can win. With 3 nodes the cluster survives 1 failure, with 5 nodes 2
+  failures (a majority of N is ⌊N/2⌋ + 1). Paxos is the older, harder-to-explain cousin; ZooKeeper uses a
+  similar protocol called ZAB. Use these systems as tools; you almost never implement them yourself.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>A lock with no expiry (a crash blocks everyone) or with expiry but no fencing (two holders).</li>
+      <li>Releasing a lock without checking the token, so you free someone else's lock.</li>
+      <li>Using a single Redis node as a "correct" lock; if it fails over, the lock state can be lost.</li>
+      <li>Running a cluster of 2 or 4 consensus nodes: no extra fault tolerance over 1 or 3 respectively.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Explain the pause-after-lease story and the fencing token fix.</li>
+      <li>Say "majority quorum" and "odd number of nodes" when Raft or ZooKeeper comes up.</li>
+      <li>Prefer not to need a lock: idempotency or a database constraint is often simpler.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m6-interview">
+  <h3>Interview questions — Distributed system patterns</h3>
+
+  <details class="qa">
+    <summary>When would you choose microservices over a monolith?</summary>
+    <div class="qa-a">
+      <p>Only when a real pain exists: independent scaling of one part, many teams blocked by one release
+      train, different reliability or technology needs, or fault isolation. Otherwise start with a modular
+      monolith. Microservices add network failures, distributed data, versioned contracts and operational
+      cost. Splitting too early or along technical layers gives a distributed monolith.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>What is a bounded context, and why does it matter for service boundaries?</summary>
+    <div class="qa-a">
+      <p>A part of the business where terms have one clear meaning and one team owns the rules. "Product"
+      means title and images to the catalogue, stock to inventory and price to billing. Cut services along
+      these contexts so that things which change together stay together and the services need few calls to
+      each other.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Sync vs async communication: how do you choose?</summary>
+    <div class="qa-a">
+      <p>Sync (REST, gRPC) when the caller needs the answer to continue, such as a price lookup. Async
+      (queue, events) for side effects, fan-out, spikes and long work. Sync couples availability and adds up
+      latency; async decouples in time and smooths load but is eventually consistent and harder to debug.
+      Real systems mix both: a fast sync call at the edge triggers async processing behind it.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Choreography or orchestration for a multi-service workflow?</summary>
+    <div class="qa-a">
+      <p>Choreography: services react to each other's events; loose coupling but the flow is hidden.
+      Orchestration: a coordinator sends commands and tracks state; the flow is visible and failure handling
+      is in one place, but the orchestrator knows all participants. Use choreography for two to four simple
+      steps and orchestration (or a workflow engine) for longer flows with compensation.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>What is idempotency and how do you make a payment API idempotent?</summary>
+    <div class="qa-a">
+      <p>Repeating an operation has the same effect as doing it once. For <code>POST /payments</code> the
+      client sends an <code>Idempotency-Key</code> header, reused on every retry. The server inserts the key
+      into a dedupe table with a primary key, does the work, and stores the response. A repeat returns the
+      stored response. Also store a request hash to reject the same key with a different body, and handle
+      the in-progress state.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>How do you retry correctly?</summary>
+    <div class="qa-a">
+      <p>Retry only transient failures on idempotent operations. Use exponential backoff with a cap, add
+      jitter so clients do not retry in sync, limit attempts, and add a retry budget (for example retries at
+      most 10% of traffic). Retry at one layer only; three layers with three attempts each can turn one
+      request into 27 calls. Add a timeout and a circuit breaker.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>At-most-once, at-least-once and exactly-once: what is the difference?</summary>
+    <div class="qa-a">
+      <p>At-most-once may lose messages (ack before processing). At-least-once may duplicate them (ack after
+      processing, retry until acked). Exactly-once delivery is not possible over an unreliable network, so
+      we combine at-least-once with idempotent consumers to get exactly-once effects. Kafka's idempotent
+      producer and transactions help only inside Kafka.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Why is two-phase commit avoided in microservices?</summary>
+    <div class="qa-a">
+      <p>It blocks: after voting yes, participants hold locks until the coordinator decides, and a
+      coordinator crash leaves them in doubt. It also lowers availability because all participants must be up,
+      adds latency, and many brokers and external APIs cannot take part. Sagas give up atomic isolation in
+      return for availability.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Explain the saga pattern with an order example.</summary>
+    <div class="qa-a">
+      <p>Order → payment → inventory → shipping, each a local transaction. If inventory fails after payment
+      succeeded, run the compensations in reverse: refund the payment, cancel the order. Steps and
+      compensations are idempotent, saga state is persisted, and hard-to-undo steps go last. It can be
+      orchestrated (one coordinator) or choreographed (events). The UI shows PENDING until the end.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>What is the dual-write problem and how does the outbox pattern solve it?</summary>
+    <div class="qa-a">
+      <p>Writing to the database and publishing to a broker are two separate writes; a crash between them
+      loses the event or announces something that never committed. With an outbox, the event row is saved in
+      the same database transaction as the business data. A polling relay or CDC (for example Debezium)
+      publishes it later, at least once, and consumers dedupe by event id.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Explain the circuit breaker and bulkhead patterns.</summary>
+    <div class="qa-a">
+      <p>A circuit breaker counts failures and slow calls; above a threshold it opens and fails fast, then
+      half-opens to test recovery, then closes. It protects threads and the sick dependency. A bulkhead limits
+      resources per dependency (separate thread pools or concurrency caps) so one slow service cannot consume
+      everything. Together with timeouts, fallbacks and load shedding they stop cascading failures.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Design a unique ID generator. Explain Snowflake.</summary>
+    <div class="qa-a">
+      <p>64 bits: 1 sign bit, 41 bits of milliseconds since a custom epoch (2<sup>41</sup> ms ≈ 69.7 years),
+      10 bits machine id (1,024 generators), 12 bits sequence (4,096 IDs per ms per machine, about 4.1
+      million per second). IDs are unique, sortable by time and need no per-ID coordination. Risks: clock
+      moving backwards and duplicate machine ids. Alternatives: UUID v7 and range-based ticket servers.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>UUID v4 vs UUID v7 as a primary key?</summary>
+    <div class="qa-a">
+      <p>v4 is fully random, so inserts scatter across the B-tree index, causing page splits and cache
+      misses. v7 begins with a 48-bit millisecond timestamp, so new keys are mostly appended and indexes stay
+      compact, while still needing no coordination. Both are 16 bytes, twice a BIGINT.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>What are logs, metrics and traces, and what do RED and USE mean?</summary>
+    <div class="qa-a">
+      <p>Logs say what happened, metrics say how much and how fast, traces show where one request spent time
+      across services, linked by a trace id. RED (rate, errors, duration) is for request-driven services;
+      USE (utilisation, saturation, errors) is for resources. Alert on symptoms such as error rate and p99
+      latency, not on raw CPU.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Why are distributed locks hard? What is a fencing token?</summary>
+    <div class="qa-a">
+      <p>A lock holder can pause (garbage collection) past its lease, wake up and write while a new holder
+      is also writing. A fencing token is a number that grows with each lock grant; the storage rejects
+      writes with a token older than one it has seen. So correctness is enforced at the resource. Better
+      still, avoid the lock with idempotency or a unique constraint.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m6-cheatsheet">
+  <h3>Cheat sheet — Distributed system patterns</h3>
+  <ul class="cheat">
+    <li><b>Monolith first</b> split for independent scaling, team size, fault isolation</li>
+    <li><b>Distributed monolith</b> services that must deploy together; the anti-pattern</li>
+    <li><b>Bounded context</b> area where one team owns the meaning of the words</li>
+    <li><b>Database per service</b> no shared tables, no joins across services, eventual consistency</li>
+    <li><b>Sync</b> caller waits, simple, couples availability; <b>async</b> broker, decoupled, eventual</li>
+    <li><b>Choreography</b> events and reactions; <b>orchestration</b> a coordinator with state</li>
+    <li><b>Idempotent</b> N times equals once; GET, PUT, DELETE yes; POST no</li>
+    <li><b>Idempotency-Key</b> client UUID per intent, dedupe table with PK, store response and request hash</li>
+    <li><b>Backoff</b> wait = min(cap, base × 2^attempt); add full jitter</li>
+    <li><b>Retry storm</b> 3 layers × 3 attempts = 27 calls; retry at one layer, use a budget</li>
+    <li><b>At-most-once</b> ack first, may lose; <b>at-least-once</b> ack after work, may duplicate</li>
+    <li><b>Effectively once</b> at-least-once + idempotent consumer (processed-message table)</li>
+    <li><b>DLQ</b> parking place for messages that keep failing</li>
+    <li><b>2PC</b> prepare then commit; blocks, coordinator is a single point of failure</li>
+    <li><b>Saga</b> local transactions + compensations in reverse; persist state; idempotent steps</li>
+    <li><b>Outbox</b> event row in the same DB transaction; relay by polling or CDC (Debezium)</li>
+    <li><b>Timeouts</b> connect short, read from p99; pass deadlines down the chain</li>
+    <li><b>Circuit breaker</b> closed → open → half-open; counts slow calls too</li>
+    <li><b>Bulkhead</b> separate pools per dependency; <b>fallback</b> degrade optional features</li>
+    <li><b>Load shedding</b> reject early with 503/429 when over capacity; bounded queues</li>
+    <li><b>Snowflake</b> 1 + 41 + 10 + 12 bits; 69.7 years; 1,024 machines; 4,096 per ms</li>
+    <li><b>UUID v4</b> random, bad for index locality; <b>v7</b> time-ordered; JS needs 64-bit ids as strings</li>
+    <li><b>Observability</b> structured logs + correlation id, metrics (counter, gauge, histogram), traces</li>
+    <li><b>RED</b> rate, errors, duration; <b>USE</b> utilisation, saturation, errors; use p99 not average</li>
+    <li><b>Locks</b> need a lease and a fencing token; <b>Raft</b> leader + majority quorum, odd node count</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m6-practice">
+  <h3>Practice — Distributed system patterns</h3>
+  <ol class="steps">
+    <li>Take a small monolith you know (for example a shop with users, products, orders) and list its modules
+    and their tables. Mark which tables each module reads and writes. Done when you can say where the
+    service boundaries would go and which cross-module joins would have to become API calls.</li>
+    <li>Write the idempotent payment endpoint from the notes in Spring Boot with a PostgreSQL dedupe table.
+    Fire the same request 10 times in parallel (a script or a test with an executor). Done when exactly one
+    payment row exists and all 10 responses are identical.</li>
+    <li>Implement the <code>Retry.withBackoff</code> helper with full jitter and a max attempt count. Write a
+    test with a fake call that fails twice and then succeeds; record the sleep times. Done when the delays
+    are random but never above the backoff cap.</li>
+    <li>Draw by hand the order → payment → inventory → shipping saga as a sequence diagram for both the happy
+    path and a shipping failure. List every compensation in order. Done when each step has a named
+    compensation and a status in the order table.</li>
+    <li>Add a transactional outbox to a small Spring Boot service: an outbox table, a polling relay with
+    <code>SKIP LOCKED</code>, and a consumer with a processed-message table. Kill the app between send and
+    mark-published. Done when the consumer handles the duplicate without a double effect.</li>
+    <li>Wrap a slow HTTP dependency with a timeout, a circuit breaker and a bounded concurrency limit (see
+    <a href="04-spring-boot.html#m7">Spring Boot · Module 7</a>). Make the dependency sleep 30 seconds. Done
+    when your service answers other endpoints normally and the breaker state changes to open.</li>
+    <li>Fill in the Snowflake arithmetic yourself: years for 41 bits, machines for 10 bits, IDs per second
+    per machine for 12 bits, and the Java shifts. Then run the generator from the notes with two threads.
+    Done when 1 million IDs are generated with zero duplicates and the IDs increase over time.</li>
+    <li>Add correlation ids: generate one in a servlet filter, put it in the logging MDC, return it in a
+    response header, and send it on every outbound call. Done when one id finds the log lines from two
+    services.</li>
+    <li>Explain out loud, in under three minutes, the pause-after-lease story and the fencing token. Done
+    when a friend can say why a Redis lock alone is not enough for correctness.</li>
+  </ol>
+</article>

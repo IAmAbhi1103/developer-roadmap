@@ -1,0 +1,601 @@
+<article class="topic" id="m2-proxies">
+  <h3>Forward and reverse proxies, Nginx and load balancing</h3>
+  <p class="tldr">A forward proxy acts for clients, a reverse proxy acts for servers; Nginx in front of your
+  Spring Boot app terminates TLS, routes requests, serves static files, compresses, rate-limits and can
+  spread traffic over several app instances.</p>
+
+  <h4>Forward proxy versus reverse proxy</h4>
+  <p>A <strong>proxy</strong> is a server that passes requests on behalf of someone else. Who it speaks for
+  decides its name.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  subgraph Forward proxy
+    U1[Employee browser] --> FP[Forward proxy]
+    FP --> I1[Internet sites]
+  end
+  subgraph Reverse proxy
+    U2[Users on the internet] --> RP[Reverse proxy Nginx]
+    RP --> A1[App server 1]
+    RP --> A2[App server 2]
+  end
+</pre>
+    <figcaption>A forward proxy hides clients; a reverse proxy hides and protects servers</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Forward proxy</th><th>Reverse proxy</th></tr></thead>
+    <tbody>
+      <tr><td>Acts for</td><td>Clients</td><td>Servers</td></tr>
+      <tr><td>Who configures it</td><td>The client or its network (browser setting, corporate network)</td><td>The site owner; clients do not know it exists</td></tr>
+      <tr><td>Typical jobs</td><td>Filtering, caching, hiding the client's IP, access control in offices</td><td>TLS termination, routing, caching, compression, load balancing, protection</td></tr>
+      <tr><td>Examples</td><td>Squid, a corporate proxy, a VPN-like proxy</td><td>Nginx, HAProxy, AWS ALB, Cloudflare</td></tr>
+    </tbody>
+  </table></div>
+  <p>When people say "put Nginx in front of the app" they mean a reverse proxy.</p>
+
+  <h4>Why not expose Spring Boot directly?</h4>
+  <p>The embedded Tomcat can serve HTTPS itself, but a dedicated proxy is better at the edge:</p>
+  <ul>
+    <li><strong>TLS termination.</strong> Nginx holds the certificate and does the HTTPS work (and
+    renewals with certbot). Your app speaks plain HTTP on localhost.</li>
+    <li><strong>Routing.</strong> One domain, many backends: <code>/api/</code> goes to Spring Boot,
+    <code>/</code> serves the React build, <code>/admin/</code> goes to another service.</li>
+    <li><strong>Static files.</strong> Nginx serves JS, CSS and images far more cheaply than a Java
+    thread would, with caching headers.</li>
+    <li><strong>Compression.</strong> gzip (or brotli) shrinks JSON and JS for slow mobile networks.</li>
+    <li><strong>Protection.</strong> Rate limits, request size limits and timeouts shield the app from
+    slow or abusive clients. The app is not directly reachable from the internet at all.</li>
+    <li><strong>Ports.</strong> Nginx runs as a system service on 80 and 443; the app runs as a
+    low-privilege user on 8080.</li>
+    <li><strong>Zero-downtime tricks.</strong> Send traffic to a second instance while you restart the
+    first.</li>
+  </ul>
+  <figure class="fig">
+<pre class="diagram">
+ Browser ──HTTPS:443──► Nginx ──HTTP──► Spring Boot :8080 ──► PostgreSQL :5432
+                         │
+                         └──────────► /var/www/shop (React build, static)
+</pre>
+    <figcaption>A common single-server production layout</figcaption>
+  </figure>
+
+  <h4>Load balancing basics</h4>
+  <p>A <strong>load balancer</strong> spreads requests across several identical app instances. This adds
+  capacity and removes the single point of failure: if one instance dies, the others continue. Nginx can
+  do this with an <code>upstream</code> block; in AWS you would use an Application Load Balancer (ALB).
+  The system-design view (layers 4 and 7, algorithms, sticky sessions) is in
+  <a href="08-system-design.html#m5">System Design · Module 5</a>.</p>
+  <pre data-title="Nginx upstream with three instances"><code class="language-nginx">upstream billing_backend {
+    least_conn;
+    server 10.0.1.11:8080 max_fails=3 fail_timeout=30s;
+    server 10.0.1.12:8080 max_fails=3 fail_timeout=30s;
+    server 10.0.1.13:8080 backup;
+}</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>How it chooses</th><th>Good for</th></tr></thead>
+    <tbody>
+      <tr><td>Round robin (default)</td><td>Takes servers in turn; <code>weight=N</code> gives some servers more</td><td>Similar requests, similar servers</td></tr>
+      <tr><td><code>least_conn</code></td><td>Server with the fewest active connections</td><td>Requests of very different duration</td></tr>
+      <tr><td><code>ip_hash</code></td><td>Same client IP always goes to the same server</td><td>Simple stickiness when sessions are kept in memory (better: make the app stateless)</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Health checks.</strong> Open-source Nginx does <em>passive</em> checks: after
+  <code>max_fails</code> failed attempts within <code>fail_timeout</code> it stops sending traffic to that
+  server for that period. <em>Active</em> checks (the proxy polls a health URL) need Nginx Plus or a
+  separate load balancer such as an AWS ALB, which polls a path like <code>/actuator/health</code> and
+  removes unhealthy instances. Keep the app <strong>stateless</strong> (sessions in Redis or JWT, files in
+  object storage) so any instance can handle any request.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: the app listens on localhost, the proxy faces the world</p>
+    <p>Set <code>server.address=127.0.0.1</code> (or block 8080 in the firewall) when Nginx is on the same
+    machine, so nobody can bypass the proxy's rate limits and TLS by calling port 8080 directly.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>The proxy becomes a single point of failure itself; large setups run two behind a cloud load
+      balancer.</li>
+      <li>With <code>ip_hash</code>, all users behind one corporate NAT hit the same server.</li>
+      <li>A client's real IP is hidden behind the proxy; your app sees the proxy's address unless you
+      pass and read <code>X-Forwarded-For</code> (next article).</li>
+      <li>Load balancing does not fix a slow database; measure first.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a reverse proxy? Why use Nginx in front of Spring Boot?"</p>
+    <ul>
+      <li>A server that receives client requests and forwards them to backends; clients never talk to the
+      backends directly.</li>
+      <li>TLS termination, routing, static files, compression, rate limiting, load balancing, hiding the
+      app. Contrast with a forward proxy, which represents clients.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-nginx-config">
+  <h3>A complete Nginx config: HTTPS, Spring Boot proxy and a React SPA</h3>
+  <p class="tldr">One Nginx server block can redirect HTTP to HTTPS, serve the React build with a
+  <code>try_files</code> fallback to <code>index.html</code>, proxy <code>/api/</code> to Spring Boot on
+  <code>localhost:8080</code> with the right forwarding headers, and compress responses.</p>
+
+  <h4>The goal</h4>
+  <p>A single domain, <code>shop.example.com</code>, with a React app (built with Vite) at <code>/</code>
+  and the Spring Boot API at <code>/api/</code>:</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  B[Browser] -->|"HTTPS 443"| N[Nginx]
+  N -->|"/ and /assets/"| S["/var/www/shop (React build)"]
+  N -->|"/api/"| A["Spring Boot 127.0.0.1:8080"]
+  A --> D[(PostgreSQL)]
+</pre>
+    <figcaption>Request routing in the final setup</figcaption>
+  </figure>
+  <p>Nginx config is made of <strong>directives</strong> ending in <code>;</code>, grouped in blocks
+  <code>{ }</code>: <code>http</code> (global web settings) contains <code>server</code> blocks (one per
+  site/domain), which contain <code>location</code> blocks (matching URL paths). Debian and Ubuntu keep one
+  file per site in <code>/etc/nginx/sites-available/</code> and enable it with a symlink in
+  <code>sites-enabled/</code>; the main <code>nginx.conf</code> includes that folder inside
+  <code>http</code>.</p>
+
+  <h4>Prepare the files</h4>
+  <pre data-title="Install, publish the React build, create the site file"><code class="language-shell">$ sudo apt install -y nginx
+$ npm run build
+$ rsync -avz dist/ billing:/tmp/shop-dist/
+$ ssh billing "sudo mkdir -p /var/www/shop &amp;&amp; sudo rsync -a --delete /tmp/shop-dist/ /var/www/shop/"
+$ sudo nano /etc/nginx/sites-available/shop</code></pre>
+
+  <h4>The full configuration</h4>
+  <pre data-title="/etc/nginx/sites-available/shop"><code class="language-nginx"># Rate limit zone: 10 requests/second per client IP (lives in the http context)
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+
+upstream billing_backend {
+    server 127.0.0.1:8080;
+    keepalive 16;
+}
+
+# 1) Plain HTTP: redirect everything to HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name shop.example.com www.shop.example.com;
+    return 301 https://shop.example.com$request_uri;
+}
+
+# 2) HTTPS site
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name shop.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/shop.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/shop.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # React build output
+    root  /var/www/shop;
+    index index.html;
+
+    # gzip for text responses (HTML is always included)
+    gzip on;
+    gzip_min_length 1024;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    client_max_body_size 10m;
+
+    # Hashed Vite assets never change: cache for a year
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+
+    # index.html must always be revalidated so users get new releases
+    location = /index.html {
+        add_header Cache-Control "no-cache";
+    }
+
+    # SPA fallback: unknown paths such as /orders/42 return index.html
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # API: proxy to Spring Boot
+    location /api/ {
+        limit_req zone=api_limit burst=20 nodelay;
+
+        proxy_pass http://billing_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 5s;
+        proxy_read_timeout    60s;
+    }
+
+    # Actuator must not be public
+    location /actuator/ {
+        return 404;
+    }
+}</code></pre>
+
+  <h4>What each part does</h4>
+  <dl class="terms">
+    <dt>return 301 ...</dt><dd>Permanent redirect from HTTP to the single canonical HTTPS name, keeping
+    the path and query (<code>$request_uri</code>).</dd>
+    <dt>listen 443 ssl; http2 on;</dt><dd>HTTPS on port 443 with HTTP/2. In older Nginx versions you
+    write <code>listen 443 ssl http2;</code> instead of the separate <code>http2 on;</code>.</dd>
+    <dt>ssl_certificate / ssl_certificate_key</dt><dd>The Let's Encrypt files from certbot
+    (<a href="#m2-http-tls">HTTPS article</a>). Certbot's <code>--nginx</code> mode can write these
+    lines for you.</dd>
+    <dt>root / index</dt><dd>The folder with the built React files and the default file.</dd>
+    <dt>location /assets/</dt><dd>Long cache for files whose names contain a content hash. Only
+    <code>index.html</code> changes name-free, which is why it gets <code>no-cache</code>.</dd>
+    <dt>try_files $uri $uri/ /index.html</dt><dd>The SPA fallback. Try a file with that exact path, then a
+    directory, and if neither exists, serve <code>index.html</code> so React Router can handle
+    <code>/orders/42</code>. Without it, refreshing a deep link returns Nginx's 404.</dd>
+    <dt>proxy_pass http://billing_backend</dt><dd>Forward the request to the upstream. Because
+    <code>proxy_pass</code> has no path after the host, the original URI (<code>/api/orders</code>) is
+    sent unchanged. Adding a path (<code>proxy_pass http://x/;</code>) rewrites the prefix; be careful.</dd>
+    <dt>proxy_set_header Host $host</dt><dd>Passes the original host name, so the app knows the domain
+    requested.</dd>
+    <dt>X-Real-IP, X-Forwarded-For</dt><dd>The real client IP. <code>$proxy_add_x_forwarded_for</code>
+    appends the client address to any existing header. Without these, logs and rate limits in the app
+    only see <code>127.0.0.1</code>.</dd>
+    <dt>X-Forwarded-Proto</dt><dd>Tells the app the original scheme (<code>https</code>), because Nginx to
+    the app is plain HTTP.</dd>
+    <dt>proxy_http_version 1.1 + Connection ""</dt><dd>Needed for <code>keepalive</code> to the upstream,
+    reusing connections instead of opening a new one per request.</dd>
+    <dt>limit_req</dt><dd>Allows 10 requests/second per IP with a burst of 20; extra requests get 503.
+    This is a basic protection against abuse.</dd>
+    <dt>gzip</dt><dd>Compresses CSS, JS, JSON, SVG; not images already compressed (PNG, JPG).</dd>
+  </dl>
+
+  <h4>Enable, test, reload</h4>
+  <pre data-title="Always test before reloading"><code class="language-shell">$ sudo ln -s /etc/nginx/sites-available/shop /etc/nginx/sites-enabled/shop
+$ sudo rm -f /etc/nginx/sites-enabled/default
+$ sudo nginx -t
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: configuration file /etc/nginx/nginx.conf test is successful
+$ sudo systemctl reload nginx
+$ curl -I http://shop.example.com
+HTTP/1.1 301 Moved Permanently
+Location: https://shop.example.com/
+$ curl -s https://shop.example.com/api/products/1
+{"id":1,"name":"Keyboard","priceInPaise":149900}
+$ curl -sI https://shop.example.com/orders/42 | head -1
+HTTP/2 200
+$ sudo tail -n 20 /var/log/nginx/error.log</code></pre>
+  <p><code>nginx -t</code> checks the syntax without touching the running server.
+  <code>reload</code> loads the new config gracefully (existing connections finish);
+  <code>restart</code> drops them. If the certificate files do not exist yet, <code>nginx -t</code> fails;
+  start with only the port-80 block, run certbot, then add the HTTPS block (or let
+  <code>certbot --nginx</code> add it).</p>
+
+  <h4>Spring Boot behind a proxy</h4>
+  <p>The app receives plain HTTP from Nginx, so by default it believes the request came over HTTP from
+  <code>127.0.0.1</code>. That breaks redirects (a login redirect to <code>http://</code>), absolute links
+  in responses, OAuth2 callback URLs and client-IP logging. Tell Spring Boot to trust the forwarding
+  headers:</p>
+  <pre data-title="application.properties (production profile)"><code class="language-properties">server.address=127.0.0.1
+server.port=8080
+server.forward-headers-strategy=framework</code></pre>
+  <ul>
+    <li><code>framework</code> uses Spring's <code>ForwardedHeaderFilter</code> to read
+    <code>X-Forwarded-*</code> (and the standard <code>Forwarded</code>) headers.</li>
+    <li><code>native</code> uses the servlet container's own support (Tomcat's remote IP handling); also
+    valid, and often the default choice on platforms that set it up for you.</li>
+    <li>Only trust these headers when a proxy you control sets them; a client can send fake
+    <code>X-Forwarded-For</code> values if the app is exposed directly.</li>
+  </ul>
+  <pre data-title="Check from Java what the app sees"><code class="language-java">@GetMapping("/api/debug/request")
+public Map&lt;String, String&gt; info(HttpServletRequest request) {
+    return Map.of(
+        "scheme", request.getScheme(),          // https with forwarding enabled
+        "remoteAddr", request.getRemoteAddr(),  // client IP, not 127.0.0.1
+        "host", request.getServerName());
+}</code></pre>
+  <p>Use a temporary endpoint like this only to verify the setup, then remove it. Module 4 of the Spring
+  Boot page covers CORS and security, which interact with the proxy.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: missing the SPA fallback, or a wrong proxy_pass path</p>
+    <ul>
+      <li>Without <code>try_files ... /index.html</code> a refresh on <code>/orders/42</code> gives a 404
+      from Nginx, though clicking links in the app works.</li>
+      <li>A trailing slash changes behaviour: <code>location /api/</code> with
+      <code>proxy_pass http://billing_backend/;</code> strips <code>/api</code> before sending to the app.
+      Match your controller mappings.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: forgetting the headers, or editing the live file without nginx -t</p>
+    <p>No <code>Host</code>/<code>X-Forwarded-*</code> headers means wrong redirects and wrong client IPs. A
+    typo and <code>systemctl restart nginx</code> without testing takes the whole site down. Always
+    <code>nginx -t</code> first, then <code>reload</code>.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Errors you will see</p>
+    <ul>
+      <li><strong>502 Bad Gateway</strong> — Nginx cannot connect to the app (not running, wrong port).
+      See <code>/var/log/nginx/error.log</code>: <em>connect() failed (111: Connection refused)</em>.</li>
+      <li><strong>504 Gateway Timeout</strong> — the app took longer than <code>proxy_read_timeout</code>
+      (a slow query or a stuck thread).</li>
+      <li><strong>413 Request Entity Too Large</strong> — upload bigger than
+      <code>client_max_body_size</code> (default 1 MB). Spring's
+      <code>spring.servlet.multipart.max-file-size</code> has its own limit too.</li>
+      <li><strong>403 Forbidden</strong> on static files — Nginx's user (<code>www-data</code>) cannot read
+      <code>/var/www/shop</code>; check permissions along the whole path.</li>
+      <li><strong>404 on every static file</strong> — wrong <code>root</code>, or build copied to the wrong
+      folder.</li>
+      <li>A <code>location</code> with its own <code>add_header</code> drops the headers set at the
+      <code>server</code> level (such as HSTS) for that location, because <code>add_header</code> is
+      inherited only if the block has none of its own.</li>
+      <li>WebSockets/SSE need extra headers (<code>Upgrade</code>, <code>Connection "upgrade"</code>) and
+      a long read timeout; this config does not include them.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Many teams write this file once, keep it in the Git repository (for example in
+    <code>deploy/nginx/shop.conf</code>), and copy it during deployment. In Docker setups the same
+    config goes into an Nginx container (Module 3). Cloud load balancers (ALB) replace the TLS and
+    load-balancing parts, but SPA hosting and caching rules stay the same, or move to S3 + CloudFront.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How would you serve a React app and a Spring Boot API from one domain?"</p>
+    <ul>
+      <li>Nginx serves the static build with <code>try_files</code> fallback to <code>index.html</code>
+      and proxies <code>/api/</code> to the app with <code>Host</code>, <code>X-Real-IP</code>,
+      <code>X-Forwarded-For</code> and <code>X-Forwarded-Proto</code>.</li>
+      <li>Same origin means no CORS. TLS terminates at Nginx; set
+      <code>server.forward-headers-strategy</code> in Spring Boot.</li>
+      <li>Test with <code>nginx -t</code>, reload without downtime, read the error log.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m2-interview">
+  <h3>Interview questions — Networking for developers</h3>
+
+  <details class="qa">
+    <summary>What is the difference between a public and a private IP address? What is NAT?</summary>
+    <div class="qa-a">
+      <p>Private addresses (<code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>,
+      <code>192.168.0.0/16</code>) are used inside networks and are not routed on the internet; any
+      other address is public. <strong>NAT</strong> rewrites the source address of outgoing packets to a
+      public IP and maps the replies back, so many private machines share one public address. Devices
+      behind NAT cannot receive unsolicited incoming connections.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between 127.0.0.1, localhost and 0.0.0.0?</summary>
+    <div class="qa-a">
+      <p><code>localhost</code> is a name that resolves to <code>127.0.0.1</code> (IPv4) or
+      <code>::1</code>, the loopback address: traffic stays on the machine. <code>0.0.0.0</code> as a bind
+      address means "listen on all interfaces". An app bound to <code>127.0.0.1</code> is unreachable from
+      other machines; inside Docker an app must bind <code>0.0.0.0</code> for published ports to work.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does /24 mean in 192.168.1.0/24? How many addresses is a /16?</summary>
+    <div class="qa-a">
+      <p>The first 24 of 32 bits are the network part; the last 8 bits vary, so a /24 has 2<sup>8</sup> =
+      256 addresses (192.168.1.0 to 192.168.1.255). A /16 has 2<sup>16</sup> = 65,536. A /32 is a single
+      address; <code>0.0.0.0/0</code> is every address. Cloud providers reserve a few addresses per
+      subnet.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain how a domain name is resolved to an IP address.</summary>
+    <div class="qa-a">
+      <p>The browser and OS check their caches and the hosts file. If needed, the OS asks a recursive
+      resolver, which asks a root server for the TLD servers, the TLD server for the domain's name servers,
+      and the authoritative server for the record. The answer (for example an A record) is cached for its
+      TTL and returned. Then the client opens a TCP connection to that IP.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between an A record and a CNAME? What does TTL do?</summary>
+    <div class="qa-a">
+      <p>An A record maps a name to an IPv4 address; a CNAME maps a name to another name (an alias) which
+      is then resolved. Use CNAME for services whose IP changes (a load balancer hostname). A CNAME cannot
+      sit at the root of a domain under standard rules. TTL is the number of seconds resolvers may cache
+      the answer, so lowering it before a change makes the switch faster.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does HTTPS work? What does a TLS certificate prove?</summary>
+    <div class="qa-a">
+      <p>The client and server negotiate TLS settings; the server sends its certificate chain; the client
+      checks that a trusted CA signed it, that the name matches and that it is within its dates; both sides
+      derive a shared session key; the rest of the traffic is encrypted with it. TLS gives confidentiality,
+      integrity and server authentication. The certificate binds a public key to a domain name.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you get and renew a free certificate for your domain?</summary>
+    <div class="qa-a">
+      <p>Point the domain to the server, open ports 80 and 443, install <code>certbot</code> with the Nginx
+      plugin and run <code>sudo certbot --nginx -d example.com</code>. Let's Encrypt validates the domain
+      over HTTP, issues a 90-day certificate and certbot installs it. A systemd timer renews it
+      automatically; check with <code>sudo certbot renew --dry-run</code>. On AWS, ACM provides certificates
+      for load balancers and CloudFront.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>TCP versus UDP: differences and examples?</summary>
+    <div class="qa-a">
+      <p>TCP is connection-oriented (three-way handshake), reliable, ordered, with flow and congestion
+      control: HTTP(S), SSH, databases. UDP is connectionless with no delivery or order guarantee, but low
+      overhead: DNS queries, video calls, streaming, games, and QUIC (HTTP/3).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain the TCP three-way handshake.</summary>
+    <div class="qa-a">
+      <p>The client sends SYN with its initial sequence number; the server replies SYN-ACK with its own
+      number and acknowledges the client's; the client sends ACK. Both sides now agree on starting numbers
+      and the connection is open. See <a href="09-cs-fundamentals.html#m2">CS Fundamentals · Module 2</a> for
+      the details.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the difference between "connection refused" and "connection timed out"?</summary>
+    <div class="qa-a">
+      <p><strong>Refused</strong> means the host answered with a reset: it is reachable, but nothing listens
+      on that port (app down, wrong port). <strong>Timed out</strong> means no answer: a firewall or
+      security group dropped the packets, the IP is wrong or the host is down. The difference tells you
+      whether to look at the app or the network rules.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a security group? How is it different from a network ACL, and which rules would you set for a web app?</summary>
+    <div class="qa-a">
+      <p>A security group is a stateful, allow-only firewall attached to an instance; return traffic is
+      allowed automatically. A network ACL works at the subnet level and is stateless, with allow and deny
+      rules. For a web app: 22 from your IP only, 80 and 443 from <code>0.0.0.0/0</code>, and the database
+      port only from the app's security group.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a reverse proxy? Why put Nginx in front of Spring Boot?</summary>
+    <div class="qa-a">
+      <p>A reverse proxy receives requests for the servers behind it and forwards them. Nginx terminates
+      TLS, routes paths, serves static files, compresses, rate-limits, adds forwarding headers and balances
+      load across instances. The app can stay on localhost with no root privileges. A forward proxy, in
+      contrast, acts for clients.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Your app works at localhost:8080 on the server but not from the internet. What do you check?</summary>
+    <div class="qa-a">
+      <p>Listening address (<code>ss -tulpn</code>: <code>127.0.0.1</code> or <code>0.0.0.0</code>); the OS
+      firewall (<code>ufw status</code>); the cloud security group; whether Nginx proxies to it; the public
+      IP and route; DNS (<code>dig</code>); HTTPS certificate. Test from outside with
+      <code>nc -zv</code> and <code>curl -v</code> and read refused versus timeout.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Nginx returns 502 Bad Gateway. What does it mean and how do you debug it?</summary>
+    <div class="qa-a">
+      <p>Nginx is running but cannot get a valid response from the upstream. Check that the app is up
+      (<code>systemctl status</code>), that it listens on the address and port named in
+      <code>proxy_pass</code> (<code>ss -tulpn</code>), then read <code>/var/log/nginx/error.log</code>
+      (for example "connection refused") and the app's log for a crash. A 504 instead means the app
+      answered too slowly.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why does Spring Boot need server.forward-headers-strategy behind a proxy?</summary>
+    <div class="qa-a">
+      <p>The proxy talks plain HTTP to the app, so the app would see scheme <code>http</code>, host
+      <code>localhost</code> and client IP <code>127.0.0.1</code>. Setting
+      <code>server.forward-headers-strategy=framework</code> (or <code>native</code>) makes it read
+      <code>X-Forwarded-For/Proto/Host</code>, so redirects, generated links, OAuth callback URLs and logs
+      use the real values. Trust these headers only from your own proxy.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m2-cheatsheet">
+  <h3>Cheat sheet — Networking for developers</h3>
+  <ul class="cheat">
+    <li><b>Private ranges</b> 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16; everything else is public</li>
+    <li><b>CIDR</b> /32 one host, /24 = 256 addresses, /16 = 65,536, /0 = all; bigger prefix = smaller block</li>
+    <li><b>127.0.0.1 vs 0.0.0.0</b> loopback (same machine) vs all interfaces when listening</li>
+    <li><b>NAT</b> private hosts share a public IP for outbound traffic; no unsolicited inbound</li>
+    <li><b>Ports</b> 22 SSH, 53 DNS, 80 HTTP, 443 HTTPS, 3306 MySQL, 5432 PostgreSQL, 6379 Redis, 8080 app, 9092 Kafka, 27017 MongoDB</li>
+    <li><b>DNS path</b> cache and hosts file, resolver, root, TLD, authoritative; answer cached for the TTL</li>
+    <li><b>Records</b> A (IPv4), AAAA (IPv6), CNAME (alias), MX (mail), TXT (text/verification), NS (name servers)</li>
+    <li><b>dig +short name; dig @8.8.8.8 name</b> what DNS returns, and what a public resolver returns</li>
+    <li><b>TCP vs UDP</b> reliable ordered connection vs fast connectionless datagrams</li>
+    <li><b>Refused vs timeout</b> nothing listening vs packets dropped (firewall, wrong IP)</li>
+    <li><b>TLS gives</b> encryption, integrity, authentication; certificate = public key bound to a domain, signed by a CA</li>
+    <li><b>certbot --nginx -d domain</b> free Let's Encrypt certificate (90 days); <code>certbot renew --dry-run</code> tests renewal</li>
+    <li><b>HSTS</b> <code>Strict-Transport-Security</code> header forces HTTPS in browsers; enable only when HTTPS is solid</li>
+    <li><b>ufw</b> <code>default deny incoming</code>, <code>allow 22/tcp</code>, <code>allow 80,443/tcp</code>, <code>enable</code>, <code>status</code>; allow SSH first</li>
+    <li><b>Security group</b> stateful, allow-only; 22 from my IP, 80/443 public, DB only from the app group, never 0.0.0.0/0 for databases</li>
+    <li><b>Debug tools</b> ip a, ping, traceroute, dig, nc -zv host port, curl -v, ss -tulpn</li>
+    <li><b>Not reachable?</b> app running, listening address and port, local curl, proxy, ufw, security group, DNS, HTTPS</li>
+    <li><b>Reverse proxy</b> acts for servers: TLS, routing, static files, gzip, rate limit, load balancing</li>
+    <li><b>Nginx headers</b> Host $host, X-Real-IP, X-Forwarded-For $proxy_add_x_forwarded_for, X-Forwarded-Proto $scheme</li>
+    <li><b>SPA</b> <code>try_files $uri $uri/ /index.html;</code> so deep links work after refresh</li>
+    <li><b>nginx -t then reload</b> test the syntax first; <code>reload</code> keeps connections, <code>restart</code> drops them</li>
+    <li><b>502 vs 504</b> upstream down or refusing vs upstream too slow</li>
+    <li><b>Spring Boot</b> <code>server.forward-headers-strategy=framework</code> behind a proxy; keep the app on 127.0.0.1</li>
+    <li><b>Load balancing</b> round robin, least_conn, ip_hash; passive checks via max_fails; keep apps stateless</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m2-practice">
+  <h3>Practice — Networking for developers</h3>
+  <ol class="steps">
+    <li><strong>Know your addresses.</strong> Run <code>ip a</code> (or <code>ipconfig</code>) and find
+    your private IP and which private range it belongs to. Find your public IP with
+    <code>curl -s https://checkip.amazonaws.com</code>. Explain why they differ. Done when you can write
+    your own CIDR block and its size.</li>
+    <li><strong>CIDR exercises.</strong> On paper, give the first and last address and the count for
+    <code>10.0.1.0/24</code>, <code>10.0.0.0/16</code> and <code>172.16.0.0/12</code>. Design a VPC plan:
+    one /16 split into four /24 subnets (two public, two private). Done when a friend can check your
+    ranges without overlap.</li>
+    <li><strong>DNS detective.</strong> With <code>dig</code>, look up the A, AAAA, NS, MX and TXT records
+    of a domain you know. Find the TTL, then compare answers from your resolver and
+    <code>dig @8.8.8.8</code>. Add a test line to your hosts file that maps a made-up name to
+    <code>127.0.0.1</code> and open it in the browser. Done when you can explain each part of a dig
+    answer.</li>
+    <li><strong>Point a domain at a server.</strong> Buy or use a cheap/free domain, attach an Elastic IP
+    to your EC2 instance, create the A record (TTL 300) and a CNAME for <code>www</code>. Done when
+    <code>dig +short</code> shows your IP and Nginx's default page loads by name.</li>
+    <li><strong>Firewall by the book.</strong> On a test Ubuntu machine or VM set <code>ufw</code> to
+    default deny, allow 22 and 80/443, run <code>ufw status verbose</code>, then try
+    <code>nc -zv</code> against an open port and a blocked one from another machine. In AWS, set the
+    security group to allow SSH only from your IP and check that you can still log in. Done when you can
+    explain "refused" versus "timed out" from what you saw.</li>
+    <li><strong>Serve your full stack.</strong> Deploy a Spring Boot JAR as a systemd service
+    (<a href="#m1-systemd">Module 1</a>), build a React app, and put the complete Nginx config from this
+    module in front of them. Run <code>nginx -t</code> and reload. Check the SPA deep link by refreshing
+    <code>/some/route</code>, and the API with <code>curl</code>. Done when the site works on your
+    domain.</li>
+    <li><strong>Add HTTPS.</strong> Run <code>certbot --nginx</code> for your domain, confirm the
+    redirect from HTTP to HTTPS, inspect the certificate with <code>curl -vI</code>, and run
+    <code>certbot renew --dry-run</code>. Done when the browser shows a valid padlock and the dry run
+    succeeds.</li>
+    <li><strong>Break and diagnose.</strong> Ask a friend (or yourself) to break one thing at a time:
+    stop the app, change the app's port, bind it to <code>127.0.0.1</code> only, remove port 443 from the
+    security group, point DNS to a wrong IP, let a certificate expire (or use a staging one). For each, use
+    the checklist to name the cause in under five minutes from the symptom. Done when you can match every
+    symptom (502, refused, timeout, resolve error, certificate error) to its layer.</li>
+    <li><strong>Forwarded headers.</strong> Add the temporary endpoint from the Nginx article to a Spring
+    Boot app. Compare <code>getScheme()</code> and <code>getRemoteAddr()</code> with and without
+    <code>server.forward-headers-strategy=framework</code>. Done when the app reports <code>https</code>
+    and your real client IP; then delete the endpoint.</li>
+  </ol>
+</article>

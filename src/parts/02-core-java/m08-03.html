@@ -1,0 +1,456 @@
+<article class="topic" id="m8-logging">
+  <h3>Logging with SLF4J and Logback instead of System.out.println</h3>
+  <p class="tldr">Write log messages through the SLF4J interface, let Logback (or Log4j2) decide where and how they appear, choose the right level, use <code>{}</code> placeholders, pass the exception as the last argument, and never log secrets.</p>
+
+  <h4>Why not System.out.println?</h4>
+  <p>A <code>println</code> is fine for a ten-line practice program. In an application running on a server it is a problem:</p>
+  <ul>
+    <li><strong>No levels.</strong> You cannot turn off debug chatter in production or turn it on for one package.</li>
+    <li><strong>No context.</strong> No timestamp, thread name or class name, which you need to follow one request among thousands.</li>
+    <li><strong>No control over the destination.</strong> You cannot send output to rolling files, to a log server (ELK, Loki, CloudWatch) or in JSON.</li>
+    <li><strong>Slow and unsynchronised.</strong> Console output is slow and lines from different threads can interleave.</li>
+    <li><strong>No stack-trace handling.</strong> <code>e.printStackTrace()</code> writes to <code>System.err</code>, outside your logging setup.</li>
+  </ul>
+
+  <h4>SLF4J facade and implementations</h4>
+  <p><strong>SLF4J</strong> (Simple Logging Facade for Java) is only an API: <code>Logger</code>, <code>LoggerFactory</code> and <code>MDC</code>. The real work is done by an <strong>implementation</strong> found at runtime. This lets libraries log through SLF4J without forcing one logging library on you.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A[Your code and libraries] --> B[SLF4J API]
+  B --> C[Logback]
+  B --> D[Log4j2]
+  C --> E[Console, files, JSON]
+  D --> E
+</pre>
+    <figcaption>Code talks to SLF4J; one implementation does the logging</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Logback</strong> — written by SLF4J's author; the <strong>default in Spring Boot</strong> (<code>spring-boot-starter-logging</code>). Add <code>ch.qos.logback:logback-classic</code> in a plain project; it brings <code>slf4j-api</code> with it.</li>
+    <li><strong>Log4j2</strong> — a powerful alternative (async loggers, many appenders). Keep it up to date: old 2.x versions had the serious Log4Shell vulnerability. In Spring Boot you can switch to it by excluding the logging starter and adding <code>spring-boot-starter-log4j2</code>.</li>
+    <li>If no implementation is on the classpath, SLF4J prints a warning that no providers were found and discards the messages. Having several implementations gives a warning about multiple providers.</li>
+  </ul>
+
+  <h4>Using a logger</h4>
+  <pre data-title="OrderService.java"><code class="language-java">import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class OrderService {
+    private static final Logger log = LoggerFactory.getLogger(OrderService.class);
+
+    public void placeOrder(long orderId, long customerId) {
+        log.debug("Placing order {} for customer {}", orderId, customerId);
+        try {
+            charge(orderId);
+            log.info("Order {} created for customer {}", orderId, customerId);
+        } catch (IllegalStateException e) {
+            log.error("Payment failed for order {}", orderId, e);   // exception LAST
+            throw e;
+        }
+    }
+
+    private void charge(long orderId) {
+        throw new IllegalStateException("Gateway timeout");
+    }
+}</code></pre>
+  <pre class="out" data-title="Console output (default Logback pattern)"><code class="language-plaintext">10:15:32.118 [main] INFO  com.shop.OrderService - Order 1042 created for customer 7
+10:15:32.121 [main] ERROR com.shop.OrderService - Payment failed for order 1042
+java.lang.IllegalStateException: Gateway timeout
+	at com.shop.OrderService.charge(OrderService.java:18)
+	at com.shop.OrderService.placeOrder(OrderService.java:9)</code></pre>
+  <p>(Only lines at <code>INFO</code> and above show with the default configuration, so the <code>debug</code> line is hidden until you lower the level.) One example run shows either the first or the second path; both are shown here to illustrate the format.</p>
+  <ul>
+    <li><strong>One logger per class</strong>, declared <code>private static final</code>, named after the class. The logger name is how you filter later (<code>com.shop.OrderService</code>, or everything under <code>com.shop</code>).</li>
+    <li>With Lombok, <code>@Slf4j</code> on the class generates a field named <code>log</code>.</li>
+  </ul>
+
+  <h4>Log levels</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Level</th><th>Use it for</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>ERROR</code></td><td>An operation failed and needs attention; the system could not do what was asked</td><td>Payment gateway unreachable, unexpected exception in a request</td></tr>
+      <tr><td><code>WARN</code></td><td>Something unexpected or risky happened, but the system recovered or continues</td><td>Retry succeeded on 3rd attempt, deprecated API used, cache miss rate high</td></tr>
+      <tr><td><code>INFO</code></td><td>Important business and lifecycle events; the "story" of the application</td><td>Application started, order created, scheduled job finished</td></tr>
+      <tr><td><code>DEBUG</code></td><td>Details useful to developers while diagnosing</td><td>Request parameters, SQL timing, decision branches</td></tr>
+      <tr><td><code>TRACE</code></td><td>Very fine-grained flow</td><td>Method entry/exit, every loop iteration</td></tr>
+    </tbody>
+  </table></div>
+  <p>Levels are ordered <code>TRACE &lt; DEBUG &lt; INFO &lt; WARN &lt; ERROR</code>. Setting a logger to <code>INFO</code> shows INFO, WARN and ERROR. Production usually runs at <code>INFO</code> (or <code>WARN</code> for noisy libraries) and you temporarily lower one package to <code>DEBUG</code> when investigating. SLF4J has no <code>FATAL</code> level (Log4j2 does). Do not log expected, normal situations (like "user typed a wrong password") at <code>ERROR</code>, or the alerts become noise.</p>
+
+  <h4>Parameterised messages</h4>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: concatenation</p><pre><code class="language-java">log.debug("Order " + order + " has " + items.size() + " items");
+// builds the whole string even when DEBUG is off</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: placeholders</p><pre><code class="language-java">log.debug("Order {} has {} items", order, items.size());
+// string is built only if DEBUG is enabled</code></pre></div>
+  </div>
+  <p>With <code>{}</code> the message is formatted only when the level is enabled, so disabled debug statements cost almost nothing. If computing an argument is itself expensive (for example serialising a big object to JSON), guard it: <code>if (log.isDebugEnabled()) { log.debug("Payload: {}", toJson(payload)); }</code>. SLF4J 2 also offers a fluent API (<code>log.atDebug().setMessage(...).log()</code>) with lambdas for lazy arguments.</p>
+
+  <h4>Logging exceptions</h4>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: the stack trace is lost</p><pre><code class="language-java">catch (Exception e) {
+    log.error("Failed: " + e.getMessage());
+    // or: e.printStackTrace();
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: pass the exception as the last argument</p><pre><code class="language-java">catch (Exception e) {
+    log.error("Failed to place order {}", orderId, e);
+}</code></pre></div>
+  </div>
+  <p>When the <em>last</em> argument is a <code>Throwable</code> and there is no placeholder left for it, SLF4J prints its full stack trace and the chain of causes. Also:</p>
+  <ul>
+    <li><strong>Log an exception once.</strong> Either handle it (and log) or rethrow it; do not <code>log.error</code> and then <code>throw</code> at every layer, or one failure fills the log with the same stack trace five times. A common pattern: lower layers throw, and one place (a global exception handler in Spring, <code>@ControllerAdvice</code>) logs.</li>
+    <li>Include <em>identifiers</em> that make the message searchable (order id, user id, request id), not vague text like "error occurred".</li>
+  </ul>
+
+  <h4>Configuration basics</h4>
+  <p>Logback reads <code>logback.xml</code> (or <code>logback-test.xml</code> for tests) from <code>src/main/resources</code>:</p>
+  <pre data-title="src/main/resources/logback.xml"><code class="language-xml">&lt;configuration&gt;
+    &lt;appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender"&gt;
+        &lt;encoder&gt;
+            &lt;pattern&gt;%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n&lt;/pattern&gt;
+        &lt;/encoder&gt;
+    &lt;/appender&gt;
+
+    &lt;logger name="com.shop" level="DEBUG"/&gt;       &lt;!-- our code: verbose --&gt;
+    &lt;logger name="org.hibernate.SQL" level="WARN"/&gt;
+
+    &lt;root level="INFO"&gt;                           &lt;!-- everything else --&gt;
+        &lt;appender-ref ref="CONSOLE"/&gt;
+    &lt;/root&gt;
+&lt;/configuration&gt;</code></pre>
+  <dl class="terms">
+    <dt>Logger</dt>
+    <dd>A named source of messages, arranged in a hierarchy by dots: <code>com.shop.OrderService</code> inherits the level of <code>com.shop</code>, which inherits from <code>root</code>.</dd>
+    <dt>Appender</dt>
+    <dd>A destination: console, a file, a rolling file (new file per day or size, old ones deleted), syslog, a network socket.</dd>
+    <dt>Encoder / layout / pattern</dt>
+    <dd>The format of each line: <code>%d</code> date, <code>%thread</code>, <code>%-5level</code>, <code>%logger{36}</code> abbreviated class name, <code>%msg</code> message, <code>%n</code> newline. JSON encoders exist for log-aggregation systems.</dd>
+  </dl>
+  <p>In <strong>Spring Boot</strong> you rarely write XML; use properties (add a <code>logback-spring.xml</code> only when you need more):</p>
+  <pre data-title="application.properties"><code class="language-properties">logging.level.root=INFO
+logging.level.com.shop=DEBUG
+logging.level.org.springframework.web=WARN
+logging.file.name=logs/app.log
+logging.pattern.console=%d{HH:mm:ss.SSS} %-5level [%thread] %logger{20} - %msg%n</code></pre>
+  <p>Setting <code>logging.level.org.hibernate.SQL=DEBUG</code> prints the SQL that Hibernate sends — handy when debugging JPA (<a href="04-spring-boot.html#m3">Spring Boot · Module 3</a>).</p>
+
+  <h4>MDC — adding context to every line</h4>
+  <p>The <strong>MDC</strong> (Mapped Diagnostic Context) is a per-thread map of key-value pairs that Logback can print on every line. A filter puts a request id or user id in at the start of a request; every log line from that request, in any class, then carries it, which is how you follow one request through the logs.</p>
+  <pre data-title="MDC usage"><code class="language-java">import org.slf4j.MDC;
+
+MDC.put("requestId", "req-8f21");
+try {
+    service.handle(request);          // every log line inside can show %X{requestId}
+} finally {
+    MDC.clear();                      // threads are reused: always clean up
+}
+// pattern: %d [%thread] %-5level %X{requestId} %logger{20} - %msg%n</code></pre>
+  <p>MDC values live in the current thread; they do not automatically move to other threads (executors, async code), so copy them when you hand work over.</p>
+
+  <h4>What never to log</h4>
+  <ul>
+    <li><strong>Passwords, OTPs, API keys, JWTs, session ids and other secrets.</strong></li>
+    <li><strong>Card numbers, CVV, bank account numbers, Aadhaar, PAN</strong> and other government or financial identifiers; mask them (<code>XXXX-XXXX-XXXX-4242</code>).</li>
+    <li>Full personal data (address, phone, e-mail, health data) beyond what you need; privacy law (such as India's DPDP Act, GDPR) applies to log files too.</li>
+    <li>Whole request or response bodies by default; they hide secrets and fill disks.</li>
+    <li>Anything inside a tight loop at <code>INFO</code> or above.</li>
+  </ul>
+  <p>Logs are copied, shipped to third-party tools and read by many people. Treat them as semi-public. Beware of logging a whole object whose <code>toString()</code> includes a password field; exclude sensitive fields from <code>toString</code>.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Depend on the SLF4J API in your code; keep exactly one implementation on the classpath.</li>
+      <li>Use placeholders, not concatenation; pass the exception as the last argument.</li>
+      <li>Never log secrets or full card/ID numbers.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Messages are short sentences with identifiers: <code>"Order {} shipped to {}"</code>. Start with the event, not "Entering method".</li>
+      <li>Log business events at <code>INFO</code> at service boundaries (request received, job finished) and details at <code>DEBUG</code>.</li>
+      <li>Never use <code>System.out</code> or <code>e.printStackTrace()</code> in application code. Replace tutorial code with <code>log.info</code>.</li>
+      <li>Add a correlation/request id through the MDC in services that call other services.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Logging and rethrowing at every layer (duplicate stack traces).</li>
+      <li><code>log.info("Result: " + result)</code> in a hot path — string building and I/O cost.</li>
+      <li>Using <code>ERROR</code> for validation failures caused by users.</li>
+      <li>Creating a new logger per call or logging with the wrong class (copy-pasted <code>getLogger(OtherClass.class)</code>).</li>
+      <li>A DEBUG level left on in production for a whole day, filling the disk.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Why use a logging framework? What are the log levels?"</p>
+    <ul>
+      <li>Levels, formatting, destinations, rolling files, performance and per-package configuration, all changeable without code changes.</li>
+      <li>SLF4J is a facade; Logback or Log4j2 implement it; Spring Boot uses Logback by default.</li>
+      <li>Levels: TRACE, DEBUG, INFO, WARN, ERROR, with a one-line meaning each. Placeholders avoid string building; the exception goes last.</li>
+      <li>MDC for request ids; never log passwords, tokens or card numbers.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m8-javadoc-style">
+  <h3>Javadoc and code style</h3>
+  <p class="tldr">Write Javadoc comments for public classes and methods (<code>@param</code>, <code>@return</code>, <code>@throws</code>), and follow one consistent style enforced by the IDE formatter and a style guide such as Google Java Style.</p>
+
+  <h4>Javadoc</h4>
+  <p><strong>Javadoc</strong> is documentation written in special comments (<code>/** ... */</code>) directly above a class, method or field. The <code>javadoc</code> tool turns them into the HTML API pages you know from the JDK documentation, and IntelliJ shows them when you press <kbd>Ctrl</kbd>+<kbd>Q</kbd> over a name. The first sentence is the summary.</p>
+  <pre data-title="Wallet.java"><code class="language-java">/**
+ * A prepaid wallet that holds an amount in paise.
+ *
+ * &lt;p&gt;Instances are not thread-safe. Amounts are never negative.
+ *
+ * @author Asha Rao
+ * @since 1.0
+ */
+public class Wallet {
+    private long balancePaise;
+
+    /**
+     * Withdraws money from the wallet.
+     *
+     * @param amountPaise the amount to withdraw, in paise; must be positive
+     * @return the balance after the withdrawal, in paise
+     * @throws IllegalArgumentException if {@code amountPaise} is zero or negative
+     * @throws InsufficientFundsException if the balance is lower than the amount
+     * @see #deposit(long)
+     */
+    public long withdraw(long amountPaise) throws InsufficientFundsException {
+        if (amountPaise &lt;= 0) {
+            throw new IllegalArgumentException("amount must be positive");
+        }
+        if (amountPaise &gt; balancePaise) {
+            throw new InsufficientFundsException(balancePaise, amountPaise);
+        }
+        balancePaise -= amountPaise;
+        return balancePaise;
+    }
+}</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Tag</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>@param name</code></td><td>Describes a parameter (what it means, units, allowed values)</td></tr>
+      <tr><td><code>@return</code></td><td>Describes the returned value (not for <code>void</code>)</td></tr>
+      <tr><td><code>@throws Type</code></td><td>When the method throws that exception</td></tr>
+      <tr><td><code>@see</code>, <code>{@link Type#method}</code></td><td>Cross-reference to another class or method</td></tr>
+      <tr><td><code>{@code text}</code></td><td>Inline code, with HTML characters shown literally</td></tr>
+      <tr><td><code>@since</code>, <code>@author</code>, <code>@deprecated</code></td><td>Version, author, and a note about the replacement for old API</td></tr>
+    </tbody>
+  </table></div>
+  <p>Generate the HTML with the JDK tool or Maven: <code>javadoc -d docs src/main/java/com/shop/*.java</code> or <code>mvn javadoc:javadoc</code> (output in <code>target/site/apidocs</code>); IntelliJ has <em>Tools → Generate JavaDoc</em>. Use <code>&lt;p&gt;</code> for new paragraphs inside a comment.</p>
+  <ul>
+    <li><strong>Document the contract</strong>, not the implementation: what the caller must pass, what comes back, what can go wrong.</li>
+    <li>Public APIs of libraries and shared modules need Javadoc; internal one-line helpers rarely do. Do not write comments that repeat the code (<code>// increments i</code>).</li>
+    <li>A comment that explains <em>why</em> (a business rule, a workaround, a link to a ticket) is worth more than one that explains <em>what</em>. If you need a comment to explain what a block does, consider renaming or extracting a method.</li>
+    <li>Keep documentation true: a wrong comment is worse than none.</li>
+  </ul>
+
+  <h4>Code style</h4>
+  <p>Consistent formatting makes code reviews about logic, not about spaces, and makes diffs in Git small. Rules professionals follow:</p>
+  <ul>
+    <li>Follow the <strong>Java naming conventions</strong> (<a href="#m1-program-structure">Module 1</a>): PascalCase classes, camelCase methods and variables, UPPER_SNAKE_CASE constants.</li>
+    <li><strong>One style per codebase</strong>, applied by tools, not by arguing. The two common choices are the <em>Google Java Style</em> (2-space indent, 100-column limit, braces always) and IntelliJ's defaults (4-space indent, 120-column limit). Both are fine; the repository's choice wins.</li>
+    <li>Always use braces for <code>if</code>/<code>for</code>/<code>while</code>, one statement per line, one variable per declaration, no wildcard imports, no unused imports.</li>
+    <li>Keep methods short, with one purpose, and avoid deep nesting (use guard clauses).</li>
+    <li>Use meaningful names; avoid abbreviations and magic numbers (<code>static final int MAX_RETRIES = 3;</code>).</li>
+    <li>Declare variables as close as possible to first use; prefer <code>final</code> for fields that never change.</li>
+    <li>Order members consistently: constants, fields, constructors, public methods, private helpers.</li>
+  </ul>
+  <p>Tools that enforce it:</p>
+  <ul>
+    <li><strong>IntelliJ formatter:</strong> <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>L</kbd> reformats, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>O</kbd> optimises imports. Turn on <em>Reformat code</em> and <em>Optimize imports</em> in the commit dialog or "on save" actions.</li>
+    <li><strong>.editorconfig:</strong> a small file in the repository root (indent size, line endings, final newline) understood by IntelliJ, VS Code and Eclipse.</li>
+    <li><strong>Formatter plugins:</strong> <code>google-java-format</code> or Spotless (Maven/Gradle) can format or check formatting in the build; <strong>Checkstyle</strong> checks rules; SonarLint/SonarQube and the IDE inspections warn about bugs and smells.</li>
+  </ul>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: make style automatic</p>
+    <p>Add an <code>.editorconfig</code>, share the IDE formatter settings (or use Spotless), and let CI fail when formatting is off. Then nobody discusses braces in a pull request.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Javadoc that only repeats the method name ("Gets the name").</li>
+      <li>Forgetting to update a comment when the code changes.</li>
+      <li>Reformatting a whole file in an unrelated commit, which makes the real change impossible to review.</li>
+      <li>Leaving commented-out code in the file; Git remembers it for you.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "How do you keep code readable?"</p>
+    <ul>
+      <li>Good names, small methods, consistent formatting through tools, comments for the <em>why</em>, Javadoc for public APIs.</li>
+      <li>Code reviews, linters (Checkstyle, SonarLint), and tests as living documentation.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m8-interview">
+  <h3>Interview questions — Tools every Java developer uses</h3>
+
+  <details class="qa">
+    <summary>How do you debug a Java application in IntelliJ? Name the stepping options.</summary>
+    <div class="qa-a">
+      <p>Set a breakpoint, start in Debug mode, and inspect variables, the frames (call stack) and watches. Step Over (<kbd>F8</kbd>) runs a line, Step Into (<kbd>F7</kbd>) enters the method on the line, Step Out (<kbd>Shift</kbd>+<kbd>F8</kbd>) finishes the current method, Run to Cursor (<kbd>Alt</kbd>+<kbd>F9</kbd>) jumps ahead, and Resume (<kbd>F9</kbd>) goes to the next breakpoint. Conditional breakpoints stop only when an expression is true, exception breakpoints stop where an exception is thrown, and Evaluate Expression runs code against the paused state.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is remote debugging and how do you enable it?</summary>
+    <div class="qa-a">
+      <p>It attaches the IDE to a JVM running elsewhere. Start that JVM with <code>-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005</code>, then create a Remote JVM Debug configuration in IntelliJ with the host and port. Use it only on protected environments, because an open debug port allows arbitrary code execution.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is Maven and what does <code>mvn clean install</code> do?</summary>
+    <div class="qa-a">
+      <p>Maven is a build and dependency-management tool configured by <code>pom.xml</code>. <code>clean</code> deletes <code>target/</code>; <code>install</code> runs the default lifecycle up to the install phase: validate, compile, test, package, verify, install. The result is a JAR in <code>target/</code> that is also copied to the local repository <code>~/.m2</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Explain Maven coordinates and dependency scopes.</summary>
+    <div class="qa-a">
+      <p>Coordinates are <code>groupId</code> (organisation), <code>artifactId</code> (module name) and <code>version</code>. Scopes: <code>compile</code> (default, everywhere), <code>provided</code> (needed to compile, supplied by the runtime, e.g. servlet API), <code>runtime</code> (not needed to compile, needed to run, e.g. JDBC driver) and <code>test</code> (only for tests, e.g. JUnit).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What are transitive dependencies and how do you resolve a version conflict?</summary>
+    <div class="qa-a">
+      <p>A transitive dependency is a library required by a library you declared. When two paths need different versions, Maven keeps the nearest one in the dependency tree, and the first declared on a tie. Inspect with <code>mvn dependency:tree</code>, then pin a version in <code>dependencyManagement</code>, add an exclusion, or use a BOM such as Spring Boot's. Symptoms of a conflict are <code>NoSuchMethodError</code> and <code>NoClassDefFoundError</code> at runtime.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Maven vs Gradle?</summary>
+    <div class="qa-a">
+      <p>Both use Maven Central. Maven has declarative XML, a fixed lifecycle and strong conventions, which makes projects uniform. Gradle uses a Kotlin or Groovy script, a task graph, incremental builds and a build cache, and is more flexible and often faster on large builds. Scope <code>test</code> corresponds to <code>testImplementation</code>, <code>provided</code> to <code>compileOnly</code>, and <code>runtime</code> to <code>runtimeOnly</code>. Both provide a wrapper (<code>mvnw</code>, <code>gradlew</code>).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a SNAPSHOT version? Why shouldn't you abuse <code>-DskipTests</code>?</summary>
+    <div class="qa-a">
+      <p>A SNAPSHOT is a moving, in-development version; Maven checks for newer builds, so the same version string can mean different code. A release version is immutable. <code>-DskipTests</code> compiles tests but does not run them; using it to get a green build hides failures and ships bugs, so keep tests on in CI and release builds.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do you write a unit test with JUnit 5? What are the lifecycle annotations?</summary>
+    <div class="qa-a">
+      <p>Create a class in <code>src/test/java</code>, annotate methods with <code>@Test</code>, follow Arrange-Act-Assert and use <code>Assertions</code> (<code>assertEquals(expected, actual)</code>, <code>assertThrows</code>, <code>assertAll</code>). <code>@BeforeEach</code>/<code>@AfterEach</code> run around every test; <code>@BeforeAll</code>/<code>@AfterAll</code> run once and are static. JUnit makes a new test-class instance per method, so tests are independent.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is a parameterised test and when do you use it?</summary>
+    <div class="qa-a">
+      <p>It runs one test method several times with different arguments, using <code>@ParameterizedTest</code> and a source such as <code>@ValueSource</code>, <code>@CsvSource</code> or <code>@MethodSource</code>. Use it for the same behaviour over many inputs (boundary values, valid and invalid cases) instead of copy-pasting tests.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Describe the steps of a JDBC query and why try-with-resources matters.</summary>
+    <div class="qa-a">
+      <p>Get a <code>Connection</code> (from <code>DriverManager</code> or a pooled <code>DataSource</code>), create a <code>PreparedStatement</code>, bind parameters (index starts at 1), call <code>executeQuery</code> or <code>executeUpdate</code>, iterate the <code>ResultSet</code> with <code>next()</code>, and close everything. Try-with-resources closes the <code>ResultSet</code>, statement and connection even when an exception occurs; unclosed connections leak and exhaust the pool.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Statement vs PreparedStatement vs CallableStatement; what is SQL injection?</summary>
+    <div class="qa-a">
+      <p><code>Statement</code> runs a complete SQL string; <code>PreparedStatement</code> uses <code>?</code> placeholders, is precompiled and reusable; <code>CallableStatement</code> calls stored procedures. SQL injection is an attack where user input concatenated into SQL changes the query (<code>' OR '1'='1</code> turns a login into always-true). Prepared statements send values separately from the SQL text, so input cannot become code. Identifiers such as column names cannot be parameters and must be whitelisted.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do transactions work in JDBC?</summary>
+    <div class="qa-a">
+      <p>Auto-commit is on by default. For several dependent statements call <code>con.setAutoCommit(false)</code>, run them on the same connection, call <code>commit()</code> if all succeed, and <code>rollback()</code> in the catch block if any fails. In Spring this becomes <code>@Transactional</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why use a connection pool such as HikariCP?</summary>
+    <div class="qa-a">
+      <p>Opening a database connection is slow and databases limit how many they accept. A pool creates connections once and lends them to threads; closing a pooled connection just returns it. This improves latency and caps the load on the database. HikariCP is the default in Spring Boot, with a maximum pool size of 10 unless configured.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why use SLF4J and Logback instead of <code>System.out.println</code>? What are the log levels and how do you log an exception?</summary>
+    <div class="qa-a">
+      <p>Logging frameworks add levels, timestamps, thread and class names, configurable outputs (files, rolling, JSON) and per-package control, with better performance. SLF4J is the API; Logback or Log4j2 implement it. Levels are TRACE, DEBUG, INFO, WARN, ERROR. Use placeholders (<code>log.info("User {} created", id)</code>) and pass the exception last (<code>log.error("Failed for {}", id, e)</code>) so the stack trace is printed. Never log passwords, tokens or card numbers.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is MDC and why do teams use it?</summary>
+    <div class="qa-a">
+      <p>The Mapped Diagnostic Context is a per-thread map whose entries (request id, user id) can be printed on every log line. It lets you follow one request through all classes and, with a correlation id passed between services, across a microservice system. Clear it in a <code>finally</code> block because threads are reused.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m8-cheatsheet">
+  <h3>Cheat sheet — Tools every Java developer uses</h3>
+  <ul class="cheat">
+    <li><b>Debug keys</b> <kbd>Shift</kbd>+<kbd>F9</kbd> debug, <kbd>F8</kbd> step over, <kbd>F7</kbd> step into, <kbd>Shift</kbd>+<kbd>F8</kbd> step out, <kbd>Alt</kbd>+<kbd>F9</kbd> run to cursor, <kbd>F9</kbd> resume, <kbd>Alt</kbd>+<kbd>F8</kbd> evaluate.</li>
+    <li><b>Breakpoints</b> line, conditional, logging, exception, method, field watchpoint.</li>
+    <li><b>Remote debug</b> <code>-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005</code>; never open it in production.</li>
+    <li><b>Maven layout</b> <code>src/main/java</code>, <code>src/main/resources</code>, <code>src/test/java</code>, output in <code>target/</code>.</li>
+    <li><b>Coordinates</b> groupId : artifactId : version.</li>
+    <li><b>Scopes</b> compile (default), provided, runtime, test.</li>
+    <li><b>Lifecycle</b> validate → compile → test → package → verify → install → deploy; a phase runs all earlier ones.</li>
+    <li><b>Commands</b> <code>mvn clean install</code>, <code>mvn test -Dtest=Name</code>, <code>mvn dependency:tree</code>, <code>mvn -U</code>, <code>./mvnw</code>.</li>
+    <li><b>install vs deploy</b> to <code>~/.m2</code> vs to a remote repository.</li>
+    <li><b>Conflicts</b> nearest wins, then first declared; fix with <code>dependencyManagement</code>, exclusions or a BOM.</li>
+    <li><b>SNAPSHOT</b> changing development version; release versions never change.</li>
+    <li><b>-DskipTests</b> skips running tests; do not use it to hide failures.</li>
+    <li><b>Gradle</b> <code>implementation</code>, <code>runtimeOnly</code>, <code>compileOnly</code>, <code>testImplementation</code>; <code>./gradlew build</code>; <code>useJUnitPlatform()</code>.</li>
+    <li><b>JUnit 5</b> <code>@Test</code>, <code>@BeforeEach</code>, <code>@AfterEach</code>, <code>@BeforeAll</code> (static), <code>@DisplayName</code>, <code>@ParameterizedTest</code>.</li>
+    <li><b>Assertions</b> <code>assertEquals(expected, actual)</code>, <code>assertTrue</code>, <code>assertThrows</code>, <code>assertAll</code>; doubles need a delta.</li>
+    <li><b>Test shape</b> Arrange-Act-Assert; fast, isolated, repeatable; name the behaviour.</li>
+    <li><b>JDBC flow</b> Connection → PreparedStatement → bind (from 1) → execute → ResultSet (<code>next()</code>) → close.</li>
+    <li><b>URLs</b> <code>jdbc:postgresql://host:5432/db</code>, <code>jdbc:mysql://host:3306/db</code>.</li>
+    <li><b>Injection</b> never concatenate input into SQL; use <code>?</code> placeholders; whitelist identifiers.</li>
+    <li><b>Transactions</b> <code>setAutoCommit(false)</code> → <code>commit()</code> / <code>rollback()</code>.</li>
+    <li><b>Batch</b> <code>addBatch()</code> + <code>executeBatch()</code>; commit once at the end.</li>
+    <li><b>SQLException</b> checked; <code>getSQLState()</code>, <code>23505</code> = duplicate key in PostgreSQL.</li>
+    <li><b>Pool</b> HikariCP reuses open connections; <code>close()</code> returns the connection to the pool.</li>
+    <li><b>Logging</b> SLF4J API + Logback; levels TRACE &lt; DEBUG &lt; INFO &lt; WARN &lt; ERROR.</li>
+    <li><b>Log calls</b> <code>log.info("Order {} created", id)</code>; <code>log.error("msg {}", id, e)</code>; one <code>private static final Logger</code> per class.</li>
+    <li><b>Never log</b> passwords, tokens, card or ID numbers; log an exception once.</li>
+    <li><b>Javadoc</b> <code>/** … */</code> with <code>@param</code>, <code>@return</code>, <code>@throws</code>; document the contract.</li>
+    <li><b>Style</b> one formatter for the team (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>L</kbd>), <code>.editorconfig</code>, no wildcard imports.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m8-practice">
+  <h3>Practice — Tools every Java developer uses</h3>
+  <ol class="steps">
+    <li><strong>Debug the cart (easy).</strong> Copy the <code>Cart</code> program from the debugger article and use a breakpoint, the Variables panel and a watch on <code>items.size()</code> to find the off-by-one. Then add a conditional breakpoint that stops only when <code>item.price() &gt; 100</code>. Done when you can find the bug without adding a single <code>println</code>.</li>
+    <li><strong>Exception breakpoint (easy).</strong> Write code that throws a <code>NullPointerException</code> three calls deep. Add a Java Exception Breakpoint for it and use the Frames panel to walk back to the line that passed the null. Done when you can state the cause from the debugger alone.</li>
+    <li><strong>Maven project from scratch (easy).</strong> Create a project with Spring Initializr or <code>mvn archetype:generate</code>, or hand-write the <code>pom.xml</code> from this module (Java 21, Logback, JUnit). Run <code>mvn clean install</code> and run the JAR with <code>java -jar</code> (set the <code>mainClass</code> in the manifest). Done when the build is green and the program prints a log line.</li>
+    <li><strong>Dependency conflicts (medium).</strong> Add two libraries that need different versions of one dependency, run <code>mvn dependency:tree -Dverbose</code>, identify the conflict, and fix it with <code>dependencyManagement</code> and an exclusion. Done when the tree shows only the version you chose.</li>
+    <li><strong>JUnit suite (medium).</strong> Test a <code>PriceCalculator</code> or your own class: at least one test per rule, edge cases, an <code>assertThrows</code>, one <code>@ParameterizedTest</code> with <code>@CsvSource</code>, and <code>@BeforeEach</code>. Done when a deliberately introduced bug makes exactly the right test fail, and the tests run with <code>mvn test</code>.</li>
+    <li><strong>JDBC DAO (medium).</strong> Create the <code>customers</code> table in PostgreSQL or MySQL and write a DAO with insert, findById, findAll, update and delete using records, try-with-resources and environment variables for credentials. Done when a <code>main</code> method exercises every method and the table matches what you expect.</li>
+    <li><strong>Break it, then fix it (medium).</strong> Write a login method using string concatenation, log in with <code>' OR '1'='1</code>, then rewrite it with a <code>PreparedStatement</code>. Done when the attack succeeds on the first version and fails on the second.</li>
+    <li><strong>Transaction and batch (medium).</strong> Implement <code>transfer(from, to, amount)</code> with commit and rollback; prove that a failure after the debit leaves balances unchanged. Then insert 10,000 customers with a batch and compare the time with single inserts. Done when both results are shown with numbers.</li>
+    <li><strong>Replace println with logging (easy).</strong> Add SLF4J and Logback to an earlier practice program, write a <code>logback.xml</code> with a console appender, log at three levels, log an exception with its stack trace, and add a request id through MDC. Done when changing one level in the config shows or hides messages without code changes.</li>
+    <li><strong>Project 1 — Expense tracker or library manager (end of month 2).</strong> Build a console application with a menu. Requirements: OOP classes (for example <code>Expense</code>, <code>Category</code>, <code>ExpenseService</code>; or <code>Book</code>, <code>Member</code>, <code>Loan</code>), collections for in-memory work, data saved in MySQL or PostgreSQL through JDBC with a DAO layer and try-with-resources, custom exceptions (for example <code>ExpenseNotFoundException</code>, <code>BookNotAvailableException</code>), SLF4J logging, a few JUnit tests for the service layer, and a Maven build. Put it on GitHub with a README that has the description, setup steps (database script, environment variables, how to run), screenshots or sample output, and the features list. Done when someone else can clone it, follow the README and run it, and every commit message says what changed.</li>
+  </ol>
+</article>

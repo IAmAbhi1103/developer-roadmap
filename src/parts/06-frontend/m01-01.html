@@ -1,0 +1,620 @@
+<div class="mintro">
+  <p>As a Java developer you already know one side of the web: a Spring Boot controller receives a request and returns a response. This module shows you the other side — what the <strong>browser</strong> does before, during and after that request. You will learn how a URL is split into parts, how DNS finds your server, what an HTTP request and response really contain, and how the browser turns HTML, CSS and JavaScript into pixels on the screen.</p>
+  <p>Everything in the later modules builds on this. HTML (<a href="#m2">Module 2</a>) and CSS (<a href="#m3">Module 3</a>) are files the browser downloads and renders. JavaScript (<a href="#m4">Module 4</a>) and React (<a href="#m5">Module 5</a>) run inside the browser and call your API (<a href="#m6">Module 6</a>). When something breaks between React and Spring Boot, the browser DevTools covered at the end of this module are how you find out which side is at fault.</p>
+  <ul>
+    <li>Explain the client–server model and the request–response cycle clearly in an interview.</li>
+    <li>Split any URL into scheme, host, port, path, query and fragment, and know which parts reach the server.</li>
+    <li>Describe DNS resolution in a few clear steps.</li>
+    <li>Read a raw HTTP request and response, and choose the right method and status code.</li>
+    <li>Walk through what happens when you open a page, and how the browser renders it.</li>
+    <li>Tell static from dynamic sites, MPAs from SPAs and CSR from SSR — and place a React + Spring Boot app correctly.</li>
+    <li>Use the DevTools Elements, Console, Network, Application, Sources and Lighthouse panels to debug real problems.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m1-client-server">
+  <h3>Browser, server and the request–response cycle</h3>
+  <p class="tldr">The browser (the client) always starts the conversation by sending an HTTP request; the server answers with exactly one response — an HTML page, a CSS or JavaScript file, an image or JSON data.</p>
+
+  <p>The web is built on the <strong>client–server model</strong>. A <strong>client</strong> is a program that asks for something. A <strong>server</strong> is a program that waits for requests and answers them. On the web, the usual client is a <strong>browser</strong> — Chrome, Edge, Firefox or Safari. The server is a program listening on a network <strong>port</strong> (a numbered "door" on a machine), for example the embedded Tomcat inside your Spring Boot app on port 8080, or Nginx on port 443.</p>
+  <p>The word "server" means two things: the machine (a cloud VM, a container) and the program running on it. When someone says "the server is down", they may mean either. In these notes, "server" means the program unless stated otherwise.</p>
+
+  <h4>The request–response cycle</h4>
+  <p>Every interaction on the web follows the same pattern:</p>
+  <ol class="steps">
+    <li>The client opens a connection to the server and sends a <strong>request</strong>, for example "GET me <code>/products/42</code>".</li>
+    <li>The server runs some code — it reads a file from disk, or calls your controller, service and repository, which query the database.</li>
+    <li>The server sends back exactly one <strong>response</strong>: a status code (200, 404, 500…), some headers and usually a body.</li>
+    <li>The client uses the response — the browser renders HTML, applies CSS, runs JavaScript, or hands JSON to your React code.</li>
+  </ol>
+  <p>For a Java developer, a useful picture is a method call over the network. The request is like the method name plus its arguments; the response is like the return value. The differences matter, though: a network call is slow (milliseconds, not nanoseconds), it can fail halfway, and the server does not remember you between calls.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  B[Browser] -->|HTTPS request| LB[Load balancer or Nginx]
+  LB --> APP[Spring Boot app]
+  APP --> DB[(PostgreSQL)]
+  DB --> APP
+  APP -->|JSON or HTML| LB
+  LB -->|HTTPS response| B
+</pre>
+  <figcaption>A typical request path in a Java full-stack application</figcaption>
+  </figure>
+
+  <h4>What a server can send back</h4>
+  <p>The server tells the browser what kind of data the body contains using the <code>Content-Type</code> header. The browser decides what to do with the body based on it.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Body</th><th>Content-Type</th><th>What the browser does with it</th></tr></thead>
+    <tbody>
+      <tr><td>HTML document</td><td><code>text/html</code></td><td>Parses it and builds the page</td></tr>
+      <tr><td>Stylesheet</td><td><code>text/css</code></td><td>Applies the styles to the page</td></tr>
+      <tr><td>Script</td><td><code>text/javascript</code></td><td>Runs it in the JavaScript engine</td></tr>
+      <tr><td>Image, font, video</td><td><code>image/png</code>, <code>font/woff2</code>, <code>video/mp4</code></td><td>Displays it, or uses it to draw text</td></tr>
+      <tr><td>Data</td><td><code>application/json</code></td><td>Hands it to your JavaScript (for example a React component)</td></tr>
+    </tbody>
+  </table></div>
+  <p>One page is never one request. The browser first downloads the HTML, then discovers the stylesheets, scripts, images and fonts it references and requests each of them. A React app then makes further requests for JSON data. A busy shopping page easily makes dozens of requests — you will see every one of them in the <a href="#m1-devtools-network">Network panel</a>.</p>
+
+  <h4>Try it: your own server and client</h4>
+  <p>The smallest possible "server" is a Spring Boot controller. The browser is the client.</p>
+  <pre data-title="HelloController.java"><code class="language-java">import java.util.Map;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class HelloController {
+
+    @GetMapping("/api/hello")
+    public Map&lt;String, String&gt; hello() {
+        // Spring converts the Map to JSON and sets Content-Type: application/json
+        return Map.of("message", "Namaste from Spring Boot");
+    }
+}</code></pre>
+  <p>Start the app and open <code>http://localhost:8080/api/hello</code> in the browser. The browser sends a GET request; Tomcat hands it to Spring's <code>DispatcherServlet</code>, which calls your method; the return value goes back as the response body.</p>
+  <pre class="out" data-title="What the browser shows"><code class="language-plaintext">{"message":"Namaste from Spring Boot"}</code></pre>
+
+  <h4>Web server vs application server</h4>
+  <p>In production you often see two kinds of server, one in front of the other.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Web server (Nginx, Apache httpd)</th><th>Application server (Spring Boot + embedded Tomcat)</th></tr></thead>
+    <tbody>
+      <tr><td>Main job</td><td>Serve static files fast, terminate HTTPS, forward requests</td><td>Run your Java code: controllers, services, database calls</td></tr>
+      <tr><td>Typical content</td><td>The React build (<code>index.html</code>, JS and CSS files), images</td><td>JSON from your REST API, or HTML from Thymeleaf templates</td></tr>
+      <tr><td>Runs Java?</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Common extra roles</td><td>Reverse proxy, load balancer, gzip compression, caching</td><td>Security, transactions, validation, business rules</td></tr>
+    </tbody>
+  </table></div>
+  <p>A <strong>reverse proxy</strong> is a server that receives requests from browsers and forwards them to another server behind it. A common setup: Nginx serves the React files directly and forwards every request that starts with <code>/api</code> to Spring Boot.</p>
+
+  <h4>Ports you will meet every day</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Port</th><th>Usually</th></tr></thead>
+    <tbody>
+      <tr><td>80</td><td>HTTP (browsers use it when the URL starts with <code>http://</code> and has no port)</td></tr>
+      <tr><td>443</td><td>HTTPS (the default for <code>https://</code>)</td></tr>
+      <tr><td>8080</td><td>Spring Boot's default (<code>server.port</code>)</td></tr>
+      <tr><td>5173</td><td>The Vite dev server for your React app</td></tr>
+      <tr><td>5432 / 3306</td><td>PostgreSQL / MySQL</td></tr>
+      <tr><td>6379</td><td>Redis</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>localhost</strong> is the name for your own machine; it resolves to <code>127.0.0.1</code> (IPv4) or <code>::1</code> (IPv6). During development the browser, the Vite server and Spring Boot all run on localhost, just on different ports.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: the client always speaks first</p>
+    <p>In plain HTTP the server cannot send anything to a browser that did not ask. For live updates — order tracking, chat, stock prices — applications use <strong>WebSockets</strong> (a two-way connection) or <strong>Server-Sent Events</strong> (a one-way stream from server to browser), or the browser simply asks again every few seconds (<strong>polling</strong>).</p>
+  </div>
+  <div class="co co-rule">
+    <p class="co-t">Rule: HTTP is stateless</p>
+    <p>Each request is independent. The server does not automatically remember that the same user sent the previous request. Logins, carts and preferences work only because the client sends something with every request — a cookie with a session id, or an <code>Authorization</code> header with a token. You will see how in <a href="#m1-http">HTTP requests and responses</a>.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge case: the browser is not the only client</p>
+    <p>curl, Postman, a mobile app, another microservice or an attacker's script can all send the same requests your React app sends. Anything only the browser enforces — a hidden Delete button, a disabled field, HTML form validation — can be bypassed in seconds. The server must validate and authorise every single request.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: "the admin API is safe because normal users never see the button"</p>
+    <p>Hiding a button is a user-interface decision, not security. Protect the endpoint itself on the server, for example with Spring Security rules or <code>@PreAuthorize</code> (see <a href="04-spring-boot.html#m4">Spring Boot · Module 4</a>).</p>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>A common production layout: the React build sits on a CDN or behind Nginx, the Spring Boot API runs as several instances behind a load balancer, and all instances share one PostgreSQL database. Because HTTP is stateless and the instances share nothing in memory, any instance can serve any request — that is what makes scaling out easy.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle: "Explain the client–server model"</p>
+    <ul>
+      <li>The client (browser, app) sends a request; the server processes it and returns one response.</li>
+      <li>The client always initiates; HTTP is stateless, so state travels in cookies or tokens.</li>
+      <li>Mention the layers: browser → load balancer or Nginx → Spring Boot → database.</li>
+      <li>Close with the security point: never trust the client; validate and authorise on the server.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-url-anatomy">
+  <h3>URL anatomy: scheme, host, port, path, query, fragment</h3>
+  <p class="tldr">A URL tells the browser which protocol to use (scheme), which server to contact (host and port), which resource to ask for (path), extra parameters (query) and a position inside the page (fragment) — and the fragment never reaches the server.</p>
+
+  <p>A <strong>URL</strong> (Uniform Resource Locator) is the address of a resource on the web. You type URLs, put them in links, and call them from <code>fetch()</code>. Spring Boot reads parts of them with <code>@PathVariable</code> and <code>@RequestParam</code>. Knowing each part precisely saves you from many small bugs.</p>
+
+  <figure class="fig">
+<pre class="diagram">
+ https://shop.example.com:8443/products/42?color=red&amp;size=m#reviews
+ └─┬─┘   └──────┬───────┘ └┬─┘└────┬─────┘└───────┬───────┘└──┬───┘
+scheme         host       port    path          query      fragment
+</pre>
+  <figcaption>The six parts of a URL</figcaption>
+  </figure>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Part</th><th>In the example</th><th>Meaning</th><th>Sent to the server?</th></tr></thead>
+    <tbody>
+      <tr><td>Scheme</td><td><code>https</code></td><td>The protocol. <code>https</code> = HTTP over an encrypted TLS connection.</td><td>Decides how to connect</td></tr>
+      <tr><td>Host</td><td><code>shop.example.com</code></td><td>Domain name (or IP address) of the server. DNS turns it into an IP.</td><td>Yes, in the <code>Host</code> header</td></tr>
+      <tr><td>Port</td><td><code>8443</code></td><td>Which port on that machine. Omitted = default (80 for http, 443 for https).</td><td>Used to connect</td></tr>
+      <tr><td>Path</td><td><code>/products/42</code></td><td>Which resource. Maps to <code>@GetMapping("/products/{id}")</code>.</td><td>Yes</td></tr>
+      <tr><td>Query</td><td><code>?color=red&amp;size=m</code></td><td>Key–value parameters after <code>?</code>, separated by <code>&amp;</code>. Maps to <code>@RequestParam</code>.</td><td>Yes</td></tr>
+      <tr><td>Fragment</td><td><code>#reviews</code></td><td>A position inside the page — usually the element with <code>id="reviews"</code>.</td><td><strong>No</strong> — browser only</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Scheme</h4>
+  <p>Besides <code>http</code> and <code>https</code> you will meet <code>mailto:</code> (open an email client), <code>tel:</code> (dial a number), <code>ws:</code> and <code>wss:</code> (WebSockets), <code>file:</code> (a local file — opening an HTML file by double-clicking gives you a <code>file:///C:/...</code> URL) and <code>data:</code> (data embedded in the URL itself). Modern browsers mark plain <code>http</code> sites as "Not secure"; production sites use <code>https</code>.</p>
+
+  <h4>Host and port</h4>
+  <p>The host can be a domain (<code>shop.example.com</code>), an IPv4 address (<code>192.168.1.20</code>) or an IPv6 address in square brackets (<code>[::1]</code>). <code>shop</code> is a <strong>subdomain</strong> of <code>example.com</code>. Host names are case-insensitive: <code>SHOP.Example.com</code> is the same server.</p>
+  <p>The port is written after a colon. You rarely see it in production because sites use the defaults, but in development it is everywhere: <code>http://localhost:5173</code> (Vite) and <code>http://localhost:8080</code> (Spring Boot).</p>
+
+  <h4>Path</h4>
+  <p>The path identifies a resource on the server. Unlike the host, the path is usually case-sensitive — Spring MVC treats <code>/Products/42</code> and <code>/products/42</code> as different paths. REST APIs use the path to name resources: <code>/api/orders/1042</code>, <code>/api/customers/7/orders</code>.</p>
+
+  <h4>Query string</h4>
+  <p>The <strong>query string</strong> starts with <code>?</code> and holds <code>key=value</code> pairs joined with <code>&amp;</code>. Use it for optional inputs: filters, sorting, paging and search terms. A key can repeat: <code>?tag=veg&amp;tag=spicy</code> binds to <code>List&lt;String&gt; tag</code> in Spring.</p>
+  <pre data-title="ProductController.java (fragment)"><code class="language-java">// GET /api/products?category=snacks&amp;page=2&amp;sort=price
+@GetMapping("/api/products")
+public Page&lt;ProductDto&gt; list(@RequestParam String category,
+                             @RequestParam(defaultValue = "0") int page,
+                             @RequestParam(defaultValue = "name") String sort) {
+    // ...
+}
+
+// GET /api/products/42  -&gt; id = 42
+@GetMapping("/api/products/{id}")
+public ProductDto one(@PathVariable long id) {
+    // ...
+}</code></pre>
+
+  <h4>Fragment</h4>
+  <p>The <strong>fragment</strong> (also called the hash) starts with <code>#</code>. The browser keeps it to itself: it scrolls to the element whose <code>id</code> matches, and JavaScript can read it with <code>location.hash</code>. It is never sent in the HTTP request, so your Spring Boot logs never show it. Older single-page apps used it for routing (<code>/#/orders/42</code>) precisely because changing the fragment does not reload the page.</p>
+
+  <h4>Percent-encoding</h4>
+  <p>Only a limited set of characters may appear in a URL as-is. Others — spaces, <code>&amp;</code>, <code>?</code>, <code>#</code>, non-English text — must be <strong>percent-encoded</strong>: each byte becomes <code>%</code> plus two hex digits. A space becomes <code>%20</code>, <code>@</code> becomes <code>%40</code>, <code>&amp;</code> becomes <code>%26</code>. In HTML form submissions (and in Java's <code>URLEncoder</code>) a space in the query string becomes <code>+</code> instead.</p>
+  <pre data-title="Encoding in the browser console"><code class="language-javascript">encodeURIComponent("Asha &amp; Co");   // "Asha%20%26%20Co"
+encodeURIComponent("मसाला");        // "%E0%A4%AE%E0%A4%B8%E0%A4%BE%E0%A4%B2%E0%A4%BE"
+decodeURIComponent("Asha%20%26%20Co"); // "Asha &amp; Co"</code></pre>
+  <pre data-title="Encoding in Java"><code class="language-java">import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+
+String q = URLEncoder.encode("Asha &amp; Co", StandardCharsets.UTF_8);
+System.out.println(q);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Asha+%26+Co</code></pre>
+
+  <h4>Reading a URL in code</h4>
+  <p>Never split URLs by hand with string methods. Both languages have a parser. Paste this into the browser console:</p>
+  <pre data-title="URL API (JavaScript)"><code class="language-javascript">const url = new URL("https://shop.example.com:8443/products/42?color=red&amp;size=m#reviews");
+console.log(url.protocol);               // "https:"
+console.log(url.hostname);               // "shop.example.com"
+console.log(url.port);                   // "8443"
+console.log(url.pathname);               // "/products/42"
+console.log(url.search);                 // "?color=red&amp;size=m"
+console.log(url.searchParams.get("size")); // "m"
+console.log(url.hash);                   // "#reviews"
+console.log(url.origin);                 // "https://shop.example.com:8443"
+
+const api = new URL("https://shop.example.com/api/products");
+api.searchParams.set("q", "dosa mix &amp; chutney"); // encodes for you
+console.log(api.toString());
+// "https://shop.example.com/api/products?q=dosa+mix+%26+chutney"</code></pre>
+  <pre data-title="java.net.URI"><code class="language-java">import java.net.URI;
+
+URI uri = URI.create("https://shop.example.com:8443/products/42?color=red&amp;size=m#reviews");
+System.out.println(uri.getScheme());   // https
+System.out.println(uri.getHost());     // shop.example.com
+System.out.println(uri.getPort());     // 8443
+System.out.println(uri.getPath());     // /products/42
+System.out.println(uri.getQuery());    // color=red&amp;size=m
+System.out.println(uri.getFragment()); // reviews</code></pre>
+
+  <h4>Origin: the part that matters for security</h4>
+  <p>An <strong>origin</strong> is the combination <em>scheme + host + port</em>. <code>https://shop.example.com</code> and <code>https://shop.example.com:443</code> are the same origin (443 is the default). <code>http://localhost:5173</code> and <code>http://localhost:8080</code> are <em>different</em> origins because the ports differ. Browsers isolate data per origin (cookies work a little differently, by domain), and a page from one origin calling an API on another origin triggers <strong>CORS</strong> checks — the reason your first React-to-Spring call fails in development. <a href="#m6">Module 6</a> explains the fix.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: encode every value you put into a URL</p>
+    <p>Build query strings with <code>URLSearchParams</code> / <code>url.searchParams</code> in JavaScript and <code>UriComponentsBuilder</code> or <code>URLEncoder</code> in Java. A raw <code>&amp;</code> or <code>#</code> inside a value silently cuts it short or starts a new parameter.</p>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Convention: path for identity, query for options</p>
+    <p>Use the path to identify a resource (<code>/api/orders/1042</code>) and the query for filtering, sorting and paging (<code>/api/orders?status=SHIPPED&amp;page=0</code>). Use lowercase, hyphen-separated path segments: <code>/order-items</code>, not <code>/OrderItems</code>.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>url.port</code> returns an empty string when the port is the default — <code>new URL("https://a.com:443/").port</code> is <code>""</code>. Java's <code>URI.getPort()</code> returns <code>-1</code> when no port is written.</li>
+      <li>URLs have practical length limits. Spring Boot's embedded Tomcat limits the request line plus headers to 8 KB by default (<code>server.max-http-request-header-size</code>); a longer URL gets an error response before your controller runs. Send large data in a POST body.</li>
+      <li>A trailing slash can matter: since Spring Framework 6 (Boot 3), <code>/api/orders/</code> no longer matches a mapping for <code>/api/orders</code> by default.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: putting secrets or personal data in the URL</p>
+    <p>URLs end up in browser history, server and proxy logs, analytics tools and the <code>Referer</code> header sent to other sites. Never put passwords, tokens, Aadhaar or PAN numbers in a query string. Send them in a request body or header over HTTPS.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"Name the parts of a URL" — scheme, host, port, path, query, fragment; give default ports.</li>
+      <li>"Is the fragment sent to the server?" — No; the browser uses it for in-page navigation and JavaScript reads it via <code>location.hash</code>.</li>
+      <li>"What is an origin?" — scheme + host + port; different ports mean different origins, which is why CORS appears between Vite (5173) and Spring Boot (8080).</li>
+      <li>"Path variable or request param?" — path identifies the resource, query refines the result.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-dns">
+  <h3>DNS in short: from a name to an IP address</h3>
+  <p class="tldr">DNS is the internet's phone book: it turns a name like shop.example.com into the IP address the browser connects to, and every step caches the answer for a time called the TTL.</p>
+
+  <p>Computers connect to <strong>IP addresses</strong> — <code>203.0.113.10</code> (IPv4) or <code>2001:db8::10</code> (IPv6). Humans remember names. The <strong>Domain Name System (DNS)</strong> is the distributed database that maps names to addresses. Before the browser can send a single byte of HTTP, it needs the IP address of the host in the URL.</p>
+
+  <h4>How a lookup works</h4>
+  <ol class="steps">
+    <li><strong>Browser cache.</strong> The browser remembers recent answers. If it looked up the name a minute ago, it is done.</li>
+    <li><strong>Operating system.</strong> The OS checks its own cache and the <strong>hosts file</strong> — a local text file that maps names to IPs and wins over real DNS.</li>
+    <li><strong>Recursive resolver.</strong> The OS asks a resolver — usually your ISP's, your company's, or a public one such as Google (<code>8.8.8.8</code>) or Cloudflare (<code>1.1.1.1</code>). The resolver does the hard work and caches results for everyone who uses it.</li>
+    <li><strong>Root servers.</strong> If the resolver has nothing cached, it asks a root server, which answers "I don't know, but here are the servers for <code>.com</code>".</li>
+    <li><strong>TLD servers.</strong> The top-level domain servers for <code>.com</code> (or <code>.in</code>, <code>.org</code>) answer "ask the name servers of <code>example.com</code>".</li>
+    <li><strong>Authoritative server.</strong> The domain's own name server (often run by the DNS provider, such as Route 53 or Cloudflare) gives the final answer: the IP address and a <strong>TTL</strong> (time to live, in seconds).</li>
+    <li>The resolver returns the IP to your machine; everyone on the way caches it until the TTL runs out.</li>
+  </ol>
+
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant B as Browser and OS
+  participant R as Resolver
+  participant Root as Root server
+  participant TLD as .com TLD server
+  participant A as Authoritative server
+  B->>R: IP of shop.example.com?
+  R->>Root: shop.example.com?
+  Root-->>R: Ask the .com servers
+  R->>TLD: shop.example.com?
+  TLD-->>R: Ask the example.com name servers
+  R->>A: shop.example.com?
+  A-->>R: 203.0.113.10 with TTL 300
+  R-->>B: 203.0.113.10
+</pre>
+  <figcaption>A DNS lookup when nothing is cached yet</figcaption>
+  </figure>
+
+  <h4>Record types you should know</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Record</th><th>Holds</th><th>Example use</th></tr></thead>
+    <tbody>
+      <tr><td><code>A</code></td><td>An IPv4 address</td><td><code>shop.example.com → 203.0.113.10</code></td></tr>
+      <tr><td><code>AAAA</code></td><td>An IPv6 address</td><td><code>shop.example.com → 2001:db8::10</code></td></tr>
+      <tr><td><code>CNAME</code></td><td>An alias to another name</td><td><code>www.example.com → example.com</code>, or a name pointing to a cloud load balancer's host name</td></tr>
+      <tr><td><code>MX</code></td><td>Mail servers for the domain</td><td>Where email for <code>@example.com</code> is delivered</td></tr>
+      <tr><td><code>TXT</code></td><td>Free text</td><td>Domain ownership proofs, email anti-spoofing (SPF)</td></tr>
+      <tr><td><code>NS</code></td><td>The domain's name servers</td><td>Delegation from the TLD to your DNS provider</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Look it up yourself</h4>
+  <p><code>nslookup</code> works on Windows, macOS and Linux; <code>dig</code> is common on Linux and macOS; PowerShell has <code>Resolve-DnsName</code>. The output below is illustrative — real addresses and the exact layout differ.</p>
+  <pre data-title="Terminal"><code class="language-shell">$ nslookup shop.example.com
+Server:   192.168.1.1
+Address:  192.168.1.1
+
+Non-authoritative answer:
+Name:     shop.example.com
+Address:  203.0.113.10
+
+$ dig +short shop.example.com
+203.0.113.10</code></pre>
+  <p>"Non-authoritative" means the answer came from a resolver's cache, not directly from the domain's own name server. That is normal.</p>
+  <p>Java does the same lookup when you open a connection. You can trigger it directly:</p>
+  <pre data-title="DnsDemo.java"><code class="language-java">import java.net.InetAddress;
+
+public class DnsDemo {
+    public static void main(String[] args) throws Exception {
+        for (InetAddress address : InetAddress.getAllByName("localhost")) {
+            System.out.println(address);
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output (varies by machine)"><code class="language-plaintext">localhost/127.0.0.1
+localhost/0:0:0:0:0:0:0:1</code></pre>
+
+  <h4>The hosts file: DNS on your own machine</h4>
+  <p>The hosts file lets you map a name to an IP without any DNS server. Developers use it to test with a realistic name. Editing it needs administrator rights.</p>
+  <pre data-title="hosts"><code class="language-plaintext"># Windows: C:\Windows\System32\drivers\etc\hosts
+# Linux and macOS: /etc/hosts
+127.0.0.1   shop.test</code></pre>
+  <p>Now <code>http://shop.test:8080</code> reaches the Spring Boot app on your machine. Use the reserved <code>.test</code> ending for such names; it will never clash with a real domain.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: DNS gives an IP address, never a port</p>
+    <p>A and AAAA records hold only an address. The port comes from the URL — written explicitly, or the default for the scheme. If your app listens on 8080 and the URL has no port, the browser tries 80 or 443 and fails, however correct the DNS is.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases and the errors you will see</p>
+    <ul>
+      <li>Chrome shows <code>DNS_PROBE_FINISHED_NXDOMAIN</code> when a name does not exist (a typo, or a record not created yet).</li>
+      <li>In Java, a failed lookup throws <code>java.net.UnknownHostException</code> — common when a microservice's host name is misspelt in <code>application.yml</code>.</li>
+      <li>Changes are not instant. Old answers live in caches until their TTL expires, so a server migration can look "half done" for a while. Lower the TTL a day before a planned change.</li>
+      <li>The JVM caches lookups too (controlled by the <code>networkaddress.cache.ttl</code> security property), so a long-running Java process can keep using an old IP.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: forgetting an entry in the hosts file</p>
+    <p>You add <code>127.0.0.1 api.myapp.com</code> for a test, forget it, and weeks later the "production" site on your laptop is really your local server. When a site behaves strangely only on your machine, check the hosts file first.</p>
+  </div>
+  <div class="co co-note">
+    <p class="co-t">Going deeper</p>
+    <p>DNS normally runs over UDP port 53. Browsers can also use DNS over HTTPS (DoH) for privacy. Caching layers, resolvers and DNS-based load balancing are covered in <a href="09-cs-fundamentals.html#m2">CS Fundamentals · Module 2</a> and <a href="07-devops.html#m2">DevOps · Module 2</a>.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle: "How does DNS resolution work?"</p>
+    <p>Answer in order: browser cache → OS cache and hosts file → recursive resolver → root → TLD → authoritative server → answer cached for the TTL. Name the A, AAAA and CNAME records, and mention that DNS returns only an IP, never a port.</p>
+  </div>
+</article>
+
+<article class="topic" id="m1-http">
+  <h3>HTTP requests and responses</h3>
+  <p class="tldr">HTTP is the request–response protocol of the web: a request carries a method, a path, headers and an optional body; a response carries a status code, headers and an optional body — and every request stands alone.</p>
+
+  <p><strong>HTTP</strong> (HyperText Transfer Protocol) defines the messages a client and server exchange. <strong>HTTPS</strong> is exactly the same protocol, sent through an encrypted <strong>TLS</strong> connection. Every API you build in Spring Boot and every <code>fetch()</code> call you write in React is HTTP, so this is one of the most important topics in the whole page.</p>
+
+  <h4>Anatomy of a request</h4>
+  <p>In HTTP/1.1 a message is plain text. This is what the browser sends when your React app loads an order:</p>
+  <pre data-title="Request"><code class="language-http">GET /api/orders/1042 HTTP/1.1
+Host: shop.example.com
+Accept: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI3In0.signature
+Cookie: lang=en
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...</code></pre>
+  <ol class="steps">
+    <li><strong>Request line</strong>: the method (<code>GET</code>), the request target (path + query: <code>/api/orders/1042</code>) and the protocol version.</li>
+    <li><strong>Headers</strong>: <code>Name: value</code> lines with extra information — which site (<code>Host</code>), which formats the client accepts, credentials, cookies.</li>
+    <li>An empty line marks the end of the headers.</li>
+    <li>An optional <strong>body</strong> — empty for GET, JSON or form data for POST, PUT and PATCH.</li>
+  </ol>
+
+  <h4>Anatomy of a response</h4>
+  <pre data-title="Response"><code class="language-http">HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 55
+Cache-Control: no-store
+Date: Sun, 18 Oct 2026 10:15:00 GMT
+
+{"id":1042,"status":"DELIVERED","total":1499,"items":2}</code></pre>
+  <p>The <strong>status line</strong> has the version, a three-digit <strong>status code</strong> and an optional reason phrase. Then come headers, an empty line and the body. <code>Content-Length</code> is the body size in bytes (55 here).</p>
+  <p>A request that creates something usually carries a JSON body and gets <code>201 Created</code> back:</p>
+  <pre data-title="Create an order"><code class="language-http">POST /api/orders HTTP/1.1
+Host: shop.example.com
+Content-Type: application/json
+Content-Length: 29
+
+{"productId":42,"quantity":2}</code></pre>
+  <pre data-title="Response"><code class="language-http">HTTP/1.1 201 Created
+Location: /api/orders/1043
+Content-Type: application/json
+
+{"id":1043,"status":"PLACED"}</code></pre>
+
+  <h4>The same thing in Spring Boot</h4>
+  <pre data-title="OrderController.java"><code class="language-java">import java.net.URI;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    private final OrderService orderService; // your own service class
+
+    public OrderController(OrderService orderService) {
+        this.orderService = orderService;
+    }
+
+    @GetMapping("/{id}")
+    public OrderDto get(@PathVariable long id) {
+        return orderService.find(id);                 // 200 OK + JSON body
+    }
+
+    @PostMapping
+    public ResponseEntity&lt;OrderDto&gt; create(@RequestBody CreateOrderRequest req) {
+        OrderDto saved = orderService.place(req);
+        URI location = URI.create("/api/orders/" + saved.id());
+        return ResponseEntity.created(location).body(saved); // 201 + Location
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity&lt;Void&gt; cancel(@PathVariable long id) {
+        orderService.cancel(id);
+        return ResponseEntity.noContent().build();    // 204, no body
+    }
+}</code></pre>
+
+  <h4>Methods</h4>
+  <p>The <strong>method</strong> (also called the verb) says what the client wants to do. Two properties matter in interviews. A <strong>safe</strong> method does not change anything on the server. An <strong>idempotent</strong> method has the same effect on the server whether you send it once or ten times — important because networks retry requests.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Use it to</th><th>Body</th><th>Safe</th><th>Idempotent</th></tr></thead>
+    <tbody>
+      <tr><td><code>GET</code></td><td>Read a resource or a list</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td><code>POST</code></td><td>Create a resource or trigger an action (place order, pay)</td><td>Yes</td><td>No</td><td>No</td></tr>
+      <tr><td><code>PUT</code></td><td>Replace a resource completely</td><td>Yes</td><td>No</td><td>Yes</td></tr>
+      <tr><td><code>PATCH</code></td><td>Change part of a resource</td><td>Yes</td><td>No</td><td>Not guaranteed</td></tr>
+      <tr><td><code>DELETE</code></td><td>Remove a resource</td><td>Usually none</td><td>No</td><td>Yes</td></tr>
+      <tr><td><code>HEAD</code></td><td>Like GET, but only the headers</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td><code>OPTIONS</code></td><td>Ask which methods are allowed; used by the CORS preflight</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+    </tbody>
+  </table></div>
+  <p>Idempotent is about the effect, not the response. Deleting order 1042 twice leaves the server in the same state as deleting it once, even though the second call may return 404. Sending "POST /api/orders" twice creates two orders — which is why payment APIs ask for an <strong>idempotency key</strong> header so they can detect a retried POST.</p>
+
+  <h4>Status codes</h4>
+  <p>The first digit gives the class:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Class</th><th>Meaning</th><th>Think of it as</th></tr></thead>
+    <tbody>
+      <tr><td>1xx</td><td>Informational</td><td>"Keep going" — rarely seen directly</td></tr>
+      <tr><td>2xx</td><td>Success</td><td>"Done"</td></tr>
+      <tr><td>3xx</td><td>Redirection</td><td>"Look somewhere else" (or "use your cached copy")</td></tr>
+      <tr><td>4xx</td><td>Client error</td><td>"You sent something wrong"</td></tr>
+      <tr><td>5xx</td><td>Server error</td><td>"We broke"</td></tr>
+    </tbody>
+  </table></div>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Code</th><th>Name</th><th>Typical cause in a Spring Boot app</th></tr></thead>
+    <tbody>
+      <tr><td>200</td><td>OK</td><td>A controller method returned an object</td></tr>
+      <tr><td>201</td><td>Created</td><td><code>ResponseEntity.created(uri)</code> after a POST</td></tr>
+      <tr><td>204</td><td>No Content</td><td><code>ResponseEntity.noContent()</code> after a DELETE</td></tr>
+      <tr><td>301 / 308</td><td>Moved Permanently / Permanent Redirect</td><td>A URL changed for good (308 keeps the method and body)</td></tr>
+      <tr><td>302 / 307</td><td>Found / Temporary Redirect</td><td><code>return "redirect:/login";</code> in Spring MVC sends 302</td></tr>
+      <tr><td>304</td><td>Not Modified</td><td>The browser's cached copy is still valid (ETag matched)</td></tr>
+      <tr><td>400</td><td>Bad Request</td><td>Malformed JSON, or <code>@Valid</code> validation failed</td></tr>
+      <tr><td>401</td><td>Unauthorized</td><td>Not logged in, or a missing/expired token — really "unauthenticated"</td></tr>
+      <tr><td>403</td><td>Forbidden</td><td>Logged in but not allowed, for example <code>@PreAuthorize("hasRole('ADMIN')")</code> failed</td></tr>
+      <tr><td>404</td><td>Not Found</td><td>No mapping for the path, or the entity does not exist</td></tr>
+      <tr><td>405</td><td>Method Not Allowed</td><td>A POST sent to a GET-only mapping</td></tr>
+      <tr><td>409</td><td>Conflict</td><td>Duplicate email, or an optimistic-locking version clash</td></tr>
+      <tr><td>415</td><td>Unsupported Media Type</td><td><code>@RequestBody</code> received a body without <code>Content-Type: application/json</code></td></tr>
+      <tr><td>429</td><td>Too Many Requests</td><td>A rate limiter rejected the call</td></tr>
+      <tr><td>500</td><td>Internal Server Error</td><td>An unhandled exception, such as a <code>NullPointerException</code></td></tr>
+      <tr><td>502 / 503 / 504</td><td>Bad Gateway / Service Unavailable / Gateway Timeout</td><td>Nginx or the load balancer could not get a good answer from your app in time</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Headers you will use every week</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Header</th><th>Sent by</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>Host</code></td><td>Client</td><td>Which site — one IP address can host many sites. Required in HTTP/1.1.</td></tr>
+      <tr><td><code>Accept</code></td><td>Client</td><td>Formats the client can handle, for example <code>application/json</code></td></tr>
+      <tr><td><code>Content-Type</code></td><td>Both</td><td>Format of this message's body</td></tr>
+      <tr><td><code>Content-Length</code></td><td>Both</td><td>Size of the body in bytes</td></tr>
+      <tr><td><code>Authorization</code></td><td>Client</td><td>Credentials, usually <code>Bearer &lt;token&gt;</code></td></tr>
+      <tr><td><code>Cookie</code> / <code>Set-Cookie</code></td><td>Client / Server</td><td>Send stored cookies / ask the browser to store one</td></tr>
+      <tr><td><code>Cache-Control</code></td><td>Both</td><td>Caching rules: <code>no-store</code>, <code>max-age=3600</code>…</td></tr>
+      <tr><td><code>Location</code></td><td>Server</td><td>Where a new resource lives (201) or where to go (3xx)</td></tr>
+      <tr><td><code>Origin</code></td><td>Browser</td><td>The origin of the page making a cross-origin request — used by CORS</td></tr>
+      <tr><td><code>Access-Control-Allow-Origin</code></td><td>Server</td><td>Which origins may read the response (CORS)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Common body formats: <code>application/json</code> for APIs, <code>application/x-www-form-urlencoded</code> (<code>name=Asha&amp;city=Pune</code>) for classic HTML forms, and <code>multipart/form-data</code> for file uploads.</p>
+
+  <h4>State on top of a stateless protocol: cookies and tokens</h4>
+  <p>Because HTTP is stateless, a login must be proven again on every request. Two common ways:</p>
+  <ul>
+    <li><strong>Session cookie.</strong> After login the server responds with <code>Set-Cookie: JSESSIONID=8F2A…; Path=/; HttpOnly</code>. The browser stores it and automatically adds <code>Cookie: JSESSIONID=8F2A…</code> to every later request to that site. The server looks up the session by id.</li>
+    <li><strong>Token.</strong> After login the server returns a token (often a JWT). Your JavaScript stores it and adds <code>Authorization: Bearer &lt;token&gt;</code> to each API call. The browser does not do this automatically.</li>
+  </ul>
+  <p>Cookie flags matter: <code>HttpOnly</code> (JavaScript cannot read it), <code>Secure</code> (sent only over HTTPS) and <code>SameSite</code> (limits sending on cross-site requests). The JWT flow is covered in <a href="04-spring-boot.html#m4">Spring Boot · Module 4</a> and the browser side in <a href="#m6">Module 6</a>.</p>
+
+  <h4>Caching in one paragraph</h4>
+  <p>The browser keeps copies of responses according to <code>Cache-Control</code>. <code>max-age=31536000, immutable</code> suits Vite's hashed build files (<code>index-a1b2c3.js</code>): the name changes whenever the content changes. <code>no-store</code> means "never store" — right for personal data. With an <code>ETag</code> header the browser can ask "has it changed?" and get a cheap <code>304 Not Modified</code> with no body.</p>
+
+  <h4>HTTPS</h4>
+  <p>HTTPS wraps HTTP in TLS. Before any HTTP is sent, the browser and server perform a <strong>TLS handshake</strong>: the server presents a <strong>certificate</strong> proving it owns the domain, and both sides agree on encryption keys. After that, nobody in between — public Wi-Fi, an ISP — can read or change the messages. The default port is 443. A page loaded over HTTPS that tries to load a script over plain HTTP is blocked by the browser as <strong>mixed content</strong>.</p>
+
+  <h4>HTTP versions</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Version</th><th>Runs over</th><th>Key idea</th></tr></thead>
+    <tbody>
+      <tr><td>HTTP/1.1 (1997)</td><td>TCP</td><td>Text messages; connections are reused (keep-alive), but each carries one request at a time, so browsers open several connections per host (Chrome allows six)</td></tr>
+      <tr><td>HTTP/2 (2015)</td><td>TCP</td><td>Binary frames; many requests in parallel on one connection (multiplexing); compressed headers; header names always lowercase</td></tr>
+      <tr><td>HTTP/3 (2022)</td><td>QUIC over UDP</td><td>Faster connection setup; one lost packet no longer stalls every request; good on mobile networks</td></tr>
+    </tbody>
+  </table></div>
+  <p>The meaning — methods, status codes, headers — is the same in all three versions. Only the way bytes travel changes. DevTools shows the version in the Network panel's Protocol column (<code>http/1.1</code>, <code>h2</code>, <code>h3</code>).</p>
+
+  <h4>Try it with curl</h4>
+  <p><code>curl -i</code> prints the status line and headers; <code>curl -v</code> also shows what was sent (lines with <code>&gt;</code>) and received (lines with <code>&lt;</code>).</p>
+  <pre data-title="Terminal"><code class="language-shell">$ curl -i http://localhost:8080/api/hello
+HTTP/1.1 200
+Content-Type: application/json
+Transfer-Encoding: chunked
+Date: Sun, 18 Oct 2026 10:15:00 GMT
+
+{"message":"Namaste from Spring Boot"}
+
+$ curl -i -X POST http://localhost:8080/api/orders \
+    -H "Content-Type: application/json" \
+    -d '{"productId":42,"quantity":2}'
+HTTP/1.1 201
+Location: /api/orders/1043
+Content-Type: application/json
+...</code></pre>
+  <p>Notice <code>HTTP/1.1 200</code> with no "OK": Tomcat leaves out the optional reason phrase. Clients only use the number. <code>Transfer-Encoding: chunked</code> means the body was streamed in pieces instead of declaring a <code>Content-Length</code> up front.</p>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: curl on Windows</p>
+    <p>In Windows PowerShell 5.1, <code>curl</code> is an alias for <code>Invoke-WebRequest</code>, which takes different options. Type <code>curl.exe</code> to run real curl (it ships with Windows 10 and 11), or use Git Bash.</p>
+  </div>
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>GET must not change server state. Links, prefetchers and crawlers follow GET URLs freely.</li>
+      <li>A <code>204</code> response and a <code>304</code> response have no body.</li>
+      <li>Send <code>Content-Type: application/json</code> with a JSON body, or Spring rejects <code>@RequestBody</code> with 415.</li>
+      <li>Header names are case-insensitive (<code>content-type</code> = <code>Content-Type</code>); values often are not.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions for REST APIs</p>
+    <ul>
+      <li>Nouns in paths, methods for actions: <code>POST /api/orders</code>, not <code>POST /api/createOrder</code>.</li>
+      <li>Return the most specific status code: 201 + <code>Location</code> on create, 204 on delete, 404 for a missing id, 400 with field errors for bad input.</li>
+      <li>Return errors as JSON with a consistent shape. Spring supports the standard Problem Details format (<code>application/problem+json</code>).</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A GET request with a body has no defined meaning; many servers and proxies drop it, and <code>fetch()</code> refuses it with <code>TypeError: Request with GET/HEAD method cannot have body</code>.</li>
+      <li><code>Cache-Control: no-cache</code> does not mean "do not cache" — it means "store it, but check with the server before every use". Use <code>no-store</code> to forbid storing.</li>
+      <li>With 301 and 302, browsers may change a redirected POST into a GET. 307 and 308 keep the method and body.</li>
+      <li>Browsers and <code>fetch()</code> follow redirects automatically, so your code sees the final response, not the 302.</li>
+    </ul>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: 200 for everything</p><pre><code class="language-http">HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"success":false,"error":"Order not found"}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: the status code tells the truth</p><pre><code class="language-http">HTTP/1.1 404 Not Found
+Content-Type: application/problem+json
+
+{"title":"Not Found","status":404,"detail":"Order 1042 not found"}</code></pre></div>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">More common mistakes</p>
+    <ul>
+      <li>Using 401 when the user is logged in but lacks permission — that is 403.</li>
+      <li>Making "Delete" a GET link (<code>/orders/1042/delete</code>); a browser prefetch or crawler can trigger it.</li>
+      <li>Forgetting that <code>fetch()</code> does not throw on 404 or 500 — you must check <code>response.ok</code> (see <a href="#m6">Module 6</a>).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><strong>GET vs POST</strong>: GET reads, is safe and idempotent, sends data in the URL and can be cached and bookmarked; POST creates or acts, sends data in the body and is not idempotent.</li>
+      <li><strong>PUT vs PATCH</strong>: PUT replaces the whole resource and is idempotent; PATCH changes some fields and is not guaranteed idempotent.</li>
+      <li><strong>401 vs 403</strong>: 401 = who are you? (authenticate); 403 = I know you, and the answer is no.</li>
+      <li><strong>Stateless</strong>: each request carries everything needed; sessions and JWTs add state on top.</li>
+      <li><strong>HTTP/2</strong>: multiplexing many requests over one connection; HTTP/3 moves to QUIC over UDP.</li>
+    </ul>
+  </div>
+</article>

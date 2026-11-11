@@ -1,0 +1,663 @@
+<div class="mintro">
+  <p>Code that is not tested is code you are afraid to change. In a real job you do not get to say "it works on my machine": a pull request is merged only when the tests pass, and reviewers expect tests next to every new service and endpoint. Testing is also one of the most common interview topics for Spring Boot developers, and one of the first things that separates a job-ready developer from a tutorial follower.</p>
+  <p>This module teaches testing the way Spring Boot projects do it: fast unit tests with JUnit 5, Mockito and AssertJ; <strong>slice tests</strong> that load only one layer (<code>@WebMvcTest</code>, <code>@DataJpaTest</code>); full <code>@SpringBootTest</code> integration tests; and Testcontainers, which runs a real PostgreSQL in Docker so tests behave like production. It also covers coverage with JaCoCo and what makes a test good. The examples test Project 2 (<a href="#m2">REST</a>, <a href="#m3">JPA</a>, <a href="#m4">Security</a>) and finish with the goal "Project 2 passes all its tests with <code>mvn test</code>".</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>Choose the right kind of test (unit, slice, integration) for each layer and name and structure tests clearly.</li>
+    <li>Write unit tests with JUnit 5, Mockito (<code>@Mock</code>, <code>@InjectMocks</code>, <code>when</code>, <code>verify</code>, <code>ArgumentCaptor</code>) and AssertJ.</li>
+    <li>Test controllers with <code>@WebMvcTest</code> and MockMvc, including validation errors and secured endpoints.</li>
+    <li>Test repositories with <code>@DataJpaTest</code> and integration flows with <code>@SpringBootTest</code>.</li>
+    <li>Run tests against a real PostgreSQL with Testcontainers and <code>@ServiceConnection</code>.</li>
+    <li>Measure coverage, run tests in Maven and CI, and avoid flaky tests.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m5-why-pyramid">
+  <h3>Why test: the testing pyramid, structure and naming</h3>
+  <p class="tldr">Tests give you the confidence to change code; write many fast unit tests, fewer slice tests, a few integration tests and very few end-to-end tests, and keep every test in Arrange-Act-Assert shape with a name that says what is expected.</p>
+
+  <h4>Why write tests</h4>
+  <ul>
+    <li><strong>Catch bugs early.</strong> A failing test on your laptop costs minutes; the same bug in production costs a night.</li>
+    <li><strong>Refactor safely.</strong> With tests you can restructure a service and know within seconds whether behaviour changed.</li>
+    <li><strong>Documentation that runs.</strong> A test named <code>apply_whenJobClosed_throwsConflict</code> states a business rule and never goes out of date.</li>
+    <li><strong>Design pressure.</strong> Code that is hard to test (static calls, <code>new</code> everywhere, huge methods) is usually badly designed. Constructor injection from <a href="#m1">module 1</a> makes testing easy.</li>
+    <li><strong>CI gate.</strong> The pipeline runs the tests on every push (<a href="07-devops.html#m4">DevOps · Module 4</a>).</li>
+  </ul>
+
+  <h4>The testing pyramid</h4>
+  <figure class="fig">
+<pre class="diagram">
+              /\
+             /  \         End-to-end (browser, whole system)
+            /----\        few, slow, fragile
+           /      \
+          /--------\      Integration (@SpringBootTest, Testcontainers)
+         /          \     some, seconds each
+        /------------\
+       /              \   Slice (@WebMvcTest, @DataJpaTest)
+      /----------------\  more, 100s of ms to seconds
+     /                  \
+    /--------------------\ Unit (JUnit + Mockito, no Spring)
+   /                      \ many, milliseconds each
+  /------------------------\
+</pre>
+  <figcaption>The testing pyramid: more tests at the bottom, fewer at the top</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Level</th><th>What is loaded</th><th>Speed</th><th>Test in a Spring Boot app</th></tr></thead>
+    <tbody>
+      <tr><td>Unit</td><td>One class, collaborators mocked, no Spring</td><td>Milliseconds</td><td>Services (business rules), mappers, validators, utilities</td></tr>
+      <tr><td>Slice</td><td>Part of the context: web layer or JPA layer only</td><td>Under a second to a few seconds</td><td>Controllers (status, JSON, validation, security) and repositories (queries)</td></tr>
+      <tr><td>Integration</td><td>Whole context, real database (Testcontainers)</td><td>Seconds</td><td>Key flows: register, login, post job, apply; Flyway migrations; transactions</td></tr>
+      <tr><td>End-to-end</td><td>Deployed app, real browser or API client</td><td>Slowest</td><td>A handful of critical user journeys (Playwright, Cypress); not in this module</td></tr>
+    </tbody>
+  </table></div>
+  <p>The shape matters because tests higher up are slower, need more setup, and fail for more reasons. A pyramid turned upside down (hundreds of end-to-end tests, few unit tests) gives a suite that takes an hour and fails randomly. Put each check at the <em>lowest level that can prove it</em>: a price calculation is a unit test; "an unauthenticated call returns 401" is a slice test; "this query works on PostgreSQL" needs a real database.</p>
+
+  <h4>Arrange-Act-Assert (Given-When-Then)</h4>
+  <p>Every test has three parts: <strong>Arrange</strong> (prepare data and mocks), <strong>Act</strong> (call the one thing under test), <strong>Assert</strong> (check the result). BDD people call it <strong>Given-When-Then</strong>; it is the same idea. Separate the parts with a blank line or a comment.</p>
+  <pre data-title="One test, three parts"><code class="language-java">@Test
+void applyFee_forPremiumJob_addsTwoPercent() {
+    // Arrange (given)
+    var calculator = new FeeCalculator();
+    var job = JobTestData.premiumJob(100_000);
+
+    // Act (when)
+    long fee = calculator.feeFor(job);
+
+    // Assert (then)
+    assertThat(fee).isEqualTo(2_000);
+}</code></pre>
+  <p>Rules: one behaviour per test; at most one "Act" call; no <code>if</code> or loops in the test body (a test with logic needs its own test).</p>
+
+  <h4>Naming</h4>
+  <p>The test name should tell what failed without opening the file. Two common styles:</p>
+  <ul>
+    <li><code>methodName_condition_expectedResult</code>: <code>update_whenNotOwner_throwsAccessDenied</code></li>
+    <li><code>shouldDoXWhenY</code>: <code>shouldRejectApplicationWhenJobIsClosed</code></li>
+  </ul>
+  <p>Pick one per project. Add <code>@DisplayName("...")</code> if the team prefers sentences in reports. Name classes <code>JobServiceTest</code> (unit), <code>JobControllerTest</code> (web slice), <code>JobRepositoryTest</code> (JPA slice) and <code>JobFlowIT</code> (integration, see the Failsafe note in <a href="#m5-coverage-maven">the Maven article</a>).</p>
+
+  <h4>Folder structure</h4>
+  <p>The test tree mirrors the main tree, so a class and its test are in the same package (this also lets tests use package-private members):</p>
+  <pre class="out" data-title="Project 2 layout"><code class="language-plaintext">src/main/java/com/example/jobs/job/JobService.java
+src/main/java/com/example/jobs/job/JobController.java
+src/test/java/com/example/jobs/job/JobServiceTest.java        (unit)
+src/test/java/com/example/jobs/job/JobControllerTest.java     (@WebMvcTest)
+src/test/java/com/example/jobs/job/JobRepositoryTest.java     (@DataJpaTest)
+src/test/java/com/example/jobs/AbstractIntegrationTest.java   (Testcontainers base)
+src/test/java/com/example/jobs/JobFlowIT.java                 (@SpringBootTest)
+src/test/resources/application-test.yml</code></pre>
+
+  <h4>What spring-boot-starter-test gives you</h4>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-test&lt;/artifactId&gt;
+    &lt;scope&gt;test&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Library</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td>JUnit Jupiter (JUnit 5)</td><td>The test framework: <code>@Test</code>, lifecycle, parameterized tests</td></tr>
+      <tr><td>Mockito</td><td>Mocks and verification</td></tr>
+      <tr><td>AssertJ</td><td>Fluent assertions: <code>assertThat(x).isEqualTo(y)</code></td></tr>
+      <tr><td>Hamcrest</td><td>Older matcher library, still used by some MockMvc examples</td></tr>
+      <tr><td>JSONassert, JsonPath</td><td>Compare and query JSON</td></tr>
+      <tr><td>Spring Test and Spring Boot Test</td><td><code>MockMvc</code>, <code>@SpringBootTest</code>, test slices, <code>@MockitoBean</code></td></tr>
+      <tr><td>Awaitility, XMLUnit</td><td>Waiting for async results; XML comparison</td></tr>
+    </tbody>
+  </table></div>
+  <p>Add separately: <code>spring-security-test</code> for secured endpoints, Testcontainers for real databases, and JaCoCo for coverage.</p>
+  <div class="co co-version">
+    <p class="co-t">Versions</p>
+    <p>Each Spring Boot release manages the versions of JUnit, Mockito and AssertJ, so you normally never write their version numbers. Newer Boot lines ship newer JUnit Jupiter releases, but the annotations in this module stay the same. Boot 4 also reorganised the test support into smaller modules and moved some test annotations to new packages (for example <code>@WebMvcTest</code> and <code>@DataJpaTest</code>); the annotation names are unchanged, so let the IDE fix imports and check the release notes of your version.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Making every test a <code>@SpringBootTest</code>. The suite becomes slow, and nobody runs it.</li>
+      <li>Testing getters and setters, or the framework itself, for coverage numbers.</li>
+      <li>Tests that depend on the order of other tests or on leftover data.</li>
+      <li>A test named <code>test1</code>, or one test that checks ten things.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Explain the testing pyramid." Draw it, give a Spring example per level, and explain why the base is wide (speed, precision). "What do you test in a Spring Boot app, and how?" Services with unit tests, controllers with <code>@WebMvcTest</code>, repositories with <code>@DataJpaTest</code> on a real database, a few <code>@SpringBootTest</code> flows.</p>
+  </div>
+</article>
+
+<article class="topic" id="m5-junit">
+  <h3>JUnit 5 essentials for Spring developers</h3>
+  <p class="tldr">JUnit 5 gives you @Test, lifecycle hooks, @DisplayName, @Nested groups, parameterized tests and assertThrows; Spring Boot projects need just these plus AssertJ.</p>
+
+  <p>JUnit 5 (also called <strong>JUnit Jupiter</strong>) is the test framework behind <code>spring-boot-starter-test</code>. A test method is any method annotated <code>@Test</code>. Test classes and methods need no <code>public</code> modifier; package-private is the convention. For core Java background on JUnit see <a href="02-core-java.html#m8">Core Java · Module 8</a>.</p>
+  <pre data-title="PriceTest.java"><code class="language-java">import static org.assertj.core.api.Assertions.assertThat;
+import org.junit.jupiter.api.Test;
+
+class SalaryRangeTest {
+
+    @Test
+    void midpoint_ofRange_isAverage() {
+        var range = new SalaryRange(600_000, 1_000_000);
+        assertThat(range.midpoint()).isEqualTo(800_000);
+    }
+}</code></pre>
+  <pre class="out" data-title="mvn test"><code class="language-plaintext">[INFO] Running com.example.jobs.job.SalaryRangeTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS</code></pre>
+
+  <h4>What is inside "JUnit 5"</h4>
+  <p>JUnit 5 is not one library but three parts. Knowing them explains many dependency questions.</p>
+  <dl class="terms">
+    <dt>JUnit Platform</dt>
+    <dd>The launcher that finds and runs tests. Maven Surefire, Gradle and IDEs talk to the Platform, not to your tests directly.</dd>
+    <dt>JUnit Jupiter</dt>
+    <dd>The new programming model (<code>@Test</code>, <code>@BeforeEach</code>, assertions, extensions in the package <code>org.junit.jupiter.api</code>) and its test engine.</dd>
+    <dt>JUnit Vintage</dt>
+    <dd>An engine that runs old JUnit 3 and 4 tests on the Platform. Boot's starter no longer includes it by default, so an old <code>org.junit.Test</code> is simply not found.</dd>
+  </dl>
+  <p><code>spring-boot-starter-test</code> bundles Jupiter, AssertJ, Mockito, Hamcrest, JsonPath and the Spring test support, so you add one dependency with <code>test</code> scope and nothing else (<a href="#m5-why-pyramid">testing overview</a>).</p>
+
+  <h4>Lifecycle annotations</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation</th><th>Runs</th><th>Typical use</th></tr></thead>
+    <tbody>
+      <tr><td><code>@BeforeEach</code></td><td>Before every test method</td><td>Create the object under test, reset data</td></tr>
+      <tr><td><code>@AfterEach</code></td><td>After every test method</td><td>Clean up files or static state</td></tr>
+      <tr><td><code>@BeforeAll</code></td><td>Once before all tests; method must be <code>static</code></td><td>Start an expensive shared resource</td></tr>
+      <tr><td><code>@AfterAll</code></td><td>Once after all tests; <code>static</code></td><td>Stop it</td></tr>
+    </tbody>
+  </table></div>
+  <p>JUnit creates a <strong>new instance of the test class for every test method</strong>, so instance fields are never shared between tests: that is what keeps tests independent. (<code>@TestInstance(Lifecycle.PER_CLASS)</code> changes this and lets <code>@BeforeAll</code> be non-static; avoid it unless needed.) The order for one test is: <code>@BeforeAll</code> once, then for each test <code>@BeforeEach</code>, the test, <code>@AfterEach</code>, and finally <code>@AfterAll</code> once.</p>
+  <pre data-title="Seeing the order"><code class="language-java">class LifecycleDemoTest {
+    @BeforeAll static void beforeAll() { System.out.println("beforeAll"); }
+    @BeforeEach void beforeEach()      { System.out.println("  beforeEach"); }
+    @Test void a()                     { System.out.println("    test a"); }
+    @Test void b()                     { System.out.println("    test b"); }
+    @AfterEach void afterEach()        { System.out.println("  afterEach"); }
+    @AfterAll static void afterAll()   { System.out.println("afterAll"); }
+}</code></pre>
+  <pre class="out" data-title="Output (a and b may swap)"><code class="language-plaintext">beforeAll
+  beforeEach
+    test a
+  afterEach
+  beforeEach
+    test b
+  afterEach
+afterAll</code></pre>
+  <p>JUnit runs test methods in a deterministic but intentionally not obvious order. Never depend on it. If you really need an order (rare, mostly for slow end-to-end flows), add <code>@TestMethodOrder(MethodOrderer.OrderAnnotation.class)</code> and <code>@Order(1)</code> on the methods.</p>
+
+  <h4>@DisplayName, @Nested, @Disabled, @Tag</h4>
+  <pre data-title="Grouping with @Nested"><code class="language-java">@DisplayName("ApplicationService")
+class ApplicationServiceTest {
+
+    @Nested
+    @DisplayName("apply()")
+    class Apply {
+
+        @Test
+        @DisplayName("saves an application for an open job")
+        void openJob_savesApplication() { ... }
+
+        @Test
+        @DisplayName("rejects a second application to the same job")
+        void duplicate_throwsConflict() { ... }
+    }
+
+    @Nested
+    class Withdraw {
+        @Test void byOwner_marksWithdrawn() { ... }
+
+        @Disabled("fails until JIRA-123 is fixed")
+        @Test void byOtherUser_isForbidden() { ... }
+    }
+}</code></pre>
+  <ul>
+    <li><code>@Nested</code> inner classes group tests per method or per scenario; the reports show the tree. An outer <code>@BeforeEach</code> runs before each nested test.</li>
+    <li><code>@Disabled("reason")</code> skips a test; always give a reason and a ticket. A disabled test is a debt.</li>
+    <li><code>@Tag("slow")</code> labels tests; run only some with Maven: <code>mvn test -Dgroups=fast</code> or exclude with <code>-DexcludedGroups=slow</code>.</li>
+    <li><code>@Timeout(2)</code> fails a test that takes longer than 2 seconds.</li>
+    <li><code>@DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)</code> on the class turns <code>saves_application</code> into "saves application" in reports, so you can skip <code>@DisplayName</code> on every method.</li>
+  </ul>
+
+  <h4>Parameterized tests</h4>
+  <p>One test body, many inputs. Needs the <code>junit-jupiter-params</code> module, already included in the starter.</p>
+  <pre data-title="@ValueSource, @CsvSource, @MethodSource"><code class="language-java">@ParameterizedTest
+@ValueSource(strings = {"", " ", "ab", "not-an-email"})
+void isValidEmail_forBadInput_returnsFalse(String input) {
+    assertThat(EmailValidator.isValid(input)).isFalse();
+}
+
+@ParameterizedTest(name = "{0} years -&gt; {1}")
+@CsvSource({
+        "0, JUNIOR",
+        "2, JUNIOR",
+        "3, MID",
+        "8, SENIOR"
+})
+void levelFor_experience(int years, Level expected) {
+    assertThat(Level.forYears(years)).isEqualTo(expected);
+}
+
+@ParameterizedTest
+@MethodSource("invalidSalaryRanges")
+void create_withInvalidRange_isRejected(int min, int max) {
+    assertThatThrownBy(() -&gt; new SalaryRange(min, max))
+            .isInstanceOf(IllegalArgumentException.class);
+}
+
+static Stream&lt;Arguments&gt; invalidSalaryRanges() {
+    return Stream.of(
+            Arguments.of(100, 50),
+            Arguments.of(-1, 10),
+            Arguments.of(0, 0));
+}
+
+@ParameterizedTest
+@EnumSource(value = Role.class, names = {"CANDIDATE", "RECRUITER"})
+void selfRegistration_isAllowedFor(Role role) { ... }</code></pre>
+  <p>The test name template <code>{0}</code>, <code>{1}</code> shows the arguments in the report. The factory method for <code>@MethodSource</code> is <code>static</code> (unless <code>PER_CLASS</code>). Also available: <code>@NullSource</code>, <code>@EmptySource</code>, <code>@CsvFileSource</code>. For a factory in another class, give the full name: <code>@MethodSource("com.example.Data#cases")</code>. Each row runs as its own test, so one bad row does not hide the others.</p>
+  <pre class="out" data-title="Report names from the template"><code class="language-plaintext">levelFor_experience
+  0 years -&gt; JUNIOR   ✓
+  2 years -&gt; JUNIOR   ✓
+  3 years -&gt; MID      ✓
+  8 years -&gt; SENIOR   ✓</code></pre>
+
+  <h4>Testing exceptions and grouping assertions</h4>
+  <pre data-title="JUnit's own assertions"><code class="language-java">import static org.junit.jupiter.api.Assertions.*;
+
+@Test
+void divide_byZero_throws() {
+    ArithmeticException ex = assertThrows(ArithmeticException.class,
+            () -&gt; calculator.divide(1, 0));
+    assertEquals("/ by zero", ex.getMessage());      // expected FIRST, then actual
+}
+
+@Test
+void response_hasAllFields() {
+    var r = service.getJob(7L);
+    assertAll("job response",                        // all failures are reported
+            () -&gt; assertEquals(7L, r.id()),
+            () -&gt; assertEquals("Java Developer", r.title()),
+            () -&gt; assertTrue(r.open()));
+}</code></pre>
+  <p>JUnit's <code>assertEquals(expected, actual)</code> takes the expected value first; swapping them gives confusing failure messages. AssertJ (<a href="#m5-assertj">next articles</a>) reads better and is the usual choice in Spring projects. <code>assertThrows</code> passes only if the thrown exception is the given type or a subtype, and it returns the exception so you can check the message.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>JUnit assertion</th><th>Use</th><th>Failure</th></tr></thead>
+    <tbody>
+      <tr><td><code>assertEquals</code>, <code>assertNotEquals</code></td><td>Values equal or not</td><td><code>AssertionFailedError</code> with expected and actual</td></tr>
+      <tr><td><code>assertTrue</code>, <code>assertFalse</code></td><td>A boolean condition</td><td><code>AssertionFailedError</code></td></tr>
+      <tr><td><code>assertNull</code>, <code>assertNotNull</code></td><td>Null checks</td><td><code>AssertionFailedError</code></td></tr>
+      <tr><td><code>assertThrows</code></td><td>An exception is thrown</td><td>Fails if nothing, or another type, is thrown</td></tr>
+      <tr><td><code>assertAll</code></td><td>Several checks together</td><td><code>MultipleFailuresError</code> lists every failing check</td></tr>
+      <tr><td><code>assertTimeout</code></td><td>Code finishes in time</td><td>Fails if too slow</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>JUnit with Spring: extensions</h4>
+  <p>JUnit 5 replaced the single "runner" of JUnit 4 with <strong>extensions</strong>; you can use several at once. Two matter in Spring work:</p>
+  <ul>
+    <li><code>@ExtendWith(MockitoExtension.class)</code> creates <code>@Mock</code> and <code>@InjectMocks</code> fields for a plain unit test, with no Spring at all (<a href="#m5-mockito">Mockito</a>). This is the fastest kind of test.</li>
+    <li><code>SpringExtension</code> loads the Spring context and injects beans into the test. You normally do not write it: <code>@SpringBootTest</code>, <code>@WebMvcTest</code> and <code>@DataJpaTest</code> already include it (<a href="#m5-springboottest">SpringBootTest</a>).</li>
+  </ul>
+  <pre data-title="A plain unit test with Mockito, a Spring test with injection"><code class="language-java">@ExtendWith(MockitoExtension.class)
+class JobServiceTest {
+    @Mock JobRepository jobRepository;
+    @InjectMocks JobService jobService;
+    @Test void find_missing_throws() { ... }
+}
+
+@SpringBootTest
+class JobRepositoryIT {
+    @Autowired JobRepository jobRepository;     // injected by SpringExtension
+    @Test void contextLoads() { assertThat(jobRepository).isNotNull(); }
+}</code></pre>
+  <p>JUnit 5 also lets a test constructor or method take parameters. Spring supplies beans for them, and JUnit supplies built-in ones such as <code>@TempDir Path dir</code> (a temporary folder deleted after the test), <code>TestInfo</code> and <code>RepetitionInfo</code>. A parameter nobody can resolve fails with <code>ParameterResolutionException</code>.</p>
+
+  <h4>Comparison: JUnit 4 and JUnit 5</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>JUnit 4</th><th>JUnit 5</th></tr></thead>
+    <tbody>
+      <tr><td><code>org.junit.Test</code></td><td><code>org.junit.jupiter.api.Test</code></td></tr>
+      <tr><td><code>@Before</code>, <code>@After</code></td><td><code>@BeforeEach</code>, <code>@AfterEach</code></td></tr>
+      <tr><td><code>@BeforeClass</code>, <code>@AfterClass</code></td><td><code>@BeforeAll</code>, <code>@AfterAll</code></td></tr>
+      <tr><td><code>@Ignore</code></td><td><code>@Disabled</code></td></tr>
+      <tr><td><code>@RunWith(...)</code>, <code>@Rule</code></td><td><code>@ExtendWith(...)</code></td></tr>
+      <tr><td><code>@Test(expected = ...)</code></td><td><code>assertThrows</code></td></tr>
+      <tr><td>Test classes and methods public</td><td>Package-private is fine</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Test methods must not be <code>private</code> or <code>static</code>, and must return <code>void</code>.</li>
+      <li><code>@BeforeAll</code> / <code>@AfterAll</code> must be <code>static</code> in the default lifecycle.</li>
+      <li>Do not mix JUnit 4 (<code>org.junit.Test</code>, <code>@RunWith</code>) and JUnit 5 (<code>org.junit.jupiter.api.Test</code>) imports; a test with the wrong <code>@Test</code> is silently not run. Use <code>@ExtendWith</code> instead of <code>@RunWith</code>.</li>
+      <li>Name test classes so the build finds them: Surefire runs <code>*Test</code>, <code>Test*</code> and <code>*Tests</code>; integration tests named <code>*IT</code> go to Failsafe (<a href="#m5-coverage-maven">Maven setup</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Name the test class after the class under test (<code>OrderServiceTest</code>) and methods as <code>method_condition_result</code> or with <code>@DisplayName</code> (<a href="#m5-why-pyramid">naming</a>).</li>
+      <li>One logical behaviour per test, and the arrange-act-assert shape with blank lines between the parts.</li>
+      <li>Prefer parameterized tests over copy-pasted tests that differ only in the data.</li>
+      <li>Put the test in the same package as the class, so package-private code is reachable.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Relying on test order or on state left by another test. Each test must set up its own data.</li>
+      <li>Catching an exception with <code>try/catch</code> and forgetting <code>fail()</code>, so the test passes when nothing is thrown. Use <code>assertThrows</code>.</li>
+      <li><code>@Disabled</code> without a reason, left for months.</li>
+    </ul>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: passes even if nothing is thrown</p><pre><code class="language-java">@Test
+void withdraw_tooMuch() {
+    try {
+        account.withdraw(10_000);
+    } catch (InsufficientFundsException e) {
+        assertEquals("Not enough balance", e.getMessage());
+    }
+}</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: fails unless it is thrown</p><pre><code class="language-java">@Test
+void withdraw_tooMuch() {
+    var ex = assertThrows(InsufficientFundsException.class,
+            () -&gt; account.withdraw(10_000));
+    assertEquals("Not enough balance", ex.getMessage());
+}</code></pre></div>
+    </div>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>PreconditionViolationException: @BeforeAll method must be static unless the test class is annotated with @TestInstance(Lifecycle.PER_CLASS)</code>: you forgot <code>static</code>. The same rule applies to a <code>@MethodSource</code> factory.</li>
+      <li><code>ParameterResolutionException: No ParameterResolver registered for parameter</code>: a test method takes a parameter that JUnit and your extensions cannot supply. Often a missing <code>@ParameterizedTest</code> or <code>@Autowired</code>.</li>
+      <li><code>AssertionFailedError: expected: &lt;5&gt; but was: &lt;4&gt;</code>: a normal failed assertion. <code>MultipleFailuresError</code> comes from <code>assertAll</code> and lists every failure; <code>assertThrows</code> reports "Unexpected exception type thrown" when the type differs.</li>
+      <li>If a test run reports "No tests found" or runs zero tests, the usual reasons are a JUnit 4 <code>@Test</code> import, a name that Surefire does not match, or a missing <code>junit-platform</code> provider on an old Surefire version.</li>
+      <li>An exception in <code>@BeforeEach</code> marks every test of the class as failed, and an exception in <code>@AfterEach</code> fails the test that already passed. Keep hooks simple.</li>
+      <li>A static field shared between tests is shared state again: the new-instance rule does not protect static data or Spring singletons.</li>
+    </ul>
+  </div>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: run one test quickly</p>
+    <p>From the command line: <code>./mvnw test -Dtest=JobServiceTest</code> runs one class, and <code>-Dtest=JobServiceTest#find_missing_throws</code> runs one method. In IntelliJ, click the green arrow beside the method.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is new in JUnit 5?" Jupiter API, extensions via <code>@ExtendWith</code> (instead of runners), <code>@Nested</code>, <code>@ParameterizedTest</code>, <code>assertThrows</code>/<code>assertAll</code>, Java 8+ lambdas. "Does JUnit share the test instance?" No: new instance per method, which is why tests do not leak state through fields. Also ready: the three parts (Platform, Jupiter, Vintage), the difference between <code>@BeforeEach</code> and <code>@BeforeAll</code>, how to test an exception, and why <code>@BeforeAll</code> is static. A good extra point is that unit tests with <code>MockitoExtension</code> are far faster than tests that start Spring.</p>
+  </div>
+</article>
+
+<article class="topic" id="m5-mockito">
+  <h3>Mockito in depth: mocks, stubbing, verification and a full service test</h3>
+  <p class="tldr">Mockito replaces a class's collaborators with fakes you control: @Mock creates them, @InjectMocks wires them into the class under test, when(...).thenReturn(...) scripts answers, and verify(...) and ArgumentCaptor check what the class did.</p>
+
+  <h4>Why mocks</h4>
+  <p>A unit test of <code>JobService</code> should test <em>the service's logic</em>, not the database and not the e-mail sender. A <strong>mock</strong> is a fake object that has the same type as the real collaborator (<code>JobRepository</code>), returns whatever you script, and records how it was called. The test stays fast and is only about the class under test (the <strong>SUT</strong>, system under test).</p>
+
+  <h4>Setup</h4>
+  <pre data-title="Test class skeleton"><code class="language-java">import static org.assertj.core.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)         // JUnit 5 integration; no Spring context
+class JobServiceTest {
+
+    @Mock JobRepository jobRepository;
+    @Mock UserRepository userRepository;
+
+    @InjectMocks JobService jobService;     // gets the mocks through its constructor
+    ...
+}</code></pre>
+  <dl class="terms">
+    <dt><code>@ExtendWith(MockitoExtension.class)</code></dt><dd>Creates the mocks before each test, injects them, and checks strictness after each test.</dd>
+    <dt><code>@Mock</code></dt><dd>A mock of the field's type. Every method returns a default: <code>null</code>, <code>0</code>, <code>false</code>, an empty <code>List</code>/<code>Optional</code>.</dd>
+    <dt><code>@InjectMocks</code></dt><dd>Creates the real object under test and injects the mocks. It tries the biggest constructor first, then setters, then fields. If a constructor argument has no matching mock it passes <code>null</code>, so a missing <code>@Mock</code> shows up as a <code>NullPointerException</code> in your service.</dd>
+    <dt><code>@Spy</code></dt><dd>A real object whose methods run for real unless you stub them; used rarely (partial mocking).</dd>
+  </dl>
+  <p>Without the extension you can create mocks by hand: <code>JobRepository repo = mock(JobRepository.class);</code>. The annotations are shorter.</p>
+
+  <h4>Stubbing: when ... then</h4>
+  <pre data-title="Scripting answers"><code class="language-java">when(jobRepository.findById(7L)).thenReturn(Optional.of(job));
+when(jobRepository.findById(99L)).thenReturn(Optional.empty());
+when(userRepository.findById(any())).thenThrow(new IllegalStateException("db down"));
+
+// consecutive calls: first returns a, then b
+when(jobRepository.count()).thenReturn(1L, 2L);
+
+// compute the answer from the arguments
+when(jobRepository.save(any(Job.class))).thenAnswer(inv -&gt; {
+    Job j = inv.getArgument(0);
+    ReflectionTestUtils.setField(j, "id", 7L);       // simulate the generated id
+    return j;
+});</code></pre>
+  <p>For methods that return <code>void</code>, and for spies, <code>when(...)</code> does not work (the call would run for real or does not compile). Use the other form, <em>action first</em>:</p>
+  <pre data-title="doThrow / doNothing / doReturn"><code class="language-java">doThrow(new MailException("smtp down")).when(mailSender).send(any());
+doNothing().when(auditLog).record(anyString());
+doReturn(42).when(spyCalculator).slowCompute();       // on a @Spy, avoids calling the real method</code></pre>
+
+  <h4>Argument matchers: the all-or-none rule</h4>
+  <p>Matchers (<code>any()</code>, <code>anyLong()</code>, <code>anyString()</code>, <code>eq(x)</code>, <code>argThat(...)</code>, <code>isNull()</code>) say "any value of this kind". <strong>If one argument uses a matcher, all arguments of that call must use matchers</strong>; wrap plain values in <code>eq()</code>.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: mixing a matcher and a raw value</p><pre><code class="language-java">when(repo.findByTitleAndCity(anyString(), "Pune")).thenReturn(list);
+// InvalidUseOfMatchersException: 2 matchers expected, 1 recorded</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: matchers for all arguments</p><pre><code class="language-java">when(repo.findByTitleAndCity(anyString(), eq("Pune"))).thenReturn(list);</code></pre></div>
+  </div>
+  <p>With Mockito 5 (used by current Boot), <code>any(Job.class)</code> matches only a non-null instance of that type; <code>any()</code> matches anything including <code>null</code>.</p>
+
+  <h4>Verification</h4>
+  <p>Stubbing controls what the mock <em>returns</em>; <code>verify</code> checks what the SUT <em>did</em> to it.</p>
+  <pre data-title="verify"><code class="language-java">verify(jobRepository).save(any(Job.class));                // exactly once (default)
+verify(jobRepository, times(2)).findById(anyLong());
+verify(jobRepository, never()).deleteById(anyLong());
+verify(jobRepository, atLeastOnce()).findById(7L);
+verifyNoInteractions(mailSender);                          // never touched
+verifyNoMoreInteractions(jobRepository);                   // nothing else was called</code></pre>
+  <p>Use <code>verify</code> for <em>side effects</em> that matter (an e-mail was sent, a row was saved, nothing was deleted). Do not verify every call of every mock: <code>verifyNoMoreInteractions</code> in every test makes tests break whenever you refactor, which is the "testing implementation details" trap (<a href="#m5-good-tests">good tests</a>). If the method returns a value, assert the value instead of verifying the call that produced it.</p>
+
+  <h4>ArgumentCaptor</h4>
+  <p>Sometimes the SUT builds an object internally and passes it to a collaborator. A captor lets you grab it and assert on it.</p>
+  <pre data-title="Capturing the saved entity"><code class="language-java">ArgumentCaptor&lt;Job&gt; captor = ArgumentCaptor.forClass(Job.class);
+verify(jobRepository).save(captor.capture());
+Job saved = captor.getValue();
+assertThat(saved.getTitle()).isEqualTo("Java Developer");
+assertThat(saved.getPostedBy().getId()).isEqualTo(5L);</code></pre>
+  <p>You can also declare <code>@Captor ArgumentCaptor&lt;Job&gt; captor;</code> as a field with the extension.</p>
+
+  <h4>BDDMockito: given / then</h4>
+  <p>The same API with names that match Given-When-Then, in <code>org.mockito.BDDMockito</code>:</p>
+  <pre data-title="BDD style"><code class="language-java">import static org.mockito.BDDMockito.*;
+
+given(jobRepository.findById(7L)).willReturn(Optional.of(job));        // given
+JobResponse r = jobService.getJob(7L);                                 // when
+then(jobRepository).should().findById(7L);                             // then
+then(mailSender).shouldHaveNoInteractions();</code></pre>
+
+  <h4>Strict stubs and UnnecessaryStubbingException</h4>
+  <p>With <code>MockitoExtension</code> the default is <strong>strict stubs</strong>: if you stub something the test never uses, the test fails with <code>org.mockito.exceptions.misusing.UnnecessaryStubbingException</code>. This is useful: it finds dead set-up code and wrong assumptions about what the SUT calls. Also, strict stubs report a <code>PotentialStubbingProblem</code> if the SUT calls a stubbed method with different arguments than you stubbed. Fix by removing the stub or correcting the arguments. Use <code>lenient().when(...)</code> only for set-up shared by many tests in <code>@BeforeEach</code>.</p>
+
+  <h4>Mocking static methods (brief)</h4>
+  <p>Since Mockito 5 (Mockito 3.4+ with the inline mock maker) you can mock a static method. It is limited to a block and thread, via try-with-resources:</p>
+  <pre data-title="mockStatic"><code class="language-java">Instant fixed = Instant.parse("2026-11-10T10:00:00Z");
+try (MockedStatic&lt;Instant&gt; mocked = mockStatic(Instant.class, CALLS_REAL_METHODS)) {
+    mocked.when(Instant::now).thenReturn(fixed);
+    assertThat(service.isExpired(job)).isFalse();
+}   // the static mock is closed here</code></pre>
+  <p>A static mock is a design smell more often than a solution. Inject a <code>java.time.Clock</code> into the service (<code>clock.instant()</code>) and pass <code>Clock.fixed(...)</code> in the test; that is simpler and thread-safe.</p>
+
+  <h4>What not to mock</h4>
+  <ul>
+    <li><strong>The class under test.</strong> A test that mocks the SUT tests the mock.</li>
+    <li><strong>Value objects and records</strong> (<code>JobResponse</code>, <code>Money</code>, <code>LocalDate</code>, <code>String</code>): just create them.</li>
+    <li><strong>Collections and simple data holders</strong>: use <code>List.of(...)</code>.</li>
+    <li><strong>Types you do not own</strong> (the JDBC driver, <code>RestTemplate</code>, <code>EntityManager</code>) in deep chains: wrap them in your own class and mock that, or test with a real thing (Testcontainers, MockWebServer).</li>
+    <li><strong>Everything.</strong> If a test has six mocks and eleven stubs, it is probably re-implementing the code. Test that logic at a higher level instead.</li>
+  </ul>
+
+  <h4>A complete service test: JobServiceTest</h4>
+  <p>The service under test (simplified from the earlier modules):</p>
+  <pre data-title="JobService.java (under test)"><code class="language-java">@Service
+public class JobService {
+
+    private final JobRepository jobRepository;
+    private final UserRepository userRepository;
+
+    public JobService(JobRepository jobRepository, UserRepository userRepository) {
+        this.jobRepository = jobRepository;
+        this.userRepository = userRepository;
+    }
+
+    @Transactional
+    public JobResponse create(CreateJobRequest req, CurrentUser me) {
+        User recruiter = userRepository.findById(me.id())
+                .orElseThrow(() -&gt; new ResourceNotFoundException("User " + me.id()));
+        Job saved = jobRepository.save(new Job(req.title(), req.description(), recruiter));
+        return JobResponse.from(saved);
+    }
+
+    @Transactional
+    public JobResponse update(Long jobId, UpdateJobRequest req, CurrentUser me) {
+        Job job = jobRepository.findById(jobId)
+                .orElseThrow(() -&gt; new ResourceNotFoundException("Job " + jobId));
+        if (!job.getPostedBy().getId().equals(me.id()) &amp;&amp; !me.isAdmin()) {
+            throw new AccessDeniedException("You can only edit your own jobs");
+        }
+        job.update(req.title(), req.description());
+        return JobResponse.from(job);
+    }
+}</code></pre>
+  <pre data-title="JobServiceTest.java"><code class="language-java">@ExtendWith(MockitoExtension.class)
+class JobServiceTest {
+
+    @Mock JobRepository jobRepository;
+    @Mock UserRepository userRepository;
+    @InjectMocks JobService jobService;
+
+    private User recruiter;
+    private final CurrentUser asRecruiter = new CurrentUser(5L, Set.of("ROLE_RECRUITER"));
+
+    @BeforeEach
+    void setUp() {
+        recruiter = TestData.user(5L, "asha@example.com", Role.RECRUITER);
+    }
+
+    @Nested
+    class Create {
+
+        @Test
+        void create_savesJobPostedByCurrentUser() {
+            when(userRepository.findById(5L)).thenReturn(Optional.of(recruiter));
+            when(jobRepository.save(any(Job.class))).thenAnswer(inv -&gt; {
+                Job j = inv.getArgument(0);
+                ReflectionTestUtils.setField(j, "id", 7L);
+                return j;
+            });
+
+            JobResponse response = jobService.create(
+                    new CreateJobRequest("Java Developer", "Spring Boot, SQL"), asRecruiter);
+
+            assertThat(response.id()).isEqualTo(7L);
+            ArgumentCaptor&lt;Job&gt; captor = ArgumentCaptor.forClass(Job.class);
+            verify(jobRepository).save(captor.capture());
+            assertThat(captor.getValue().getPostedBy()).isSameAs(recruiter);
+        }
+
+        @Test
+        void create_whenUserMissing_throwsNotFound() {
+            when(userRepository.findById(5L)).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -&gt; jobService.create(
+                    new CreateJobRequest("x", "y"), asRecruiter))
+                    .isInstanceOf(ResourceNotFoundException.class)
+                    .hasMessageContaining("User 5");
+
+            verify(jobRepository, never()).save(any());
+        }
+    }
+
+    @Nested
+    class Update {
+
+        @Test
+        void update_byOwner_changesFields() {
+            Job job = TestData.job(7L, "Old title", recruiter);
+            when(jobRepository.findById(7L)).thenReturn(Optional.of(job));
+
+            JobResponse r = jobService.update(7L,
+                    new UpdateJobRequest("New title", "New text"), asRecruiter);
+
+            assertThat(r.title()).isEqualTo("New title");
+        }
+
+        @Test
+        void update_byAnotherRecruiter_isForbidden() {
+            Job job = TestData.job(7L, "Old title", recruiter);
+            when(jobRepository.findById(7L)).thenReturn(Optional.of(job));
+            var other = new CurrentUser(6L, Set.of("ROLE_RECRUITER"));
+
+            assertThatThrownBy(() -&gt; jobService.update(7L,
+                    new UpdateJobRequest("Hacked", "x"), other))
+                    .isInstanceOf(AccessDeniedException.class);
+
+            assertThat(job.getTitle()).isEqualTo("Old title");     // unchanged
+        }
+
+        @Test
+        void update_byAdmin_isAllowed() {
+            Job job = TestData.job(7L, "Old title", recruiter);
+            when(jobRepository.findById(7L)).thenReturn(Optional.of(job));
+            var admin = new CurrentUser(1L, Set.of("ROLE_ADMIN"));
+
+            jobService.update(7L, new UpdateJobRequest("By admin", "x"), admin);
+
+            assertThat(job.getTitle()).isEqualTo("By admin");
+        }
+
+        @Test
+        void update_whenJobMissing_throwsNotFound() {
+            when(jobRepository.findById(99L)).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -&gt; jobService.update(99L,
+                    new UpdateJobRequest("t", "d"), asRecruiter))
+                    .isInstanceOf(ResourceNotFoundException.class);
+        }
+    }
+}</code></pre>
+  <p><code>TestData</code> is a small helper class in <code>src/test</code> that builds entities (see <a href="#m5-good-tests">test data builders</a>); it uses reflection to set generated ids. Notice what the tests check: returned values and state for the main behaviour, <code>verify</code> only for the important side effect ("nothing saved" when the user is missing), and no real database. No <code>save</code> call is verified in <code>update</code> because the service relies on dirty checking (<a href="#m3">module 3</a>); in a unit test we assert the entity changed.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>NullPointerException</code> inside the SUT: a dependency has no <code>@Mock</code> (it was injected as <code>null</code>), or an unstubbed mock returned <code>null</code> from a method returning a non-collection object.</li>
+      <li><code>InvalidUseOfMatchersException</code>: mixed matchers and raw values, or a matcher used outside a stubbing/verification call.</li>
+      <li><code>UnnecessaryStubbingException</code>: a stub was never used (strict stubs).</li>
+      <li><code>WantedButNotInvoked</code> / <code>TooManyActualInvocations</code>: <code>verify</code> failed; the message lists the actual calls.</li>
+      <li><code>MockitoException: Cannot mock/spy class ... final</code>: very old Mockito versions could not mock final classes; Mockito 5 can.</li>
+      <li>Stubbing <code>when(mock.voidMethod())</code> does not compile; use <code>doThrow</code>/<code>doNothing</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Testing the mock: stub <code>repo.findById</code> to return X and then assert the service returned X, with no logic in between.</li>
+      <li>Mocking <code>User</code>, <code>Job</code> or other entities; create real objects.</li>
+      <li>Using <code>@Mock</code> with <code>@SpringBootTest</code>: that is <code>@MockitoBean</code> (see <a href="#m5-webmvctest">the MockMvc article</a>); <code>@Mock</code> is for pure unit tests.</li>
+      <li>Over-verifying every call, so every refactor breaks tests.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"@Mock vs @InjectMocks?" Mock creates a fake; InjectMocks builds the real SUT and injects the fakes. "Mock vs spy?" Mock is a full fake, spy wraps a real object. "When do you use <code>doReturn</code>?" Void methods and spies. "What is <code>ArgumentCaptor</code> for?" Inspecting arguments passed to a collaborator. "What does <code>UnnecessaryStubbingException</code> mean?" Strict stubs found a stub that was not used. Also expect: "What would you not mock?"</p>
+  </div>
+</article>

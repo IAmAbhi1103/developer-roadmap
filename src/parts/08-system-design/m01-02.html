@@ -1,0 +1,600 @@
+<article class="topic" id="m1-lsp">
+  <h3>L: Liskov Substitution Principle</h3>
+  <p class="tldr">If S is a subtype of T, you must be able to use an S anywhere a T is expected without breaking the program: a subclass may do more than its parent promises, but never less, and it must not surprise callers.</p>
+
+  <p>Barbara Liskov's principle protects the main promise of inheritance and interfaces: <em>code written against the parent type keeps working with every child</em>. If a method takes a <code>Shape</code>, it must work for every <code>Shape</code> you ever create. When a subclass breaks this promise, callers start writing <code>if (x instanceof Special)</code> checks, and polymorphism is lost.</p>
+  <p>"Is-a" in English is not enough. A square <em>is a</em> rectangle in geometry, but a <code>Square</code> class is not a valid subtype of a mutable <code>Rectangle</code> class. The test is behavioural: can the child stand in for the parent in all the parent's contracts?</p>
+
+  <h4>The classic violation: Rectangle and Square</h4>
+  <pre data-title="RectangleSquare.java"><code class="language-java">class Rectangle {
+    protected int width;
+    protected int height;
+
+    void setWidth(int w)  { this.width = w; }
+    void setHeight(int h) { this.height = h; }
+    int area() { return width * height; }
+}
+
+class Square extends Rectangle {              // "a square is a rectangle"
+    @Override void setWidth(int w)  { this.width = w; this.height = w; }
+    @Override void setHeight(int h) { this.width = h; this.height = h; }
+}
+
+public class LspDemo {
+    static void resize(Rectangle r) {
+        r.setWidth(5);
+        r.setHeight(4);
+        System.out.println(r.area() + " (expected 20)");
+    }
+    public static void main(String[] args) {
+        resize(new Rectangle());
+        resize(new Square());
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">20 (expected 20)
+16 (expected 20)</code></pre>
+  <p>The method <code>resize</code> is correct for a <code>Rectangle</code>. With a <code>Square</code> it gives a wrong answer, because <code>Square</code> changed the meaning of <code>setWidth</code> (it also changes the height). The subtype broke the parent's implied contract: "setting the width does not change the height".</p>
+  <p><strong>Fix:</strong> do not model it as inheritance of a mutable class. Make both implement a common read-only abstraction, or make them immutable so the problem disappears.</p>
+  <pre data-title="ShapesFixed.java"><code class="language-java">interface Shape { int area(); }
+
+record Rectangle(int width, int height) implements Shape {
+    public int area() { return width * height; }
+}
+
+record Square(int side) implements Shape {
+    public int area() { return side * side; }
+}</code></pre>
+
+  <h4>Violation 2: the unsupported method</h4>
+  <p>A very common LSP break is a subclass that throws <code>UnsupportedOperationException</code> (or does nothing) for a method it inherited.</p>
+  <pre data-title="Birds.java"><code class="language-java">// Violating
+abstract class Bird {
+    abstract void eat();
+    abstract void fly();
+}
+class Sparrow extends Bird {
+    void eat() { /* ... */ }
+    void fly() { /* ... */ }
+}
+class Penguin extends Bird {
+    void eat() { /* ... */ }
+    void fly() { throw new UnsupportedOperationException("Penguins cannot fly"); }
+}
+
+static void migrate(java.util.List&lt;Bird&gt; birds) {
+    for (Bird b : birds) b.fly();           // crashes when a Penguin is in the list
+}</code></pre>
+  <p>The callers of <code>Bird</code> believe every bird flies. The fix is to split the hierarchy so that the contract matches reality:</p>
+  <pre data-title="BirdsFixed.java"><code class="language-java">interface Bird { void eat(); }
+interface Flyer { void fly(); }
+
+class Sparrow implements Bird, Flyer {
+    public void eat() { /* ... */ }
+    public void fly() { /* ... */ }
+}
+class Penguin implements Bird {
+    public void eat() { /* ... */ }
+}
+
+static void migrate(java.util.List&lt;? extends Flyer&gt; flyers) {
+    for (Flyer f : flyers) f.fly();         // only things that can fly are accepted
+}</code></pre>
+  <p>Now a <code>Penguin</code> cannot even be passed to <code>migrate</code>: the compiler enforces the contract.</p>
+
+  <h4>The rules behind LSP</h4>
+  <p>The contract of a method has a before part (preconditions), an after part (postconditions), and rules that always hold (invariants). A valid subtype follows these:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Rule</th><th>Meaning</th><th>Violation example</th></tr></thead>
+    <tbody>
+      <tr><td>Preconditions: do not strengthen</td><td>Child accepts at least what the parent accepts</td><td>Parent takes any amount; child rejects amounts above 10,000</td></tr>
+      <tr><td>Postconditions: do not weaken</td><td>Child promises at least what the parent promises</td><td>Parent never returns null; child returns null</td></tr>
+      <tr><td>Invariants: keep them</td><td>Rules that always hold, still hold</td><td>Parent keeps balance at 0 or more; child allows negative</td></tr>
+      <tr><td>Exceptions: no new surprises</td><td>Child throws only what the parent's contract allows</td><td>Child throws <code>UnsupportedOperationException</code> from an inherited method</td></tr>
+      <tr><td>History: no new mutation</td><td>Child must not change what the parent treats as fixed</td><td>An immutable parent whose child adds setters</td></tr>
+    </tbody>
+  </table></div>
+  <p>Java helps with some of this: an overriding method cannot throw broader <em>checked</em> exceptions, cannot reduce visibility, and may only narrow the return type (covariance). It cannot enforce the rest. Contracts live in Javadoc, in tests, and in your head.</p>
+
+  <h4>A realistic example: payment methods</h4>
+  <pre data-title="PaymentLsp.java"><code class="language-java">interface PaymentMethod {
+    /** Charges the amount. Never returns null; throws PaymentFailedException if declined. */
+    Receipt charge(long amountInPaise);
+}
+
+class UpiPayment implements PaymentMethod { /* ... */
+    public Receipt charge(long amountInPaise) { return new Receipt("UPI", amountInPaise); }
+}
+
+// Violating child: returns null for small amounts and refuses large ones silently
+class WalletPayment implements PaymentMethod {
+    public Receipt charge(long amountInPaise) {
+        if (amountInPaise &lt; 100) return null;            // postcondition weakened
+        if (amountInPaise &gt; 1_000_000) return null;      // surprise
+        return new Receipt("WALLET", amountInPaise);
+    }
+}
+record Receipt(String mode, long paise) { }
+class PaymentFailedException extends RuntimeException { }</code></pre>
+  <p>The checkout code written for <code>PaymentMethod</code> calls <code>receipt.mode()</code> and gets a <code>NullPointerException</code>. The honest fix: <code>WalletPayment</code> throws <code>PaymentFailedException</code>, exactly as the contract says.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Misunderstandings and JDK examples</p>
+    <ul>
+      <li><strong>LSP is about behaviour, not syntax.</strong> A class can compile as a subtype and still violate LSP.</li>
+      <li>The JDK itself bends LSP: <code>List.of(...)</code>, <code>Arrays.asList(...)</code> and <code>Collections.unmodifiableList(...)</code> implement <code>List</code> but throw <code>UnsupportedOperationException</code> on some mutators. It is documented as an "optional operation", and it is a known trade-off. In your own code, avoid it; split read-only and mutable interfaces instead.</li>
+      <li>A subclass that overrides a method with an <em>empty</em> body ("do nothing") is often a violation too: callers expect the effect.</li>
+      <li>Frequent <code>instanceof</code> checks in client code ("if it is a Penguin, skip") are the symptom.</li>
+    </ul>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: test the contract once, run it for every subtype</p>
+    <p>Write an abstract JUnit test class for the interface (<code>PaymentMethodContractTest</code>) with an abstract <code>create()</code> method, and extend it once per implementation. Any subclass that breaks the contract fails the same tests.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: explain LSP in 30 seconds</p>
+    <p>"LSP says a subtype must be usable wherever its parent type is, without the caller noticing. The standard example: a <code>Square</code> extending a mutable <code>Rectangle</code> breaks code that sets width and height separately. Another sign is a child that throws <code>UnsupportedOperationException</code>. A subclass must not require more, promise less, or throw surprises. The fix is usually to change the hierarchy: smaller interfaces, immutable types, or composition."</p>
+  </div>
+</article>
+
+<article class="topic" id="m1-isp">
+  <h3>I: Interface Segregation Principle</h3>
+  <p class="tldr">Clients should not be forced to depend on methods they do not use: prefer several small, role-specific interfaces over one fat interface.</p>
+
+  <p>An interface is a contract the implementer must fulfil and the client sees. When one interface has twenty methods, every implementer must write all twenty (many as empty stubs), and every client sees methods it should never call. A change to a method that a client never uses can still force that client to recompile and retest. The <strong>Interface Segregation Principle (ISP)</strong> says: split the interface by <em>client role</em>.</p>
+
+  <h4>The violation: a fat interface</h4>
+  <pre data-title="Worker.java (violating ISP)"><code class="language-java">interface MultiFunctionDevice {
+    void print(Document d);
+    void scan(Document d);
+    void fax(Document d);
+    void staple(Document d);
+}
+
+class OfficePrinterPro implements MultiFunctionDevice {      // can do all
+    public void print(Document d)  { /* ... */ }
+    public void scan(Document d)   { /* ... */ }
+    public void fax(Document d)    { /* ... */ }
+    public void staple(Document d) { /* ... */ }
+}
+
+class BasicPrinter implements MultiFunctionDevice {          // can only print
+    public void print(Document d)  { /* ... */ }
+    public void scan(Document d)   { throw new UnsupportedOperationException(); }
+    public void fax(Document d)    { throw new UnsupportedOperationException(); }
+    public void staple(Document d) { throw new UnsupportedOperationException(); }
+}
+class Document { }</code></pre>
+  <p>Three methods in <code>BasicPrinter</code> lie. That also breaks <a href="#m1-lsp">LSP</a>: callers of <code>MultiFunctionDevice</code> cannot trust <code>scan</code>. A fat interface is usually the cause of an LSP violation.</p>
+
+  <h4>The refactoring: role interfaces</h4>
+  <pre data-title="Devices.java"><code class="language-java">interface Printer  { void print(Document d); }
+interface Scanner  { void scan(Document d); }
+interface Fax      { void fax(Document d); }
+
+class BasicPrinter implements Printer {
+    public void print(Document d) { /* ... */ }
+}
+
+class OfficePrinterPro implements Printer, Scanner, Fax {
+    public void print(Document d) { /* ... */ }
+    public void scan(Document d)  { /* ... */ }
+    public void fax(Document d)   { /* ... */ }
+}
+
+class ReportJob {
+    private final Printer printer;                 // needs only printing
+    ReportJob(Printer printer) { this.printer = printer; }
+    void run(Document d) { printer.print(d); }
+}</code></pre>
+  <p><code>ReportJob</code> asks only for a <code>Printer</code>. It works with both devices, and a change in <code>Fax</code> cannot affect it. Java lets a class implement many interfaces, so splitting costs nothing for implementers who do everything.</p>
+
+  <h4>A backend example: the repository</h4>
+  <p>Suppose you start with this interface:</p>
+  <pre data-title="UserStore.java"><code class="language-java">// Fat: login code, admin code and report code all see everything
+interface UserStore {
+    User findById(long id);
+    User findByEmail(String email);
+    void save(User user);
+    void delete(long id);
+    List&lt;User&gt; searchAll(String text);
+    void exportToCsv(Path file);
+}
+
+// Segregated by client role
+interface UserReader { User findById(long id); User findByEmail(String email); }
+interface UserWriter { void save(User user); void delete(long id); }
+interface UserSearch { List&lt;User&gt; searchAll(String text); }
+interface UserExporter { void exportToCsv(Path file); }</code></pre>
+  <p>The login service gets only a <code>UserReader</code>. If someone injects a mock in a test, there is one method to fake, not six. The read-only report job cannot call <code>delete</code> by accident, because the type does not allow it. That is also a security benefit.</p>
+  <p>(Assumed types for the fragment: <code>User</code>, <code>java.util.List</code>, <code>java.nio.file.Path</code>.)</p>
+
+  <h4>ISP in the JDK and Spring</h4>
+  <ul>
+    <li><strong>Java Collections</strong>: <code>Iterable</code>, <code>Collection</code>, <code>List</code>, <code>RandomAccess</code> are layers. A method that only loops should take <code>Iterable</code> or <code>Collection</code>, not <code>ArrayList</code>.</li>
+    <li><strong>Functional interfaces</strong>: <code>Runnable</code>, <code>Supplier</code>, <code>Comparator</code> each have one method: the smallest possible role interface.</li>
+    <li><strong>Spring Data</strong>: <code>Repository</code>, <code>CrudRepository</code> and <code>PagingAndSortingRepository</code> are separate layers, so you extend only what you need. A custom repository can extend plain <code>Repository</code> and declare just the two query methods the service needs.</li>
+    <li><strong>Servlet and Spring listeners</strong>: callbacks like <code>ApplicationListener</code> have a single method.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Limits and misunderstandings</p>
+    <ul>
+      <li>ISP does not mean "one method per interface" for everything. Group methods that always change together and are used together.</li>
+      <li>Too many micro-interfaces make code hard to navigate. Split when two kinds of clients use different subsets.</li>
+      <li>It applies to classes too: a class with a wide public API forces clients to know too much. Expose a narrow API.</li>
+      <li>Java 8 <code>default</code> methods can hide a fat interface: adding a new default method to a widely used interface is easier than splitting it, but the interface is still fat.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: empty or throwing implementations</p>
+    <p>If you write <code>throw new UnsupportedOperationException()</code> or an empty body to satisfy an interface, stop. Either the interface is too big (ISP) or the subtype is wrong (LSP). Fix the interface.</p>
+  </div>
+    <h4>Why the principle exists</h4>
+  <p>Robert C. Martin formulated ISP while helping a company with a printer system in which one big <code>Job</code> class served every kind of client: print jobs, staple jobs and fax jobs all used the same class. Any change to the stapling code forced a rebuild and redeploy of the code that only printed. The cost was not the bad design itself; it was the <strong>ripple</strong>. A client that depends on a method it never calls still depends on the interface as a whole, so every change to the interface reaches it.</p>
+  <p>You feel the same pain today: a unit test must fake six methods when the class under test uses one, a new method on a shared interface breaks twelve implementers, and a junior developer calls <code>delete()</code> on a repository handed to a read-only report. ISP asks you to design the interface from the <em>client's point of view</em>: "what does this caller need?", not "what can this implementation do?".</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  subgraph Fat[One fat interface]
+    C1[Checkout] --> F[PaymentOps]
+    C2[Admin panel] --> F
+    C3[Settlement job] --> F
+  end
+  subgraph Split[Role interfaces]
+    D1[Checkout] --> R1[Charger]
+    D2[Admin panel] --> R2[Refunder]
+    D3[Settlement job] --> R3[Settler]
+  end
+</pre>
+    <figcaption>With the fat interface every client sees every method; with role interfaces each client sees only its own</figcaption>
+  </figure>
+
+  <h4>A second example: payments</h4>
+  <p>A payment service starts with one interface. Checkout needs <code>charge</code>, the support team needs <code>refund</code>, and a nightly job needs <code>settle</code>. Putting them in one <code>PaymentOps</code> interface looks tidy, until you add a cash-on-delivery provider that cannot do online refunds and has no settlement. Now it must throw from two methods.</p>
+  <pre data-title="PaymentRoles.java"><code class="language-java">interface Charger  { String charge(String orderId, long paise); }
+interface Refunder { void refund(String paymentId, long paise); }
+interface Settler  { void settle(java.time.LocalDate day); }
+
+// An online provider plays all three roles
+class CardProvider implements Charger, Refunder, Settler {
+    public String charge(String orderId, long paise) { return "PAY-" + orderId; }
+    public void refund(String paymentId, long paise) { /* call the bank */ }
+    public void settle(java.time.LocalDate day)      { /* send the batch file */ }
+}
+
+// Cash on delivery only plays one role: no fake methods
+class CashOnDelivery implements Charger {
+    public String charge(String orderId, long paise) { return "COD-" + orderId; }
+}
+
+class CheckoutService {
+    private final Charger charger;                    // sees one method only
+    CheckoutService(Charger charger) { this.charger = charger; }
+    String pay(String orderId, long paise) { return charger.charge(orderId, paise); }
+}</code></pre>
+  <p>Wiring is easy: one <code>CardProvider</code> object is passed to the checkout as a <code>Charger</code>, to the support tool as a <code>Refunder</code> and to the job as a <code>Settler</code>. The object is the same; the <em>view</em> of it is narrow. A test for <code>CheckoutService</code> can even use a lambda: <code>new CheckoutService((id, p) -&gt; "FAKE")</code>, because a single-method interface is a functional interface.</p>
+
+  <h4>ISP in the JDK, honestly</h4>
+  <p>The JDK is not perfect. <code>Collection.add</code> is an "optional operation": <code>List.of(...)</code> and <code>Collections.unmodifiableList</code> return lists whose <code>add</code> throws <code>UnsupportedOperationException</code>. That is a fat interface leaking into an LSP problem, and the JDK accepted it for convenience in 1998. Functional interfaces such as <code>Supplier</code> and <code>Comparator</code> show the opposite style: one method, one role. Use these examples to show you can see the trade-off, not only the textbook case.</p>
+
+  <h4>ISP, SRP and LSP: how they differ</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Principle</th><th>Looks at</th><th>Question it asks</th></tr></thead>
+    <tbody>
+      <tr><td><a href="#m1-srp">SRP</a></td><td>A class</td><td>Does it have more than one reason to change?</td></tr>
+      <tr><td>ISP</td><td>An interface, from each client's side</td><td>Does any client depend on methods it does not use?</td></tr>
+      <tr><td><a href="#m1-lsp">LSP</a></td><td>A subtype</td><td>Can it replace its parent without surprises?</td></tr>
+      <tr><td><a href="#m1-dip">DIP</a></td><td>The direction of a dependency</td><td>Does high-level code own the abstraction?</td></tr>
+    </tbody>
+  </table></div>
+  <p>A fat interface is often an SRP problem in disguise: an interface that mixes reading, writing and exporting has several reasons to change. Splitting by client role usually fixes both at once.</p>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: the client takes the fat type</p><pre><code class="language-java">class ReportJob {
+    private final UserStore store;          // can also delete and export
+    ReportJob(UserStore store) { this.store = store; }
+    long countActive() {
+        return store.searchAll("").size();
+    }
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: the client asks for its role</p><pre><code class="language-java">class ReportJob {
+    private final UserSearch search;        // exactly what it uses
+    ReportJob(UserSearch search) { this.search = search; }
+    long countActive() {
+        return search.searchAll("").size();
+    }
+}</code></pre></div>
+  </div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules for applying ISP</p>
+    <ul>
+      <li>Design the interface for the caller. Write the client first, see which calls it makes, and shape the interface to match.</li>
+      <li>Declare parameters, fields and constructor arguments with the narrowest type that works.</li>
+      <li>If an implementation must throw <code>UnsupportedOperationException</code> or leave a body empty, the interface is wrong.</li>
+    </ul>
+  </div>
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Name role interfaces after what the client wants: <code>Charger</code>, <code>UserReader</code>, <code>Notifier</code>. Avoid <code>IManager</code> and <code>Handler2</code>.</li>
+      <li>Keep one fat <em>implementation class</em> if it is natural; the segregation is in the interfaces, not necessarily in the classes.</li>
+      <li>Put an interface in the package of the client that uses it (the DIP habit), not next to the implementation.</li>
+    </ul>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">When NOT to split</p>
+    <ul>
+      <li>Methods that every client uses together, such as <code>open</code>, <code>read</code> and <code>close</code> of one resource, belong in one interface.</li>
+      <li>A small public library interface with one implementer and one client gains nothing from three tiny interfaces. Split when a second kind of client or a second implementation appears.</li>
+      <li>Splitting a published interface breaks every user of it. For a public API, add a new narrower interface and let the old one extend it.</li>
+    </ul>
+  </div>
+<div class="co co-interview">
+    <p class="co-t">Interview: explain ISP in 30 seconds</p>
+    <p>"No client should depend on methods it does not use. A fat <code>MultiFunctionDevice</code> forces a basic printer to implement <code>scan</code> and <code>fax</code> as empty methods. I split it into <code>Printer</code>, <code>Scanner</code> and <code>Fax</code>, and each class implements only the roles it has. The benefits: fewer fake methods, easier mocking, smaller change impact. In Spring Data, the layered repository interfaces follow the same idea."</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: follow-up questions on ISP</p>
+    <ul>
+      <li><b>ISP vs SRP?</b> SRP is about reasons to change of a class. ISP is about what each client is forced to see of an interface. They often fix the same code.</li>
+      <li><b>How do you spot a violation?</b> Empty or throwing methods, mocks with many unused stubs, and clients that import an interface for one call.</li>
+      <li><b>Does ISP mean one method per interface?</b> No. Group methods by client role.</li>
+      <li><b>Show a real example.</b> The payment roles above, or Spring Data's layered repositories.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-dip">
+  <h3>D: Dependency Inversion Principle (and DI, and IoC)</h3>
+  <p class="tldr">High-level business code should not depend on low-level details such as a database or an email library; both should depend on an abstraction that the high-level code owns, and the concrete detail is supplied from outside.</p>
+
+  <p>In a normal top-down program, the high-level class (<code>OrderService</code>, the business rules) calls the low-level class (<code>MySqlOrderRepository</code>, <code>SmtpMailer</code>). The source code of the high level then <em>mentions</em> the low level, so a change of database edits the business code. The <strong>Dependency Inversion Principle (DIP)</strong> reverses the arrow of the source dependency:</p>
+  <ol class="steps">
+    <li>High-level modules should not depend on low-level modules. <strong>Both</strong> should depend on abstractions.</li>
+    <li>Abstractions should not depend on details. <strong>Details</strong> should depend on abstractions.</li>
+  </ol>
+  <p>"Inversion" means that the low-level class now implements an interface which the high-level module defines. The arrow that used to point from business to database now points from database to business.</p>
+
+  <figure class="fig">
+<pre class="mermaid">
+classDiagram
+  class OrderService
+  class OrderRepository {
+    &lt;&lt;interface&gt;&gt;
+    +save(Order)
+    +findById(String) Order
+  }
+  class JdbcOrderRepository
+  class InMemoryOrderRepository
+  OrderService --> OrderRepository : depends on
+  OrderRepository &lt;|.. JdbcOrderRepository
+  OrderRepository &lt;|.. InMemoryOrderRepository
+</pre>
+    <figcaption>Both the service and the JDBC class depend on the interface; the interface depends on neither</figcaption>
+  </figure>
+
+  <h4>The violation</h4>
+  <pre data-title="OrderServiceBad.java"><code class="language-java">public class OrderService {
+    private final MySqlOrderRepository repository = new MySqlOrderRepository();   // concrete
+    private final SmtpMailer mailer = new SmtpMailer("smtp.example.com");          // concrete
+
+    public void place(Order order) {
+        repository.insert(order);
+        mailer.send(order.customerEmail(), "Order placed");
+    }
+}</code></pre>
+  <p>Problems: you cannot unit-test <code>place</code> without MySQL and an SMTP server; moving to PostgreSQL or SES means editing the service; the service decides how its collaborators are built.</p>
+
+  <h4>The refactoring: abstraction + constructor injection</h4>
+  <pre data-title="OrderServiceGood.java"><code class="language-java">// The high-level module owns these abstractions
+public interface OrderRepository {
+    void save(Order order);
+}
+public interface Mailer {
+    void send(String to, String message);
+}
+
+public class OrderService {
+    private final OrderRepository repository;
+    private final Mailer mailer;
+
+    public OrderService(OrderRepository repository, Mailer mailer) {   // injected
+        this.repository = repository;
+        this.mailer = mailer;
+    }
+
+    public void place(Order order) {
+        repository.save(order);
+        mailer.send(order.customerEmail(), "Order placed: " + order.id());
+    }
+}
+
+// Low-level details implement the abstractions
+class JdbcOrderRepository implements OrderRepository {
+    public void save(Order order) { /* JDBC code */ }
+}
+class SmtpMailer implements Mailer {
+    public void send(String to, String message) { /* SMTP code */ }
+}</code></pre>
+  <p>Now a unit test needs no infrastructure:</p>
+  <pre data-title="OrderServiceTest.java"><code class="language-java">class FakeRepository implements OrderRepository {
+    final java.util.List&lt;Order&gt; saved = new java.util.ArrayList&lt;&gt;();
+    public void save(Order order) { saved.add(order); }
+}
+
+@Test
+void savesAndNotifies() {
+    var repo = new FakeRepository();
+    var sent = new java.util.ArrayList&lt;String&gt;();
+    var service = new OrderService(repo, (to, msg) -&gt; sent.add(to));   // lambda as Mailer
+
+    service.place(new Order("O1", "asha@example.com", java.util.List.of()));
+
+    assertEquals(1, repo.saved.size());
+    assertEquals(java.util.List.of("asha@example.com"), sent);
+}</code></pre>
+  <p>(JUnit 5 imports omitted. <code>Mailer</code> has one method, so a lambda can implement it.)</p>
+
+  <h4>DIP vs DI vs IoC</h4>
+  <p>These three terms are confused in every interview. They are related but different.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Term</th><th>What it is</th><th>Level</th></tr></thead>
+    <tbody>
+      <tr><td><strong>DIP</strong> Dependency Inversion Principle</td><td>A design rule: depend on abstractions, owned by the high-level code</td><td>Principle (the "why")</td></tr>
+      <tr><td><strong>IoC</strong> Inversion of Control</td><td>A broad idea: a framework or container calls your code, and controls creation and flow, instead of your code controlling everything</td><td>Architecture style</td></tr>
+      <tr><td><strong>DI</strong> Dependency Injection</td><td>A technique: an object receives its collaborators from outside (constructor, setter, field) instead of creating them</td><td>Technique (the "how")</td></tr>
+    </tbody>
+  </table></div>
+  <p>DI is one way to achieve IoC. DIP is the design goal that DI makes easy. You can follow DIP without a framework (pass objects in <code>main</code>), and you can use a Spring container and still violate DIP by injecting concrete classes everywhere.</p>
+
+  <h4>How Spring helps</h4>
+  <p>The Spring container is an IoC container: you declare components, and Spring creates them and injects the dependencies. Constructor injection is the recommended style because it makes dependencies visible and fields <code>final</code>:</p>
+  <pre data-title="SpringWiring.java"><code class="language-java">@Repository
+class JdbcOrderRepository implements OrderRepository {
+    private final JdbcTemplate jdbc;
+    JdbcOrderRepository(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+    public void save(Order order) {
+        jdbc.update("INSERT INTO orders(id, email) VALUES (?, ?)",
+                    order.id(), order.customerEmail());
+    }
+}
+
+@Service
+class OrderService {
+    private final OrderRepository repository;      // the interface, not the JDBC class
+    private final Mailer mailer;
+
+    OrderService(OrderRepository repository, Mailer mailer) {   // one constructor: no @Autowired
+        this.repository = repository;
+        this.mailer = mailer;
+    }
+}</code></pre>
+  <p>With one implementation per interface, Spring picks it automatically. With two, use <code>@Primary</code> or <code>@Qualifier</code>. Switching from JDBC to JPA is a new <code>@Repository</code> class, with no change to <code>OrderService</code>. More on wiring in the Spring notes (<a href="04-spring-boot.html#m1">Spring fundamentals</a>).</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Misunderstandings</p>
+    <ul>
+      <li><strong>"DIP = using @Autowired."</strong> No. Injecting <code>JdbcOrderRepository</code> (a concrete class) into the service is DI without DIP.</li>
+      <li><strong>"Every class needs an interface."</strong> No. Value objects, records, DTOs and simple stable utilities (<code>String</code>, <code>List</code>) do not need one. Add an abstraction at boundaries: database, network, clock, file system, email, payment gateways.</li>
+      <li>The interface must be shaped by what the <em>business needs</em> (<code>save(Order)</code>), not copied from the library API (<code>executeUpdate(String sql)</code>). Otherwise the abstraction leaks details.</li>
+      <li>Injecting the clock (<code>java.time.Clock</code>) is a small DIP win: tests can fix the time.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes to avoid</p>
+    <ul>
+      <li>Calling <code>new</code> on a collaborator inside a service, or using a static singleton (<code>Mailer.getInstance()</code>) that cannot be replaced.</li>
+      <li>Field injection (<code>@Autowired private Foo foo;</code>), which hides dependencies and blocks <code>final</code> fields and plain-Java tests.</li>
+      <li>Circular dependencies (A needs B needs A): the abstractions are split wrongly; extract a third class.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: explain DIP in 30 seconds</p>
+    <p>"High-level policy should not depend on low-level detail; both depend on an abstraction. My <code>OrderService</code> depends on an <code>OrderRepository</code> interface that it owns; <code>JdbcOrderRepository</code> implements it. So I can swap the database or test with a fake. DI is the technique that supplies the implementation through the constructor, and IoC is the idea that the container, not my code, builds and wires the objects." Be ready to separate the three terms.</p>
+  </div>
+</article>
+
+<article class="topic" id="m1-dry-kiss-yagni">
+  <h3>DRY, KISS and YAGNI</h3>
+  <p class="tldr">DRY says every piece of knowledge should live in one place; KISS says choose the simplest design that works; YAGNI says do not build features or flexibility until you actually need them. They pull against over-engineering and against copy-paste.</p>
+
+  <p>SOLID tells you how to structure code. Three shorter slogans tell you when to stop. They sound obvious, but a surprising amount of real damage comes from ignoring them or from applying them blindly.</p>
+
+  <h4>DRY: Don't Repeat Yourself</h4>
+  <p>The principle comes from <em>The Pragmatic Programmer</em>: <em>every piece of knowledge must have a single, unambiguous, authoritative representation in the system</em>. The key word is <strong>knowledge</strong>, not text. If the GST rate is 18% and you write <code>0.18</code> in the cart, the invoice and the report, then one business fact lives in three places. When the rate changes, you will miss one, and the invoice will disagree with the cart.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: the same rule copied</p><pre><code class="language-java">// CartService
+long tax = amount * 18 / 100;
+// InvoiceService
+long gst = amount * 18 / 100;
+// ReportService
+long taxPart = amount * 18 / 100;</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: one authoritative place</p><pre><code class="language-java">public final class TaxPolicy {
+    private static final int GST_PERCENT = 18;
+    public long gstOn(long amountInPaise) {
+        return amountInPaise * GST_PERCENT / 100;
+    }
+}
+// every service calls taxPolicy.gstOn(amount)</code></pre></div>
+  </div>
+  <p>DRY also covers: constants and enums (not repeated strings), shared validation rules, database schema versus entity classes (generate one from the other or keep them in sync with tests), documentation that restates code, and build configuration.</p>
+
+  <h4>DRY is about knowledge, not identical-looking code</h4>
+  <p>Two code blocks may look the same today but represent <em>different</em> knowledge. Merging them couples two unrelated things. Example: a shipping-address validator and a billing-address validator are both "check pincode has six digits". If the rule for billing later allows foreign postal codes while shipping stays Indian only, the shared function now needs flags and conditions. That is <strong>accidental duplication</strong>, and removing it was the mistake.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Situation</th><th>Same knowledge?</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td>GST rate used in three services</td><td>Yes, one business rule</td><td>Extract to one place</td></tr>
+      <tr><td>Two DTO classes with the same three fields</td><td>No, different API contracts that may diverge</td><td>Keep separate</td></tr>
+      <tr><td>Same 6-line loop in two methods, same reason to change</td><td>Yes</td><td>Extract a method</td></tr>
+      <tr><td>Two validators that look alike but belong to different features</td><td>Probably not</td><td>Wait; see the rule of three</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The rule of three</h4>
+  <p>Copy once: fine. Copy a second time: you have three copies, so now refactor. Duplicating twice shows you the real shape of what is common and what differs; abstracting after the first copy is a guess. Martin Fowler describes it as: "the first time you do something, you just do it; the second time you wince but do it anyway; the third time you refactor". Duplication is cheaper than the wrong abstraction.</p>
+
+  <h4>KISS: Keep It Simple, Stupid</h4>
+  <p>Among designs that work, prefer the simplest one. Simple means few moving parts, easy to read, easy to debug, and easy for a new teammate to follow, not "fewest lines". A clever one-liner with nested ternaries and streams is not simple.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: clever</p><pre><code class="language-java">return users.stream()
+    .collect(Collectors.groupingBy(u -&gt; u.age() &gt; 17 ? u.city() != null
+        ? u.city() : "NA" : "MINOR", Collectors.counting()))
+    .entrySet().stream().max(Map.Entry.comparingByValue())
+    .map(Map.Entry::getKey).orElse(null);</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: boring and clear</p><pre><code class="language-java">Map&lt;String, Long&gt; countByCity = new HashMap&lt;&gt;();
+for (User u : users) {
+    if (u.age() &lt; 18) continue;
+    String city = u.city() == null ? "NA" : u.city();
+    countByCity.merge(city, 1L, Long::sum);
+}
+return mostFrequent(countByCity);      // a small named method</code></pre></div>
+  </div>
+  <p>KISS in design: a method call before a message queue, a monolith before microservices, a <code>HashMap</code> before a distributed cache, an <code>if</code> before a rules engine. Add complexity only when a measured problem demands it.</p>
+
+  <h4>YAGNI: You Aren't Gonna Need It</h4>
+  <p>From Extreme Programming: <em>do not add functionality until it is necessary</em>. Developers love building "just in case" features: a plugin system, a generic base class, ten configuration flags, support for MongoDB "in case we change". Unused code still costs: it must be written, tested, read, and kept compatible, and your guess about the future is usually wrong.</p>
+  <pre data-title="Yagni.java"><code class="language-java">// Over-engineered for a service with one payment gateway
+interface PaymentGatewayFactoryProvider { PaymentGatewayFactory get(String region); }
+interface PaymentGatewayFactory { PaymentGateway create(Map&lt;String, Object&gt; config); }
+// ... 6 more types, an XML config loader, a registry
+
+// What the team needed on day one
+class RazorpayClient {
+    Receipt charge(long paise, String token) { /* call the API */ return null; }
+}
+// Add an interface when the second gateway is really planned (then it is easy)</code></pre>
+  <p>YAGNI is not "never plan". It means: do not <em>implement</em> speculative features. Good habits (small classes, tests, loose coupling) keep change cheap, so you do not need to predict it.</p>
+
+  <h4>The tension between them</h4>
+  <p>DRY pushes you to abstract; KISS and YAGNI push you to wait. A balanced working rule: write the simple version first; duplicate once if unsure; abstract when the third case appears and the shared knowledge is clear; delete code that is not used.</p>
+
+  <h4>Other short principles</h4>
+  <dl class="terms">
+    <dt>Separation of concerns</dt><dd>Keep different jobs in different places (UI, business rules, data access). See <a href="#m1-demeter-tell-soc">next article</a>.</dd>
+    <dt>Law of Demeter</dt><dd>Talk only to your direct friends. See the <a href="#m1-demeter-tell-soc">next article</a>.</dd>
+    <dt>Principle of least astonishment</dt><dd>A method should do what its name says and nothing surprising. <code>getUser()</code> that creates a user breaks it.</dd>
+    <dt>Fail fast</dt><dd>Check inputs early and throw a clear exception, instead of letting bad data travel deep.</dd>
+    <dt>Boy Scout rule</dt><dd>Leave the code a little cleaner than you found it.</dd>
+    <dt>Premature optimisation</dt><dd>Do not optimise without measuring; Knuth: "premature optimization is the root of all evil" (in the 97% of cases where it does not matter).</dd>
+  </dl>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes to avoid</p>
+    <ul>
+      <li>Merging two similar-looking methods with a boolean flag parameter to "stay DRY"; the result is harder to read than the duplicates (see <a href="#m1-clean-code">clean code</a>).</li>
+      <li>Building a generic framework "for the next project" inside the current one.</li>
+      <li>Using KISS as an excuse for one 600-line method.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: DRY, KISS, YAGNI</p>
+    <ul>
+      <li><b>What is DRY?</b> One authoritative place for each piece of knowledge; example the GST rate. Add: it is about knowledge, not identical lines.</li>
+      <li><b>When does DRY go wrong?</b> When you merge code that looks similar but changes for different reasons; mention the rule of three.</li>
+      <li><b>YAGNI vs designing for change?</b> I keep the code loosely coupled so change is cheap, but I do not build the features until they are needed.</li>
+    </ul>
+  </div>
+</article>

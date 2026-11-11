@@ -1,0 +1,470 @@
+<article class="topic" id="m7-payments">
+  <h3>Design payments and e-commerce checkout</h3>
+  <p class="tldr">Checkout must never charge twice or sell stock you do not have; the design uses idempotency keys
+  on every money-moving call, a payment state machine confirmed by gateway webhooks, a double-entry ledger as the
+  record of truth, atomic stock reservation with expiry, and daily reconciliation against the payment provider.</p>
+
+  <h4>1. Requirements</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>Customer reviews the cart and places an order: choose address and payment method (UPI, card, net banking,
+    wallet, cash on delivery).</li>
+    <li>The system reserves inventory, takes payment through an external payment gateway, and confirms the
+    order.</li>
+    <li>Failed or abandoned payments release the stock. The customer can retry payment.</li>
+    <li>Refunds (full and partial) and order cancellation.</li>
+    <li>Payment status is visible to the customer and to support; finance can reconcile and settle.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> <strong>correctness over speed</strong>: no double charge, no lost payment,
+  no overselling, a complete audit trail. Strong consistency for money and stock. High availability for
+  checkout, but when in doubt, fail safe (refuse rather than guess). Peak traffic during sales. Security and
+  compliance: never store raw card numbers or CVV (use the gateway's hosted fields or tokens; PCI DSS rules apply
+  to card data). <strong>Out of scope:</strong> building a bank or card network, tax and invoice rules in detail,
+  fraud model internals.</p>
+
+  <h4>2. Capacity estimates (assumptions)</h4>
+  <ul>
+    <li>1 million orders per day → 1,000,000 ÷ 86,400 ≈ 12 orders per second on average. A big-sale hour might
+    carry 100× the normal rate for popular items: assume <strong>1,500 checkout attempts per second</strong> at
+    the sale peak (several attempts per successful order, since many payments fail or are abandoned).</li>
+    <li>Payment attempts: about 1.5 attempts per order → 1.5M per day, 17 per second average, up to 2,000 per
+    second at the peak.</li>
+    <li>Ledger: each completed order creates about 4 ledger entries (customer payment, merchant payable, platform
+    fee, tax) of ~100 B → 1M × 4 × 100 B = 400 MB per day ≈ 146 GB per year. Small. Because it is append-only and
+    critical, keep it forever in a durable relational store.</li>
+    <li>Inventory contention: a flash sale of 1,000 phones with 100,000 users trying at once is 100 requests per
+    unit. The stock row is a hot row; the hard problem is contention, not volume.</li>
+    <li>Gateway calls are slow (hundreds of milliseconds to seconds) and rate limited, so they must be
+    asynchronous-friendly and protected with timeouts and circuit breakers.</li>
+  </ul>
+
+  <h4>3. API design</h4>
+  <pre data-title="API" class="out"><code class="language-http">POST /api/v1/checkout/orders
+Idempotency-Key: 3b7e...
+{"cartId": "c_55", "addressId": 301}
+201 Created
+{"orderId": "o_9012", "status": "PENDING_PAYMENT", "totalPaise": 249900,
+ "reservedUntil": "2026-11-11T09:45:00Z"}
+
+POST /api/v1/orders/o_9012/payments
+Idempotency-Key: 8c21...
+{"method": "UPI", "returnUrl": "https://shop.example/pay/return"}
+201 Created
+{"paymentId": "pay_771", "status": "REQUIRES_ACTION",
+ "gatewayRedirectUrl": "https://gateway.example/pay/..."}
+
+GET  /api/v1/orders/o_9012            (order and payment status)
+POST /api/v1/orders/o_9012/refunds    {"amountPaise": 50000, "reason": "damaged"}
+
+POST /webhooks/gateway                (called by the gateway; signed)
+{"event": "payment.captured", "gatewayPaymentId": "gw_1", "orderRef": "pay_771", ...}</code></pre>
+  <p>Both create calls need <code>Idempotency-Key</code> (<a href="#m6-idempotency">Idempotency</a>): the order
+  call so a double-click makes one order, and the payment call so a retry after a timeout does not start a second
+  payment. The same key is passed to the gateway when it supports one. Money is always an integer in the smallest
+  unit (paise) plus a currency code. Webhooks are verified with a signature and are idempotent too.</p>
+
+  <h4>4. Data model</h4>
+  <p>Use a relational database with ACID transactions for orders, payments, stock and the ledger.</p>
+  <pre data-title="schema.sql"><code class="language-sql">CREATE TABLE orders (
+    order_id      VARCHAR(20) PRIMARY KEY,
+    customer_id   BIGINT      NOT NULL,
+    status        VARCHAR(20) NOT NULL,   -- PENDING_PAYMENT, CONFIRMED, CANCELLED, REFUNDED
+    total_paise   BIGINT      NOT NULL,
+    reserved_until TIMESTAMP,
+    created_at    TIMESTAMP   NOT NULL
+);
+CREATE TABLE payment (
+    payment_id    VARCHAR(20) PRIMARY KEY,
+    order_id      VARCHAR(20) NOT NULL REFERENCES orders(order_id),
+    amount_paise  BIGINT      NOT NULL,
+    method        VARCHAR(12) NOT NULL,
+    status        VARCHAR(16) NOT NULL,   -- CREATED, PENDING, AUTHORIZED, CAPTURED, FAILED, REFUNDED
+    gateway_ref   VARCHAR(64),
+    version       INT         NOT NULL DEFAULT 0,
+    updated_at    TIMESTAMP   NOT NULL
+);
+CREATE TABLE idempotency_key (
+    key VARCHAR(64) PRIMARY KEY, request_hash CHAR(64), response_code INT, response_body TEXT
+);
+CREATE TABLE stock (
+    sku VARCHAR(20) PRIMARY KEY, available INT NOT NULL CHECK (available &gt;= 0)
+);
+CREATE TABLE stock_reservation (
+    order_id VARCHAR(20), sku VARCHAR(20), qty INT, expires_at TIMESTAMP,
+    PRIMARY KEY (order_id, sku)
+);
+CREATE TABLE ledger_entry (
+    entry_id BIGSERIAL PRIMARY KEY, txn_id VARCHAR(30) NOT NULL,
+    account  VARCHAR(40) NOT NULL,   -- e.g. customer:9912, merchant:44, platform_fee
+    direction CHAR(1)    NOT NULL,   -- D debit, C credit
+    amount_paise BIGINT  NOT NULL CHECK (amount_paise &gt; 0),
+    created_at TIMESTAMP NOT NULL
+);</code></pre>
+
+  <h4>5. High-level architecture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  C[Client] --> GW[API gateway]
+  GW --> OS[Order service]
+  OS --> INV[Inventory service]
+  OS --> PS[Payment service]
+  PS --> GWAY[Payment gateway]
+  GWAY -.->|webhook| WH[Webhook handler]
+  WH --> PS
+  PS --> LED[(Ledger)]
+  OS --> ODB[(Order DB)]
+  PS --> PDB[(Payment DB)]
+  INV --> IDB[(Stock DB)]
+  PS --> K[[Event stream]]
+  K --> OS
+  K --> NS[Notifications]
+  REC[Reconciliation job] --> PDB
+  REC --> BANK[Gateway settlement files]
+</pre>
+    <figcaption>Order, inventory and payment are separate services joined by events; the gateway confirms by webhook and a daily job reconciles</figcaption>
+  </figure>
+
+  <h4>6. Deep dive A: the checkout flow, idempotency and unknown outcomes</h4>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant O as Order service
+  participant I as Inventory
+  participant P as Payment service
+  participant G as Gateway
+  C->>O: place order with key K1
+  O->>I: reserve stock for 15 minutes
+  I-->>O: reserved
+  O-->>C: order PENDING_PAYMENT
+  C->>P: pay with key K2
+  P->>G: create payment with K2
+  G-->>P: redirect to the bank or UPI app
+  C->>G: customer approves payment
+  G-->>P: webhook payment captured
+  P->>P: update payment, write ledger
+  P-->>O: event PaymentCaptured
+  O->>O: order CONFIRMED, commit stock
+</pre>
+    <figcaption>Happy path: reserve, pay, webhook confirms, then confirm the order and commit the stock</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Why not trust the browser?</strong> After paying, the customer may close the tab before returning to
+    your site. The <strong>webhook</strong> from the gateway (server to server, signed) is the source of truth for
+    the outcome; the browser return only triggers a status check. Deliveries can repeat or arrive out of order, so
+    the handler is idempotent and applies only valid state transitions.</li>
+    <li><strong>The unknown outcome.</strong> You call the gateway and the request times out. Did the money move?
+    You do not know. Never assume failure and never blindly retry without the idempotency key. Mark the payment
+    PENDING, then <strong>query the gateway status</strong> by your reference, and let the webhook arrive. A
+    periodic job polls payments stuck in PENDING for more than a few minutes. This is the central lesson of
+    payment design: handle "I don't know" as a first-class state.</li>
+    <li><strong>State machine.</strong> Payment moves CREATED → PENDING → AUTHORIZED → CAPTURED, or → FAILED, and
+    later → REFUNDED. Transitions use conditional updates / optimistic locking
+    (<code>UPDATE payment SET status = 'CAPTURED', version = version + 1 WHERE payment_id = ? AND status IN
+    ('PENDING','AUTHORIZED') AND version = ?</code>), so a duplicate webhook changes nothing.</li>
+    <li><strong>Authorise then capture</strong> (cards): authorise at checkout to hold funds, capture when the
+    item ships; void if cancelled. UPI and many methods capture immediately.</li>
+    <li><strong>Saga and compensation.</strong> Order, stock and payment are separate services, so this is a saga
+    (<a href="#m6-saga">Saga</a>): if payment fails or times out, release the stock and cancel; if the order cannot
+    be confirmed after payment, refund. Events are published with the outbox
+    (<a href="#m6-outbox-cdc">Outbox</a>) so a captured payment always produces an <code>PaymentCaptured</code>
+    event.</li>
+    <li><strong>Double-click and retries:</strong> the client generates the idempotency key when the user starts
+    the payment attempt and reuses it on each retry of the same attempt; a new attempt (after a failure) gets a
+    new key.</li>
+  </ul>
+
+  <h4>7. Deep dive B: inventory without overselling</h4>
+  <p>Two customers both see "1 left" and both pay. The check and the decrement must be one atomic step:</p>
+  <pre data-title="reserve.sql"><code class="language-sql">UPDATE stock
+   SET available = available - 2
+ WHERE sku = 'SKU-1' AND available &gt;= 2;     -- affected rows: 1 = success, 0 = out of stock
+INSERT INTO stock_reservation (order_id, sku, qty, expires_at)
+VALUES ('o_9012', 'SKU-1', 2, now() + interval '15 minutes');</code></pre>
+  <ul>
+    <li><strong>Reserve, then commit.</strong> Reserving at order time and holding it for 15 minutes balances two
+    risks: no reservation means many paid orders you cannot fulfil; reserving forever lets abandoned carts block
+    stock. A scheduled job releases expired reservations (add the quantity back) and cancels the pending order.</li>
+    <li><strong>Hot rows.</strong> In a flash sale, one row takes thousands of updates per second and locks
+    serialise them. Options: put the sale stock in Redis with an atomic <code>DECR</code> (a Lua script that
+    checks and decrements) and sync to the database asynchronously; split stock into N buckets (sub-rows) and pick
+    one at random; or queue purchase requests and process them in order, returning "you are in line". Use a
+    waiting room to control entry (<a href="#m7-rate-limiter">Rate limiter</a>).</li>
+    <li><strong>Overselling vs underselling.</strong> Redis-first approaches can lose a decrement on a crash;
+    choose which error is acceptable. For limited drops, prefer underselling (a few units re-released later) to
+    overselling (apologies and refunds).</li>
+  </ul>
+
+  <h4>8. Deep dive C: the ledger and reconciliation</h4>
+  <p>Do not model money as a mutable <code>balance</code> column that you overwrite. Use a <strong>double-entry
+  ledger</strong>: every money movement is a transaction with at least two <strong>immutable</strong> entries, a
+  debit and a credit, which add up to zero. Balances are computed from entries (and cached or snapshotted).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>txn_id</th><th>account</th><th>direction</th><th>amount (paise)</th></tr></thead>
+    <tbody>
+      <tr><td>t_1</td><td>gateway_clearing</td><td>D</td><td>249,900</td></tr>
+      <tr><td>t_1</td><td>merchant:44 payable</td><td>C</td><td>224,900</td></tr>
+      <tr><td>t_1</td><td>platform_fee</td><td>C</td><td>25,000</td></tr>
+    </tbody>
+  </table></div>
+  <p>Debits 249,900 equal credits 224,900 + 25,000 = 249,900. A refund is a <em>new</em> transaction with the
+  opposite entries; you never edit or delete old rows. Benefits: a full audit trail, easy to prove where every
+  rupee went, and errors are corrected by adding entries. Write the ledger entries in the same database
+  transaction as the payment state change, so they cannot disagree.</p>
+  <p><strong>Reconciliation.</strong> Your records and the gateway's records must match. A daily (or more
+  frequent) job downloads the gateway's settlement report and compares it with your payments by gateway
+  reference and amount. It reports: payments you think succeeded but the gateway has no record of; payments the
+  gateway captured that you marked failed (the unknown-outcome cases); amount mismatches; fee differences.
+  Mismatches create tickets or automatic fixes (refund the stray capture, or mark the order paid). Reconciliation
+  is the safety net for every bug and every lost webhook.</p>
+
+  <h4>9. Consistency, failure and scaling</h4>
+  <ul>
+    <li><strong>Consistency model.</strong> Strong (ACID) inside each service's database for its own data; eventual
+    consistency between services through events. Show the customer the real state ("payment pending") instead of
+    guessing.</li>
+    <li><strong>Gateway failure.</strong> Protect calls with timeouts and a circuit breaker
+    (<a href="#m6-resilience">Resilience</a>); offer a second gateway for routing/fallback; show a clear message
+    and allow retry later. Do not retry charges blindly.</li>
+    <li><strong>Scaling.</strong> Services are stateless; payment DB sharded by payment or order id if needed; read
+    replicas for status queries (but read your own writes from the primary right after payment); cache the cart
+    and product data, never the payment status.</li>
+    <li><strong>Security.</strong> TLS everywhere, signed webhooks, secrets in a vault, tokenised card data via
+    the gateway, least-privilege access, audit logging, rate limits on payment attempts per user to stop card
+    testing by fraudsters.</li>
+    <li><strong>Monitoring:</strong> payment success rate by method and bank, PENDING age, webhook delay,
+    reconciliation mismatches, reservation expiry count, stock vs reservations drift.</li>
+  </ul>
+
+  <h4>Follow-up questions</h4>
+  <ul>
+    <li>What if the webhook never arrives? (Poll the gateway status; reconciliation catches the rest.)</li>
+    <li>What if the customer pays twice from two tabs? (Idempotency key per attempt; detect a second capture for
+    the same order and auto-refund.)</li>
+    <li>How do you handle partial refunds and partial shipments? (Refund transactions in the ledger per item;
+    order lines have their own status.)</li>
+    <li>Cash on delivery? (No payment capture up front; collection by the delivery partner is recorded and
+    settled later; higher return/fraud risk.)</li>
+    <li>How do you support multiple currencies? (Store amount plus currency; convert only at defined points; never
+    use floats.)</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Say the four words early: idempotency, webhook, ledger, reconciliation.</li>
+      <li>Treat "unknown outcome after a timeout" as a first-class state, and say what you do about it.</li>
+      <li>Explain the atomic conditional update for stock and the reservation expiry.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m7-interview">
+  <h3>Interview questions — HLD interview practice</h3>
+
+  <details class="qa">
+    <summary>How do you structure a 45-minute HLD interview?</summary>
+    <div class="qa-a">
+      <p>Requirements and scope (5 minutes), capacity estimates (5), API and high-level design (10–15), data model
+      (5), deep dive on the hardest part (10–15), then trade-offs, failures and scaling (5). Narrate your choices,
+      check in with the interviewer at phase ends, and tie each component to a requirement or a number.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>What clarifying questions would you ask first?</summary>
+    <div class="qa-a">
+      <p>Who are the users and what are the core actions; expected scale (users, requests per day, read:write
+      ratio); which features are in scope; latency and availability targets; consistency needs (can data be
+      slightly stale); durability (can we lose data); single or multi-region; and constraints such as abuse,
+      privacy and retention. Then write functional, non-functional and out-of-scope lists.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>URL shortener: how do you generate the short code?</summary>
+    <div class="qa-a">
+      <p>Three options: a unique counter encoded in base62 (no collisions, short, but sequential and needs a
+      counter service; ranges per server remove the bottleneck), a hash of the URL truncated to 7 characters (no
+      coordination but collisions must be handled), or pre-generated random keys (fast, unguessable, needs a key
+      service). With 6 billion URLs, 62<sup>7</sup> ≈ 3.5 trillion gives ample room. I would pick pre-generated
+      keys or a counter with a reversible shuffle.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>301 or 302 for a URL shortener?</summary>
+    <div class="qa-a">
+      <p>301 is permanent and browsers cache it, so later clicks bypass you: cheaper, but no analytics and the
+      target cannot change or expire. 302 (temporary) sends every click through your server, enabling click
+      counting, edits and expiry at the cost of more load. If analytics or expiry matter, use 302.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Pastebin: why not store paste content in the database?</summary>
+    <div class="qa-a">
+      <p>Pastes can be up to megabytes. Large rows bloat the buffer cache, backups and replication and cost more
+      per GB. Store metadata (key, owner, size, expiry, blob path) in the database and the text in object storage,
+      served via a CDN since pastes are immutable. Expire with lazy checks on read plus a background cleaner or
+      lifecycle rule.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>How do you build a distributed rate limiter and make it atomic?</summary>
+    <div class="qa-a">
+      <p>Keep a token bucket or counter per client in Redis, sharded by client key. The read-modify-write must be
+      atomic, so use a Lua script (or <code>INCR</code> for a fixed window); otherwise two gateways both read "1
+      token left" and both allow. Decide the failure policy: fail open for most APIs, fail closed for login or
+      SMS, with a local limiter as a fallback. Return 429 with Retry-After.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Notification system: how do you avoid duplicates and handle bursts?</summary>
+    <div class="qa-a">
+      <p>Delivery is at-least-once, so give every notification an id and dedupe before sending (a conditional
+      status update or a Redis SET NX), and pass idempotency or collapse keys to providers. For bursts, use one
+      queue per channel and per priority so an OTP never waits behind a campaign, throttle against provider rate
+      limits, retry with backoff and jitter, and move poison messages to a DLQ. Size for the campaign burst, not
+      the average.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Chat: how does a message reach an online user and an offline user?</summary>
+    <div class="qa-a">
+      <p>The sender's WebSocket gateway forwards the message to the message service, which assigns a per-chat
+      sequence number and stores it durably, then acks the sender. A session registry maps the recipient to their
+      gateway, and the message is pushed down their socket. If they are offline, it stays in their inbox and a
+      push notification is sent; on reconnect the client asks for everything after its last sequence number.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Chat: how do you order messages and show delivered / read ticks?</summary>
+    <div class="qa-a">
+      <p>Order per conversation using a server-assigned sequence number, not phone clocks and not globally.
+      Delivered and read are acknowledgements from the recipient app; store them as watermarks per user per chat
+      ("read up to seq 412") rather than a row per message. Clients dedupe by message id because delivery is
+      at-least-once.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>News feed: fan-out on write or on read?</summary>
+    <div class="qa-a">
+      <p>Fan-out on write precomputes each follower's feed when a post is created, making reads very cheap, which
+      suits a 100:1 read-heavy workload, but a celebrity with 50 million followers makes one post cost 50 million
+      writes. Fan-out on read has no write cost but slow reads. Use a hybrid: push for normal accounts, pull and
+      merge celebrity posts at read time, skip inactive users. Store post ids in the feed and use cursor
+      pagination.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Ride sharing: how do you find nearby drivers fast?</summary>
+    <div class="qa-a">
+      <p>A normal index on latitude and longitude cannot do a 2D radius search. Use a geospatial index: a geohash
+      or hex grid with a set of drivers per cell, or a quadtree. Query the rider's cell plus its eight neighbours,
+      then filter by exact distance and rank by road ETA. Keep latest positions in memory (Redis GEO), sharded by
+      city; 1 million drivers updating every 4 seconds is 250,000 writes per second.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Video streaming: what happens between upload and playback?</summary>
+    <div class="qa-a">
+      <p>The client uploads in parts to object storage using a pre-signed URL. A job queue triggers transcoding:
+      the video is split into chunks, each encoded in parallel into several resolutions, packaged into short
+      segments and HLS/DASH manifests, and published. Playback uses adaptive bitrate streaming: the player picks a
+      rendition per segment based on bandwidth. A CDN serves nearly all bytes because the egress is enormous.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Payments: how do you prevent a double charge when a request times out?</summary>
+    <div class="qa-a">
+      <p>The client sends an idempotency key per payment attempt and reuses it on retries; the server stores the
+      key and result in a dedupe table and passes the key to the gateway. On a timeout, the payment is marked
+      PENDING (unknown), not failed; the gateway status is queried and the webhook updates the state with
+      conditional transitions. A reconciliation job against the gateway's settlement report catches whatever
+      slips through.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>Why a double-entry ledger instead of a balance column?</summary>
+    <div class="qa-a">
+      <p>Each movement is an immutable pair of debit and credit entries that sum to zero, so you keep a full audit
+      trail, can prove where money went, and correct mistakes by adding reversing entries instead of editing
+      history. Balances are derived from entries. Entries are written in the same transaction as the payment
+      state change.</p>
+    </div>
+  </details>
+  <details class="qa">
+    <summary>The interviewer asks: "what if traffic grows 10 times?"</summary>
+    <div class="qa-a">
+      <p>Redo the numbers to find the first bottleneck, then go inwards from the edge: CDN and caching, more
+      stateless app servers, a larger cache with a better hit ratio, read replicas, sharding for writes and
+      storage, queues for slow work, and protection with rate limits and load shedding. Then say what breaks next
+      at 100 times.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m7-cheatsheet">
+  <h3>Cheat sheet — HLD interview practice</h3>
+  <ul class="cheat">
+    <li><b>Time plan</b> requirements 5, estimates 5, design 10–15, data 5, deep dive 10–15, trade-offs 5</li>
+    <li><b>Estimate shortcut</b> per second = per day ÷ 86,400 (about 10<sup>5</sup>); peak 2–3× average</li>
+    <li><b>Always say</b> assumptions, one number per component, one trade-off, one failure case</li>
+    <li><b>URL shortener</b> 40 writes/s, 4,000 reads/s, 6B URLs, 62<sup>7</sup> ≈ 3.5T, ~3 TB, cache-aside</li>
+    <li><b>301 vs 302</b> 301 cached by browsers (no analytics); 302 every click hits you</li>
+    <li><b>Pastebin</b> metadata in DB, text in object storage + CDN; lazy expiry + cleaner job</li>
+    <li><b>Rate limiter</b> token bucket in Redis, atomic Lua, shard by client, fail open or closed, 429</li>
+    <li><b>Notification</b> API → validate/prefs/template → queue per channel and priority → workers → provider</li>
+    <li><b>Notification safety</b> at-least-once + dedupe id, backoff + jitter, DLQ, provider rate limits</li>
+    <li><b>Chat</b> WebSocket gateways, session registry, store then route, per-chat seq, inbox for offline</li>
+    <li><b>Chat numbers</b> 20M connections ÷ 100K per gateway = 200 gateways</li>
+    <li><b>Receipts</b> sent → delivered → read, kept as watermarks per chat</li>
+    <li><b>News feed</b> 100:1 reads; push for normal users, pull for celebrities; ids in Redis sorted sets</li>
+    <li><b>Pagination</b> cursor (last id), not offset</li>
+    <li><b>Food delivery</b> order state machine + payment saga; geo index of partners; match with timeout</li>
+    <li><b>Ride sharing</b> geohash cell + 8 neighbours or quadtree; 250K location writes/s in memory</li>
+    <li><b>Assignment</b> conditional update (driver_id IS NULL) so only one driver wins</li>
+    <li><b>Video</b> pre-signed multipart upload → queue → parallel chunk transcode → HLS/DASH → CDN</li>
+    <li><b>ABR</b> several renditions, 2–6 s segments, player switches per segment</li>
+    <li><b>Video numbers</b> 5M concurrent × 2.5 Mbps = 12.5 Tbps; CDN is mandatory</li>
+    <li><b>Payments</b> idempotency key, state machine, webhook = truth, ledger, reconciliation</li>
+    <li><b>Unknown outcome</b> timeout means PENDING, then query gateway; never assume failure</li>
+    <li><b>Stock</b> UPDATE ... WHERE available &gt;= n; reserve with expiry; hot rows need buckets or Redis</li>
+    <li><b>10× traffic</b> CDN, stateless scale-out, cache, replicas, shard, queue, shed load</li>
+    <li><b>Mistakes</b> no requirements, no numbers, over-engineering, ignoring failure, name-dropping</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m7-practice">
+  <h3>Practice — HLD interview practice</h3>
+  <ol class="steps">
+    <li><strong>Warm-up arithmetic.</strong> Without notes, redo the estimates for the URL shortener and the chat
+    app on paper (QPS, storage, connections). Done when your numbers match the notes within a factor of 2 and
+    you can say what each number implies for the design.</li>
+    <li><strong>The 45-minute URL shortener.</strong> Set a timer and design a URL shortener out loud, on a
+    whiteboard or paper, using the six phases. Record yourself or practise with a friend. Done when you finish
+    all phases inside 45 minutes, covered code generation, 301 vs 302 and caching, and named two failure
+    cases.</li>
+    <li><strong>Build the core.</strong> Implement a small URL shortener in Spring Boot: <code>POST</code> to
+    create, <code>GET /{code}</code> to redirect, PostgreSQL for storage, Redis cache-aside, base62 encoding.
+    Done when 10,000 redirects in a load test show a high cache hit ratio and creation is idempotent with an
+    Idempotency-Key header.</li>
+    <li><strong>Atomic rate limiter.</strong> Implement the Redis token-bucket Lua script from the notes and call
+    it from a Spring filter. Fire 200 parallel requests at a limit of 100. Done when at most about 100 succeed and
+    the rest get 429 with a Retry-After header.</li>
+    <li><strong>Draw all ten.</strong> For each of the ten problems, draw the architecture flowchart from memory
+    on one page and write three bullet points for its hardest deep dive. Done when each page has a diagram, two
+    numbers and one trade-off, and you can explain each in two minutes.</li>
+    <li><strong>Queue and cache discussion (Project 4).</strong> Take your Project 4 and prepare a five-minute
+    explanation of where it uses a cache and a queue: why, which pattern (cache-aside, TTL, invalidation),
+    delivery guarantee, retry and dead-letter handling, and what happens when each fails. Done when you can
+    answer follow-ups on stampede, duplicates and ordering.</li>
+    <li><strong>Mock the hard follow-ups.</strong> Ask a friend to challenge you with "what if traffic grows
+    10×", "what if the cache dies" and "what if the database is down" on any two problems. Done when each answer
+    follows the edge-to-database walk and names a first bottleneck.</li>
+    <li><strong>Payments walkthrough.</strong> Write the sequence diagram for checkout with a gateway timeout in
+    the middle and mark where each state is persisted. Done when it shows the idempotency key, the PENDING state,
+    the status poll, the webhook and the reconciliation fix.</li>
+    <li><strong>Peer review.</strong> Give one of your designs to a friend with the rubric from the method
+    article and ask for scores on requirements, numbers, depth, failure thinking and communication. Done when you
+    have one improvement noted per area and redo the weakest phase.</li>
+  </ol>
+</article>

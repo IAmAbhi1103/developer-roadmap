@@ -1,0 +1,604 @@
+<div class="mintro">
+  <p>Almost every Spring Boot job is about one thing: building <strong>REST APIs</strong> — HTTP endpoints that a React app, a mobile app or another service calls to read and change data, usually as JSON. This module takes you from the raw text of an HTTP request all the way to a layered, validated, documented CRUD API with clean error responses and pagination.</p>
+  <p>It builds on Spring fundamentals (<a href="#m1">Module 1</a>: beans, dependency injection, configuration). The repository layer uses Spring Data JPA, which <a href="#m3">Module 3</a> explains in depth; <a href="#m4">Module 4</a> secures the API and <a href="#m5">Module 5</a> tests it. The React app in <a href="06-frontend.html#m6">Frontend · Module 6</a> is the client that consumes what you build here. Examples work on Spring Boot 3.x and 4.x; where the two differ, a version note says so.</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>read and write raw HTTP requests and responses, and choose the right method, status code and headers;</li>
+    <li>design resource URLs, version an API, and explain what makes an API RESTful;</li>
+    <li>build controllers with the mapping annotations and explain how a request travels through Spring MVC;</li>
+    <li>split an application into controller, service and repository layers, and map entities to DTOs by hand or with MapStruct;</li>
+    <li>validate input with Bean Validation and return consistent error JSON with <code>ProblemDetail</code>;</li>
+    <li>add pagination, sorting and filtering, document the API with Swagger UI, and test it with curl, Postman or Bruno.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m2-http-anatomy">
+  <h3>HTTP basics: how a request and a response look</h3>
+  <p class="tldr">HTTP is a text-based request–response protocol: the client sends a method, a URL, headers and an optional body, and the server answers with a status code, headers and an optional body.</p>
+
+  <p>Every REST API runs on <strong>HTTP</strong> (HyperText Transfer Protocol). Your React app, Postman, curl and a mobile app all do the same thing: open a connection, send one <strong>request</strong>, and read one <strong>response</strong>. Spring annotations only make sense when you can read the raw messages, because that is what your controller methods really work with.</p>
+
+  <h4>The five words you need first</h4>
+  <dl class="terms">
+    <dt>Client</dt>
+    <dd>The program that sends the request: a browser, a React app, a mobile app, curl, or another service.</dd>
+    <dt>Server</dt>
+    <dd>The program that listens and answers. For you, that is your Spring Boot application running inside an embedded Tomcat.</dd>
+    <dt>Resource</dt>
+    <dd>A "thing" the API exposes, named by a URL: a product, an order, a user.</dd>
+    <dt>Request</dt>
+    <dd>One message from client to server that says "do this <em>method</em> on that <em>URL</em>".</dd>
+    <dt>Response</dt>
+    <dd>The server's single reply to a request: a status code, headers and, usually, a body.</dd>
+  </dl>
+
+  <h4>A request, line by line</h4>
+  <p>This is exactly what travels over the network when a client creates a product. Nothing is hidden: it is plain text.</p>
+  <pre data-title="Raw HTTP request"><code class="language-http">POST /api/v1/products HTTP/1.1
+Host: localhost:8080
+Content-Type: application/json
+Accept: application/json
+Content-Length: 68
+
+{"sku":"MSE-1001","name":"Wireless Mouse","price":799.00,"stock":25}</code></pre>
+  <ol class="steps">
+    <li><strong>Request line</strong> — three parts: the <strong>method</strong> (<code>POST</code>), the <strong>request target</strong> (path plus query string: <code>/api/v1/products</code>) and the <strong>protocol version</strong> (<code>HTTP/1.1</code>).</li>
+    <li><strong>Headers</strong> — one <code>Name: value</code> pair per line. They describe the request: which host, what format the body is in, what format the client wants back, how long the body is.</li>
+    <li><strong>An empty line</strong> — this blank line is the signal "headers are over".</li>
+    <li><strong>Body</strong> (optional) — the data. A <code>GET</code> normally has none; a <code>POST</code> or <code>PUT</code> usually carries JSON.</li>
+  </ol>
+
+  <h4>A response, line by line</h4>
+  <pre data-title="Raw HTTP response"><code class="language-http">HTTP/1.1 201 Created
+Content-Type: application/json
+Location: http://localhost:8080/api/v1/products/1
+Content-Length: 75
+Date: Wed, 21 Oct 2026 04:45:30 GMT
+
+{"id":1,"sku":"MSE-1001","name":"Wireless Mouse","price":799.00,"stock":25}</code></pre>
+  <p>The first line is the <strong>status line</strong>: protocol version, a three-digit <strong>status code</strong> (<code>201</code>) and a short reason phrase (<code>Created</code>). The reason phrase is optional and clients ignore it — Spring Boot's Tomcat usually sends just <code>HTTP/1.1 201</code>. Then come the response headers, a blank line and the body. Code decides everything; the phrase is only for humans.</p>
+
+  <h4>The parts of a URL</h4>
+  <p>A URL tells the client where the resource lives. Take this one:</p>
+  <pre data-title="One URL, split"><code class="language-plaintext">https://shop.example.com:8443/api/v1/products/42?category=books&amp;sort=price#reviews</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Part</th><th>In the example</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td>Scheme</td><td><code>https</code></td><td>The protocol. <code>https</code> is HTTP inside an encrypted TLS connection.</td></tr>
+      <tr><td>Host</td><td><code>shop.example.com</code></td><td>Which machine to talk to (looked up through DNS).</td></tr>
+      <tr><td>Port</td><td><code>8443</code></td><td>Which program on that machine. Defaults: 80 for <code>http</code>, 443 for <code>https</code>. Spring Boot listens on 8080 unless you set <code>server.port</code>.</td></tr>
+      <tr><td>Path</td><td><code>/api/v1/products/42</code></td><td>Which resource. This is where <code>@PathVariable</code> values come from.</td></tr>
+      <tr><td>Query string</td><td><code>category=books&amp;sort=price</code></td><td>Extra options as <code>name=value</code> pairs joined by <code>&amp;</code>. This is where <code>@RequestParam</code> values come from.</td></tr>
+      <tr><td>Fragment</td><td><code>#reviews</code></td><td>A position inside the page. The browser keeps it; it is <strong>never sent</strong> to the server.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Seeing real HTTP yourself</h4>
+  <p>Do not guess what is on the wire — look. Two tools show it. First, <code>curl -v</code> prints the request lines (starting with <code>&gt;</code>) and the response lines (starting with <code>&lt;</code>). Second, the browser: press <kbd>F12</kbd>, open the <strong>Network</strong> tab, click any request and read its Headers, Payload and Response tabs.</p>
+  <pre data-title="curl -v shows both messages"><code class="language-shell">$ curl -v http://localhost:8080/api/v1/products/1
+&gt; GET /api/v1/products/1 HTTP/1.1
+&gt; Host: localhost:8080
+&gt; User-Agent: curl/8.x
+&gt; Accept: */*
+&gt;
+&lt; HTTP/1.1 200
+&lt; Content-Type: application/json
+&lt; Content-Length: 75
+&lt; Date: Wed, 21 Oct 2026 04:46:02 GMT
+&lt;
+{"id":1,"sku":"MSE-1001","name":"Wireless Mouse","price":799.00,"stock":25}</code></pre>
+  <p>Use <code>curl -i</code> when you want only the response headers followed by the body, without the request lines.</p>
+
+  <h4>HTTP is stateless</h4>
+  <p>The server treats every request as a brand-new conversation. It does not remember that you called it a second ago. That is called being <strong>stateless</strong>. To stay "logged in", the client must send proof with <em>every</em> request: either a session cookie (<code>Cookie: JSESSIONID=…</code>) or a token (<code>Authorization: Bearer …</code>). REST APIs prefer tokens, because any server instance can verify a token without shared memory — you will build this in <a href="#m4">Module 4</a>.</p>
+
+  <h4>HTTP/1.1, HTTP/2 and HTTP/3</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Version</th><th>How it travels</th><th>What changes for you</th></tr></thead>
+    <tbody>
+      <tr><td>HTTP/1.1</td><td>Plain text messages; one request at a time per connection (the connection can be reused)</td><td>This is what you see in curl. It is the default for Tomcat.</td></tr>
+      <tr><td>HTTP/2</td><td>Binary frames; many requests in parallel on one connection; compressed headers</td><td>Same methods, status codes and headers. Spring Boot can enable it with <code>server.http2.enabled=true</code>; browsers use it only over HTTPS.</td></tr>
+      <tr><td>HTTP/3</td><td>Same meaning as HTTP/2, but over QUIC (UDP) instead of TCP</td><td>Usually handled by a CDN or load balancer, not by your Spring app.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The important point: the <em>meaning</em> (methods, status codes, headers, bodies) is the same in all versions. Learn the semantics once.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules of the message format</p>
+    <ul>
+      <li>A message is: start line, headers, an empty line, optional body — in that order.</li>
+      <li>Header <strong>names</strong> are case-insensitive (<code>content-type</code> equals <code>Content-Type</code>). Header values and URL paths are normally case-sensitive.</li>
+      <li>HTTP/1.1 requires a <code>Host</code> header.</li>
+      <li>If there is a body, the sender says how long it is (<code>Content-Length</code>) or sends it in chunks (<code>Transfer-Encoding: chunked</code>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A <code>GET</code> request <em>can</em> carry a body, but its meaning is undefined and many proxies and servers drop it. Do not design APIs that depend on it.</li>
+      <li>Some responses never have a body: replies to <code>HEAD</code>, <code>204 No Content</code> and <code>304 Not Modified</code>.</li>
+      <li>Very long URLs get rejected. Servers usually limit the request line plus headers to a few KB (Tomcat's default is 8 KB), so never pack big data into the query string.</li>
+      <li>Local development uses plain <code>http://localhost:8080</code>. In production, HTTPS is mandatory; it is usually terminated by a reverse proxy or load balancer in front of your app (see <a href="07-devops.html#m2">DevOps · Module 2</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: putting secrets in the URL</p>
+    <p>Everything in the URL ends up in server logs, browser history, proxy logs and the <code>Referer</code> header. Passwords and tokens belong in the body or in the <code>Authorization</code> header, and always over HTTPS.</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: credentials in the query string</p><pre><code class="language-http">GET /login?user=ravi&amp;password=Secret@123 HTTP/1.1
+Host: shop.example.com</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: credentials in the body, over HTTPS</p><pre><code class="language-http">POST /api/v1/auth/login HTTP/1.1
+Host: shop.example.com
+Content-Type: application/json
+
+{"email":"ravi@example.com","password":"Secret@123"}</code></pre></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is HTTP? What does stateless mean?"</p>
+    <ul>
+      <li>HTTP is an application-layer request–response protocol over TCP (or QUIC for HTTP/3). The client always starts; the server only replies.</li>
+      <li>A request has a method, a target, headers and an optional body. A response has a status code, headers and an optional body.</li>
+      <li>Stateless means the server keeps no memory of earlier requests; each request carries everything needed, such as a token. This lets you run many identical server instances behind a load balancer.</li>
+      <li>HTTPS is HTTP over TLS: it encrypts the traffic and proves the server's identity with a certificate. The HTTP messages themselves are unchanged.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-http-methods">
+  <h3>HTTP methods: purpose, safe and idempotent</h3>
+  <p class="tldr">The method says what you want to do with a resource; <strong>safe</strong> methods never change server state, and <strong>idempotent</strong> methods leave the server in the same state whether you call them once or ten times.</p>
+
+  <p>An HTTP <strong>method</strong> (also called a verb) is the first word of a request. It tells the server the <em>intent</em>: read, create, replace, change, delete. The URL names the resource, and the method says what to do with it. If you pick methods correctly, clients, proxies, caches and browsers all behave correctly without extra work.</p>
+
+  <h4>The methods at a glance</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Purpose</th><th>Request body</th><th>Safe</th><th>Idempotent</th></tr></thead>
+    <tbody>
+      <tr><td><code>GET</code></td><td>Read a resource or a collection</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td><code>POST</code></td><td>Create a resource, or trigger an action</td><td>Yes</td><td>No</td><td>No</td></tr>
+      <tr><td><code>PUT</code></td><td>Replace a resource completely</td><td>Yes</td><td>No</td><td>Yes</td></tr>
+      <tr><td><code>PATCH</code></td><td>Change part of a resource</td><td>Yes</td><td>No</td><td>Not guaranteed</td></tr>
+      <tr><td><code>DELETE</code></td><td>Remove a resource</td><td>Usually no</td><td>No</td><td>Yes</td></tr>
+      <tr><td><code>HEAD</code></td><td>Same as <code>GET</code>, but only the headers come back</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td><code>OPTIONS</code></td><td>Ask which methods a URL supports (also used for CORS preflight)</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Safe and idempotent — two different ideas</h4>
+  <dl class="terms">
+    <dt>Safe</dt>
+    <dd>The method only <em>reads</em>. It must not change anything the user cares about on the server. Because <code>GET</code> is safe, browsers can prefetch it, search-engine crawlers can follow it, and caches can store its response.</dd>
+    <dt>Idempotent</dt>
+    <dd>Sending the same request many times has the <em>same effect on the server</em> as sending it once. This is what makes a request safe to <strong>retry</strong> after a network timeout, when the client does not know whether the first attempt worked.</dd>
+  </dl>
+  <p>Every safe method is idempotent, but not the other way round: <code>DELETE</code> changes state, yet deleting the same product twice leaves the same final state — the product is gone. The <em>response</em> may differ (first call <code>204</code>, second call <code>404</code>); idempotency is about server state, not about identical responses.</p>
+  <p>Idempotency is a promise that <em>you</em> keep in your code. HTTP does not enforce it. If you write a <code>PUT</code> handler that appends to a list each time, it is no longer idempotent, and clients that retry will create damage.</p>
+
+  <h4>POST vs PUT vs PATCH</h4>
+  <p>These three cause the most confusion. Use the same product to compare them.</p>
+  <pre data-title="POST — create a new product; the server picks the id"><code class="language-http">POST /api/v1/products HTTP/1.1
+Content-Type: application/json
+
+{"sku":"MSE-1001","name":"Wireless Mouse","price":799.00,"stock":25}</code></pre>
+  <pre data-title="PUT — replace product 1; you must send the whole representation"><code class="language-http">PUT /api/v1/products/1 HTTP/1.1
+Content-Type: application/json
+
+{"name":"Wireless Mouse","description":"Silent click","price":749.00,"stock":25}</code></pre>
+  <pre data-title="PATCH — change only the price of product 1"><code class="language-http">PATCH /api/v1/products/1 HTTP/1.1
+Content-Type: application/json
+
+{"price":749.00}</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Question</th><th>POST</th><th>PUT</th><th>PATCH</th></tr></thead>
+    <tbody>
+      <tr><td>Target URL</td><td>A collection (<code>/products</code>)</td><td>One resource (<code>/products/1</code>)</td><td>One resource (<code>/products/1</code>)</td></tr>
+      <tr><td>Body means</td><td>"Create something from this"</td><td>"This is the new full state"</td><td>"Apply these changes"</td></tr>
+      <tr><td>Fields you leave out</td><td>Server uses defaults</td><td>Reset to null or default</td><td>Left unchanged</td></tr>
+      <tr><td>Repeat 3 times</td><td>Three products</td><td>Same final state</td><td>Depends on the change</td></tr>
+      <tr><td>Typical success</td><td><code>201</code> + <code>Location</code></td><td><code>200</code> or <code>204</code></td><td><code>200</code></td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Why PATCH is "not guaranteed" idempotent:</strong> it depends on what the patch says. <code>{"status":"SHIPPED"}</code> sets a value, so repeating it changes nothing — idempotent. <code>{"stockDelta":-1}</code> subtracts one each time — not idempotent. The method itself does not decide; your design does.</p>
+  <p><strong>PUT can also create.</strong> If the client chooses the id and the resource does not exist yet, <code>PUT /users/ravi</code> may create it (return <code>201</code>); if it exists, replace it (return <code>200</code> or <code>204</code>). Most Spring APIs use <code>PUT</code> only for replacing an existing resource and generate ids on the server with <code>POST</code>.</p>
+
+  <h4>Which method for which job?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>You want to…</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td>Fetch one item or a list</td><td><code>GET</code></td></tr>
+      <tr><td>Create an item and let the server choose its id</td><td><code>POST</code> to the collection</td></tr>
+      <tr><td>Replace the whole item with a new version</td><td><code>PUT</code></td></tr>
+      <tr><td>Change one or two fields</td><td><code>PATCH</code></td></tr>
+      <tr><td>Remove an item</td><td><code>DELETE</code></td></tr>
+      <tr><td>Check that a URL exists without downloading the body</td><td><code>HEAD</code></td></tr>
+      <tr><td>Run something that is not CRUD (cancel an order, send an OTP)</td><td><code>POST</code> to an action URL such as <code>/orders/5/cancel</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Making a POST safe to retry: the Idempotency-Key pattern</h4>
+  <p>Creating a payment with <code>POST</code> is the classic danger: the client times out, retries, and the customer is charged twice. Payment APIs such as Stripe solve this with an <strong>idempotency key</strong>: the client generates a unique value (a UUID) and sends it in a header. Spring has no built-in feature for this; you implement it in a filter or in the service.</p>
+  <ol class="steps">
+    <li>The client sends <code>POST /payments</code> with <code>Idempotency-Key: 7c9e6679-…</code>.</li>
+    <li>The server looks the key up in a table. If the key is new, it processes the payment and stores the key together with the response it produced.</li>
+    <li>If the client retries with the same key, the server does not process again. It returns the stored response.</li>
+    <li>Keys expire after some time (for example 24 hours), and the same key with a <em>different</em> body is rejected with <code>422</code> or <code>409</code>.</li>
+  </ol>
+
+  <h4>What Spring does for you</h4>
+  <p>In Spring MVC each method has a mapping annotation (<code>@GetMapping</code>, <code>@PostMapping</code>, <code>@PutMapping</code>, <code>@PatchMapping</code>, <code>@DeleteMapping</code>; see <a href="#m2-rest-controller">the mapping annotations article</a>). Two things happen automatically: a <code>GET</code> mapping also answers <code>HEAD</code> (the body is dropped), and <code>OPTIONS</code> on a mapped path returns an <code>Allow</code> header that lists the supported methods.</p>
+  <pre data-title="An automatic OPTIONS answer"><code class="language-shell">$ curl -i -X OPTIONS http://localhost:8080/api/v1/products
+HTTP/1.1 200
+Allow: GET,HEAD,POST,OPTIONS
+Content-Length: 0</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li><code>GET</code>, <code>HEAD</code> and <code>OPTIONS</code> must <strong>never</strong> change data. No "delete" or "cancel" behind a <code>GET</code>.</li>
+      <li><code>PUT</code> and <code>DELETE</code> must be idempotent. Design them so that a retry is harmless.</li>
+      <li>Only <code>GET</code> and <code>HEAD</code> responses are normally cached.</li>
+      <li>A wrong method on a known URL must give <code>405 Method Not Allowed</code> with an <code>Allow</code> header. Spring does this for you (<code>HttpRequestMethodNotSupportedException</code>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>One URL, several methods: <code>/products</code> supports <code>GET</code> and <code>POST</code>; <code>/products/{id}</code> supports <code>GET</code>, <code>PUT</code>, <code>PATCH</code> and <code>DELETE</code>.</li>
+      <li>Prefer <code>PATCH</code> for partial updates and keep <code>PUT</code> for full replacement. If you only offer one update endpoint, <code>PUT</code> with the full body is the simplest and safest.</li>
+      <li>Return the updated resource (<code>200</code>) or nothing (<code>204</code>) from <code>PUT</code>/<code>PATCH</code> — pick one style for the whole API.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>The second <code>DELETE</code> of the same id: return <code>404</code> (honest) or <code>204</code> (idempotent outcome). Both are valid; stay consistent.</li>
+      <li><code>DELETE</code> with a body is allowed but unreliable; some proxies strip it. Put the identifier in the URL.</li>
+      <li>Plain HTML forms can only send <code>GET</code> and <code>POST</code>. That limit does not apply to <code>fetch</code>/<code>axios</code> in a React app.</li>
+      <li>Firewalls and old proxies sometimes block <code>PUT</code>, <code>PATCH</code> and <code>DELETE</code>. If a client behind such a network fails, this is the first thing to check.</li>
+      <li><code>TRACE</code> and <code>CONNECT</code> exist but are not used for APIs; <code>TRACE</code> is normally disabled.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using GET for actions</p>
+    <p>A link, a browser prefetch or a crawler can call any <code>GET</code> URL. If that URL deletes data, the data disappears without anyone clicking "delete".</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: a state change behind GET</p><pre><code class="language-java">@GetMapping("/products/{id}/delete")
+public void delete(@PathVariable Long id) {
+    service.delete(id);
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: DELETE on the resource</p><pre><code class="language-java">@DeleteMapping("/products/{id}")
+@ResponseStatus(HttpStatus.NO_CONTENT)
+public void delete(@PathVariable Long id) {
+    service.delete(id);
+}</code></pre></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "PUT vs PATCH vs POST?" and "Is DELETE idempotent?"</p>
+    <ul>
+      <li>POST creates under a collection and is not idempotent. PUT replaces a whole resource at a known URL and is idempotent. PATCH changes part of a resource and is idempotent only if the change itself is.</li>
+      <li>Safe = read-only (GET, HEAD, OPTIONS). Idempotent = same server state after one or many identical calls (safe methods plus PUT and DELETE).</li>
+      <li>DELETE is idempotent because the end state is the same ("not there") even though the second call may answer 404.</li>
+      <li>Mention retries: idempotency is why clients and gateways can retry PUT and DELETE automatically, and why POST needs an idempotency key for payments.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-http-status-codes">
+  <h3>HTTP status codes and which one to return</h3>
+  <p class="tldr">The first digit of a status code tells the class — 2xx success, 3xx redirect, 4xx client error, 5xx server error — and a good API returns the most specific code so clients can react without reading the body.</p>
+
+  <p>A <strong>status code</strong> is the three-digit number at the start of every response. Clients, browsers, load balancers and monitoring dashboards all make decisions from it alone: retry or not, show an error or not, count it as a failure or not. Returning <code>200</code> for everything and hiding the real outcome in the body breaks all of that.</p>
+
+  <h4>The five classes</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Class</th><th>Meaning</th><th>Who should act</th></tr></thead>
+    <tbody>
+      <tr><td><code>1xx</code></td><td>Informational (for example <code>100 Continue</code>)</td><td>Handled by the HTTP stack; you rarely see them.</td></tr>
+      <tr><td><code>2xx</code></td><td>Success — the request worked</td><td>Nobody; carry on.</td></tr>
+      <tr><td><code>3xx</code></td><td>Redirection — look somewhere else, or use your cached copy</td><td>The client follows the <code>Location</code> header.</td></tr>
+      <tr><td><code>4xx</code></td><td>Client error — the request is wrong</td><td>The caller must fix the request. Retrying the same request will not help (exceptions: <code>408</code>, <code>429</code>).</td></tr>
+      <tr><td><code>5xx</code></td><td>Server error — the server failed</td><td>You must fix it. The client may retry later.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The codes you will actually use</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Code</th><th>Name</th><th>Return it when</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>200</code></td><td>OK</td><td>A read or an update succeeded and you return a body</td><td>Also for an empty search result (with <code>[]</code>)</td></tr>
+      <tr><td><code>201</code></td><td>Created</td><td>A <code>POST</code> created a resource</td><td>Add a <code>Location</code> header; the body is usually the new resource</td></tr>
+      <tr><td><code>202</code></td><td>Accepted</td><td>You accepted the request but processing is not finished (report, email, video encoding)</td><td>Return a status URL the client can poll</td></tr>
+      <tr><td><code>204</code></td><td>No Content</td><td>Success with nothing to return</td><td>Typical for <code>DELETE</code>; must have no body</td></tr>
+      <tr><td><code>301</code> / <code>302</code></td><td>Moved Permanently / Found</td><td>The URL moved for good / temporarily</td><td>Rare in JSON APIs; <code>307</code> and <code>308</code> keep the method</td></tr>
+      <tr><td><code>304</code></td><td>Not Modified</td><td>A conditional <code>GET</code> found the client's cached copy still valid</td><td>No body; see ETag in the headers article</td></tr>
+      <tr><td><code>400</code></td><td>Bad Request</td><td>Malformed JSON, a missing or invalid parameter, a failed validation</td><td>The catch-all for "your request is wrong"</td></tr>
+      <tr><td><code>401</code></td><td>Unauthorized</td><td>The caller is <strong>not authenticated</strong>: no token, bad token, expired token</td><td>Send <code>WWW-Authenticate</code>; the name is historical</td></tr>
+      <tr><td><code>403</code></td><td>Forbidden</td><td>The caller is authenticated but <strong>not allowed</strong> to do this</td><td>Logging in again will not help</td></tr>
+      <tr><td><code>404</code></td><td>Not Found</td><td>The resource does not exist</td><td>Also used to hide that a resource exists</td></tr>
+      <tr><td><code>405</code></td><td>Method Not Allowed</td><td>The URL exists but not for this method</td><td>Send an <code>Allow</code> header</td></tr>
+      <tr><td><code>409</code></td><td>Conflict</td><td>The request clashes with the current state: duplicate unique value, version conflict, resource still in use</td><td>The most useful "business rule failed" code</td></tr>
+      <tr><td><code>415</code></td><td>Unsupported Media Type</td><td>The request body's <code>Content-Type</code> is not supported</td><td>Example: XML sent to a JSON-only endpoint</td></tr>
+      <tr><td><code>422</code></td><td>Unprocessable Content</td><td>The JSON is well-formed but its content breaks a rule</td><td>Alternative to <code>400</code> for validation errors</td></tr>
+      <tr><td><code>429</code></td><td>Too Many Requests</td><td>The caller hit a rate limit</td><td>Send <code>Retry-After</code></td></tr>
+      <tr><td><code>500</code></td><td>Internal Server Error</td><td>An unexpected bug or failure in your code</td><td>Never use it for bad client input</td></tr>
+      <tr><td><code>502</code></td><td>Bad Gateway</td><td>A gateway or proxy got an invalid reply from the service behind it</td><td>Seen from nginx or an API gateway</td></tr>
+      <tr><td><code>503</code></td><td>Service Unavailable</td><td>The server is overloaded, starting up or in maintenance</td><td>Add <code>Retry-After</code> if you can</td></tr>
+      <tr><td><code>504</code></td><td>Gateway Timeout</td><td>A gateway waited too long for the service behind it</td><td>Slow downstream call or database</td></tr>
+    </tbody>
+  </table></div>
+  <p>Also good to know: <code>406 Not Acceptable</code> (the server cannot produce what the <code>Accept</code> header asks for), <code>410 Gone</code> (existed once, removed on purpose), <code>412 Precondition Failed</code> (an <code>If-Match</code> check failed) and <code>413</code> (the upload is too large).</p>
+
+  <h4>Which code for which operation?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operation</th><th>Success</th><th>Typical failures</th></tr></thead>
+    <tbody>
+      <tr><td><code>GET /products</code></td><td><code>200</code> (empty list is still <code>200</code>)</td><td><code>400</code> bad filter, <code>401</code>, <code>403</code></td></tr>
+      <tr><td><code>GET /products/{id}</code></td><td><code>200</code></td><td><code>404</code>, <code>401</code>, <code>403</code></td></tr>
+      <tr><td><code>POST /products</code></td><td><code>201</code> + <code>Location</code></td><td><code>400</code>/<code>422</code> invalid, <code>409</code> duplicate, <code>415</code></td></tr>
+      <tr><td><code>PUT /products/{id}</code></td><td><code>200</code> or <code>204</code></td><td><code>400</code>, <code>404</code>, <code>409</code></td></tr>
+      <tr><td><code>PATCH /products/{id}</code></td><td><code>200</code></td><td><code>400</code>, <code>404</code>, <code>409</code></td></tr>
+      <tr><td><code>DELETE /products/{id}</code></td><td><code>204</code></td><td><code>404</code>, <code>409</code> (still referenced)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Choosing a code: a quick decision path</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  A[Request arrives] --> B{Authenticated?}
+  B -->|No| U[401 Unauthorized]
+  B -->|Yes| C{Allowed to do this?}
+  C -->|No| F[403 Forbidden]
+  C -->|Yes| D{Request valid?}
+  D -->|No| V[400 Bad Request]
+  D -->|Yes| E{Resource exists?}
+  E -->|No| N[404 Not Found]
+  E -->|Yes| G{Clashes with current state?}
+  G -->|Yes| K[409 Conflict]
+  G -->|No| S[2xx Success]
+</pre>
+    <figcaption>A typical order of checks for an update request: the first check that fails decides the status code</figcaption>
+  </figure>
+  <p>In Spring the order is slightly different in one place: the request body is validated <em>before</em> your method runs. So a bad body sent to a missing id gives <code>400</code>, not <code>404</code>.</p>
+
+  <h4>401 vs 403</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>401 Unauthorized</th><th>403 Forbidden</th></tr></thead>
+    <tbody>
+      <tr><td>Real meaning</td><td>I do not know who you are (unauthenticated)</td><td>I know who you are, and you may not do this</td></tr>
+      <tr><td>Example</td><td>No <code>Authorization</code> header, or an expired JWT</td><td>A normal user calls <code>DELETE /users/7</code>, which needs the ADMIN role</td></tr>
+      <tr><td>Client reaction</td><td>Log in (again) and retry</td><td>Show "access denied"; do not retry</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>400 vs 422 for validation errors</h4>
+  <p>Both are used in real APIs. <code>400</code> means "I cannot understand or accept this request" and is what Spring returns by default for malformed JSON and failed <code>@Valid</code> checks. <code>422</code> means "I understood the JSON, but the values break rules". Pick one for validation, document it, and use it everywhere. These notes use <code>400</code> because it is Spring's default.</p>
+
+  <h4>How Spring maps its own exceptions</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Exception</th><th>Status</th><th>Caused by</th></tr></thead>
+    <tbody>
+      <tr><td><code>HttpMessageNotReadableException</code></td><td>400</td><td>Missing body, malformed JSON, wrong field type</td></tr>
+      <tr><td><code>MethodArgumentNotValidException</code></td><td>400</td><td><code>@Valid</code> on a request body failed</td></tr>
+      <tr><td><code>MissingServletRequestParameterException</code></td><td>400</td><td>A required <code>@RequestParam</code> is absent</td></tr>
+      <tr><td><code>MethodArgumentTypeMismatchException</code></td><td>400</td><td><code>/products/abc</code> where a number is expected</td></tr>
+      <tr><td><code>NoResourceFoundException</code></td><td>404</td><td>No controller and no static file matches (Spring 6.1+, Boot 3.2+)</td></tr>
+      <tr><td><code>HttpRequestMethodNotSupportedException</code></td><td>405</td><td>Wrong method for a known path</td></tr>
+      <tr><td><code>HttpMediaTypeNotAcceptableException</code></td><td>406</td><td>The <code>Accept</code> header cannot be satisfied</td></tr>
+      <tr><td><code>HttpMediaTypeNotSupportedException</code></td><td>415</td><td>Unsupported <code>Content-Type</code> on the request</td></tr>
+      <tr><td>any uncaught exception</td><td>500</td><td>A bug in your code</td></tr>
+    </tbody>
+  </table></div>
+  <p>In your own code, pick codes with the <code>HttpStatus</code> enum (<code>HttpStatus.CREATED</code>) or by number (<code>ResponseEntity.status(409)</code>). Spring 6 also has the <code>HttpStatusCode</code> interface, which covers any number, including codes that are not in the enum.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>A <code>201</code> response should carry a <code>Location</code> header; a <code>204</code> response must not have a body.</li>
+      <li>A <code>401</code> response should carry <code>WWW-Authenticate</code>; a <code>405</code> response must carry <code>Allow</code>.</li>
+      <li>The error body must match the status. Never send <code>200</code> with <code>{"error": ...}</code>.</li>
+      <li>4xx means "the caller can fix it"; 5xx means "we have a bug or an outage". Use them honestly so monitoring works.</li>
+    </ul>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>An empty collection is <code>200</code> with <code>[]</code>, not <code>404</code>. The collection exists; it is just empty.</li>
+      <li>To hide that something exists (another user's order), answer <code>404</code> instead of <code>403</code>.</li>
+      <li>Use <code>409</code> for business-rule clashes (duplicate SKU, insufficient stock), and put the explanation in the error body.</li>
+      <li>Return a consistent error body for every 4xx and 5xx (the <code>ProblemDetail</code> articles in this module).</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A search with no matches is <code>200</code> and <code>[]</code>, but <code>GET /products/9999</code> for a missing id is <code>404</code>.</li>
+      <li>Redirects (<code>301</code>, <code>302</code>) may change a <code>POST</code> into a <code>GET</code> in some clients. <code>307</code> and <code>308</code> keep the method and body.</li>
+      <li>Behind a gateway, <code>502</code>, <code>503</code> and <code>504</code> usually come from the gateway, not from your Spring app. Check the gateway logs first.</li>
+      <li>If an exception is thrown after the response has started streaming, the status is already sent and cannot change.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: success status with an error inside</p>
+    <p>Clients, caches and dashboards read the status code first. A <code>200</code> that contains <code>"success": false</code> looks like a success everywhere except in your own front-end code.</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: HTTP 200 for a missing product</p><pre><code class="language-java">@GetMapping("/{id}")
+public Map&lt;String, Object&gt; get(@PathVariable Long id) {
+    Optional&lt;Product&gt; product = repository.findById(id);
+    if (product.isEmpty()) {
+        return Map.of("success", false, "message", "Product not found");
+    }
+    return Map.of("success", true, "data", product.get());
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: throw, and let the handler answer 404</p><pre><code class="language-java">@GetMapping("/{id}")
+public ProductResponse get(@PathVariable Long id) {
+    // throws ResourceNotFoundException, which the global
+    // handler turns into a 404 response
+    return service.findById(id);
+}</code></pre></div>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "401 vs 403? 200 vs 201 vs 204? When 409?"</p>
+    <ul>
+      <li>401 = not authenticated (no or bad credentials). 403 = authenticated but not authorised.</li>
+      <li>200 = success with a body, 201 = something was created (with <code>Location</code>), 204 = success with no body.</li>
+      <li>409 = the request conflicts with the current state: a duplicate email, an optimistic-locking version clash, deleting a record that others still use.</li>
+      <li>400 = malformed or invalid input; 422 = well-formed but semantically invalid; 404 = no such resource; 405 = wrong method; 415 = wrong <code>Content-Type</code>.</li>
+      <li>502, 503 and 504 are gateway-side failures: bad reply, unavailable, and timeout. 500 is an unexpected bug in the service itself.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-http-headers">
+  <h3>HTTP headers that matter for APIs</h3>
+  <p class="tldr">Headers are name–value metadata on a request or response; <code>Content-Type</code>, <code>Accept</code>, <code>Authorization</code>, <code>Location</code>, <code>Cache-Control</code> and <code>ETag</code> do most of the work in a REST API.</p>
+
+  <p>A <strong>header</strong> is one line of the form <code>Name: value</code> placed before the body. Headers carry information <em>about</em> the message: what format the body is in, who is calling, how long the answer may be cached. Your JSON stays clean because this extra information travels beside it.</p>
+
+  <h4>The headers you will meet every day</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Header</th><th>Sent in</th><th>Meaning</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>Content-Type</code></td><td>Request and response</td><td>The format of the <em>body being sent</em></td><td><code>application/json</code></td></tr>
+      <tr><td><code>Accept</code></td><td>Request</td><td>The formats the client is willing to <em>receive</em></td><td><code>application/json</code></td></tr>
+      <tr><td><code>Authorization</code></td><td>Request</td><td>Credentials for the caller</td><td><code>Bearer eyJhbGciOi…</code></td></tr>
+      <tr><td><code>Location</code></td><td>Response</td><td>URL of the newly created resource (<code>201</code>) or the redirect target (<code>3xx</code>)</td><td><code>/api/v1/products/42</code></td></tr>
+      <tr><td><code>Cache-Control</code></td><td>Response (and request)</td><td>Rules for storing and reusing the response</td><td><code>max-age=60</code></td></tr>
+      <tr><td><code>ETag</code></td><td>Response</td><td>A version label for the representation</td><td><code>"3"</code></td></tr>
+      <tr><td><code>If-None-Match</code></td><td>Request</td><td>"Send the body only if the ETag changed"</td><td><code>"3"</code></td></tr>
+      <tr><td><code>If-Match</code></td><td>Request</td><td>"Apply my update only if the ETag still matches"</td><td><code>"3"</code></td></tr>
+      <tr><td><code>Allow</code></td><td>Response</td><td>Methods the URL supports (sent with <code>405</code>)</td><td><code>GET, POST</code></td></tr>
+      <tr><td><code>WWW-Authenticate</code></td><td>Response</td><td>How to authenticate (sent with <code>401</code>)</td><td><code>Bearer</code></td></tr>
+      <tr><td><code>Retry-After</code></td><td>Response</td><td>When to retry (sent with <code>429</code>/<code>503</code>)</td><td><code>30</code> (seconds)</td></tr>
+      <tr><td><code>Origin</code></td><td>Request</td><td>The website that started a browser call (CORS)</td><td><code>http://localhost:5173</code></td></tr>
+      <tr><td><code>X-Request-Id</code></td><td>Both</td><td>A correlation id to trace one request across services</td><td><code>b4f1c2…</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Header <em>names</em> are case-insensitive. You can invent custom headers; the old habit of prefixing them with <code>X-</code> is discouraged for new ones, but <code>X-Request-Id</code> and similar names are everywhere. Use hyphens, not underscores: nginx drops headers with underscores by default.</p>
+
+  <h4>Content-Type vs Accept</h4>
+  <p>These two are confused all the time. <code>Content-Type</code> describes the data <strong>I am sending</strong>. <code>Accept</code> describes the data <strong>I want back</strong>.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Header</th><th>Direction</th><th>If it is wrong, Spring answers…</th></tr></thead>
+    <tbody>
+      <tr><td><code>Content-Type</code> on the request</td><td>Describes the request body</td><td><code>415 Unsupported Media Type</code> when no converter can read that type</td></tr>
+      <tr><td><code>Accept</code> on the request</td><td>Asks for a response format</td><td><code>406 Not Acceptable</code> when no converter can produce it</td></tr>
+      <tr><td><code>Content-Type</code> on the response</td><td>Describes the response body</td><td>Set by Spring from the converter it used</td></tr>
+    </tbody>
+  </table></div>
+  <p>A very common surprise: <code>curl -d '{"name":"x"}'</code> sends <code>Content-Type: application/x-www-form-urlencoded</code> by default, so your JSON endpoint answers <code>415</code>. Always add <code>-H "Content-Type: application/json"</code>, or use <code>curl --json '…'</code> (curl 7.82 and newer), which sets both <code>Content-Type</code> and <code>Accept</code> for you.</p>
+
+  <h4>Authorization</h4>
+  <p>The caller proves who it is with <code>Authorization: &lt;scheme&gt; &lt;credentials&gt;</code>. Two schemes matter. <strong>Basic</strong> sends <code>username:password</code> encoded in Base64 — encoded, <em>not</em> encrypted, so it is only acceptable over HTTPS. <strong>Bearer</strong> sends a token, usually a JWT: <code>Authorization: Bearer eyJhbGciOi…</code>. "Bearer" means whoever holds the token is let in, so treat tokens like passwords. <a href="#m4">Module 4</a> builds the JWT flow. Never send credentials in the URL.</p>
+
+  <h4>Caching with Cache-Control</h4>
+  <p><code>Cache-Control</code> tells browsers and proxies whether and how long they may reuse a response.</p>
+  <ul>
+    <li><code>max-age=60</code> — the response is fresh for 60 seconds; reuse it without asking the server.</li>
+    <li><code>no-cache</code> — you may store it, but you <strong>must revalidate</strong> with the server before every reuse.</li>
+    <li><code>no-store</code> — do not store it at all. Use it for sensitive data such as account details.</li>
+    <li><code>public</code> / <code>private</code> — shared caches (CDNs) may store it / only the user's own browser may.</li>
+  </ul>
+
+  <h4>ETag and conditional requests</h4>
+  <p>An <strong>ETag</strong> is a label for one version of a representation, such as a hash or a version number. The client stores it and sends it back, and the server can reply "nothing changed" instead of resending the body.</p>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: GET /products/1
+  S-->>C: 200 OK + ETag "3" + body
+  Note over C: client stores body and ETag
+  C->>S: GET /products/1 with If-None-Match "3"
+  S-->>C: 304 Not Modified (no body)
+</pre>
+    <figcaption>Conditional GET: the second answer is tiny because the body is not sent again</figcaption>
+  </figure>
+  <pre data-title="ProductController.java (fragment)"><code class="language-java">@GetMapping("/{id}")
+public ResponseEntity&lt;ProductResponse&gt; get(@PathVariable Long id) {
+    ProductResponse product = service.findById(id);
+    return ResponseEntity.ok()
+            .eTag(String.valueOf(product.version()))   // quotes are added for you
+            .cacheControl(CacheControl.maxAge(Duration.ofSeconds(60)).cachePublic())
+            .body(product);
+}</code></pre>
+  <pre data-title="Second request and its answer"><code class="language-http">GET /api/v1/products/1 HTTP/1.1
+Host: localhost:8080
+If-None-Match: "3"
+
+HTTP/1.1 304
+ETag: "3"
+Cache-Control: max-age=60, public</code></pre>
+  <p>When a <code>ResponseEntity</code> carries an ETag and the request has a matching <code>If-None-Match</code>, Spring turns the reply into <code>304</code> for you. If you do not want to compute ETags yourself, register Spring's <code>ShallowEtagHeaderFilter</code>: it hashes each response body and adds the ETag. It saves bandwidth, not server work, because the handler still runs.</p>
+  <p><code>If-Match</code> solves a different problem: the <strong>lost update</strong>. Two users load product 1 (ETag <code>"3"</code>). User A saves; the ETag becomes <code>"4"</code>. User B then sends <code>PUT</code> with <code>If-Match: "3"</code>, the server sees the mismatch and answers <code>412 Precondition Failed</code> instead of silently overwriting A's change. In a JPA application the ETag is usually the <code>@Version</code> column (<a href="#m3">Module 3</a>).</p>
+
+  <h4>Reading and setting headers in Spring</h4>
+  <ul>
+    <li><strong>Read</strong> a header with <code>@RequestHeader</code> (details in <a href="#m2-body-header-status">the request body and headers article</a>).</li>
+    <li><strong>Set</strong> response headers with <code>ResponseEntity</code> builders (<a href="#m2-response-entity">the ResponseEntity article</a>), with <code>HttpHeaders</code>, or on the <code>HttpServletResponse</code> parameter.</li>
+    <li><strong>CORS</strong> headers (<code>Origin</code>, <code>Access-Control-Allow-Origin</code>, …) are covered in <a href="#m2-negotiation-cors">the CORS article</a>; Spring Security also adds protective headers such as <code>X-Content-Type-Options</code> (<a href="#m4">Module 4</a>).</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Send <code>Content-Type: application/json</code> whenever the request has a JSON body.</li>
+      <li>Every <code>201 Created</code> response needs a <code>Location</code> header; every <code>405</code> needs <code>Allow</code>.</li>
+      <li>Never put tokens or passwords in URLs; use <code>Authorization</code>.</li>
+      <li>Weak validators, <code>W/"abc"</code>, mean "semantically the same"; strong ones mean "byte-for-byte the same". <code>If-Match</code> needs strong ETags.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Some headers repeat or hold a comma-separated list (<code>Accept: application/json, text/plain;q=0.5</code>). The <code>q</code> value is a preference weight from 0 to 1.</li>
+      <li>Oversized headers (huge cookies or tokens) can be rejected by Tomcat or a proxy with a <code>400</code> or <code>431</code> before your code runs.</li>
+      <li>Behind a reverse proxy, the original client IP and scheme arrive in <code>X-Forwarded-For</code> and <code>X-Forwarded-Proto</code>. Without <code>server.forward-headers-strategy</code> set, Spring may build wrong absolute URLs (for example in <code>Location</code>).</li>
+      <li>Browsers hide most response headers from JavaScript on cross-origin calls unless the server lists them in <code>Access-Control-Expose-Headers</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: forgetting Content-Type on a JSON POST</p>
+    <p>Without <code>Content-Type: application/json</code> your <code>@RequestBody</code> endpoint cannot choose a converter and returns <code>415</code>. Testing tools set the header for you only if you pick "JSON" as the body type.</p>
+  </div>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: curl sends a form content type</p><pre><code class="language-shell">$ curl -i -X POST http://localhost:8080/api/v1/products \
+    -d '{"name":"Mouse"}'
+HTTP/1.1 415</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: declare the body as JSON</p><pre><code class="language-shell">$ curl -i -X POST http://localhost:8080/api/v1/products \
+    -H "Content-Type: application/json" \
+    -d '{"name":"Mouse"}'</code></pre></div>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>In a typical service you read <code>Authorization</code> in Spring Security (not by hand), add a <code>X-Request-Id</code> or <code>traceparent</code> header in a filter so logs from several services line up, set <code>Cache-Control: no-store</code> on anything personal, and add ETags only to read-heavy endpoints that really benefit, such as product details or reference data.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Content-Type vs Accept? How does ETag caching work? no-cache vs no-store?"</p>
+    <ul>
+      <li><code>Content-Type</code> labels the body you send; <code>Accept</code> lists the formats you want back. Wrong values give 415 and 406.</li>
+      <li>ETag: the server labels a version; the client sends it back in <code>If-None-Match</code>; if unchanged, the server returns <code>304</code> with no body. With <code>If-Match</code> the same label protects updates from lost writes (<code>412</code>).</li>
+      <li><code>no-cache</code> means "revalidate before reuse"; <code>no-store</code> means "never keep a copy".</li>
+      <li>Tokens go in <code>Authorization: Bearer …</code>, never in the URL. Basic auth is only Base64, not encryption.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,831 @@
+<article class="topic" id="m3-try-catch-finally">
+  <h3>try, catch and finally: rules and flow</h3>
+  <p class="tldr">Put the code that can fail in try, handle specific failures in catch blocks ordered
+  from most specific to most general, and put cleanup that must always happen in finally.</p>
+
+  <p>A <strong>try statement</strong> marks a region of code whose exceptions you want to deal with. A
+  <strong>catch block</strong> (also called a handler) says which exception types you handle and how.
+  A <strong>finally block</strong> holds code that must run whether the try block succeeded or failed —
+  releasing a lock, closing a resource, clearing a thread-local value.</p>
+
+<pre data-title="The full shape"><code class="language-java">try {
+    // code that may throw
+} catch (NoSuchFileException e) {          // most specific first
+    // handle a missing file
+} catch (IOException e) {                  // then more general
+    // handle any other I/O problem
+} finally {
+    // always runs: cleanup
+}</code></pre>
+
+  <h4>Structure rules</h4>
+  <ul>
+    <li>A <code>try</code> needs at least one <code>catch</code> or a <code>finally</code> (or resource
+    declarations — see <a href="#m3-try-with-resources">try-with-resources</a>). A bare
+    <code>try { }</code> fails with <em>'try' without 'catch', 'finally' or resource
+    declarations</em>.</li>
+    <li>You may have any number of catch blocks and at most one finally block, which comes last.</li>
+    <li>At most <strong>one</strong> catch block runs: the first one, from top to bottom, whose type
+    matches the exception (the exception is an instance of that type).</li>
+    <li>Variables declared inside the try block are not visible in catch or finally. If finally needs
+    a variable, declare it before the try.</li>
+    <li>The catch parameter (<code>e</code>) exists only inside its own catch block.</li>
+  </ul>
+
+  <h4>The four possible paths</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>What happens in try</th><th>Then</th><th>After the statement</th></tr></thead>
+    <tbody>
+      <tr><td>No exception</td><td>All catch blocks are skipped; finally runs</td><td>Execution
+      continues normally</td></tr>
+      <tr><td>Exception, and a catch matches</td><td>The rest of try is skipped; that catch runs;
+      finally runs</td><td>Execution continues normally</td></tr>
+      <tr><td>Exception, no catch matches</td><td>The rest of try is skipped; finally runs</td><td>The
+      exception propagates to the caller</td></tr>
+      <tr><td>A catch block itself throws</td><td>finally runs</td><td>The new exception propagates to
+      the caller</td></tr>
+    </tbody>
+  </table></div>
+
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  T[Run the try block] --> Q{"Exception thrown?"}
+  Q -->|No| F[Run finally]
+  Q -->|Yes| M{"Does a catch match?"}
+  M -->|Yes| C[Run that catch block]
+  C --> F
+  M -->|No| F2[Run finally]
+  F --> N[Continue after the try statement]
+  F2 --> P[Exception propagates to the caller]
+</pre>
+    <figcaption>Control flow through try, catch and finally</figcaption>
+  </figure>
+
+  <h4>Example: all three main paths</h4>
+<pre data-title="TryCatchFlow.java"><code class="language-java">public class TryCatchFlow {
+    public static void main(String[] args) {
+        System.out.println("Result: " + parseQuantity("3"));
+        System.out.println("Result: " + parseQuantity("three"));
+        try {
+            System.out.println("Result: " + parseQuantity(null));
+        } catch (NullPointerException e) {
+            System.out.println("main caught: " + e.getClass().getSimpleName());
+        }
+    }
+
+    static int parseQuantity(String input) {
+        System.out.println("-- parsing " + input);
+        try {
+            int quantity = Integer.parseInt(input.trim());   // NPE if input is null
+            System.out.println("try: parsed");
+            return quantity;
+        } catch (NumberFormatException e) {
+            System.out.println("catch: not a number, using 1");
+            return 1;
+        } finally {
+            System.out.println("finally: runs every time");
+        }
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">-- parsing 3
+try: parsed
+finally: runs every time
+Result: 3
+-- parsing three
+catch: not a number, using 1
+finally: runs every time
+Result: 1
+-- parsing null
+finally: runs every time
+main caught: NullPointerException</code></pre>
+  <p>Three things to notice. First, <code>finally</code> runs even though the try and catch blocks
+  execute <code>return</code> — it runs <em>before</em> the method actually returns. Second, with
+  <code>"three"</code> the line <code>try: parsed</code> is skipped, because the exception jumped
+  straight to the catch. Third, with <code>null</code> the exception is a
+  <code>NullPointerException</code>, which the catch block does not match, so finally runs and the
+  exception travels on to <code>main</code>.</p>
+
+  <h4>Catch order: specific before general</h4>
+  <p>Because the first matching catch wins, a general type placed first would catch everything and the
+  specific block below it could never run. Java treats that unreachable handler as a compile
+  error.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: general first — does not compile</p><pre><code class="language-java">try {
+    Files.readString(Path.of("a.txt"));
+} catch (IOException e) {
+    System.out.println("I/O problem");
+} catch (NoSuchFileException e) {   // error: exception
+    System.out.println("missing");  // NoSuchFileException has
+}                                   // already been caught</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: subclass first, superclass last</p><pre><code class="language-java">try {
+    Files.readString(Path.of("a.txt"));
+} catch (NoSuchFileException e) {
+    System.out.println("missing");
+} catch (IOException e) {
+    System.out.println("I/O problem");
+}</code></pre></div>
+  </div>
+  <p>The order only matters between types that are related by inheritance. Unrelated types, such as
+  <code>NumberFormatException</code> and <code>IOException</code>, can appear in any order.</p>
+
+  <h4>Multi-catch (Java 7+)</h4>
+  <p>When two exceptions need the same handling, list them in one catch with <code>|</code> instead
+  of copying the block.</p>
+<pre data-title="MultiOk.java"><code class="language-java">public class MultiOk {
+    public static void main(String[] args) {
+        for (String s : new String[] {"4", "zero", "0"}) {
+            try {
+                System.out.println("100 / " + s + " = " + 100 / Integer.parseInt(s));
+            } catch (NumberFormatException | ArithmeticException e) {
+                System.out.println("Cannot divide by '" + s + "': " + e);
+            }
+        }
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">100 / 4 = 25
+Cannot divide by 'zero': java.lang.NumberFormatException: For input string: "zero"
+Cannot divide by '0': java.lang.ArithmeticException: / by zero</code></pre>
+  <div class="co co-rule">
+    <p class="co-t">Rules of multi-catch</p>
+    <ul>
+      <li>The parameter is implicitly <code>final</code>. Assigning to it fails with <em>multi-catch
+      parameter e may not be assigned</em>.</li>
+      <li>The alternatives cannot be subclasses of each other. <code>catch (IOException |
+      NoSuchFileException e)</code> fails with <em>Alternatives in a multi-catch statement cannot be
+      related by subclassing</em> — just catch <code>IOException</code>.</li>
+      <li>Inside the block, you can only use methods of the closest common supertype of the
+      alternatives (here <code>RuntimeException</code>), because <code>e</code> could be either
+      type.</li>
+    </ul>
+  </div>
+
+  <h4>Nested try</h4>
+  <p>A try statement can sit inside a try, catch or finally block. An exception that the inner
+  statement does not catch moves outwards to the outer one.</p>
+<pre data-title="Nested try"><code class="language-java">static int readQuantity(Path file) {
+    try {
+        String text = Files.readString(file).strip();
+        try {
+            return Integer.parseInt(text);
+        } catch (NumberFormatException e) {          // inner: bad content
+            System.out.println("Not a number in " + file + ": " + text);
+            return 0;
+        }
+    } catch (IOException e) {                        // outer: cannot read the file
+        System.out.println("Cannot read " + file + ": " + e);
+        return 0;
+    }
+}</code></pre>
+<pre class="out" data-title="Output for qty.txt (12), bad.txt (twelve) and a missing file"><code class="language-plaintext">12
+Not a number in bad.txt: twelve
+0
+Cannot read missing.txt: java.nio.file.NoSuchFileException: missing.txt
+0</code></pre>
+  <p>Nested try blocks work, but they are hard to read. Usually it is cleaner to move the inner part
+  into its own method, such as <code>parseOrZero(String text)</code>, and call it from a single try
+  statement.</p>
+
+  <h4>finally: when it runs, and when it does not</h4>
+  <p>The finally block runs when the try block completes normally, when it throws (caught or not),
+  and when try or catch leave early with <code>return</code>, <code>break</code> or
+  <code>continue</code>. That is why it is the place for cleanup. The classic example is releasing a
+  lock:</p>
+<pre data-title="The lock idiom"><code class="language-java">private final ReentrantLock lock = new ReentrantLock();
+
+public void transfer(Account from, Account to, BigDecimal amount) {
+    lock.lock();              // acquire BEFORE the try
+    try {
+        from.withdraw(amount);
+        to.deposit(amount);
+    } finally {
+        lock.unlock();        // released even if withdraw() throws
+    }
+}</code></pre>
+  <p><code>Lock</code> does not implement <code>AutoCloseable</code>, so try-with-resources cannot
+  help here — this try/finally idiom is still the standard way.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions: when finally does NOT run</p>
+    <ul>
+      <li><code>System.exit()</code> (or <code>Runtime.halt()</code>) is called inside try or catch.
+      The JVM starts shutting down and the rest of the thread's code, including finally, never
+      runs.</li>
+      <li>The JVM process dies: a native crash, <code>kill -9</code>, a power cut, the container
+      being killed.</li>
+      <li>The try block never finishes: an infinite loop or a thread stuck forever in a deadlock.</li>
+      <li>The code runs in a <strong>daemon thread</strong> and the JVM exits because all non-daemon
+      threads have finished. Daemon threads are abandoned; their finally blocks do not run.</li>
+    </ul>
+  </div>
+<pre data-title="ExitFinally.java"><code class="language-java">public class ExitFinally {
+    public static void main(String[] args) {
+        try {
+            System.out.println("try");
+            System.exit(0);
+        } finally {
+            System.out.println("finally");     // never printed
+        }
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">try</code></pre>
+  <p>Shutdown hooks registered with <code>Runtime.getRuntime().addShutdownHook(...)</code> do run on
+  <code>System.exit()</code>; finally blocks of the exiting thread do not.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: an exception thrown from finally hides the original</p>
+    <p>If the try block throws exception A and the finally block then throws exception B, the caller
+    sees only B — A is lost completely. This happens easily when finally calls
+    <code>close()</code> on a resource that also fails. Use try-with-resources, which keeps the close
+    failure as a <em>suppressed</em> exception instead. A <code>return</code> in finally is even worse:
+    it discards the exception silently (see <a href="#m3-finally-puzzles">the puzzles</a>).</p>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Keep try blocks small: wrap only the statements that can throw what you catch, so it is clear
+      what failed.</li>
+      <li>Catch the most specific type you can handle; let the rest propagate.</li>
+      <li>Use try-with-resources for anything closeable; use finally for other cleanup (locks,
+      resetting state, clearing logging context).</li>
+      <li>Never leave a catch block empty. If ignoring really is correct, write a comment saying why
+      and name the variable <code>ignored</code> (Java 22+ also lets you write
+      <code>catch (IOException _)</code> with an unnamed variable).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: quick-fire questions on try/catch/finally</p>
+    <ul>
+      <li><em>Can we have try without catch?</em> Yes: try-finally, or try-with-resources.</li>
+      <li><em>Can more than one catch block run?</em> No — only the first matching one.</li>
+      <li><em>Why must subclasses be caught first?</em> The superclass handler would catch them first,
+      making the subclass handler unreachable — a compile error.</li>
+      <li><em>Does finally run if try has a return?</em> Yes, before the method returns.</li>
+      <li><em>When does finally not run?</em> <code>System.exit()</code>, JVM crash/kill, a try block
+      that never ends, daemon threads at JVM exit.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m3-finally-puzzles">
+  <h3>finally and return: output-prediction puzzles</h3>
+  <p class="tldr">The return value is saved before finally runs, so finally can change a returned
+  object's contents but not a returned primitive or the returned reference; and a return or throw
+  inside finally overrides everything, including a pending exception.</p>
+
+  <p>Interviewers love finally puzzles because they test whether you really understand the order of
+  execution. They all become easy once you know how the compiler implements finally.</p>
+
+  <h4>How javac implements finally</h4>
+  <p>There is no "finally" instruction in bytecode. The compiler <strong>copies the finally code into
+  every exit path</strong> of the try and catch blocks: the normal exit, each <code>return</code>, and
+  an extra hidden handler that catches any <code>Throwable</code>, runs the finally code, and rethrows.
+  For a <code>return expr;</code> the compiler first evaluates <code>expr</code> and stores the result in
+  a hidden local variable, then runs the finally code, then returns the stored value.</p>
+<pre data-title="Source"><code class="language-java">static int puzzle2() {
+    int x = 10;
+    try {
+        return x;
+    } finally {
+        x = 20;
+    }
+}</code></pre>
+<pre class="out" data-title="javap -c (JDK 25), with comments added"><code class="language-plaintext"> 0: bipush 10
+ 2: istore_0      // x = 10
+ 3: iload_0
+ 4: istore_1      // hidden slot 1 = x   (the return value is saved here)
+ 5: bipush 20
+ 7: istore_0      // finally code: x = 20
+ 8: iload_1
+ 9: ireturn       // return the SAVED value: 10
+10: astore_2      // hidden catch-any handler: save the exception
+11: bipush 20
+13: istore_0      // finally code copied again
+14: aload_2
+15: athrow        // rethrow the saved exception</code></pre>
+  <p>With that picture in mind, each puzzle below is mechanical: evaluate the return expression, save
+  it, run finally, then return the saved value — unless finally itself returns or throws. Try each
+  one before opening the answer.</p>
+
+  <h4>Puzzle 1: return inside try</h4>
+<pre><code class="language-java">static int puzzle1() {
+    try {
+        System.out.println("try");
+        return 1;
+    } finally {
+        System.out.println("finally");
+    }
+}
+// main: System.out.println("P1 -&gt; " + puzzle1());</code></pre>
+  <details class="qa">
+    <summary>What does it print?</summary>
+    <div class="qa-a">
+<pre class="out"><code class="language-plaintext">try
+finally
+P1 -&gt; 1</code></pre>
+      <p>finally runs before the method returns, so "finally" is printed before <code>main</code>
+      receives the value 1 and prints it.</p>
+    </div>
+  </details>
+
+  <h4>Puzzle 2: changing a primitive in finally</h4>
+<pre><code class="language-java">static int puzzle2() {
+    int x = 10;
+    try {
+        return x;
+    } finally {
+        x = 20;
+    }
+}</code></pre>
+  <details class="qa">
+    <summary>Does it return 10 or 20?</summary>
+    <div class="qa-a">
+      <p><strong>10.</strong> The value of <code>x</code> was copied into the hidden slot when
+      <code>return x</code> ran. Changing <code>x</code> afterwards does not change the copy (see the
+      bytecode above).</p>
+    </div>
+  </details>
+
+  <h4>Puzzle 3: changing an object in finally</h4>
+<pre><code class="language-java">static StringBuilder puzzle3() {
+    StringBuilder sb = new StringBuilder("Hello");
+    try {
+        return sb;
+    } finally {
+        sb.append(" World");
+        sb = null;
+    }
+}
+// main: System.out.println("P3 -&gt; " + puzzle3());</code></pre>
+  <details class="qa">
+    <summary>Does it print "Hello", "Hello World" or "null"?</summary>
+    <div class="qa-a">
+<pre class="out"><code class="language-plaintext">P3 -&gt; Hello World</code></pre>
+      <p>The saved return value is a <em>copy of the reference</em>, which still points to the same
+      <code>StringBuilder</code> object. <code>append</code> changes that object, so the caller sees
+      "Hello World". <code>sb = null</code> changes only the local variable, not the saved copy, so
+      the method does not return null. Same rule as Java's pass-by-value for references.</p>
+    </div>
+  </details>
+
+  <h4>Puzzle 4: return in both try and finally</h4>
+<pre><code class="language-java">static int puzzle4() {
+    try {
+        return 1;
+    } finally {
+        return 2;
+    }
+}</code></pre>
+  <details class="qa">
+    <summary>What is returned?</summary>
+    <div class="qa-a">
+      <p><strong>2.</strong> The try block saves 1 and runs finally, but finally executes its own
+      <code>return 2</code>, which completes the method. The saved 1 is thrown away. Compiling with
+      <code>javac -Xlint:finally</code> warns: <em>finally clause cannot complete normally</em>.</p>
+    </div>
+  </details>
+
+  <h4>Puzzle 5: an exception and a return in finally</h4>
+<pre><code class="language-java">static int puzzle5() {
+    try {
+        throw new IllegalStateException("boom");
+    } finally {
+        return 42;
+    }
+}
+// main: System.out.println("P5 -&gt; " + puzzle5());</code></pre>
+  <details class="qa">
+    <summary>Does main see the exception?</summary>
+    <div class="qa-a">
+<pre class="out"><code class="language-plaintext">P5 -&gt; 42</code></pre>
+      <p><strong>No.</strong> The hidden catch-any handler saves the exception and runs the finally
+      code — but that code returns, so the <code>athrow</code> that would rethrow the exception is
+      never reached. The exception is <em>silently swallowed</em>: no log, no stack trace. This is the
+      main reason for the rule "never return from finally".</p>
+    </div>
+  </details>
+
+  <h4>Puzzle 6: three exceptions</h4>
+<pre><code class="language-java">static void puzzle6() {
+    try {
+        throw new IllegalStateException("from try");
+    } catch (IllegalStateException e) {
+        throw new IllegalArgumentException("from catch");
+    } finally {
+        throw new UnsupportedOperationException("from finally");
+    }
+}
+// main: try { puzzle6(); } catch (RuntimeException e) { System.out.println("P6 -&gt; " + e); }</code></pre>
+  <details class="qa">
+    <summary>Which exception reaches main?</summary>
+    <div class="qa-a">
+<pre class="out"><code class="language-plaintext">P6 -&gt; java.lang.UnsupportedOperationException: from finally</code></pre>
+      <p>The try exception is caught. The catch block throws a new exception, so finally runs before it
+      can leave. finally throws a third exception, which replaces the pending one. Only the last one
+      escapes; the other two are lost (not even attached as suppressed).</p>
+    </div>
+  </details>
+
+  <h4>Puzzle 7: finally inside a loop</h4>
+<pre><code class="language-java">static void puzzle7() {
+    for (int i = 1; i &lt;= 3; i++) {
+        try {
+            if (i == 2) continue;
+            if (i == 3) break;
+            System.out.println("body " + i);
+        } finally {
+            System.out.println("finally " + i);
+        }
+    }
+    System.out.println("after loop");
+}</code></pre>
+  <details class="qa">
+    <summary>What does it print?</summary>
+    <div class="qa-a">
+<pre class="out"><code class="language-plaintext">body 1
+finally 1
+finally 2
+finally 3
+after loop</code></pre>
+      <p><code>continue</code> and <code>break</code> leave the try block, so finally runs on each
+      exit: for <code>i = 2</code> before continuing, for <code>i = 3</code> before breaking out of the
+      loop.</p>
+    </div>
+  </details>
+
+  <h4>Puzzle 8: return from catch</h4>
+<pre><code class="language-java">static String puzzle8() {
+    try {
+        Integer.parseInt("x");
+        return "try";
+    } catch (NumberFormatException e) {
+        return "catch";
+    } finally {
+        System.out.println("finally runs first");
+    }
+}
+// main: System.out.println("P8 -&gt; " + puzzle8());</code></pre>
+  <details class="qa">
+    <summary>What does it print?</summary>
+    <div class="qa-a">
+<pre class="out"><code class="language-plaintext">finally runs first
+P8 -&gt; catch</code></pre>
+      <p>The exception skips <code>return "try"</code>. The catch block saves <code>"catch"</code> as
+      the return value, finally prints its line, and then the saved value is returned.</p>
+    </div>
+  </details>
+
+  <h4>Puzzle 9: side effects on a field</h4>
+<pre><code class="language-java">static int counter = 0;
+
+static int puzzle9() {
+    try {
+        return ++counter;
+    } finally {
+        counter += 10;
+    }
+}
+// main: System.out.println("P9 -&gt; " + puzzle9() + ", counter = " + counter);</code></pre>
+  <details class="qa">
+    <summary>What are the returned value and the final counter?</summary>
+    <div class="qa-a">
+<pre class="out"><code class="language-plaintext">P9 -&gt; 1, counter = 11</code></pre>
+      <p><code>++counter</code> makes counter 1 and saves 1 as the return value. finally then adds 10
+      to the field, so the field is 11, but the saved return value is still 1. String concatenation
+      evaluates left to right, so <code>puzzle9()</code> runs before <code>counter</code> is read.</p>
+    </div>
+  </details>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: never return, throw, break or continue out of a finally block</p>
+    <p>Any of these makes the finally block "complete abruptly", which discards the pending return
+    value or exception. Code reviewers and static analysis tools flag it; <code>javac
+    -Xlint:finally</code> warns about it. Keep finally blocks short and limited to cleanup. If cleanup
+    can itself throw, catch that inside finally (and log it), or use try-with-resources.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: how to answer any finally puzzle</p>
+    <ol>
+      <li>Find which block exits first and how: normal end, <code>return</code>, or an exception.</li>
+      <li>For a return, evaluate the expression now and remember the value (a primitive value or a
+      reference).</li>
+      <li>Run finally. If it returns or throws, that wins and the remembered value or exception is
+      lost.</li>
+      <li>Otherwise, return the remembered value or rethrow the remembered exception. Mention that
+      objects can be mutated through the remembered reference.</li>
+    </ol>
+  </div>
+</article>
+
+<article class="topic" id="m3-try-with-resources">
+  <h3>try-with-resources and AutoCloseable</h3>
+  <p class="tldr">try-with-resources closes every resource declared in its header automatically, in
+  reverse order, even when an exception is thrown, and keeps failures from close() as suppressed
+  exceptions instead of losing the original one.</p>
+
+  <p>A <strong>resource</strong> is an object that holds something outside the JVM's memory that must
+  be given back: an open file handle, a database connection, a network socket. The garbage collector
+  does not close these for you in any predictable way. Forget to close them and you get a
+  <strong>resource leak</strong>: after a few thousand requests the operating system refuses to open
+  more files ("Too many open files"), or the database connection pool runs dry and every request
+  starts timing out.</p>
+
+  <h4>The problem with the old way</h4>
+  <p>Before Java 7, correct cleanup looked like this:</p>
+<pre data-title="Java 6 style — do not write this today"><code class="language-java">BufferedReader reader = null;
+try {
+    reader = new BufferedReader(new FileReader("orders.csv"));
+    return reader.readLine();
+} finally {
+    if (reader != null) {
+        try {
+            reader.close();
+        } catch (IOException e) {
+            // ignore? log? -- and the original exception may already be lost
+        }
+    }
+}</code></pre>
+  <p>It is long, easy to get wrong, and it has a hidden bug: if the body throws and then
+  <code>close()</code> also throws, the close exception replaces the original one. You can see the
+  original error vanish:</p>
+<pre data-title="OldStyleLost.java"><code class="language-java">public class OldStyleLost {
+    static class FlakyConnection implements AutoCloseable {
+        @Override
+        public void close() {
+            throw new IllegalStateException("close failed");
+        }
+    }
+
+    public static void main(String[] args) {
+        try {
+            FlakyConnection c = new FlakyConnection();
+            try {
+                throw new RuntimeException("query failed");    // the real problem
+            } finally {
+                c.close();                                     // throws, replacing it
+            }
+        } catch (RuntimeException e) {
+            System.out.println("Caught: " + e.getMessage());
+            System.out.println("Suppressed count: " + e.getSuppressed().length);
+        }
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">Caught: close failed
+Suppressed count: 0</code></pre>
+  <p>The log would say "close failed" and nobody would ever learn that the query failed.</p>
+
+  <h4>The syntax</h4>
+  <p>Declare the resources in parentheses after <code>try</code>. When the block ends — normally or
+  with an exception — Java calls <code>close()</code> on each one.</p>
+<pre data-title="ErrorCounter.java"><code class="language-java">import java.io.BufferedReader;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+public class ErrorCounter {
+    static long countErrors(Path log) throws IOException {
+        try (BufferedReader reader = Files.newBufferedReader(log)) {
+            long count = 0;
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.contains("ERROR")) {
+                    count++;
+                }
+            }
+            return count;
+        }   // reader.close() runs here, even if readLine() throws
+    }
+
+    public static void main(String[] args) throws IOException {
+        Path log = Path.of("app.log");
+        Files.write(log, List.of(
+                "10:00:01 INFO  Order 101 placed",
+                "10:00:02 ERROR Payment gateway timeout",
+                "10:00:05 INFO  Order 102 placed",
+                "10:00:09 ERROR Inventory service down"));
+        System.out.println("Errors: " + countErrors(log));
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">Errors: 2</code></pre>
+  <p>The resource variable is implicitly <code>final</code>, and its scope is the try block. A
+  try-with-resources statement may still have catch and finally blocks.</p>
+
+  <h4>AutoCloseable vs Closeable</h4>
+  <p>A resource must implement <code>java.lang.AutoCloseable</code>. Its older cousin
+  <code>java.io.Closeable</code> was retrofitted to extend it, so every <code>Closeable</code> works
+  too.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th><code>AutoCloseable</code></th><th><code>Closeable</code></th></tr></thead>
+    <tbody>
+      <tr><td>Package, since</td><td><code>java.lang</code>, Java 7</td><td><code>java.io</code>, Java
+      5</td></tr>
+      <tr><td>Method</td><td><code>void close() throws Exception</code></td><td><code>void close()
+      throws IOException</code></td></tr>
+      <tr><td>Repeated close()</td><td>Not required to be idempotent (but strongly
+      encouraged)</td><td>Must be idempotent: closing an already closed stream has no
+      effect</td></tr>
+      <tr><td>Relationship</td><td>The parent interface</td><td><code>Closeable extends
+      AutoCloseable</code></td></tr>
+      <tr><td>Typical implementations</td><td>JDBC <code>Connection</code>, <code>Statement</code>,
+      <code>ResultSet</code>; <code>Stream</code>; <code>ExecutorService</code> (Java 19+);
+      <code>HttpClient</code> (Java 21+)</td><td><code>InputStream</code>, <code>OutputStream</code>,
+      <code>Reader</code>, <code>Writer</code>, <code>Scanner</code>, <code>FileChannel</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>When you implement <code>close()</code> yourself, narrow the signature: an override may throw
+  fewer exceptions, so <code>public void close()</code> with no <code>throws</code> clause spares your
+  callers a pointless catch block.</p>
+
+  <h4>Multiple resources and closing order</h4>
+  <p>Separate resources with semicolons. They are opened left to right and closed in
+  <strong>reverse order</strong> — the last opened is closed first, which is right because later
+  resources often depend on earlier ones (a statement depends on its connection).</p>
+<pre data-title="TwrOrder.java"><code class="language-java">public class TwrOrder {
+    static class Resource implements AutoCloseable {
+        private final String name;
+
+        Resource(String name) {
+            this.name = name;
+            System.out.println("open " + name);
+        }
+
+        @Override
+        public void close() {
+            System.out.println("close " + name);
+        }
+    }
+
+    public static void main(String[] args) {
+        try (Resource a = new Resource("A");
+             Resource b = new Resource("B")) {
+            System.out.println("body");
+            throw new IllegalStateException("body failed");
+        } catch (IllegalStateException e) {
+            System.out.println("catch: " + e.getMessage());
+        } finally {
+            System.out.println("finally");
+        }
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">open A
+open B
+body
+close B
+close A
+catch: body failed
+finally</code></pre>
+  <div class="co co-rule">
+    <p class="co-t">Rule: resources are closed before catch and finally run</p>
+    <p>The order is: open resources → body → close resources (reverse order) → matching catch →
+    finally. So inside catch and finally the resources are already closed — you cannot use them
+    there.</p>
+  </div>
+  <p>If opening a resource fails, the ones already opened are still closed, and the failed one is not
+  (it was never assigned):</p>
+<pre class="out" data-title="Opening A succeeds, opening B throws"><code class="language-plaintext">open A
+close A
+catch: cannot open B</code></pre>
+
+  <h4>Suppressed exceptions</h4>
+  <p>When the body throws exception A and <code>close()</code> then throws exception B,
+  try-with-resources keeps A as the main exception and attaches B to it with
+  <code>A.addSuppressed(B)</code>. Nothing is lost. You can read the attached exceptions with
+  <code>getSuppressed()</code>, and the stack trace prints them under <code>Suppressed:</code>.</p>
+<pre data-title="SuppressedDemo.java"><code class="language-java">public class SuppressedDemo {
+    static class FlakyConnection implements AutoCloseable {
+        @Override
+        public void close() {
+            throw new IllegalStateException("close failed");
+        }
+    }
+
+    public static void main(String[] args) {
+        try (FlakyConnection c = new FlakyConnection()) {
+            throw new RuntimeException("query failed");
+        } catch (RuntimeException e) {
+            System.out.println("Caught: " + e.getMessage());
+            for (Throwable s : e.getSuppressed()) {
+                System.out.println("Suppressed: " + s.getMessage());
+            }
+            e.printStackTrace();
+        }
+    }
+}</code></pre>
+<pre class="out" data-title="Output"><code class="language-plaintext">Caught: query failed
+Suppressed: close failed
+java.lang.RuntimeException: query failed
+    at SuppressedDemo.main(SuppressedDemo.java:11)
+    Suppressed: java.lang.IllegalStateException: close failed
+        at SuppressedDemo$FlakyConnection.close(SuppressedDemo.java:5)
+        at SuppressedDemo.main(SuppressedDemo.java:10)</code></pre>
+  <p>Compare with the old-style output above: the real problem ("query failed") is now the main
+  exception. If only <code>close()</code> throws (the body succeeded), that close exception is simply
+  thrown as the main exception.</p>
+
+  <h4>Java 9: using an existing variable as a resource</h4>
+  <p>Since Java 9 you can put an existing variable in the header, as long as it is
+  <code>final</code> or <strong>effectively final</strong> (never reassigned). This is handy when the
+  resource is a parameter.</p>
+<pre data-title="Java 9+"><code class="language-java">static void copyLines(BufferedReader reader, BufferedWriter writer) throws IOException {
+    try (reader; writer) {             // both closed at the end, writer first
+        String line;
+        while ((line = reader.readLine()) != null) {
+            writer.write(line);
+            writer.newLine();
+        }
+    }
+}</code></pre>
+  <p>If the variable is reassigned anywhere, compilation fails with <em>variable reader used as a
+  try-with-resources resource neither final nor effectively final</em>.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>A null resource is allowed.</strong> If the resource expression is
+      <code>null</code>, the body runs and <code>close()</code> is simply skipped — no
+      <code>NullPointerException</code>.</li>
+      <li><strong>Only declared resources are closed.</strong> In <code>try (var r = new
+      BufferedReader(new FileReader(f)))</code> only the outer reader is a resource; closing it closes
+      the inner one too, because wrapper streams close what they wrap.</li>
+      <li><strong>Not every cleanup is AutoCloseable.</strong> <code>Lock</code> is not; keep using
+      try/finally with <code>unlock()</code>.</li>
+    </ul>
+  </div>
+
+  <h4>What the compiler generates</h4>
+  <p>The Java Language Specification defines try-with-resources as a translation into ordinary
+  try/catch/finally. Simplified, for one resource:</p>
+<pre data-title="Roughly what try (Resource r = open()) { body } becomes"><code class="language-java">final Resource r = open();
+Throwable primary = null;
+try {
+    // body
+} catch (Throwable t) {
+    primary = t;
+    throw t;
+} finally {
+    if (r != null) {
+        if (primary != null) {
+            try {
+                r.close();
+            } catch (Throwable closeFailure) {
+                primary.addSuppressed(closeFailure);   // keep the original exception
+            }
+        } else {
+            r.close();
+        }
+    }
+}</code></pre>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: returning a resource that the try already closed</p><pre><code class="language-java">static Stream&lt;String&gt; lines(Path p) throws IOException {
+    try (Stream&lt;String&gt; s = Files.lines(p)) {
+        return s;          // closed on the way out
+    }
+}
+// caller: lines(p).forEach(...) throws
+// IllegalStateException: stream has already
+// been operated upon or closed</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: finish the work inside the try</p><pre><code class="language-java">static List&lt;String&gt; errorLines(Path p) throws IOException {
+    try (Stream&lt;String&gt; s = Files.lines(p)) {
+        return s.filter(l -&gt; l.contains("ERROR"))
+                .toList();   // fully read before close
+    }
+}</code></pre></div>
+  </div>
+  <p>The same trap with a <code>BufferedReader</code> fails with <code>java.io.IOException: Stream
+  closed</code> at the caller. If a method must hand an open resource to its caller, do not close it
+  there — document that the caller owns it and must close it.</p>
+
+  <div class="co co-real">
+    <p class="co-t">Real project: where you still write it by hand</p>
+    <ul>
+      <li>Plain JDBC code: <code>Connection</code>, <code>PreparedStatement</code> and
+      <code>ResultSet</code> in one header.</li>
+      <li><code>Files.lines</code>, <code>Files.list</code> and <code>Files.walk</code> streams — they
+      hold open file handles.</li>
+      <li>Spring Data repository methods that return <code>Stream&lt;T&gt;</code>: the stream keeps a
+      database cursor open and must be closed (and used inside a transaction).</li>
+      <li>In typical Spring code you rarely close connections yourself — <code>JdbcTemplate</code> and
+      JPA do it — but you still close the files, streams and clients you open.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is try-with-resources and what are suppressed exceptions?"</p>
+    <ul>
+      <li>Java 7 feature: resources declared in the header are closed automatically in reverse order;
+      the resource type must implement <code>AutoCloseable</code>.</li>
+      <li>If the body and <code>close()</code> both throw, the body's exception propagates and the close
+      failure is attached as suppressed (<code>getSuppressed()</code>), unlike try/finally where the
+      original was lost.</li>
+      <li>Resources are closed before catch/finally run. Java 9 allows effectively final variables in
+      the header.</li>
+      <li><code>Closeable</code> vs <code>AutoCloseable</code>: <code>IOException</code> vs
+      <code>Exception</code>, and the idempotency requirement.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,335 @@
+<article class="topic" id="m1-memory-contiguous">
+  <h3>Memory management: addresses, contiguous allocation and fragmentation</h3>
+  <p class="tldr">The MMU translates the logical addresses a program uses into physical RAM addresses; with contiguous allocation each process gets one unbroken block (placed by first, best or worst fit), which leads to internal and external fragmentation that compaction or paging must repair.</p>
+
+  <h4>Why memory management?</h4>
+  <p>RAM is shared by the kernel and many processes. The memory manager must (1) track which parts are free or used, (2) give memory to processes and take it back, (3) <strong>protect</strong> each process from touching another's memory, and (4) let programs be bigger than RAM (virtual memory, the next articles). Remember the layout of a process from <a href="#m1-processes">the process article</a>: text, data, heap and stack. Here we look at how the OS places them in RAM.</p>
+
+  <h4>Logical vs physical addresses and the MMU</h4>
+  <ul>
+    <li>A <strong>logical (virtual) address</strong> is what the CPU generates while running a program. The program thinks its memory starts at address 0 and is its own.</li>
+    <li>A <strong>physical address</strong> is the actual location in RAM.</li>
+    <li>The <strong>Memory Management Unit (MMU)</strong> is hardware between the CPU and RAM that converts logical to physical addresses on every memory access.</li>
+  </ul>
+  <p>The simplest MMU scheme uses two registers per process: a <strong>base (relocation) register</strong> and a <strong>limit register</strong>. Physical address = logical address + base, and the access is allowed only if logical address &lt; limit; otherwise the hardware raises a trap (the OS then ends the process: on Linux, "segmentation fault"). Only the kernel can change these registers when it does a context switch.</p>
+  <figure class="fig">
+<pre class="diagram">
+  CPU ── logical address 346 ──►  is 346 &lt; limit (1200)? ──no──► trap (error)
+                                     │yes
+                                     ▼
+                               346 + base (14000)
+                                     │
+                                     ▼
+                         physical address 14346 ──► RAM
+</pre>
+    <figcaption>Base and limit registers: relocation plus protection (example values)</figcaption>
+  </figure>
+  <p>Because of this translation, a process can be loaded anywhere in RAM and even moved later. The OS can also <strong>swap</strong> a whole process out to disk when RAM is short and bring it back later (swapping).</p>
+
+  <h4>Contiguous allocation</h4>
+  <p>In the oldest scheme each process occupies <strong>one contiguous block</strong> of RAM. Memory is divided into <strong>partitions</strong>: <em>fixed-size</em> partitions (simple, but a process wastes the unused part of its partition) or <em>variable-size</em> partitions (the OS carves out exactly what a process needs). Free blocks are called <strong>holes</strong>. To place a process of size <em>n</em>, the OS chooses a hole of at least <em>n</em> by one of three strategies:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Strategy</th><th>Rule</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><strong>First fit</strong></td><td>First hole that is big enough, scanning from the start</td><td>Fast; leaves small holes near the start</td></tr>
+      <tr><td><strong>Best fit</strong></td><td>Smallest hole that is big enough</td><td>Must search all holes (unless sorted); leaves many tiny, useless holes</td></tr>
+      <tr><td><strong>Worst fit</strong></td><td>Largest hole</td><td>Leaves big leftover holes; in practice performs poorly</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Worked example: first, best and worst fit</h4>
+  <p>Memory has five holes in this order: <strong>100 KB, 500 KB, 200 KB, 300 KB, 600 KB</strong>. Processes arrive in the order <strong>212 KB, 417 KB, 112 KB, 426 KB</strong>.</p>
+  <p><strong>First fit.</strong></p>
+  <ul>
+    <li>212 → the 500 KB hole (first big enough; 100 is too small). The hole becomes 288.</li>
+    <li>417 → 500 is now 288 (too small), 200 and 300 too small, so the 600 KB hole. It becomes 183.</li>
+    <li>112 → holes are now 100, 288, 200, 300, 183. First big enough is 288 → 176 left.</li>
+    <li>426 → holes: 100, 176, 200, 300, 183. None is large enough, so the process <strong>must wait</strong>.</li>
+  </ul>
+  <p><strong>Best fit.</strong></p>
+  <ul>
+    <li>212 → smallest hole ≥ 212 is 300 → 88 left.</li>
+    <li>417 → smallest ≥ 417 is 500 → 83 left.</li>
+    <li>112 → holes 100, 83, 200, 88, 600; smallest ≥ 112 is 200 → 88 left.</li>
+    <li>426 → only 600 fits → 174 left. <strong>All four processes are placed.</strong></li>
+  </ul>
+  <p><strong>Worst fit.</strong></p>
+  <ul>
+    <li>212 → largest hole is 600 → 388 left.</li>
+    <li>417 → largest is 500 → 83 left.</li>
+    <li>112 → holes 100, 83, 200, 300, 388; largest is 388 → 276 left.</li>
+    <li>426 → holes 100, 83, 200, 300, 276: none fits, so it <strong>must wait</strong>.</li>
+  </ul>
+  <p>So in this example best fit gave the best result, but that is not guaranteed in general: first fit and best fit are about equally good in studies, and both beat worst fit on average.</p>
+
+  <h4>Fragmentation</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Internal fragmentation</th><th>External fragmentation</th></tr></thead>
+    <tbody>
+      <tr><td>What is wasted</td><td>Space <em>inside</em> an allocated block that the process does not use</td><td>Free space <em>between</em> allocated blocks, in scattered small holes</td></tr>
+      <tr><td>Cause</td><td>Fixed-size units (fixed partitions, pages): the block is larger than the request</td><td>Variable-size contiguous allocation: processes come and go, leaving holes</td></tr>
+      <tr><td>Example</td><td>A 10 KB process in a 12 KB partition wastes 2 KB; the last page of a process</td><td>Holes of 50 KB + 60 KB + 40 KB = 150 KB free in total, but a 100 KB process cannot be placed</td></tr>
+      <tr><td>Remedy</td><td>Smaller allocation units; variable partitions</td><td>Compaction; paging or segmentation (non-contiguous allocation)</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Compaction</strong> slides all processes to one end of memory so that the holes merge into one large block. It is possible only if relocation is dynamic (the base register can be changed), and it is expensive because a lot of memory must be copied. The better cure is to stop requiring contiguous memory, which is what paging does.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: every memory access passes through the MMU, and the OS alone controls its registers</p>
+    <p>That is the basis of process isolation: a process can only form addresses inside its own mapping.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A 50-percent rule from studies of first fit says that with <em>N</em> allocated blocks about <em>N/2</em> blocks are lost to fragmentation (one third of memory unusable); treat it as a rule of thumb, not a guarantee.</li>
+      <li>Internal and external fragmentation cannot both be eliminated by the same fix; paging removes the external kind but brings back a little internal waste.</li>
+      <li>A "segmentation fault" is the OS reacting to an access that the hardware rejected, such as a null pointer dereference in C. In Java the same mistake becomes <code>NullPointerException</code> because the JVM checks first.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: mixing up the two kinds of fragmentation</p>
+    <p>Internal = wasted <em>inside</em> a block you were given. External = free memory that exists but is split into pieces too small to use. A quick memory aid: external is "outside any process".</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Logical vs physical address? Fragmentation?"</p>
+    <ul>
+      <li>Logical = generated by the CPU, per-process view; physical = real RAM address; the MMU maps one to the other with base and limit or page tables.</li>
+      <li>First/best/worst fit with the holes example; mention that external fragmentation can be cured by compaction or paging.</li>
+      <li>Internal vs external fragmentation with one example each.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-paging">
+  <h3>Paging and address translation</h3>
+  <p class="tldr">Paging cuts a process's logical address space into fixed-size pages and RAM into frames of the same size, so pages can sit in any free frames; a per-process page table maps page numbers to frame numbers, and an address is split into page number and offset.</p>
+
+  <h4>The idea</h4>
+  <p>Paging removes the need for contiguous memory. Logical memory is divided into <strong>pages</strong>; physical memory is divided into <strong>frames</strong> of exactly the same size (a power of two, commonly 4 KB). Any page can go into any free frame, so external fragmentation disappears. The OS keeps a <strong>free-frame list</strong>. To run a program of <em>n</em> pages it finds <em>n</em> free frames and loads the pages there, then fills in the <strong>page table</strong>.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Logical memory        Page table            Physical memory
+ (process view)        (one per process)     (frames)
+
+ ┌────────┐            page │ frame          ┌────────┐ frame 0
+ │ page 0 │ ───────────  0  │  5             │ page 3 │
+ ├────────┤            ─────┼─────           ├────────┤ frame 1
+ │ page 1 │ ───────────  1  │  2             │        │
+ ├────────┤            ─────┼─────           ├────────┤ frame 2
+ │ page 2 │ ───────────  2  │  7             │ page 1 │
+ ├────────┤            ─────┼─────           ├────────┤ frame 3
+ │ page 3 │ ───────────  3  │  0             │        │
+ └────────┘                                   ├────────┤ frame 4
+                                              │        │
+ Pages are contiguous for the program;        ├────────┤ frame 5
+ frames are scattered in RAM.                 │ page 0 │
+                                              ├────────┤ frame 6
+                                              │        │
+                                              ├────────┤ frame 7
+                                              │ page 2 │
+                                              └────────┘
+</pre>
+    <figcaption>A page table maps each page to some frame; frames need not be in order</figcaption>
+  </figure>
+
+  <h4>Splitting the address</h4>
+  <p>Every logical address the CPU generates is split in two by simple bit slicing:</p>
+  <ul>
+    <li><strong>Page number (p):</strong> the high bits; used as an index into the page table.</li>
+    <li><strong>Page offset (d):</strong> the low bits; the position inside the page, unchanged by translation.</li>
+  </ul>
+  <p>If the logical address space is 2<sup>m</sup> bytes and the page size is 2<sup>n</sup> bytes, then the offset takes <em>n</em> bits and the page number takes <em>m − n</em> bits. The physical address is <code>frame number × page size + offset</code> (or: frame number bits followed by the offset bits).</p>
+
+  <h4>Worked example</h4>
+  <p>Logical address space 64 KB (16-bit addresses), page size 4 KB (2<sup>12</sup>), physical memory 32 KB.</p>
+  <ul>
+    <li>Offset = 12 bits. Page number = 16 − 12 = 4 bits, so there are 16 pages.</li>
+    <li>Physical memory has 32 KB / 4 KB = 8 frames, so a frame number needs 3 bits and a physical address has 15 bits.</li>
+  </ul>
+  <p>Part of the page table (page 5 is not in memory):</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Page</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th></tr></thead>
+    <tbody>
+      <tr><td>Frame</td><td>5</td><td>2</td><td>7</td><td>0</td><td>3</td><td>invalid</td></tr>
+    </tbody>
+  </table></div>
+  <p>Translate logical address <strong>9000</strong>:</p>
+  <ol class="steps">
+    <li>Page number = 9000 div 4096 = 2 (2 × 4096 = 8192). Offset = 9000 − 8192 = 808.</li>
+    <li>Page table: page 2 → frame 7.</li>
+    <li>Physical address = 7 × 4096 + 808 = 28672 + 808 = <strong>29480</strong>.</li>
+  </ol>
+  <p>Check in binary: 9000 = 0010 0011 0010 1000. The top 4 bits 0010 are page 2; the low 12 bits 0011 0010 1000 (hex 328 = 808) are the offset. Frame 7 is 111, so the physical address is 111 0011 0010 1000 = hex 7328 = 29480. ✓</p>
+  <pre data-title="Translate.java"><code class="language-java">public class Translate {
+    static final int PAGE_BITS = 12;                  // 4 KB pages
+    static final int[] FRAME = {5, 2, 7, 0, 3, -1};   // -1 = page not in memory
+
+    public static void main(String[] args) {
+        int[] logicalAddresses = {9000, 4100, 12345, 21000};
+        for (int addr : logicalAddresses) {
+            int page = addr &gt;&gt; PAGE_BITS;               // high bits
+            int offset = addr &amp; 0xFFF;                  // low 12 bits
+            if (FRAME[page] &lt; 0) {
+                System.out.println(addr + " -&gt; page " + page + ", offset " + offset
+                        + " -&gt; PAGE FAULT");
+                continue;
+            }
+            int physical = (FRAME[page] &lt;&lt; PAGE_BITS) | offset;
+            System.out.println(addr + " -&gt; page " + page + ", offset " + offset
+                    + " -&gt; frame " + FRAME[page] + " -&gt; physical " + physical);
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">9000 -&gt; page 2, offset 808 -&gt; frame 7 -&gt; physical 29480
+4100 -&gt; page 1, offset 4 -&gt; frame 2 -&gt; physical 8196
+12345 -&gt; page 3, offset 57 -&gt; frame 0 -&gt; physical 57
+21000 -&gt; page 5, offset 520 -&gt; PAGE FAULT</code></pre>
+  <p>Check the second line by hand: 4100 = 4096 + 4, so page 1, offset 4; frame 2 gives 2 × 4096 + 4 = 8196. Third: 12345 − 3 × 4096 (12288) = 57; frame 0 gives 57. Fourth: 21000 − 5 × 4096 (20480) = 520; page 5 is invalid, so the hardware traps to the OS (a page fault, see <a href="#m1-virtual-memory">virtual memory</a>).</p>
+
+  <h4>Page table entries (PTE)</h4>
+  <p>A page-table entry holds the frame number plus control bits:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Bit</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td>Valid / present</td><td>Is the page in a frame (1) or not (0)? An access to a 0 page causes a page fault.</td></tr>
+      <tr><td>Protection</td><td>Read, write, execute permissions; writing to a read-only page traps.</td></tr>
+      <tr><td>Dirty (modified)</td><td>Set when the page has been written; a dirty page must be saved to disk before its frame is reused.</td></tr>
+      <tr><td>Referenced (accessed)</td><td>Set on any use; helps page replacement decide what is old.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The code page of two processes running the same program can point to the <em>same</em> frame (<strong>sharing</strong>), saving RAM. This is how shared libraries work, and also how <code>fork()</code> with copy-on-write starts.</p>
+
+  <h4>Page-table size and internal fragmentation</h4>
+  <p>On a 32-bit system with 4 KB pages, the page number has 32 − 12 = 20 bits, so a single-level page table has 2<sup>20</sup> = 1,048,576 entries. At 4 bytes per entry that is <strong>4 MB per process</strong> just for the table, and 64-bit systems make a flat table impossible. The remedies, multi-level tables and others, are in the next article.</p>
+  <p>Paging has no external fragmentation but has <strong>internal fragmentation</strong> in the last page of every process. Example: with a page size of 2,048 bytes, a process of 72,766 bytes needs 35 full pages (71,680 bytes) plus 1,086 bytes, so 36 pages; the last page wastes 2,048 − 1,086 = 962 bytes. On average a process wastes about half a page. A smaller page size wastes less but needs larger page tables and more disk transfers, so common sizes are 4 KB, with "huge pages" of 2 MB for big-memory servers.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: page size = frame size = a power of two</p>
+    <p>That is what makes the split of an address into page number and offset a simple cut in the bits, with no division needed.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>The page table must be in memory, so without a cache every access would cost <em>two</em> memory accesses (one for the table, one for the data). The TLB solves this.</li>
+      <li>A context switch must switch the page-table pointer, which is why it is part of the saved context.</li>
+      <li>Programmers see contiguous memory; only the OS sees the scattered frames. So a Java <code>int[]</code> that is contiguous in the JVM's virtual addresses can sit in many unrelated physical frames.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: translating the offset</p>
+    <p>The offset is copied unchanged from the logical to the physical address. Only the page number is replaced by the frame number.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain paging with an example"</p>
+    <ul>
+      <li>Pages and frames, same size; page table per process; address = (page number, offset).</li>
+      <li>Do a numeric translation like above: split, look up, recombine.</li>
+      <li>No external fragmentation; some internal fragmentation; extra memory access, solved by the TLB.</li>
+      <li>Mention PTE bits (valid, dirty, referenced, protection) and sharing of code pages.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-tlb-multilevel-segmentation">
+  <h3>TLB, multi-level page tables and segmentation</h3>
+  <p class="tldr">A TLB caches recent page-to-frame translations so most accesses need no page-table lookup, multi-level page tables keep the table small for sparse address spaces, and segmentation divides memory by logical parts (code, stack, heap) instead of fixed-size pages.</p>
+
+  <h4>The Translation Lookaside Buffer (TLB)</h4>
+  <p>Without help, each memory access needs two RAM accesses: one to read the page-table entry, one for the actual data. The <strong>TLB</strong> is a small, very fast hardware cache inside the MMU that stores recent (page → frame) pairs, usually tens to a few thousand entries.</p>
+  <ol class="steps">
+    <li>The CPU generates a logical address; the MMU takes the page number.</li>
+    <li>It looks the page up in the TLB (in parallel across all entries).</li>
+    <li><strong>TLB hit:</strong> the frame number is available at once; access RAM once.</li>
+    <li><strong>TLB miss:</strong> read the page table in RAM (an extra access), then load that entry into the TLB (evicting another) and access the data.</li>
+  </ol>
+  <p>On a context switch the old process's translations are wrong for the new one, so the TLB is flushed, or its entries are tagged with an <strong>address-space id (ASID)</strong> so both can coexist. This flush is part of the hidden cost of switching processes (<a href="#m1-processes">context switching</a>). Locality of reference (programs reuse nearby addresses) gives hit ratios of 98 percent or more in practice.</p>
+
+  <h4>Effective Access Time (EAT)</h4>
+  <p>Let the TLB lookup take <em>ε</em>, a memory access take <em>m</em>, and the TLB hit ratio be <em>h</em>. With a single-level page table:</p>
+  <p><code>EAT = h × (ε + m) + (1 − h) × (ε + m + m)</code></p>
+  <p><strong>Example.</strong> TLB lookup = 10 ns, memory access = 100 ns.</p>
+  <ul>
+    <li>Hit ratio 80%: EAT = 0.80 × (10 + 100) + 0.20 × (10 + 100 + 100) = 0.80 × 110 + 0.20 × 210 = 88 + 42 = <strong>130 ns</strong>. That is 30% slower than the ideal 100 ns.</li>
+    <li>Hit ratio 98%: EAT = 0.98 × 110 + 0.02 × 210 = 107.8 + 4.2 = <strong>112 ns</strong> (only 12% slower).</li>
+  </ul>
+  <p>With a <em>two-level</em> page table a miss costs two table reads plus the data: at 98% hits, EAT = 0.98 × 110 + 0.02 × (10 + 100 + 100 + 100) = 107.8 + 0.02 × 310 = 107.8 + 6.2 = <strong>114 ns</strong>. The TLB makes deep page tables affordable. (Some textbooks ignore the TLB lookup time ε; if so, use 100 and 200 in the formula instead. State your assumption.)</p>
+
+  <h4>Multi-level (hierarchical) page tables</h4>
+  <p>A flat table for a 32-bit space needs 2<sup>20</sup> entries (4 MB) per process, even if the process uses a few pages. The fix is to page the page table itself. In a <strong>two-level</strong> scheme with 4 KB pages and 4-byte entries, the 32-bit address splits as 10 + 10 + 12 bits:</p>
+  <figure class="fig">
+<pre class="diagram">
+ 32-bit logical address
+┌──────────────┬──────────────┬─────────────────┐
+│ p1 (10 bits) │ p2 (10 bits) │ offset (12 bits)│
+└──────┬───────┴──────┬───────┴─────────────────┘
+       │              │
+       ▼              ▼
+ Outer page table   Inner page table (one 4 KB page = 1024 entries)
+ (1024 entries) ──► [ ... frame number ... ] ──► frame + offset = physical address
+</pre>
+    <figcaption>Two-level translation: the outer table points to inner tables, which hold frame numbers</figcaption>
+  </figure>
+  <p>An inner table is allocated only if some page in its 4 MB range is used (1024 pages × 4 KB). A small process needs the outer table plus a few inner tables, a few KB instead of 4 MB. 64-bit CPUs use four or five levels (x86-64 uses four, with an optional fifth). The price is more memory accesses per TLB miss, which the TLB hides.</p>
+  <p>Two other designs exist: <strong>hashed page tables</strong> (hash the page number) and <strong>inverted page tables</strong> (one entry per physical frame for the whole system, searched by process id and page number; small, but lookup is slow without a hash and sharing is hard). Know the names.</p>
+
+  <h4>Segmentation</h4>
+  <p><strong>Segmentation</strong> divides a program by its logical parts: main code, functions, global data, heap, stack, each a <strong>segment</strong> of different length. A logical address is a pair <strong>(segment number, offset)</strong>. A <strong>segment table</strong> has, for each segment, a <strong>base</strong> (start in RAM) and a <strong>limit</strong> (length). The translation is: if offset &lt; limit, physical = base + offset; otherwise trap.</p>
+  <p><strong>Worked example.</strong> Segment table:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Segment</th><th>Base</th><th>Limit</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>1400</td><td>1000</td></tr>
+      <tr><td>1</td><td>6300</td><td>400</td></tr>
+      <tr><td>2</td><td>4300</td><td>400</td></tr>
+      <tr><td>3</td><td>3200</td><td>1100</td></tr>
+      <tr><td>4</td><td>4700</td><td>1000</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li>Address (2, 53): 53 &lt; 400, so physical = 4300 + 53 = <strong>4353</strong>.</li>
+    <li>Address (3, 852): 852 &lt; 1100, so physical = 3200 + 852 = <strong>4052</strong>.</li>
+    <li>Address (0, 1222): 1222 ≥ 1000, so the hardware <strong>traps</strong>: the offset is beyond the segment.</li>
+  </ul>
+  <p>Segmentation matches how programmers think and makes sharing and protection natural (a code segment is read-only; a stack segment is read-write). But segments have different sizes, so it suffers from <strong>external fragmentation</strong> again. Real systems either use paging alone (modern Linux, with a flat address space) or <strong>paged segmentation</strong>, where each segment is itself divided into pages (the old x86 and others).</p>
+
+  <h4>Paging vs segmentation</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th>Paging</th><th>Segmentation</th></tr></thead>
+    <tbody>
+      <tr><td>Unit</td><td>Fixed-size page</td><td>Variable-size segment (logical unit)</td></tr>
+      <tr><td>Who decides the division</td><td>The OS/hardware; invisible to the programmer</td><td>The programmer or compiler; visible</td></tr>
+      <tr><td>Address</td><td>(page number, offset)</td><td>(segment number, offset)</td></tr>
+      <tr><td>Table entry</td><td>Frame number (plus flags)</td><td>Base and limit</td></tr>
+      <tr><td>External fragmentation</td><td>None</td><td>Yes</td></tr>
+      <tr><td>Internal fragmentation</td><td>Yes, in the last page</td><td>None</td></tr>
+      <tr><td>Sharing and protection</td><td>Per page, less natural</td><td>Per segment, natural</td></tr>
+      <tr><td>Speed</td><td>Fast with a TLB</td><td>Needs a limit check and an add</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: translation hardware sits on the critical path, so it must be cached</p>
+    <p>The TLB is not optional; without it paging would halve memory speed. Hit ratio drives performance, and a context switch that flushes the TLB hurts.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>A TLB miss is not a page fault. A miss only means the translation was not cached; the page may well be in RAM. A page fault means the page is not in RAM at all.</li>
+      <li>Huge pages (2 MB or 1 GB) cover much more memory per TLB entry and so reduce TLB misses for large heaps; the JVM can use them with <code>-XX:+UseLargePages</code> or transparent huge pages.</li>
+      <li>Segmentation in a segmented system can give two different errors from the same bad address range: a limit violation (trap) versus a not-present segment (fault).</li>
+    </ul>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">Real projects</p>
+    <p>For a big Java heap or a database with a huge buffer cache, TLB misses show up as slower memory access; operations teams then enable huge pages. In everyday backend work you only meet the idea indirectly: a large, randomly accessed data structure is slower than a compact, sequentially accessed one partly because of cache and TLB behaviour (see <a href="#m1-os-backend">backend work</a>).</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview: "What is a TLB? How do you compute effective access time? Paging vs segmentation?"</p>
+    <ul>
+      <li>TLB: small associative cache of page-table entries; hit = one memory access, miss = extra table access.</li>
+      <li>EAT formula with the 80%/98% example, or write the formula and substitute the given numbers.</li>
+      <li>Multi-level tables reduce the memory used by page tables for sparse address spaces.</li>
+      <li>Paging: fixed size, internal fragmentation, invisible. Segmentation: variable size, external fragmentation, matches program structure.</li>
+    </ul>
+  </div>
+</article>

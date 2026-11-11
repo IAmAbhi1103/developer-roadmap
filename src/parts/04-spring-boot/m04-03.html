@@ -1,0 +1,419 @@
+<article class="topic" id="m4-jwt-resource-server">
+  <h3>JWT way 2 (recommended): OAuth2 Resource Server with JwtEncoder and JwtDecoder</h3>
+  <p class="tldr">Add spring-boot-starter-oauth2-resource-server, define a JwtDecoder and JwtEncoder from your key, and Spring Security's BearerTokenAuthenticationFilter does the parsing, validation and Authentication for you; you only write the token issuing and a role converter.</p>
+
+  <h4>Why this way</h4>
+  <p>Spring Security ships a complete, well-tested Bearer-token implementation called the <strong>OAuth2 Resource Server</strong> support. A <em>resource server</em> is simply an API that accepts access tokens. It reads <code>Authorization: Bearer</code>, validates the JWT with a <code>JwtDecoder</code> (built on the Nimbus library, a dependency of the starter), maps claims to authorities, and produces the standard 401 responses. You do not write a filter, you do not catch parser exceptions, and moving later to RS256 keys or to an external identity provider (Keycloak, Auth0, Okta) is a configuration change. Use it for new code; it is the approach Spring Security's documentation recommends.</p>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-oauth2-resource-server&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+  <p>Keep <code>spring-boot-starter-security</code> too. Remove the jjwt dependencies and the custom filter, or leave them unused while you compare.</p>
+
+  <h4>Step 1: the key, encoder and decoder</h4>
+  <p>The decoder verifies tokens; the encoder creates them (the encoder is only needed because <em>this</em> application also issues tokens at login). Both use the same HS256 secret from <code>app.jwt.secret</code> (<a href="#m4-jwt-custom-filter">same properties</a> as before).</p>
+  <pre data-title="JwtConfig.java"><code class="language-java">import com.nimbusds.jose.jwk.source.ImmutableSecret;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+import org.springframework.security.oauth2.jwt.*;
+
+@Configuration
+@EnableConfigurationProperties(JwtProperties.class)
+public class JwtConfig {
+
+    @Bean
+    SecretKey jwtSecretKey(JwtProperties props) {
+        byte[] bytes = Base64.getDecoder().decode(props.secret());
+        return new SecretKeySpec(bytes, "HmacSHA256");
+    }
+
+    @Bean
+    JwtEncoder jwtEncoder(SecretKey key) {
+        return new NimbusJwtEncoder(new ImmutableSecret&lt;&gt;(key));
+    }
+
+    @Bean
+    JwtDecoder jwtDecoder(SecretKey key, JwtProperties props) {
+        NimbusJwtDecoder decoder = NimbusJwtDecoder.withSecretKey(key)
+                .macAlgorithm(MacAlgorithm.HS256)
+                .build();
+        // default validators (exp, nbf) + the issuer must match
+        decoder.setJwtValidator(JwtValidators.createDefaultWithIssuer(props.issuer()));
+        return decoder;
+    }
+}</code></pre>
+
+  <h4>Step 2: issue the token at login</h4>
+  <pre data-title="NimbusTokenService.java"><code class="language-java">@Service
+public class NimbusTokenService implements TokenService {
+
+    private final JwtEncoder encoder;
+    private final JwtProperties props;
+
+    public NimbusTokenService(JwtEncoder encoder, JwtProperties props) {
+        this.encoder = encoder;
+        this.props = props;
+    }
+
+    @Override
+    public String issueAccessToken(AppUserDetails user) {
+        Instant now = Instant.now();
+        JwtClaimsSet claims = JwtClaimsSet.builder()
+                .issuer(props.issuer())
+                .issuedAt(now)
+                .expiresAt(now.plus(Duration.ofMinutes(props.accessTtlMinutes())))
+                .subject(String.valueOf(user.getId()))
+                .claim("email", user.getUsername())
+                .claim("roles", List.of(user.getRole().name()))
+                .build();
+        JwsHeader header = JwsHeader.with(MacAlgorithm.HS256).build();   // see below
+        return encoder.encode(JwtEncoderParameters.from(header, claims)).getTokenValue();
+    }
+}</code></pre>
+  <div class="co co-exc">
+    <p class="co-t">Edge case: set the header algorithm yourself</p>
+    <p>If you call <code>JwtEncoderParameters.from(claims)</code> without a header, the encoder defaults to RS256 and fails with a "Failed to select a JWK signing key" error when your key is an HMAC secret. Pass <code>JwsHeader.with(MacAlgorithm.HS256).build()</code> as shown. Also keep only one <code>TokenService</code> bean: delete <code>@Service</code> from <code>JjwtService</code> (or the class itself) when you switch.</p>
+  </div>
+  <p>The login controller from the previous article is unchanged: it authenticates with the <code>AuthenticationManager</code> and calls <code>tokenService.issueAccessToken(user)</code>.</p>
+
+  <h4>Step 3: turn on the resource server and map roles</h4>
+  <p>By default the converter looks at the <code>scope</code> or <code>scp</code> claim and prefixes each value with <code>SCOPE_</code>. Our tokens carry a <code>roles</code> claim, so we tell the converter to read that claim and prefix <code>ROLE_</code>, which makes <code>hasRole("RECRUITER")</code> work.</p>
+  <pre data-title="SecurityConfig.java (resource server version)"><code class="language-java">@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain api(HttpSecurity http, JsonSecurityHandlers handlers)
+            throws Exception {
+        http
+            .csrf(csrf -&gt; csrf.disable())
+            .cors(Customizer.withDefaults())
+            .sessionManagement(s -&gt;
+                    s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -&gt; auth
+                    .requestMatchers("/api/auth/**").permitAll()
+                    .requestMatchers(HttpMethod.GET, "/api/jobs/**").permitAll()
+                    .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                    .anyRequest().authenticated())
+            .oauth2ResourceServer(oauth -&gt; oauth
+                    .jwt(jwt -&gt; jwt.jwtAuthenticationConverter(jwtConverter()))
+                    .authenticationEntryPoint(handlers)     // 401 JSON
+                    .accessDeniedHandler(handlers));        // 403 JSON
+        return http.build();
+    }
+
+    @Bean
+    JwtAuthenticationConverter jwtConverter() {
+        JwtGrantedAuthoritiesConverter authorities = new JwtGrantedAuthoritiesConverter();
+        authorities.setAuthoritiesClaimName("roles");
+        authorities.setAuthorityPrefix("ROLE_");
+        JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
+        converter.setJwtGrantedAuthoritiesConverter(authorities);
+        return converter;
+    }
+
+    @Bean
+    AuthenticationManager authenticationManager(AuthenticationConfiguration cfg)
+            throws Exception {
+        return cfg.getAuthenticationManager();
+    }
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        return PasswordEncoderFactories.createDelegatingPasswordEncoder();
+    }
+}</code></pre>
+  <p>What you get for free: <code>BearerTokenAuthenticationFilter</code> in the chain; for each request the token goes to the <code>JwtDecoder</code>, then the converter builds a <code>JwtAuthenticationToken</code> whose principal is a <code>Jwt</code> object (claims accessible by <code>jwt.getClaim("email")</code>) and whose <code>getName()</code> is the <code>sub</code> claim, the user id. In a controller:</p>
+  <pre data-title="Reading the token in a controller"><code class="language-java">@GetMapping("/api/me")
+public Map&lt;String, Object&gt; me(@AuthenticationPrincipal Jwt jwt) {
+    return Map.of(
+            "id", jwt.getSubject(),
+            "email", jwt.getClaimAsString("email"),
+            "roles", jwt.getClaimAsStringList("roles"));
+}</code></pre>
+
+  <h4>Expired and invalid tokens</h4>
+  <p>If the token is missing the entry point answers 401. If it is present but bad, <code>BearerTokenAuthenticationFilter</code> catches the failure and calls the entry point with an <code>InvalidBearerTokenException</code>. The default entry point returns an empty body with:</p>
+  <pre class="out" data-title="Default 401 for an expired token"><code class="language-http">HTTP/1.1 401
+WWW-Authenticate: Bearer error="invalid_token", error_description="Jwt expired at 2026-11-10T10:15:00Z"</code></pre>
+  <p>That follows the OAuth2 standard (RFC 6750). Our <code>JsonSecurityHandlers</code> replaces it with a JSON body but can keep the header. Note the difference from the custom filter: here a bad token on a public URL is rejected with 401 too, not ignored.</p>
+
+  <h4>Asymmetric keys and external providers</h4>
+  <p>With RS256 the application that issues tokens keeps the private key; other services only need the public key. With the resource server you can configure that with properties alone:</p>
+  <pre data-title="application.yml (verify tokens from another issuer)"><code class="language-yaml">spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://login.example.com/realms/jobs    # discovers the JWKS
+          # or: jwk-set-uri: https://login.example.com/.well-known/jwks.json
+          # or: public-key-location: classpath:app.pub</code></pre>
+  <p>When Boot sees one of these properties it builds the <code>JwtDecoder</code> for you, and you do not define the decoder bean. This is how a microservice trusts tokens from Keycloak without any security code of its own (<a href="#m7">module 7</a>).</p>
+
+  <h4>Comparison: custom filter vs resource server</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Custom filter + jjwt</th><th>OAuth2 Resource Server</th></tr></thead>
+    <tbody>
+      <tr><td>Code you write</td><td>Filter, parsing, error cases</td><td>Decoder/encoder beans, role converter</td></tr>
+      <tr><td>Validation</td><td>Whatever you remember to check</td><td>Signature, expiry, not-before, issuer, standard</td></tr>
+      <tr><td>401 for bad tokens</td><td>You build it (request attribute + entry point)</td><td>Built in, RFC 6750 header</td></tr>
+      <tr><td>RS256 / JWKS / Keycloak</td><td>More code</td><td>A few properties</td></tr>
+      <tr><td>Testing</td><td>Generate real tokens</td><td><code>jwt()</code> post-processor (<a href="#m5-webmvctest">module 5</a>)</td></tr>
+      <tr><td>Learning value</td><td>Shows every step</td><td>Hides the steps behind framework classes</td></tr>
+      <tr><td>Recommended</td><td>For learning; legacy codebases</td><td><strong>New code</strong></td></tr>
+    </tbody>
+  </table></div>
+  <p>Real codebases you join will contain both, so you should be able to read either.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Roles never work: the default converter uses <code>scope</code> and <code>SCOPE_</code>, so <code>hasRole</code> fails with 403 until you add the converter above.</li>
+      <li>A secret shorter than 32 bytes: the HS256 key is rejected or insecure.</li>
+      <li>Forgetting the HS256 header when encoding (see the edge case).</li>
+      <li>Defining both your own <code>JwtDecoder</code> bean and the <code>issuer-uri</code> property and expecting both to work: your bean wins.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How would you secure a Spring Boot API with JWT today?" Resource Server with a <code>JwtDecoder</code> and a converter for roles; mention Nimbus, <code>BearerTokenAuthenticationFilter</code>, and that issuing tokens uses <code>JwtEncoder</code> (or an external identity provider). Contrast with the hand-written filter and say why the framework version is safer.</p>
+  </div>
+</article>
+
+<article class="topic" id="m4-error-responses">
+  <h3>JSON error responses for 401 and 403: AuthenticationEntryPoint and AccessDeniedHandler</h3>
+  <p class="tldr">Security filters run before Spring MVC, so @RestControllerAdvice cannot handle their errors; implement AuthenticationEntryPoint for 401 and AccessDeniedHandler for 403 and write the JSON yourself.</p>
+
+  <h4>Why a separate mechanism</h4>
+  <p>Your <code>@RestControllerAdvice</code> from <a href="#m2">module 2</a> only sees exceptions thrown inside <code>DispatcherServlet</code>. Security filters run <em>before</em> it. When <code>AuthorizationFilter</code> denies a request, or the token is bad, the exception is caught by <code>ExceptionTranslationFilter</code> which delegates to two strategies:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Interface</th><th>Called when</th><th>Status</th><th>Default behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>AuthenticationEntryPoint</code></td><td>Anonymous user hits a protected URL, or authentication failed</td><td>401</td><td>Empty body (and a <code>WWW-Authenticate</code> header)</td></tr>
+      <tr><td><code>AccessDeniedHandler</code></td><td>Authenticated user lacks permission</td><td>403</td><td>Empty 403</td></tr>
+    </tbody>
+  </table></div>
+  <p>A client that gets an empty body cannot show a good message. We write one handler class that implements both interfaces and returns a <code>ProblemDetail</code>-style JSON (the same shape as the rest of the API, <a href="#m2">module 2</a>).</p>
+
+  <h4>The handlers</h4>
+  <pre data-title="JsonSecurityHandlers.java"><code class="language-java">@Component
+public class JsonSecurityHandlers implements AuthenticationEntryPoint, AccessDeniedHandler {
+
+    @Override   // 401
+    public void commence(HttpServletRequest request, HttpServletResponse response,
+                         AuthenticationException ex) throws IOException {
+        String detail = "Authentication is required or the token is invalid.";
+        if (ex instanceof InvalidBearerTokenException) {
+            detail = "The access token is invalid or has expired.";
+        }
+        response.setHeader(HttpHeaders.WWW_AUTHENTICATE, "Bearer");
+        write(response, 401, "Unauthorized", detail, request.getRequestURI());
+    }
+
+    @Override   // 403
+    public void handle(HttpServletRequest request, HttpServletResponse response,
+                       AccessDeniedException ex) throws IOException {
+        write(response, 403, "Forbidden",
+                "You do not have permission to do this.", request.getRequestURI());
+    }
+
+    private void write(HttpServletResponse response, int status, String title,
+                       String detail, String path) throws IOException {
+        response.setStatus(status);
+        response.setContentType("application/problem+json");
+        response.setCharacterEncoding("UTF-8");
+        response.getWriter().write("""
+                {"type":"about:blank","title":"%s","status":%d,\
+                "detail":"%s","instance":"%s"}"""
+                .formatted(title, status, detail, path.replace("\"", "")));
+    }
+}</code></pre>
+  <pre class="out" data-title="Response for a missing token"><code class="language-http">HTTP/1.1 401
+WWW-Authenticate: Bearer
+Content-Type: application/problem+json
+
+{"type":"about:blank","title":"Unauthorized","status":401,
+ "detail":"Authentication is required or the token is invalid.",
+ "instance":"/api/jobs/mine"}</code></pre>
+  <p>The detail texts are fixed strings, so no user input reaches the JSON except the path, whose quotes we remove. If you build bigger bodies, use your JSON mapper (<code>JsonMapper</code>/<code>ObjectMapper</code>) instead of string formatting; its package differs between Jackson 2 in Boot 3 and Jackson 3 in Boot 4, which is why this example avoids it.</p>
+  <p>Register the handlers as shown in the earlier configurations: <code>exceptionHandling(e -&gt; e.authenticationEntryPoint(h).accessDeniedHandler(h))</code> for the custom filter, or the same two calls inside <code>oauth2ResourceServer(...)</code> for the resource server.</p>
+
+  <h4>Method-security exceptions inside controllers</h4>
+  <p>An <code>AccessDeniedException</code> thrown by <code>@PreAuthorize</code> or by your service code <em>is</em> raised inside MVC. If you have a catch-all <code>@ExceptionHandler(Exception.class)</code> returning 500, it swallows it and the user gets a wrong status. Handle it explicitly in the advice (or rethrow it):</p>
+  <pre data-title="In @RestControllerAdvice"><code class="language-java">@ExceptionHandler(AccessDeniedException.class)
+ProblemDetail denied(AccessDeniedException ex) {
+    return ProblemDetail.forStatusAndDetail(HttpStatus.FORBIDDEN,
+            "You do not have permission to do this.");
+}</code></pre>
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Expecting <code>@RestControllerAdvice</code> to format the 401/403 for URL rules.</li>
+      <li>A catch-all handler that turns <code>AccessDeniedException</code> into 500.</li>
+      <li>Putting stack traces or "user not found" details into the 401 body.</li>
+      <li>Forgetting the <code>WWW-Authenticate</code> header (it is part of the 401 contract, and clients and tools use it).</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Where do you customise the 401 and 403 responses?" <code>AuthenticationEntryPoint</code> and <code>AccessDeniedHandler</code>, set in <code>exceptionHandling</code> (or in the resource-server DSL). Explain why controller advice does not apply: the filters run before the DispatcherServlet.</p>
+  </div>
+</article>
+
+<article class="topic" id="m4-authorization">
+  <h3>Authorization: roles, hasRole, @PreAuthorize and owner-only checks</h3>
+  <p class="tldr">Use URL rules for coarse role checks, @PreAuthorize for method-level rules, and an ownership check in the service layer for "only the owner can edit"; roles need the ROLE_ prefix and the current user comes from the Authentication.</p>
+
+  <h4>Roles vs authorities and the ROLE_ prefix</h4>
+  <p>Spring Security has one concept: a <code>GrantedAuthority</code>, a string. A <strong>role</strong> is just an authority whose name starts with <code>ROLE_</code>. A finer-grained <strong>authority</strong> (also called permission) has any other name, e.g. <code>job:write</code>.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Expression</th><th>Checks for</th></tr></thead>
+    <tbody>
+      <tr><td><code>hasRole("ADMIN")</code></td><td>Authority <code>ROLE_ADMIN</code> (prefix added for you)</td></tr>
+      <tr><td><code>hasAnyRole("ADMIN", "RECRUITER")</code></td><td>Either role</td></tr>
+      <tr><td><code>hasAuthority("ROLE_ADMIN")</code></td><td>The exact string, same result as <code>hasRole("ADMIN")</code></td></tr>
+      <tr><td><code>hasAuthority("job:write")</code></td><td>A permission name, exactly as stored</td></tr>
+      <tr><td><code>authenticated()</code>, <code>permitAll()</code>, <code>denyAll()</code></td><td>Any user / everyone / nobody</td></tr>
+    </tbody>
+  </table></div>
+  <p>The classic bug: the database stores <code>RECRUITER</code>, the authority list contains <code>RECRUITER</code>, and <code>hasRole("RECRUITER")</code> returns 403 because it looks for <code>ROLE_RECRUITER</code>. Add the prefix when you build authorities (we did in both implementations).</p>
+  <p>Roles suit a small fixed set (CANDIDATE, RECRUITER, ADMIN). If you need "can edit jobs but not delete" across many roles, use permissions and map roles to permission sets.</p>
+
+  <h4>URL rules vs method security</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>URL rules (<code>authorizeHttpRequests</code>)</th><th>Method security (<code>@PreAuthorize</code>)</th></tr></thead>
+    <tbody>
+      <tr><td>Where</td><td>Central, in <code>SecurityConfig</code></td><td>On controller or service methods</td></tr>
+      <tr><td>Sees</td><td>Path, HTTP method, roles</td><td>Method arguments, return value, the Authentication</td></tr>
+      <tr><td>Good for</td><td>Coarse rules: public vs login vs admin area</td><td>Fine rules: "owner only", argument-based checks</td></tr>
+      <tr><td>Risk</td><td>Path patterns that miss a URL variant</td><td>Self-invocation skips the proxy (as with <code>@Transactional</code>)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Use both: URL rules as the outer wall, method security next to the business code.</p>
+
+  <h4>@EnableMethodSecurity and @PreAuthorize</h4>
+  <pre data-title="Method security examples"><code class="language-java">@RestController
+@RequestMapping("/api/jobs")
+public class JobController {
+
+    @PostMapping
+    @PreAuthorize("hasRole('RECRUITER')")
+    public JobResponse create(@Valid @RequestBody CreateJobRequest req,
+                              Authentication auth) { ... }
+
+    @DeleteMapping("/{id}")
+    @PreAuthorize("hasRole('ADMIN')")
+    public void delete(@PathVariable Long id) { ... }
+
+    @GetMapping("/admin/stats")
+    @PreAuthorize("hasAnyRole('ADMIN', 'RECRUITER')")
+    public Stats stats() { ... }
+}</code></pre>
+  <p>The annotation holds a <strong>SpEL</strong> expression (Spring Expression Language). The useful pieces: <code>authentication</code> (the <code>Authentication</code>), <code>principal</code>, method arguments with <code>#name</code> (needs the <code>-parameters</code> compiler flag, which Spring Boot's Maven parent sets), and bean calls with <code>@beanName</code>. Related annotations: <code>@PostAuthorize</code> (checks the returned object), <code>@PreFilter</code> / <code>@PostFilter</code> (filter collections; avoid on big lists, filter in the query instead).</p>
+  <pre data-title="Argument-based rules"><code class="language-java">// Principal is a UserDetails with getId() (session / custom-filter style)
+@PreAuthorize("#id == authentication.principal.id or hasRole('ADMIN')")
+public UserResponse getProfile(Long id) { ... }
+
+// Resource server style: authentication.name is the "sub" claim
+@PreAuthorize("#id.toString() == authentication.name or hasRole('ADMIN')")
+public UserResponse getProfile(Long id) { ... }
+
+// Call a bean for anything that needs the database
+@PreAuthorize("@jobSecurity.isOwner(#jobId, authentication)")
+public JobResponse update(Long jobId, UpdateJobRequest req) { ... }</code></pre>
+  <pre data-title="JobSecurity.java"><code class="language-java">@Component("jobSecurity")
+public class JobSecurity {
+
+    private final JobRepository jobRepository;
+
+    public JobSecurity(JobRepository jobRepository) {
+        this.jobRepository = jobRepository;
+    }
+
+    public boolean isOwner(Long jobId, Authentication auth) {
+        Long userId = Long.valueOf(auth.getName());
+        return jobRepository.existsByIdAndPostedById(jobId, userId);
+    }
+}</code></pre>
+  <p>If a rule fails, <code>AuthorizationDeniedException</code> (a subclass of <code>AccessDeniedException</code>) is thrown and becomes 403 through the handler above.</p>
+
+  <h4>Ownership: "recruiters edit only their own jobs"</h4>
+  <p>Roles answer "may a recruiter edit jobs?". Ownership answers "may <em>this</em> recruiter edit <em>this</em> job?". No role expression can know that, so a check against the data is needed. Do it in the <strong>service layer</strong>, where the entity is already loaded, so it works for every caller (controllers, scheduled jobs, other services) and cannot be forgotten by a new controller.</p>
+  <pre data-title="JobService.java"><code class="language-java">@Service
+public class JobService {
+
+    @Transactional
+    public JobResponse update(Long jobId, UpdateJobRequest req, CurrentUser me) {
+        Job job = jobRepository.findById(jobId)
+                .orElseThrow(() -&gt; new ResourceNotFoundException("Job " + jobId));
+
+        boolean owner = job.getPostedBy().getId().equals(me.id());
+        if (!owner &amp;&amp; !me.isAdmin()) {
+            throw new AccessDeniedException("You can only edit your own jobs");
+        }
+        job.update(req.title(), req.description(), req.salaryMin(), req.salaryMax());
+        return JobResponse.from(job);                    // dirty checking saves it
+    }
+}</code></pre>
+  <p>Notes: the first lookup returns 404 for an unknown job, then 403 for someone else's. Some APIs return 404 in both cases so outsiders cannot discover ids; pick one. In list queries, filter by owner in the query itself: <code>findByPostedById(userId, pageable)</code> for "my jobs"; never load all and filter in Java. For candidates, "only owners can edit their data" means applications: <code>application.getApplicant().getId()</code> must equal the current user, and a recruiter may see applications only for jobs they posted.</p>
+
+  <h4>Getting the current user</h4>
+  <pre data-title="Four ways, and a helper"><code class="language-java">// 1. Parameter of the controller method (simplest and testable)
+@GetMapping("/me")
+UserResponse me(Authentication authentication) { ... }
+
+// 2. The principal itself
+@GetMapping("/me")
+Object me(@AuthenticationPrincipal Jwt jwt) { ... }                 // resource server
+Object me(@AuthenticationPrincipal AppUserDetails user) { ... }     // UserDetails style
+
+// 3. Static access (anywhere, but hidden dependency)
+Authentication a = SecurityContextHolder.getContext().getAuthentication();
+
+// 4. A small value object used by services
+public record CurrentUser(Long id, Set&lt;String&gt; roles) {
+    public static CurrentUser from(Authentication a) {
+        Set&lt;String&gt; roles = a.getAuthorities().stream()
+                .map(GrantedAuthority::getAuthority)
+                .collect(Collectors.toSet());
+        return new CurrentUser(Long.valueOf(a.getName()), roles);
+    }
+    public boolean isAdmin() { return roles.contains("ROLE_ADMIN"); }
+}</code></pre>
+  <p>Resolving <code>CurrentUser</code> once in the controller and passing it to the service keeps services free of <code>SecurityContextHolder</code> and easy to unit test (<a href="#m5">module 5</a>). Do not accept the user id from the request body or URL for "my data" endpoints: <code>POST /api/applications</code> with <code>{"userId": 5}</code> lets anyone apply as someone else.</p>
+
+  <h4>Project 2 access matrix</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Action</th><th>Anonymous</th><th>CANDIDATE</th><th>RECRUITER</th><th>ADMIN</th></tr></thead>
+    <tbody>
+      <tr><td>Browse jobs (GET)</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Post a job</td><td>No</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Edit or close a job</td><td>No</td><td>No</td><td>Own jobs only</td><td>Any</td></tr>
+      <tr><td>Apply to a job</td><td>No</td><td>Yes</td><td>No</td><td>No</td></tr>
+      <tr><td>See applications of a job</td><td>No</td><td>No</td><td>Own jobs only</td><td>Any</td></tr>
+      <tr><td>See / withdraw my application</td><td>No</td><td>Own only</td><td>No</td><td>Any</td></tr>
+      <tr><td>Manage users</td><td>No</td><td>No</td><td>No</td><td>Yes</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: authorize on the server, with data, every time</p>
+    <p>Hiding a button in React is not security. Every endpoint must check role <em>and</em> ownership on the server. Missing ownership checks are called <strong>IDOR</strong> (insecure direct object reference, also "broken object-level authorization") and top the OWASP API list.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li><code>hasRole("ROLE_ADMIN")</code> double prefix, or authorities stored without prefix and <code>hasRole</code> used.</li>
+      <li>Forgetting <code>@EnableMethodSecurity</code>: the annotations silently do nothing.</li>
+      <li>Calling a <code>@PreAuthorize</code> method from another method of the same class (no proxy, no check).</li>
+      <li>Checking the role but not the owner: any recruiter edits any job.</li>
+      <li>Using the old <code>@EnableGlobalMethodSecurity(prePostEnabled = true)</code>; it is replaced by <code>@EnableMethodSecurity</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Role vs authority?" Role is an authority with the <code>ROLE_</code> prefix. "<code>hasRole</code> vs <code>hasAuthority</code>?" Prefix handling. "How do you stop one user editing another's data?" Ownership check against the loaded entity in the service (or <code>@PreAuthorize</code> calling a bean), plus query filtering; mention IDOR. "Where do you put authorization: controller or service?" URL/role rules at the edge, ownership in the service.</p>
+  </div>
+</article>

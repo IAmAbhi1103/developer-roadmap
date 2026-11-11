@@ -1,0 +1,467 @@
+<article class="topic" id="m7-ride-sharing">
+  <h3>Design a ride-sharing app (like Uber or Ola)</h3>
+  <p class="tldr">Ride sharing needs a fast geospatial index of live driver locations (geohash cells or a
+  quadtree), a matching service that offers the trip to nearby drivers with timeouts and atomic assignment, a
+  trip state machine, and a real-time channel that streams the driver's position to the rider.</p>
+
+  <h4>1. Requirements</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li><strong>Rider:</strong> enter pickup and drop, see fare estimate and nearby vehicles, request a ride, see
+    the driver arrive on the map, pay, rate.</li>
+    <li><strong>Driver:</strong> go online, receive a request, accept or decline, navigate, start and end the
+    trip.</li>
+    <li><strong>Platform:</strong> match riders to drivers, compute ETA and fare, handle cancellations.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> match within a few seconds; location updates in near real time (the car
+  on the map should lag by seconds, not a minute); high availability in each city; a driver must never be
+  assigned two rides at once, and a ride must never be given to two drivers (consistency for assignment);
+  scalability to hundreds of thousands of online drivers. <strong>Out of scope:</strong> the routing engine,
+  surge pricing model, fraud detection (mention briefly).</p>
+
+  <h4>2. Capacity estimates (assumptions)</h4>
+  <ul>
+    <li>20 million rides per day → 20,000,000 ÷ 86,400 ≈ 230 per second on average; peak 3× ≈
+    <strong>700 ride requests per second</strong>.</li>
+    <li>1 million drivers online at peak. Each sends its location every 4 seconds →
+    1,000,000 ÷ 4 = <strong>250,000 location updates per second</strong>. Each update ~50 B → 12.5 MB/s.
+    This is the dominant load; it is write-heavy and overwrites the previous value.</li>
+    <li>Location store size: 1,000,000 drivers × 100 B = <strong>100 MB</strong> of latest positions. It fits in
+    memory on a single machine; throughput, not size, forces sharding (split by city or by geohash prefix).</li>
+    <li>Nearby-driver reads: each ride request queries nearby drivers a few times, and riders opening the app also
+    see nearby cars (say 10 map refreshes per ride request) → around 700 × 10 = 7,000 geo queries per second.
+    Moderate.</li>
+    <li>Trip records: 20M × 2 KB = 40 GB/day. GPS trail kept for disputes: 20-minute trips sampled every 4 s =
+    300 points × 30 B = 9 KB per trip → 20M × 9 KB = 180 GB/day, stored cheaply (log store or object storage)
+    and kept for a limited time.</li>
+    <li>Concurrent trips in progress: 700/s × average trip 20 min (1,200 s) ≈ 840,000 trips at peak, each
+    streaming a position to a rider every few seconds → about 200,000+ messages per second to riders.</li>
+  </ul>
+
+  <h4>3. API design</h4>
+  <pre data-title="API" class="out"><code class="language-http">POST /api/v1/rides/estimate
+{"pickup": {"lat": 12.9352, "lng": 77.6245}, "drop": {"lat": 12.9784, "lng": 77.6408}}
+200 OK  {"options": [{"type": "AUTO", "farePaise": 14500, "etaMin": 4},
+                      {"type": "SEDAN", "farePaise": 21000, "etaMin": 6}]}
+
+POST /api/v1/rides
+Idempotency-Key: 9a0d...
+{"pickup": {...}, "drop": {...}, "type": "SEDAN", "paymentMethodId": "pm_2"}
+202 Accepted  {"rideId": "r_3301", "status": "SEARCHING"}
+
+GET  /api/v1/rides/r_3301              (status, driver, ETA)
+POST /api/v1/rides/r_3301/cancel
+
+POST /api/v1/drivers/me/status         {"online": true}
+POST /api/v1/drivers/me/location       {"lat": 12.94, "lng": 77.62, "heading": 80}
+POST /api/v1/drivers/me/offers/of_1/accept
+POST /api/v1/rides/r_3301/start        (driver, after OTP check)
+POST /api/v1/rides/r_3301/end</code></pre>
+  <p>The ride request returns <code>202</code> because matching happens asynchronously; the app listens on a
+  WebSocket for status changes. The driver location endpoint is called often, so it should be a persistent
+  connection or a very light request.</p>
+
+  <h4>4. Data model</h4>
+  <ul>
+    <li><strong>Rides/trips, riders, drivers, payments:</strong> relational, with strong consistency, sharded by
+    city or ride id. Trip rows carry the state machine status and timestamps.</li>
+    <li><strong>Live driver locations:</strong> an in-memory geo index (Redis GEO or a custom service) holding
+    only the latest point per driver with a TTL (a driver who stops updating disappears after 30 seconds).</li>
+    <li><strong>Location history:</strong> append-only into Kafka, then to cold storage for analytics, disputes
+    and ETA model training.</li>
+  </ul>
+  <pre data-title="schema.sql"><code class="language-sql">CREATE TABLE ride (
+    ride_id      VARCHAR(20) PRIMARY KEY,
+    rider_id     BIGINT       NOT NULL,
+    driver_id    BIGINT,
+    status       VARCHAR(16)  NOT NULL,   -- SEARCHING, ASSIGNED, ARRIVED, STARTED, ENDED, CANCELLED
+    pickup_lat   DOUBLE PRECISION, pickup_lng DOUBLE PRECISION,
+    drop_lat     DOUBLE PRECISION, drop_lng   DOUBLE PRECISION,
+    fare_paise   BIGINT,
+    requested_at TIMESTAMP,
+    ended_at     TIMESTAMP
+);
+CREATE TABLE driver (
+    driver_id BIGINT PRIMARY KEY, name VARCHAR(80), vehicle_type VARCHAR(10),
+    rating NUMERIC(3,2), state VARCHAR(12)  -- OFFLINE, AVAILABLE, ON_TRIP
+);</code></pre>
+
+  <h4>5. High-level architecture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  R[Rider app] --> GW[API gateway]
+  D[Driver app] -->|location every 4s| LS[Location service]
+  LS --> GEO[(Geo index in Redis)]
+  LS --> K[[Location stream]]
+  GW --> RS[Ride service]
+  RS --> MS[Matching service]
+  MS --> GEO
+  MS --> ETA[ETA and routing service]
+  MS --> OS[Offer dispatcher]
+  OS -->|push offer| D
+  RS --> DB[(Ride database)]
+  RS --> WS[Realtime gateway]
+  WS -->|driver position and status| R
+  K --> ST[(Trail storage and analytics)]
+</pre>
+    <figcaption>Drivers feed a geo index; the matching service reads it, asks for ETAs and offers the ride; a realtime gateway streams updates to the rider</figcaption>
+  </figure>
+
+  <h4>6. Deep dive A: geospatial indexing (geohash vs quadtree)</h4>
+  <p>The question "which drivers are within 2 km of this point?" cannot use a plain index on latitude and
+  longitude, since that checks one coordinate at a time and scans a huge band. We need a structure that maps 2D
+  space into something searchable.</p>
+  <p><strong>Geohash.</strong> A geohash encodes a latitude/longitude pair into a short string by repeatedly
+  halving the world (alternating longitude and latitude bits) and writing the bits in base 32. Longer strings
+  mean smaller cells, and cells that share a prefix are near each other. Approximate cell sizes:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Geohash length</th><th>Cell size (approx.)</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td>5</td><td>about 4.9 km × 4.9 km</td><td>Coarse area, city districts</td></tr>
+      <tr><td>6</td><td>about 1.2 km × 0.6 km</td><td>Typical "nearby drivers" bucket</td></tr>
+      <tr><td>7</td><td>about 150 m × 150 m</td><td>Fine pickup points</td></tr>
+    </tbody>
+  </table></div>
+  <p>Index: keep a map from geohash (length 6) to the set of available drivers in that cell. To find drivers near
+  a rider: compute the rider's cell and its 8 neighbours (a driver just across a cell edge has a different
+  prefix, so neighbours are required), union their sets, then compute exact distance and filter by radius.
+  Updating a driver: if the cell changed since the last update, remove from the old set and add to the new
+  one. A geohash is also a good <strong>shard key</strong>: partition drivers by a coarse prefix so each shard
+  handles one area.</p>
+  <p><strong>Quadtree.</strong> A tree where each node covers a rectangle. If a node has more than N drivers
+  (say 500), split it into four children (NW, NE, SW, SE). Dense downtown areas get deep, small cells; empty
+  suburbs stay as big cells. To search, walk down to the leaf containing the point, then check neighbouring
+  leaves until enough drivers are found. It adapts to density, unlike fixed-size geohash cells, but is harder to
+  update at 250,000 moves per second and to distribute across servers (usually rebuilt in memory and
+  partitioned by region).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Geohash grid</th><th>Quadtree</th></tr></thead>
+    <tbody>
+      <tr><td>Structure</td><td>Fixed-size cells, string keys</td><td>Adaptive tree</td></tr>
+      <tr><td>Update cost</td><td>Cheap: change a set if the cell changed</td><td>Move between leaves, maybe split/merge</td></tr>
+      <tr><td>Density handling</td><td>Poor: crowded cells are big sets</td><td>Good: splits where crowded</td></tr>
+      <tr><td>Distribution</td><td>Easy: shard by prefix; works in Redis</td><td>Harder</td></tr>
+      <tr><td>Edge cases</td><td>Must query neighbouring cells</td><td>Must query neighbouring leaves</td></tr>
+    </tbody>
+  </table></div>
+  <p>Most practical answers use a geohash-style or hex grid (Uber published the H3 hexagonal grid for this) kept
+  in memory; mention both and pick one with a reason: "geohash in Redis, simple and shardable".</p>
+
+  <h4>7. Deep dive B: location updates at 250,000 per second</h4>
+  <ul>
+    <li><strong>Reduce the rate.</strong> Update every 4 seconds while available or on a trip, every 15–30
+    seconds when idle. Send only when the driver moved more than a few metres. Adaptive rates cut the load a lot.</li>
+    <li><strong>Writes go to memory.</strong> The location service overwrites the driver's entry in a sharded
+    in-memory store; it does not touch the SQL database. Redis GEO (<code>GEOADD</code>) or per-cell sets work;
+    shard by city or geohash prefix so each node takes tens of thousands of writes per second.</li>
+    <li><strong>Persistence is secondary.</strong> If the in-memory store is lost, drivers re-send within 4
+    seconds, so it rebuilds itself. Meanwhile, a copy of every update goes to Kafka for history.</li>
+    <li><strong>Staleness.</strong> Use a TTL or timestamp check; ignore drivers whose last update is older than
+    ~15–30 seconds when matching.</li>
+    <li><strong>Protocol.</strong> A persistent connection (WebSocket, MQTT) avoids repeated TLS handshakes and
+    headers for a tiny payload; HTTP works at smaller scale.</li>
+  </ul>
+
+  <h4>8. Deep dive C: matching, assignment and the trip lifecycle</h4>
+  <ol class="steps">
+    <li>The ride service stores the ride as SEARCHING and calls the matching service with pickup, type and
+    time.</li>
+    <li>Matching asks the geo index for available drivers of the right type within a starting radius (for
+    example 2 km); if too few, widen it step by step.</li>
+    <li>Rank candidates by <strong>road ETA</strong>, not straight-line distance (a driver 500 m away across a
+    river may be 15 minutes away), using the routing service on the top 10–20 candidates only because routing is
+    expensive. Also consider rating, acceptance rate and fairness.</li>
+    <li>Offer the ride to the best driver with a 10–15 second timeout. Alternatives: offer sequentially (simple,
+    slower) or to the top 3 at once (faster, wastes some driver attention).</li>
+    <li>On acceptance, assign atomically:
+    <code>UPDATE ride SET driver_id = ?, status = 'ASSIGNED' WHERE ride_id = ? AND driver_id IS NULL</code>
+    and set the driver to ON_TRIP in the same transaction, or use a short Redis lease on the driver while the
+    offer is open. One row updated means success; zero means someone else won the race
+    (<a href="#m6-coordination">Coordination</a>).</li>
+    <li>If no driver accepts after a few rounds, widen the search; after a limit (say 2 minutes), tell the rider
+    and cancel.</li>
+  </ol>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> SEARCHING
+  SEARCHING --> ASSIGNED: driver accepts
+  SEARCHING --> CANCELLED: no driver or rider cancels
+  ASSIGNED --> ARRIVED: driver at pickup
+  ASSIGNED --> CANCELLED: rider or driver cancels
+  ARRIVED --> STARTED: OTP verified
+  STARTED --> ENDED: drop reached
+  ENDED --> [*]
+  CANCELLED --> [*]
+</pre>
+    <figcaption>Trip states; only the ride service changes them, each change is a conditional update</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Real-time updates.</strong> The rider's app keeps a WebSocket to a realtime gateway
+    (<a href="#m7-chat">Chat</a> describes the gateway and session registry pattern). During ASSIGNED and
+    STARTED, the driver's updates are republished to the rider's channel every 2–4 seconds, and the app animates
+    the car between points. Status changes (ASSIGNED, ARRIVED) are pushed too, with a push notification as a
+    backup.</li>
+    <li><strong>Fare.</strong> Estimate before the ride (distance × rate + time × rate + base + surge multiplier),
+    compute the final fare from the actual trip. Surge: compare demand (requests) and supply (drivers) per cell
+    over a sliding window and raise a multiplier; smooth it to avoid flapping.</li>
+    <li><strong>Payment</strong> at trip end uses an idempotent charge
+    (<a href="#m7-payments">Payments</a>).</li>
+  </ul>
+
+  <h4>9. Bottlenecks, scaling and failure</h4>
+  <ul>
+    <li><strong>City sharding:</strong> riders and drivers in one city rarely interact with another city, so shard
+    the geo index, matching and ride data by city (or region). A city outage then affects only that city.</li>
+    <li><strong>Hot spots:</strong> airports and stadium exits have thousands of requests in a small area.
+    Use finer cells there and queue requests per pickup zone.</li>
+    <li><strong>Driver app offline:</strong> if heartbeats stop mid-trip, keep the trip alive, store the trail on
+    the phone and upload later; notify support after a long gap.</li>
+    <li><strong>Duplicates:</strong> accept and end calls carry idempotency keys; transitions are conditional.</li>
+    <li><strong>Monitoring:</strong> time to match, offer accept rate, location staleness, cancellations by
+    reason, geo query latency.</li>
+  </ul>
+
+  <h4>Follow-up questions</h4>
+  <ul>
+    <li>How do you handle a driver near a geohash cell boundary? (Search the 8 neighbouring cells too.)</li>
+    <li>Why not store driver positions in the SQL database? (250,000 writes per second of overwrites; memory
+    store fits better; durability not needed.)</li>
+    <li>How do you pool shared rides? (Extend matching to combine requests with compatible routes and time
+    windows; more complex optimisation.)</li>
+    <li>What if two riders are matched to one driver at the same instant? (Conditional update; the loser
+    re-matches.)</li>
+    <li>How do you compute ETA accurately? (Road graph with live traffic, learned corrections, cached for popular
+    segments.)</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Explain why lat/lng cannot use a normal index and how a geohash grid fixes it, including the
+      neighbouring-cells detail.</li>
+      <li>Give the location-update arithmetic: 1 million drivers ÷ 4 s = 250,000 per second, and say it lives in
+      memory.</li>
+      <li>Mention atomic assignment and the trip state machine.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m7-video-streaming">
+  <h3>Design a video streaming platform (like YouTube)</h3>
+  <p class="tldr">A video platform splits into an upload pipeline (upload to object storage, transcode into many
+  resolutions and small segments in parallel, publish) and a playback path (CDN serving adaptive-bitrate
+  segments chosen by the player), because storage and bandwidth, not request counts, dominate the design.</p>
+
+  <h4>1. Requirements</h4>
+  <p><strong>Functional:</strong></p>
+  <ul>
+    <li>Users upload videos (large files) with title, description and thumbnail.</li>
+    <li>Viewers search, open a video and watch with smooth playback on phones, laptops and TVs, on fast and slow
+    networks.</li>
+    <li>Seek anywhere in the video; the video starts quickly.</li>
+    <li>View counts, likes and comments (basic). Recommendations are out of scope.</li>
+  </ul>
+  <p><strong>Non-functional:</strong> very high availability for playback; start-up delay of about a second or
+  two; no buffering on stable networks; uploads must be reliable and resumable; uploaded videos must not be
+  lost (durability); cost efficiency (storage and bandwidth are the bill); eventual consistency is fine for
+  counts and for "video is processing" delays. <strong>Out of scope:</strong> live streaming, DRM details,
+  recommendation models.</p>
+
+  <h4>2. Capacity estimates (assumptions)</h4>
+  <ul>
+    <li>100 million daily active users watching 5 videos each → 500 million views per day →
+    500,000,000 ÷ 86,400 ≈ <strong>5,800 video starts per second</strong>.</li>
+    <li>Average watch time 5 minutes (300 s). Total viewing per day = 500M × 300 s = 150 billion seconds. Divide
+    by 86,400 seconds in a day: average concurrent streams = 150,000,000,000 ÷ 86,400 ≈
+    <strong>1.7 million</strong>; peak 3× ≈ 5 million.</li>
+    <li>Average stream bitrate 2.5 Mbps (megabits per second) → 2.5 ÷ 8 ≈ 0.31 MB/s. Peak egress = 5,000,000 ×
+    2.5 Mbps = 12,500,000 Mbps = <strong>12.5 Tbps</strong> (about 1.6 TB per second). No origin can serve this;
+    the CDN must carry nearly all of it.</li>
+    <li>Uploads: 100,000 new videos per day → about 1.2 per second. Average raw size 500 MB →
+    100,000 × 500 MB = <strong>50 TB per day</strong> raw, about 18 PB per year.</li>
+    <li>Transcoded versions: say 6 renditions (240p to 1080p) with the total close to the raw size → another
+    ~50 TB per day, so roughly <strong>100 TB per day, ~36 PB per year</strong> of video storage (approximate;
+    codecs, lengths and ladders change this a lot). Object storage with tiering (hot, cold) is the only option.</li>
+    <li>Metadata: 100,000 videos × 2 KB = 200 MB per day. Tiny. Views: 5,800 counter increments per second,
+    handled by batching.</li>
+  </ul>
+  <p>Conclusion: request QPS is modest; <strong>bytes</strong> (storage and egress) and <strong>compute for
+  transcoding</strong> drive the architecture.</p>
+
+  <h4>3. API design</h4>
+  <pre data-title="API" class="out"><code class="language-http">POST /api/v1/videos/uploads
+{"title": "Bengaluru metro vlog", "sizeBytes": 734003200, "contentType": "video/mp4"}
+201 Created
+{"videoId": "v_8F3k1", "uploadUrl": "https://storage.../raw/v_8F3k1?signature=...",
+ "partSizeBytes": 8388608}
+
+PUT   {uploadUrl} + part number       (client uploads parts directly to object storage)
+POST  /api/v1/videos/v_8F3k1/complete {"parts": [{"n": 1, "etag": "..."}, ...]}
+202 Accepted {"status": "PROCESSING"}
+
+GET   /api/v1/videos/v_8F3k1
+200 OK {"title": "...", "status": "READY",
+        "manifestUrl": "https://cdn.example/v_8F3k1/master.m3u8",
+        "thumbnailUrl": "...", "views": 1520}
+
+GET   /api/v1/search?q=metro&amp;cursor=...</code></pre>
+  <p>The video bytes never pass through the API servers. The client uploads in parts straight to object storage
+  with a pre-signed URL, which gives resumable uploads (retry only the failed part) and keeps the application
+  tier light.</p>
+
+  <h4>4. Data model</h4>
+  <ul>
+    <li><strong>Metadata</strong> (videos, channels, comments): SQL or a document store; read-heavy and cached.
+    Videos table: <code>video_id, owner_id, title, description, status, duration, created_at</code> with
+    status UPLOADING, PROCESSING, READY, FAILED.</li>
+    <li><strong>Video files and segments:</strong> object storage. Layout:
+    <code>raw/&lt;id&gt;/original.mp4</code> and <code>vod/&lt;id&gt;/&lt;resolution&gt;/seg_00001.ts</code> (or
+    <code>.m4s</code>), plus manifests.</li>
+    <li><strong>Search:</strong> an inverted index (Elasticsearch/OpenSearch) over titles, descriptions and
+    tags, updated from a stream of metadata changes.</li>
+    <li><strong>Counters:</strong> view and like counts aggregated from events; stored in a counter table or
+    Redis and flushed periodically.</li>
+  </ul>
+
+  <h4>5. High-level architecture</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  U[Uploader] -->|multipart upload| RAW[(Object storage raw)]
+  U --> API[Video API]
+  API --> DB[(Metadata DB)]
+  RAW --> Q[[Transcode job queue]]
+  Q --> TW[Transcoding workers]
+  TW --> VOD[(Object storage encoded segments)]
+  TW --> DB
+  V[Viewer player] --> CDN[CDN edge]
+  CDN -.->|miss| ORG[Origin shield]
+  ORG --> VOD
+  V --> API
+  V -->|view events| K[[Event stream]]
+  K --> AGG[Counters and analytics]
+</pre>
+    <figcaption>Upload and processing on one side, CDN playback on the other, joined by object storage</figcaption>
+  </figure>
+
+  <h4>6. Deep dive A: the upload and transcoding pipeline</h4>
+  <p>Raw uploads come in many formats, sizes and bitrates. Transcoding turns each into a set of standard
+  versions so every device can play something suitable. It is CPU-heavy, so it is done in parallel by many
+  workers.</p>
+  <ol class="steps">
+    <li><strong>Upload complete:</strong> an object-storage event (or the <code>complete</code> call) puts a job
+    on a queue and sets status PROCESSING.</li>
+    <li><strong>Validate:</strong> check the file type, duration limits, run a virus/abuse and copyright scan
+    (fingerprint matching), and extract metadata.</li>
+    <li><strong>Split</strong> the source into chunks of a few seconds on keyframe boundaries (groups of
+    pictures). Each chunk can be encoded independently, so a long video is processed in parallel.</li>
+    <li><strong>Encode</strong> each chunk into every rendition of the <em>bitrate ladder</em> (for example 240p,
+    360p, 480p, 720p, 1080p, optionally 4K) with a modern codec (H.264 is the universal baseline; VP9/AV1/HEVC
+    give better compression at higher compute cost). This is a DAG of tasks: split → encode chunk × rendition →
+    merge → package.</li>
+    <li><strong>Package</strong> into segments of 2–6 seconds and write a <strong>manifest</strong>: HLS uses
+    <code>.m3u8</code> playlists, MPEG-DASH uses <code>.mpd</code>. The master manifest lists the available
+    renditions and their bandwidth.</li>
+    <li><strong>Extras:</strong> thumbnails and preview sprites, captions, audio tracks.</li>
+    <li><strong>Publish:</strong> write segments to the encoded bucket, set status READY, index it for search,
+    and notify the uploader (<a href="#m7-notification">Notifications</a>).</li>
+  </ol>
+  <ul>
+    <li>Make every task <strong>idempotent</strong> (output path derived from video id, rendition and chunk
+    number, so a retried task overwrites the same file) and retry failed chunks only
+    (<a href="#m6-retries">Retries</a>). Use a workflow/orchestrator to track the DAG state
+    (<a href="#m6-sync-async">Orchestration</a>).</li>
+    <li>Use spot or preemptible compute for workers, since tasks are retryable, to save cost.</li>
+    <li>Prioritise: short videos and new uploads from verified creators first; a backlog metric shows when to
+    add workers.</li>
+    <li>Encode popular renditions first (so playback can start sooner) and add the rest later; or encode
+    lazily the rarely used ones on demand.</li>
+  </ul>
+
+  <h4>7. Deep dive B: adaptive bitrate streaming and the CDN</h4>
+  <p><strong>Adaptive bitrate (ABR) streaming.</strong> The video is available in several renditions, each cut
+  into short segments. The player downloads the manifest, starts with a medium rendition, and downloads segment
+  after segment over plain HTTP. It measures download speed and buffer level; if the network slows, it switches
+  to a lower rendition for the next segment, and switches back up when the network recovers. The user sees
+  quality change, not buffering. Seeking is easy: compute the segment number from the time (time ÷ segment
+  length), and fetch from there. Because segments are ordinary files over HTTP, they are cacheable by any CDN.</p>
+  <pre data-title="master.m3u8" class="out"><code class="language-plaintext">#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+360p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
+720p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+1080p/index.m3u8</code></pre>
+  <p><strong>CDN.</strong> Playback traffic (12.5 Tbps at peak in our estimate) is served by edge servers near
+  viewers (<a href="#m5">Module 5</a>). Segments are immutable, so they cache perfectly with long TTLs. Design
+  points:</p>
+  <ul>
+    <li><strong>Pull CDN with an origin shield:</strong> an edge miss asks a mid-tier cache, which asks the
+    origin only if it also misses. This collapses many edge misses into one origin read.</li>
+    <li><strong>Popularity is skewed:</strong> a small share of videos gets most views, so edge caches hold the
+    popular head, and the long tail is fetched from origin storage on demand. For an expected hit (new release),
+    <em>pre-warm</em> (push) segments to edges.</li>
+    <li><strong>Multiple CDNs or ISP-embedded caches</strong> for cost and resilience; steer clients by DNS or
+    manifest URLs.</li>
+    <li><strong>Cost:</strong> egress dominates the bill, so a high cache hit ratio directly lowers cost.
+    Efficient codecs reduce bytes per second.</li>
+    <li><strong>Security:</strong> signed, expiring URLs for private or paid content; hotlink protection.</li>
+  </ul>
+
+  <h4>8. Deep dive C: metadata, search, counters and consistency</h4>
+  <ul>
+    <li><strong>Metadata path.</strong> The video page API reads the cached metadata (Redis) and returns the
+    manifest URL. Metadata is small, so a replicated SQL database with a cache is enough; shard by video id if
+    needed.</li>
+    <li><strong>View counts.</strong> 5,800 starts per second would hammer one row per popular video. Players emit
+    view events into a stream; consumers aggregate in windows and add to counters periodically. Counts are
+    approximate and a few minutes late; dedupe or filter bot traffic. Show rounded numbers in the UI.</li>
+    <li><strong>Search.</strong> Index text fields; rank by relevance and engagement. The index is updated
+    asynchronously from the metadata change stream (CDC, <a href="#m6-outbox-cdc">Outbox and CDC</a>), so a new
+    video becomes searchable after a short delay.</li>
+    <li><strong>Resume playback.</strong> Store the last position per user and video, written every ~10–30
+    seconds from the client; a key-value store is enough.</li>
+    <li><strong>Thumbnails and previews</strong> are small images served by the CDN, cached aggressively.</li>
+    <li><strong>Deletion and takedown.</strong> Mark deleted in metadata (immediate effect on the API), purge CDN
+    objects, then delete files in the background.</li>
+  </ul>
+
+  <h4>9. Bottlenecks, scaling and failure</h4>
+  <ul>
+    <li><strong>Transcode backlog</strong> after a surge of uploads: autoscale workers on queue depth; show
+    "processing" and let low-resolution renditions publish first.</li>
+    <li><strong>Origin load</strong> during a viral spike of a new video: pre-warm the CDN, use an origin shield,
+    and rely on request collapsing (many simultaneous misses become one origin fetch).</li>
+    <li><strong>Storage cost:</strong> tier old and rarely watched videos to cheaper storage; drop unused high
+    renditions for cold videos and re-create on demand.</li>
+    <li><strong>Regional failure:</strong> replicate object storage across regions; multi-region CDN.</li>
+    <li><strong>Failure cases:</strong> corrupt upload (validate and mark FAILED with a reason); worker crash
+    (retry the chunk); manifest published before all segments exist (publish the manifest last).</li>
+    <li><strong>Monitoring:</strong> start-up time, rebuffer ratio, CDN hit ratio, transcode queue lag and
+    failure rate, bytes served per region.</li>
+  </ul>
+
+  <h4>Follow-up questions</h4>
+  <ul>
+    <li>How would you support live streaming? (Ingest by RTMP/WebRTC, near-real-time packaging into short
+    segments, low-latency HLS, a very different latency budget.)</li>
+    <li>Why short segments? (Faster adaptation and seeking vs more requests and manifest overhead; 2–6 s is a
+    common range.)</li>
+    <li>How do you reduce start-up time? (Start at a low rendition, small first segments, CDN proximity, preload
+    the manifest.)</li>
+    <li>How do you protect paid content? (Signed URLs, token auth, DRM licences.)</li>
+    <li>How would you detect duplicate or copyrighted uploads? (Content fingerprinting at the validation step.)</li>
+  </ul>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Do the bandwidth arithmetic (5 million concurrent × 2.5 Mbps = 12.5 Tbps) to justify the CDN.</li>
+      <li>Explain the pipeline in order: pre-signed upload → queue → chunked parallel transcode → segments plus
+      manifest → CDN.</li>
+      <li>Describe ABR in two sentences: renditions, segments, the player switches per segment.</li>
+    </ul>
+  </div>
+</article>

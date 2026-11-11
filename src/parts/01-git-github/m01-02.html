@@ -1,0 +1,392 @@
+<article class="topic" id="m1-how-git-stores">
+  <h3>How Git stores your work: snapshots, hashes and HEAD</h3>
+  <p class="tldr">Git saves each commit as a full snapshot of your project, names it with a SHA hash, links it to its parent commit, and uses tiny pointers — <code>HEAD</code> and branch names — to remember where you are.</p>
+
+  <p>You can use Git for months by memorising commands. You will use it <em>well</em> only when you know what the commands do inside. The good news: the core idea is small. Git is a simple key-value store — you give it content, it gives back a name (a hash) — and four kinds of objects built on top of that.</p>
+
+  <h4>Snapshots, not differences</h4>
+  <p>Older systems such as SVN store a file as a list of changes: "version 1, then these lines added, then these lines removed". Git thinks differently. Each time you commit, Git records <strong>a snapshot of every tracked file as it looks at that moment</strong>. If a file did not change, Git does not copy it again — the new snapshot simply points to the same stored content as before. So snapshots are cheap, and going to any commit is fast, because Git does not have to replay a chain of changes.</p>
+  <p>When you run <code>git diff</code> or <code>git show</code>, Git <em>computes</em> the difference between two snapshots on the fly. The difference is not what is stored.</p>
+
+  <h4>The four object types</h4>
+  <p>Everything inside the hidden <code>.git/objects</code> folder is one of four kinds of <strong>objects</strong>:</p>
+  <dl class="terms">
+    <dt>blob</dt>
+    <dd>The content of one file — only the content, not the file name. Two files with identical content share one blob.</dd>
+    <dt>tree</dt>
+    <dd>A folder. It lists names and, for each name, the hash of a blob (a file) or another tree (a sub-folder).</dd>
+    <dt>commit</dt>
+    <dd>A snapshot label. It points to one top-level tree, to its parent commit(s), and stores the author, date and message.</dd>
+    <dt>tag</dt>
+    <dd>A fixed, named pointer to a commit, optionally with its own message (used for releases; see <a href="#m4">Module 4</a>).</dd>
+  </dl>
+  <figure class="fig">
+<pre class="diagram">
+ commit 3f2a9c1                tree (project root)
+┌──────────────────┐         ┌───────────────────────────┐
+│ tree  ───────────┼────────▶│ README.md      → blob a1b2│
+│ parent  a17c0de  │         │ pom.xml        → blob c3d4│
+│ author  Asha Rao │         │ src/           → tree e5f6│
+│ message "Add ..."│         └─────────────┬─────────────┘
+└──────────────────┘                       ▼
+                              ┌──────────────────────────┐
+                              │ App.java       → blob 9a8b│
+                              └──────────────────────────┘
+</pre>
+    <figcaption>A commit points to a tree; trees point to blobs and other trees</figcaption>
+  </figure>
+
+  <h4>SHA hashes: the name of every object</h4>
+  <p>Git names an object by running its content through a hash function. The result is a 40-character hexadecimal string, called the <strong>SHA</strong> (or commit hash), for example <code>3f2a9c1e8b7d4a5c6f0e1d2b3a4c5d6e7f8a9b0c</code>. (Git has been moving from SHA-1 to SHA-256, which gives 64 characters; today's repositories are still SHA-1 by default, and everything you learn here works the same.)</p>
+  <ul>
+    <li><strong>Same content gives the same hash; any change gives a completely different hash.</strong> This is how Git detects corruption and how it knows two files are identical without comparing them.</li>
+    <li>A commit's hash is computed from its tree, its parent hash, author, date and message. So a commit's hash <em>includes its parent's hash</em>: changing an old commit changes every commit after it. This chain makes history tamper-evident.</li>
+    <li>You rarely type all 40 characters. The first 7 are normally enough: <code>git show 3f2a9c1</code>. Git accepts any prefix that is unique in the repository (at least 4 characters).</li>
+  </ul>
+  <p>You can look inside objects with the plumbing command <code>git cat-file</code>. This is a learning tool, not a daily one:</p>
+  <pre data-title="Look inside a commit"><code class="language-shell">$ git cat-file -t 3f2a9c1
+commit
+$ git cat-file -p 3f2a9c1
+tree 7c1e9d0b2a4f5e6d8c9b0a1f2e3d4c5b6a7f8e9d
+parent a17c0de5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9
+author Asha Rao &lt;asha@example.com&gt; 1731200000 +0530
+committer Asha Rao &lt;asha@example.com&gt; 1731200000 +0530
+
+Add GST calculation to order total
+$ git cat-file -p 7c1e9d0
+100644 blob a1b2c3d4e5f60718293a4b5c6d7e8f9012345678    README.md
+100644 blob c3d4e5f60718293a4b5c6d7e8f90123456789abc    pom.xml
+040000 tree e5f60718293a4b5c6d7e8f9012345678901234ab    src</code></pre>
+
+  <h4>Parent links make a history</h4>
+  <p>Each commit stores the hash of the commit that came before it (its <strong>parent</strong>). A merge commit has two parents. Following parent links backwards from the newest commit gives you the whole history, and that is exactly what <code>git log</code> prints.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart RL
+  C3[Commit 3f2a9c1] --> C2[Commit a17c0de]
+  C2 --> C1[Commit 5b9e0d4]
+  main([main]) -.-> C3
+  HEAD([HEAD]) -.-> main
+</pre>
+    <figcaption>Each commit points to its parent; main points to the newest commit; HEAD points to main</figcaption>
+  </figure>
+
+  <h4>Branches and HEAD are just pointers</h4>
+  <p>A <strong>branch</strong> is a file that holds one commit hash. That is all. The branch <code>main</code> is the file <code>.git/refs/heads/main</code> containing the hash of its latest commit. When you commit, Git creates the new commit and moves the branch pointer forward to it. Creating a branch means writing a new 41-byte file, which is why branches are instant and free.</p>
+  <p><strong>HEAD</strong> is a special pointer that means "where I am now". Usually it points to a branch name, not to a commit directly:</p>
+  <pre data-title="HEAD and a branch are plain text files"><code class="language-shell">$ cat .git/HEAD
+ref: refs/heads/main
+$ cat .git/refs/heads/main
+3f2a9c1e8b7d4a5c6f0e1d2b3a4c5d6e7f8a9b0c</code></pre>
+  <p>The next commit becomes the child of whatever HEAD points to, and the branch HEAD points to moves forward with it. When HEAD points straight at a commit instead of a branch, you are in <strong>detached HEAD</strong> state — you will meet that in <a href="#m3">Module 3</a>.</p>
+
+  <h4>Naming commits relative to HEAD</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Expression</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>HEAD</code></td><td>The commit you are on (the latest commit of the current branch)</td></tr>
+      <tr><td><code>HEAD~1</code> or <code>HEAD~</code> or <code>HEAD^</code></td><td>The first parent of HEAD — one commit back</td></tr>
+      <tr><td><code>HEAD~3</code></td><td>Three commits back, always following first parents</td></tr>
+      <tr><td><code>HEAD^2</code></td><td>The <em>second</em> parent of HEAD (only exists for a merge commit)</td></tr>
+      <tr><td><code>main~2</code></td><td>Two commits before the tip of <code>main</code></td></tr>
+    </tbody>
+  </table></div>
+  <p><code>~</code> means "go back N generations"; <code>^</code> means "choose which parent". For an ordinary commit with one parent, <code>HEAD~1</code> and <code>HEAD^</code> are the same.</p>
+
+  <h4>Where everything lives: the .git folder</h4>
+  <p>A repository is just your project folder plus one hidden folder, <code>.git</code>. Delete <code>.git</code> and the history is gone, but your files stay. Copy <code>.git</code> elsewhere and you have the whole repository.</p>
+  <pre data-title="Inside .git (simplified)"><code class="language-plaintext">.git/
+├── HEAD            which branch (or commit) you are on
+├── config          local configuration
+├── index           the staging area (binary file)
+├── objects/        all blobs, trees, commits, tags
+├── refs/
+│   ├── heads/      one file per local branch
+│   ├── remotes/    remote-tracking branches (Module 2)
+│   └── tags/       tags
+└── logs/           the reflog (Module 4)</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: never edit or delete files inside .git by hand</p>
+    <p>Use Git commands. Hand-editing <code>.git</code> is the fastest way to corrupt a repository. Also never run <code>git init</code> inside a folder that already sits inside another repository, or you create a nested repository.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Git stores each distinct <em>content</em> once, so a copied file costs almost nothing. It stores the content, not the file name — names live in trees.</li>
+      <li>Moving a file does not "record a move". Git simply sees one path disappear and another with identical content appear, and detects the rename when you ask (<code>git log --follow</code>, <code>git diff -M</code>).</li>
+      <li>Unreachable objects (for example commits left behind after a mistake) are not deleted immediately. Git keeps them for a while and cleans up later with garbage collection. This is what makes recovery possible (<a href="#m4">Module 4</a>).</li>
+      <li>Git packs old objects together and stores them as compressed deltas inside <em>pack files</em> to save disk space. That is an internal storage optimisation. Conceptually, every commit is still a full snapshot.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Does Git store diffs or snapshots? What is HEAD?"</p>
+    <ul>
+      <li>Snapshots: each commit points to a tree describing the whole project; unchanged files reuse the same blob.</li>
+      <li>Objects are blob, tree, commit and tag, each named by a SHA hash of its content; the commit hash includes the parent hash, so history is tamper-evident.</li>
+      <li>A branch is a movable pointer to a commit; <code>HEAD</code> is a pointer to the current branch (or commit).</li>
+      <li>That is why branching is cheap and why committing just moves a pointer forward.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-three-areas">
+  <h3>The three areas and the four file states</h3>
+  <p class="tldr">Changes travel from your working folder, to the staging area with <code>git add</code>, to the repository with <code>git commit</code> — and every file is always untracked, unmodified, modified or staged.</p>
+
+  <p>Beginners expect one step: change a file, save it to history. Git uses <strong>two</strong> steps, and that is what makes it powerful. The extra step lets you choose exactly which changes go into the next commit.</p>
+
+  <h4>The three local areas</h4>
+  <dl class="terms">
+    <dt>Working folder (working tree)</dt>
+    <dd>The real files on your disk, the ones you open in IntelliJ. You edit them freely.</dd>
+    <dt>Staging area (index)</dt>
+    <dd>A preparation zone, stored in <code>.git/index</code>. It holds the snapshot of what <em>will</em> go into the next commit. Think of it as the box you pack before you seal and ship it.</dd>
+    <dt>Repository (the <code>.git</code> folder)</dt>
+    <dd>The permanent history of commits. A commit is stored here only when you run <code>git commit</code>.</dd>
+  </dl>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  W[Working folder] -->|git add| S[Staging area]
+  S -->|git commit| R[(Repository)]
+  R -->|git restore --source=HEAD| W
+  S -->|git restore --staged| W
+</pre>
+    <figcaption>How a change moves through the three areas</figcaption>
+  </figure>
+  <p>An everyday comparison: a Swiggy order. Choosing dishes is editing the working folder. Putting them in the cart is <code>git add</code> — you can still remove items. Paying is <code>git commit</code> — now it is recorded.</p>
+
+  <h4>Why a staging area exists</h4>
+  <p>Suppose you fixed a bug in <code>PaymentService.java</code> and, in the same hour, started a new feature in <code>OrderController.java</code>. You want two separate commits, each with a clear message. With a staging area you stage and commit the bug fix first, then the feature. Without it, Git could only commit "everything that changed". Even inside one file you can stage only some changes (<code>git add -p</code>, see <a href="#m1-add-variants">git add variants</a>).</p>
+
+  <h4>The four file states</h4>
+  <p>Every file in your folder is in exactly one of these states:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>State</th><th>Meaning</th><th>How it gets here</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Untracked</strong></td><td>Git has never seen this file; it is not in any commit or in the staging area</td><td>You create a new file</td></tr>
+      <tr><td><strong>Unmodified</strong> (committed)</td><td>The file matches the last commit</td><td>After <code>git commit</code>, or right after a clone</td></tr>
+      <tr><td><strong>Modified</strong></td><td>A tracked file changed but the change is not staged</td><td>You edit and save a tracked file</td></tr>
+      <tr><td><strong>Staged</strong></td><td>The change is queued for the next commit</td><td><code>git add file</code></td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Tracked</strong> means "Git knows this file": it is in the last commit or in the staging area. Everything else is untracked (or ignored, see <a href="#m1-gitignore">.gitignore</a>).</p>
+  <figure class="fig">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Untracked : create file
+  Untracked --> Staged : git add
+  Unmodified --> Modified : edit file
+  Modified --> Staged : git add
+  Staged --> Unmodified : git commit
+  Staged --> Modified : git restore --staged
+  Unmodified --> Untracked : git rm --cached
+</pre>
+    <figcaption>The life cycle of a file in Git</figcaption>
+  </figure>
+
+  <h4>Watching the states change</h4>
+  <p>The command <code>git status</code> tells you the state of every file. Follow one file through its whole life:</p>
+  <pre data-title="From untracked to committed"><code class="language-shell">$ echo "# Billing Service" &gt; README.md
+$ git status
+On branch main
+
+No commits yet
+
+Untracked files:
+  (use "git add &lt;file&gt;..." to include in what will be committed)
+	README.md
+
+nothing added to commit but untracked files present (use "git add" to track)
+
+$ git add README.md
+$ git status
+On branch main
+
+No commits yet
+
+Changes to be committed:
+  (use "git rm --cached &lt;file&gt;..." to unstage)
+	new file:   README.md
+
+$ git commit -m "Add README"
+[main (root-commit) 5b9e0d4] Add README
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+
+$ echo "Spring Boot billing API" &gt;&gt; README.md
+$ git status
+On branch main
+Changes not staged for commit:
+  (use "git add &lt;file&gt;..." to update what will be committed)
+  (use "git restore &lt;file&gt;..." to discard changes in working directory)
+	modified:   README.md
+
+no changes added to commit (use "git add" and/or "git commit -a")</code></pre>
+  <p>Notice that <code>git status</code> itself tells you the next command to use. Read its hints.</p>
+
+  <h4>The same file can be in two places at once</h4>
+  <p>This surprises everybody once. If you stage a file and then edit it again, the <em>staged version</em> and the <em>working version</em> differ. <code>git status</code> lists the file twice:</p>
+  <pre data-title="Staged, then edited again"><code class="language-shell">$ git add README.md
+$ echo "Runs on port 8080" &gt;&gt; README.md
+$ git status
+On branch main
+Changes to be committed:
+  (use "git restore --staged &lt;file&gt;..." to unstage)
+	modified:   README.md
+
+Changes not staged for commit:
+  (use "git add &lt;file&gt;..." to update what will be committed)
+  (use "git restore &lt;file&gt;..." to discard changes in working directory)
+	modified:   README.md</code></pre>
+  <p>A commit now saves only the staged version. The last line you typed stays modified in the working folder until you <code>git add</code> it again.</p>
+
+  <h4>Short status: <code>git status -s</code></h4>
+  <p>The short form prints one line per file with two status columns. The <strong>left</strong> column is the staging area compared to the last commit; the <strong>right</strong> column is the working folder compared to the staging area.</p>
+  <pre data-title="git status -s"><code class="language-shell">$ git status -s
+M  pom.xml
+ M README.md
+MM src/main/java/App.java
+A  src/main/java/OrderService.java
+D  old-notes.txt
+?? scratch.txt
+!! target/</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>??</code></td><td>Untracked file</td></tr>
+      <tr><td><code>A_</code> (A in the left column)</td><td>New file, staged</td></tr>
+      <tr><td><code>M_</code> (M in the left column)</td><td>Modified and staged</td></tr>
+      <tr><td><code>_M</code> (M in the right column)</td><td>Modified, not staged</td></tr>
+      <tr><td><code>MM</code></td><td>Staged, then modified again</td></tr>
+      <tr><td><code>D_</code> / <code>_D</code></td><td>Deleted and staged / deleted but not staged</td></tr>
+      <tr><td><code>R_</code></td><td>Renamed, staged</td></tr>
+      <tr><td><code>UU</code></td><td>Merge conflict, both sides changed (<a href="#m3">Module 3</a>)</td></tr>
+      <tr><td><code>!!</code></td><td>Ignored (shown only with <code>--ignored</code>)</td></tr>
+    </tbody>
+  </table></div>
+  <p>In the table, <code>_</code> stands for a blank space; the real output has a space there. Quick rule: a letter in the <strong>left</strong> column means "ready to commit"; a letter in the <strong>right</strong> column means "not staged yet".</p>
+
+  <div class="co co-tip">
+    <p class="co-t">Tip: git status -sb</p>
+    <p>Add <code>-b</code> to also print the branch and its relation to the remote, for example <code>## main...origin/main [ahead 2]</code>.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: thinking git add is only for new files</p>
+    <p>Beginners edit a tracked file, run <code>git commit -m "fix"</code> and see <em>no changes added to commit</em>. Every change — new, edited or deleted — must be staged first. (The shortcut <code>git commit -a</code> stages modified and deleted tracked files for you, but never new ones.)</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>An <strong>empty folder</strong> never shows up as untracked — Git tracks files only.</li>
+      <li>If you change a file's permissions (executable bit), Git sees a change even if the content is the same.</li>
+      <li>A file that is listed in <code>.gitignore</code> but was already committed is still tracked, so it still shows up as modified (see <a href="#m1-gitignore">.gitignore</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Explain the working directory, staging area and repository."</p>
+    <ul>
+      <li>Working directory: real files you edit. Staging area (index): the snapshot being prepared for the next commit. Repository: committed history in <code>.git</code>.</li>
+      <li>Commands: <code>git add</code> moves changes working → staging; <code>git commit</code> moves staging → repository.</li>
+      <li>Reason for staging: build commits deliberately, even from part of a file with <code>git add -p</code>.</li>
+      <li>Name the four file states: untracked, unmodified, modified, staged.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-init-clone">
+  <h3>Start a repository: git init and git clone</h3>
+  <p class="tldr">Use <code>git init</code> to turn a folder you already have into a repository, and <code>git clone &lt;url&gt;</code> to copy an existing repository with its full history.</p>
+
+  <p>Every Git journey starts one of two ways. Either you have a project and want Git to track it (<code>git init</code>), or somebody already has a repository and you want a copy (<code>git clone</code>).</p>
+
+  <h4>git init: create a new repository</h4>
+  <pre data-title="Start tracking a project"><code class="language-shell">$ mkdir java-practice
+$ cd java-practice
+$ git init
+Initialized empty Git repository in C:/Users/asha/java-practice/.git/
+$ git status
+On branch main
+
+No commits yet
+
+nothing to commit (create/copy files and use "git add" to track)</code></pre>
+  <p><code>git init</code> creates the hidden <code>.git</code> folder and nothing else. It does not add or commit your files — you do that next. You can also give the folder name directly (<code>git init java-practice</code>), and choose the first branch name with <code>git init -b main</code> (or set <code>init.defaultBranch</code> once, see <a href="#m1-install-config">Install Git</a>).</p>
+  <p>If you started a project with Spring Initializr or an IDE and now want Git, run <code>git init</code> in the project root — the folder that holds <code>pom.xml</code> — and create your <a href="#m1-gitignore">.gitignore</a> <em>before</em> the first <code>git add .</code>.</p>
+
+  <h4>git clone: copy an existing repository</h4>
+  <p>A clone gives you the complete repository: all files, all branches' history, plus a link back to where it came from. Git also checks out the default branch so you can start working.</p>
+  <pre data-title="Clone a repository"><code class="language-shell">$ git clone https://github.com/spring-projects/spring-petclinic.git
+Cloning into 'spring-petclinic'...
+remote: Enumerating objects: 9850, done.
+remote: Total 9850 (delta 0), reused 0 (delta 0), pack-reused 9850
+Receiving objects: 100% (9850/9850), 7.89 MiB | 6.12 MiB/s, done.
+Resolving deltas: 100% (4021/4021), done.
+$ cd spring-petclinic
+$ git log --oneline -n 3</code></pre>
+  <p>(The object counts and sizes above are only an illustration; yours will differ.) The clone is placed in a new folder named after the repository. To choose another folder name, add it at the end: <code>git clone &lt;url&gt; my-folder</code>.</p>
+  <p>What <code>git clone</code> does, step by step:</p>
+  <ol class="steps">
+    <li>Creates the folder and runs <code>git init</code> inside it.</li>
+    <li>Adds a remote called <code>origin</code> that points to the URL you gave.</li>
+    <li>Downloads all objects (the full history).</li>
+    <li>Creates remote-tracking branches such as <code>origin/main</code> (<a href="#m2-remotes">Module 2</a>).</li>
+    <li>Creates a local branch for the remote's default branch, sets it to track <code>origin/main</code>, and checks it out.</li>
+  </ol>
+  <pre data-title="A fresh clone knows its origin"><code class="language-shell">$ git remote -v
+origin  https://github.com/spring-projects/spring-petclinic.git (fetch)
+origin  https://github.com/spring-projects/spring-petclinic.git (push)</code></pre>
+
+  <h4>URL forms</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Form</th><th>Example</th><th>Needs</th></tr></thead>
+    <tbody>
+      <tr><td>HTTPS</td><td><code>https://github.com/user/repo.git</code></td><td>Login through Git Credential Manager or a token for private repos</td></tr>
+      <tr><td>SSH</td><td><code>git@github.com:user/repo.git</code></td><td>An SSH key added to your GitHub account</td></tr>
+      <tr><td>Local path</td><td><code>../other-project</code></td><td>A repository on your own disk</td></tr>
+    </tbody>
+  </table></div>
+  <p>Cloning options such as <code>--depth 1</code> and cloning one branch are covered in <a href="#m2-clone-options">Clone options</a>.</p>
+
+  <h4>init vs clone</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>git init</code></th><th><code>git clone</code></th></tr></thead>
+    <tbody>
+      <tr><td>Starting point</td><td>An existing folder, no history</td><td>An existing repository, with history</td></tr>
+      <tr><td>Remote configured</td><td>No</td><td>Yes, <code>origin</code></td></tr>
+      <tr><td>Commits at the start</td><td>None ("No commits yet")</td><td>The full history</td></tr>
+      <tr><td>Typical use</td><td>Your own new project</td><td>Joining a team project, using open source</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: git init in the wrong folder</p>
+    <p>Running <code>git init</code> in your home folder (<code>C:\Users\asha</code>) makes your whole user profile a repository, and <code>git status</code> then lists thousands of files. Always <code>cd</code> into the project folder first. If it happened, delete the stray <code>.git</code> folder in the wrong place.</p>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and errors</p>
+    <ul>
+      <li><code>fatal: not a git repository (or any of the parent directories): .git</code> — you ran a Git command outside a repository. Check where you are with <code>pwd</code>.</li>
+      <li><code>fatal: destination path 'repo' already exists and is not an empty directory</code> — the folder you are cloning into is not empty. Choose another name.</li>
+      <li><code>Reinitialized existing Git repository</code> — running <code>git init</code> again is harmless; it does not erase anything.</li>
+      <li><code>fatal: repository '...' not found</code> or <em>Authentication failed</em> — wrong URL, a private repository, or missing login (<a href="#m2-https-token-gcm">credentials</a>).</li>
+      <li>Do not clone a repository <em>inside</em> another repository folder. Keep each project in its own folder, for example <code>C:\dev\</code>, and avoid cloning into OneDrive-synced folders, which can interfere with the many small files in <code>.git</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Difference between git init and git clone?"</p>
+    <ul>
+      <li><code>init</code> makes an empty repository from a local folder; <code>clone</code> copies an existing repository including full history and sets up <code>origin</code>.</li>
+      <li>Mention what a clone creates: a working copy, remote-tracking branches and a tracking local branch.</li>
+      <li>Add that a clone is a real, complete backup — you can clone from a clone.</li>
+    </ul>
+  </div>
+</article>

@@ -1,0 +1,720 @@
+<div class="mintro">
+  <p>Module 1 showed you how to read and change rows one table at a time. Real questions are bigger: "How many
+  orders did each customer place?", "Which department has the highest average salary?", "Which customers never
+  bought anything?" To answer them you must summarise rows (<strong>aggregates</strong> and
+  <code>GROUP BY</code>), combine tables (<strong>joins</strong>), nest queries (<strong>subqueries</strong>),
+  stack results (<code>UNION</code>), branch inside a query (<code>CASE</code>) and work with text and dates.
+  This module teaches all of it on the same company and shop tables you created in
+  <a href="#m1-sample-schema">The sample database</a>.</p>
+  <p>This is the part of SQL that every backend interview tests, and the part Spring Data JPA queries
+  (<code>@Query</code>, <code>JOIN FETCH</code>, projections) are built on. The thread that ties it together is
+  the <a href="#m2-logical-order">logical order of a query</a>: once you know in which order the database
+  evaluates the clauses, most "why does this not work?" questions answer themselves. Window functions, CTEs and
+  the classic interview puzzles come next in <a href="#m3">Module 3</a>.</p>
+  <ul>
+    <li>Summarise data with <code>COUNT</code>, <code>SUM</code>, <code>AVG</code>, <code>MIN</code>,
+    <code>MAX</code>, <code>GROUP BY</code> and <code>HAVING</code>, and say how <code>HAVING</code> differs from
+    <code>WHERE</code>.</li>
+    <li>Write inner, left, right, full, self and cross joins, join three or more tables, and avoid the
+    <code>LEFT JOIN</code> and row-multiplication traps.</li>
+    <li>Use scalar, <code>IN</code>, derived-table and correlated subqueries, and choose between
+    <code>IN</code>, <code>EXISTS</code> and <code>JOIN</code>.</li>
+    <li>Combine results with <code>UNION</code>, <code>UNION ALL</code>, <code>INTERSECT</code> and
+    <code>EXCEPT</code>, and branch with <code>CASE</code>.</li>
+    <li>Use string and date functions, filter date ranges correctly, handle time zones and cast types.</li>
+    <li>Explain the logical processing order and use it to debug a query.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m2-aggregates">
+  <h3>Aggregate functions: COUNT, SUM, AVG, MIN, MAX</h3>
+  <p class="tldr">An <strong>aggregate function</strong> reads many rows and returns one value. The five basic
+  ones are <code>COUNT</code>, <code>SUM</code>, <code>AVG</code>, <code>MIN</code> and <code>MAX</code>, and all
+  of them except <code>COUNT(*)</code> silently ignore NULL.</p>
+
+  <h4>What they do</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Function</th><th>Returns</th><th>Works on</th><th>On an empty set</th></tr></thead>
+    <tbody>
+      <tr><td><code>COUNT(*)</code></td><td>number of rows</td><td>rows</td><td>0</td></tr>
+      <tr><td><code>COUNT(col)</code></td><td>number of rows where <code>col</code> is not NULL</td><td>any type</td><td>0</td></tr>
+      <tr><td><code>SUM(col)</code></td><td>total</td><td>numbers</td><td>NULL</td></tr>
+      <tr><td><code>AVG(col)</code></td><td>mean of the non-NULL values</td><td>numbers</td><td>NULL</td></tr>
+      <tr><td><code>MIN(col)</code>, <code>MAX(col)</code></td><td>smallest / largest</td><td>numbers, text, dates</td><td>NULL</td></tr>
+    </tbody>
+  </table></div>
+  <p>Without <code>GROUP BY</code>, an aggregate collapses the whole table (or the rows that pass
+  <code>WHERE</code>) into a single row.</p>
+  <pre data-title="Company-wide numbers"><code class="language-sql">SELECT COUNT(*)                 AS employees,
+       SUM(salary)              AS payroll,
+       ROUND(AVG(salary), 2)    AS avg_salary,
+       MIN(salary)              AS lowest,
+       MAX(salary)              AS highest,
+       MIN(hire_date)           AS first_hire
+FROM employees;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> employees |  payroll   | avg_salary | lowest  | highest   | first_hire
+-----------+------------+------------+---------+-----------+------------
+        12 | 1645000.00 |  137083.33 | 55000.00 | 300000.00 | 2015-04-01
+(1 row)</code></pre>
+  <p>You cannot mix an aggregate with a plain column in the same <code>SELECT</code> unless you group:
+  <code>SELECT first_name, MAX(salary) FROM employees</code> fails with <code>ERROR:  column
+  "employees.first_name" must appear in the GROUP BY clause or be used in an aggregate function</code>. The
+  database cannot know which name to show next to the maximum. (Finding the person with the maximum is a
+  different query, see <a href="#m3-classic-nth-salary">Nth highest salary</a>.)</p>
+
+  <h4>COUNT(*) vs COUNT(col) vs COUNT(DISTINCT col)</h4>
+  <p>This is the most asked aggregate question. <code>COUNT(*)</code> counts rows. <code>COUNT(col)</code>
+  counts rows where the column has a value. <code>COUNT(DISTINCT col)</code> counts different non-NULL values.
+  They only differ when there are NULLs or repeats.</p>
+  <pre data-title="Three counts on the same data"><code class="language-sql">SELECT COUNT(*)                AS all_rows,
+       COUNT(dept_id)          AS with_dept,
+       COUNT(DISTINCT dept_id) AS distinct_depts
+FROM employees;
+
+SELECT COUNT(*) AS customers, COUNT(phone) AS with_phone FROM customers;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> all_rows | with_dept | distinct_depts
+----------+-----------+----------------
+       12 |        11 |              3
+(1 row)
+
+ customers | with_phone
+-----------+------------
+         7 |          4
+(1 row)</code></pre>
+  <p>Meera has no department, so <code>COUNT(dept_id)</code> is 11. Five employees share department 1, six
+  share 2 and 3, but only three different ids exist. <code>COUNT(1)</code> and <code>COUNT(*)</code> are the
+  same thing and equally fast; write <code>COUNT(*)</code>.</p>
+
+  <h4>NULLs are ignored</h4>
+  <p>Aggregates skip NULL values. That is usually what you want, but it changes averages:</p>
+  <pre data-title="AVG with a NULL"><code class="language-sql">SELECT ROUND(AVG(x), 2)              AS avg_ignoring_null,
+       ROUND(AVG(COALESCE(x, 0)), 2) AS avg_null_as_zero,
+       SUM(x)              AS total,
+       COUNT(x)            AS counted
+FROM (VALUES (10), (20), (NULL)) AS t(x);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> avg_ignoring_null | avg_null_as_zero | total | counted
+-------------------+------------------+-------+---------
+             15.00 |            10.00 |    30 |       2
+(1 row)</code></pre>
+  <p>Decide what a missing value means. A missing rating should not count as zero stars; a missing sale
+  probably does count as zero sales. Also remember: <code>SUM</code> of an empty set is NULL, not 0, while
+  <code>COUNT</code> of an empty set is 0.</p>
+  <pre data-title="Empty set"><code class="language-sql">SELECT SUM(salary) AS total, COALESCE(SUM(salary), 0) AS safe_total, COUNT(*) AS n
+FROM employees WHERE dept_id = 99;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">  total   | safe_total | n
+----------+------------+---
+ (null)   |          0 | 0
+(1 row)</code></pre>
+
+  <h4>AVG, integers and ROUND</h4>
+  <p><code>AVG</code> of an integer column returns <code>NUMERIC</code> in PostgreSQL (and a decimal in MySQL),
+  so it does not truncate. The trap is doing the division yourself with two integers:</p>
+  <pre data-title="Integer division trap"><code class="language-sql">SELECT SUM(hours_per_week)                       AS total_hours,
+       SUM(hours_per_week) / COUNT(*)            AS wrong_int_division,
+       ROUND(AVG(hours_per_week), 2)             AS avg_hours,
+       ROUND(SUM(hours_per_week)::NUMERIC / COUNT(*), 2) AS avg_by_hand
+FROM employee_projects;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> total_hours | wrong_int_division | avg_hours | avg_by_hand
+-------------+--------------------+-----------+-------------
+         260 |                 23 |     23.64 |       23.64
+(1 row)</code></pre>
+  <p><code>ROUND(x, 2)</code> rounds to two decimals; <code>ROUND(x)</code> to a whole number; a negative second
+  argument rounds to tens or hundreds. In PostgreSQL <code>ROUND(value, digits)</code> needs a
+  <code>NUMERIC</code> (cast a <code>DOUBLE PRECISION</code> first: <code>ROUND(x::NUMERIC, 2)</code>). Casting
+  is covered in <a href="#m2-casting">Type casting</a>.</p>
+
+  <h4>Aggregating expressions, and listing values</h4>
+  <p>The argument can be any expression. Revenue is quantity times price per line:</p>
+  <pre data-title="Revenue of the shop"><code class="language-sql">SELECT SUM(quantity * unit_price) AS revenue_all_orders FROM order_items;
+SELECT STRING_AGG(first_name, ', ' ORDER BY first_name) AS engineers
+FROM employees WHERE dept_id = 1;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> revenue_all_orders
+--------------------
+           21924.00
+(1 row)
+
+                engineers
+-----------------------------------------
+ Arjun, Divya, Priya, Rahul, Vikram
+(1 row)</code></pre>
+  <p><code>STRING_AGG</code> (PostgreSQL) glues values into one text; MySQL calls it
+  <code>GROUP_CONCAT(first_name ORDER BY first_name SEPARATOR ', ')</code>. Other useful PostgreSQL aggregates:
+  <code>BOOL_AND</code>, <code>BOOL_OR</code>, <code>ARRAY_AGG</code>, <code>JSONB_AGG</code>.
+  <code>COUNT(DISTINCT x)</code>, <code>SUM(DISTINCT x)</code> work too, but <code>SUM(DISTINCT salary)</code>
+  adds each different salary only once, which is rarely what you mean.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: no aggregates in WHERE</p>
+    <p><code>WHERE salary &gt; AVG(salary)</code> fails with <code>ERROR:  aggregate functions are not allowed
+    in WHERE</code>. <code>WHERE</code> runs before any group exists. Use a subquery
+    (<code>salary &gt; (SELECT AVG(salary) FROM employees)</code>) or <code>HAVING</code>.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: COUNT(col) when you meant COUNT(*)</p>
+    <p>"How many customers do we have?" with <code>COUNT(phone)</code> answers 4, not 7. Count a column only
+    when you want to skip its NULLs; otherwise use <code>COUNT(*)</code>.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>With no <code>GROUP BY</code>, an aggregate query always returns exactly one row, even over zero input
+      rows. With <code>GROUP BY</code> and no input rows, you get zero rows.</li>
+      <li><code>SUM</code> of an <code>INT</code> column returns <code>BIGINT</code> in PostgreSQL, and
+      <code>SUM</code> of <code>BIGINT</code> returns <code>NUMERIC</code>, so overflow is rare. <code>MIN</code>
+      and <code>MAX</code> work on text (alphabetical) and dates.</li>
+      <li>Nesting aggregates, <code>MAX(AVG(x))</code>, is an error. Aggregate in a subquery, then aggregate
+      again.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Difference between <code>COUNT(*)</code>, <code>COUNT(col)</code> and <code>COUNT(DISTINCT col)</code>?"
+    and "what do aggregates do with NULL?" are near-certain. A strong answer also mentions that
+    <code>SUM</code> of nothing is NULL (use <code>COALESCE</code>) and that
+    <code>AVG(COALESCE(x,0))</code> differs from <code>AVG(x)</code>.</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-group-by">
+  <h3>GROUP BY and HAVING</h3>
+  <p class="tldr"><code>GROUP BY</code> splits rows into groups and runs the aggregates once per group;
+  <code>HAVING</code> then filters the groups. <code>WHERE</code> filters rows <em>before</em> grouping,
+  <code>HAVING</code> filters groups <em>after</em>.</p>
+
+  <h4>How GROUP BY works</h4>
+  <p>Think of it as sorting the rows into piles by the grouping columns, then collapsing each pile into one row.
+  Every other column in the <code>SELECT</code> must either be in the <code>GROUP BY</code> or be inside an
+  aggregate.</p>
+  <figure class="fig">
+<pre class="diagram">
+ employees (12 rows)            GROUP BY dept_id            result (4 rows)
+┌─────────┬─────────┬────────┐  ┌──────────────────┐      ┌─────────┬────┬──────────┐
+│ Vikram  │ dept 1  │ 220000 │  │ dept 1: 5 rows   │ ───▶ │ dept 1  │ 5  │ 144000   │
+│ Priya   │ dept 1  │ 150000 │  │ dept 2: 3 rows   │ ───▶ │ dept 2  │ 3  │ 128333   │
+│ Ananya  │ dept 2  │ 150000 │  │ dept 3: 3 rows   │ ───▶ │ dept 3  │ 3  │ 80000    │
+│ ...     │ ...     │ ...    │  │ NULL:   1 row    │ ───▶ │ (null)  │ 1  │ 300000   │
+└─────────┴─────────┴────────┘  └──────────────────┘      └─────────┴────┴──────────┘
+</pre>
+  <figcaption>Rows are sorted into groups, then COUNT and AVG run once per group</figcaption>
+  </figure>
+  <pre data-title="Headcount and average salary per department"><code class="language-sql">SELECT dept_id,
+       COUNT(*)              AS headcount,
+       ROUND(AVG(salary), 2) AS avg_salary
+FROM employees
+GROUP BY dept_id
+ORDER BY dept_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id | headcount | avg_salary
+---------+-----------+------------
+       1 |         5 |  144000.00
+       2 |         3 |  128333.33
+       3 |         3 |   80000.00
+  (null) |         1 |  300000.00
+(4 rows)</code></pre>
+  <p>NULL is treated as one group: all NULLs go together, although NULL is never equal to NULL in a
+  comparison. To show the department name instead of the id you need a join
+  (<a href="#m2-joins">Joins</a>); you then group by the id <em>and</em> the name, or only by the id (see the
+  next section).</p>
+
+  <h4>The GROUP BY rules</h4>
+  <ul>
+    <li>Every selected column that is not inside an aggregate must appear in <code>GROUP BY</code>. Otherwise
+    PostgreSQL says <code>column "e.first_name" must appear in the GROUP BY clause or be used in an aggregate
+    function</code>.</li>
+    <li>Exception: if you group by a table's <strong>primary key</strong>, PostgreSQL lets you select the other
+    columns of that table, because they are determined by the key. <code>GROUP BY d.dept_id</code> allows
+    <code>d.name</code>.</li>
+    <li><strong>MySQL</strong> enforces the same rule through the <code>ONLY_FULL_GROUP_BY</code> mode, on by
+    default since MySQL 5.7.5 (<code>ERROR 1055</code>). Older setups with the mode off return an arbitrary
+    value from the group, a silent bug. Keep the mode on.</li>
+    <li>You can group by an <strong>expression</strong> or several columns. Write the expression or use the
+    alias (PostgreSQL and MySQL both allow an alias in <code>GROUP BY</code>, standard SQL does not).</li>
+    <li>The order of the output rows is not guaranteed. Add <code>ORDER BY</code>.</li>
+  </ul>
+
+  <h4>Grouping by several columns and by expressions</h4>
+  <p>Each distinct combination becomes one group. Orders per customer and status:</p>
+  <pre data-title="Two grouping columns"><code class="language-sql">SELECT customer_id, status, COUNT(*) AS orders
+FROM orders
+GROUP BY customer_id, status
+ORDER BY customer_id, status;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> customer_id |  status   | orders
+-------------+-----------+--------
+           1 | DELIVERED |      2
+           1 | SHIPPED   |      1
+           2 | DELIVERED |      1
+           2 | PLACED    |      1
+           3 | CANCELLED |      1
+           3 | DELIVERED |      1
+           4 | DELIVERED |      1
+           5 | PLACED    |      1
+           5 | SHIPPED   |      1
+(9 rows)</code></pre>
+  <p>Grouping by an expression: how many people were hired per year, keeping only years with more than one
+  hire (that is <code>HAVING</code>, next).</p>
+  <pre data-title="Group by an expression"><code class="language-sql">SELECT EXTRACT(YEAR FROM hire_date) AS hire_year, COUNT(*) AS hires
+FROM employees
+GROUP BY EXTRACT(YEAR FROM hire_date)
+HAVING COUNT(*) &gt; 1
+ORDER BY hire_year;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> hire_year | hires
+-----------+-------
+      2023 |     2
+      2024 |     2
+(2 rows)</code></pre>
+
+  <h4>HAVING: filtering groups</h4>
+  <p><code>HAVING</code> is <code>WHERE</code> for groups. Its condition can use aggregates, which
+  <code>WHERE</code> cannot. Departments with an average salary above 100,000:</p>
+  <pre data-title="HAVING with an aggregate"><code class="language-sql">SELECT dept_id, ROUND(AVG(salary), 2) AS avg_salary
+FROM employees
+GROUP BY dept_id
+HAVING AVG(salary) &gt; 100000
+ORDER BY dept_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id | avg_salary
+---------+------------
+       1 |  144000.00
+       2 |  128333.33
+  (null) |  300000.00
+(3 rows)</code></pre>
+  <p>PostgreSQL does not allow the alias in <code>HAVING</code> (<code>HAVING avg_salary &gt; …</code> fails);
+  repeat the expression. MySQL allows the alias.</p>
+
+  <h4>WHERE vs HAVING</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>WHERE</code></th><th><code>HAVING</code></th></tr></thead>
+    <tbody>
+      <tr><td>Filters</td><td>individual rows</td><td>groups</td></tr>
+      <tr><td>Runs</td><td>before <code>GROUP BY</code></td><td>after <code>GROUP BY</code></td></tr>
+      <tr><td>Can use aggregates</td><td>No</td><td>Yes</td></tr>
+      <tr><td>Can use plain columns</td><td>Yes</td><td>Only grouped columns</td></tr>
+      <tr><td>Speed</td><td>Reduces rows early (can use indexes)</td><td>Works on the groups already built</td></tr>
+    </tbody>
+  </table></div>
+  <p>Use both together. Question: <em>which departments have at least two people earning 100,000 or more?</em>
+  The salary test is a row condition (<code>WHERE</code>); the "at least two" is a group condition
+  (<code>HAVING</code>).</p>
+  <pre data-title="WHERE then HAVING"><code class="language-sql">SELECT dept_id, COUNT(*) AS high_earners
+FROM employees
+WHERE salary &gt;= 100000           -- row filter: runs first
+GROUP BY dept_id
+HAVING COUNT(*) &gt;= 2             -- group filter: runs after grouping
+ORDER BY dept_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id | high_earners
+---------+--------------
+       1 |            4
+       2 |            2
+(2 rows)</code></pre>
+  <p>Step by step: <code>WHERE</code> drops Divya, Neha, Farhan and Isha (under 100,000); the rest are grouped
+  into dept 1 (4 rows), dept 2 (2), dept 3 (Sunita, 1) and NULL (Meera, 1); <code>HAVING</code> keeps groups with
+  two or more. Put a row condition in <code>HAVING</code> and it still works
+  (<code>HAVING dept_id = 1</code>), but it is slower and confusing. Filter rows in <code>WHERE</code>.</p>
+  <p>Another everyday pattern: orders with a total above 4,000, from <code>order_items</code>:</p>
+  <pre data-title="Big orders"><code class="language-sql">SELECT order_id, SUM(quantity * unit_price) AS order_total
+FROM order_items
+GROUP BY order_id
+HAVING SUM(quantity * unit_price) &gt; 4000
+ORDER BY order_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> order_id | order_total
+----------+-------------
+        2 |     4097.00
+        7 |     4298.00
+(2 rows)</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: SELECT may only contain grouped columns and aggregates</p>
+    <p>Think "one output row per group". Anything else has several possible values per group and the database
+    refuses to guess.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: aggregates in WHERE</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: aggregate in WHERE</p><pre><code class="language-sql">SELECT dept_id FROM employees
+WHERE COUNT(*) &gt; 2 GROUP BY dept_id;
+-- ERROR:  aggregate functions are not allowed in WHERE</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: aggregate in HAVING</p><pre><code class="language-sql">SELECT dept_id FROM employees
+GROUP BY dept_id HAVING COUNT(*) &gt; 2;</code></pre></div>
+    </div>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><code>HAVING</code> without <code>GROUP BY</code> treats the whole result as one group:
+      <code>SELECT COUNT(*) FROM employees HAVING COUNT(*) &gt; 100</code> returns zero rows.</li>
+      <li>Departments with no employees (Marketing) do not appear in a <code>GROUP BY</code> on
+      <code>employees</code>; they have no rows. To list them with a count of 0 you need a
+      <code>LEFT JOIN</code>, see <a href="#m2-join-traps">Join traps</a>.</li>
+      <li>Join first, then group: if the join multiplies rows, the counts and sums multiply too.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is the difference between <code>WHERE</code> and <code>HAVING</code>?" Answer with the logical
+    order: <code>WHERE</code> filters rows before grouping and cannot use aggregates; <code>HAVING</code> filters
+    groups after aggregation. Then give one query using both. Often followed by "find departments with more than
+    N employees" or "duplicates" (<code>GROUP BY … HAVING COUNT(*) &gt; 1</code>, see
+    <a href="#m3-classic-duplicates">Duplicates</a>).</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-conditional-aggregation">
+  <h3>Conditional aggregation, FILTER and ROLLUP</h3>
+  <p class="tldr">Put a <code>CASE</code> (or PostgreSQL's <code>FILTER</code>) inside an aggregate to count or
+  sum only some rows, and you can build several measures, or a pivot table, in a single pass. <code>ROLLUP</code>
+  adds subtotal and grand-total rows.</p>
+
+  <h4>Why it is useful</h4>
+  <p>A report often needs several counts side by side: total orders, delivered orders, cancelled orders.
+  Running one query per number is slow and clumsy. <strong>Conditional aggregation</strong> computes them all in
+  one scan. The idea: the aggregate only sees the rows (or values) that your condition lets through.</p>
+  <pre data-title="Four measures in one query"><code class="language-sql">SELECT COUNT(*)                                          AS all_orders,
+       COUNT(*) FILTER (WHERE status = 'DELIVERED')      AS delivered,
+       SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END) AS cancelled,
+       COUNT(CASE WHEN status IN ('PLACED', 'SHIPPED') THEN 1 END) AS open_orders
+FROM orders;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> all_orders | delivered | cancelled | open_orders
+------------+-----------+-----------+-------------
+         10 |         5 |         1 |           4
+(1 row)</code></pre>
+  <p>Three equivalent spellings appear here:</p>
+  <ul>
+    <li><code>COUNT(*) FILTER (WHERE …)</code> is the standard, readable form. PostgreSQL has it; MySQL does
+    not.</li>
+    <li><code>SUM(CASE WHEN cond THEN 1 ELSE 0 END)</code> works everywhere. This is the portable version.</li>
+    <li><code>COUNT(CASE WHEN cond THEN 1 END)</code> relies on <code>COUNT</code> ignoring NULL: the
+    <code>CASE</code> returns NULL when the condition is false (no <code>ELSE</code>), and NULL is not counted.
+    Beginners write <code>COUNT(CASE … ELSE 0 END)</code> and wonder why every row is counted: 0 is not NULL.</li>
+  </ul>
+
+  <h4 id="m2-conditional-aggregation-how">How it works, step by step</h4>
+  <ol class="steps">
+    <li>The database reads each row once (after <code>WHERE</code> has removed rows, and with
+    <code>GROUP BY</code> it decides which group the row belongs to).</li>
+    <li>For every aggregate in the <code>SELECT</code> list it checks that aggregate's own condition: the
+    <code>FILTER</code> predicate, or the value of the <code>CASE</code> expression.</li>
+    <li>If the row passes, its value goes into that aggregate's running state (a counter, a sum). If not, that
+    one aggregate skips the row. The other aggregates still see it.</li>
+    <li>When the group ends, each aggregate returns its result. One scan gives many answers.</li>
+  </ol>
+  <p>What an aggregate returns when <em>no</em> row passes its condition depends on the aggregate, and this
+  causes most surprises:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Spelling</th><th>PostgreSQL</th><th>MySQL</th><th>If no row matches</th></tr></thead>
+    <tbody>
+      <tr><td><code>COUNT(*) FILTER (WHERE c)</code></td><td>yes</td><td>no</td><td>0</td></tr>
+      <tr><td><code>SUM(x) FILTER (WHERE c)</code></td><td>yes</td><td>no</td><td>NULL</td></tr>
+      <tr><td><code>SUM(CASE WHEN c THEN 1 ELSE 0 END)</code></td><td>yes</td><td>yes</td><td>0</td></tr>
+      <tr><td><code>COUNT(CASE WHEN c THEN 1 END)</code></td><td>yes</td><td>yes</td><td>0</td></tr>
+      <tr><td><code>SUM(CASE WHEN c THEN x END)</code></td><td>yes</td><td>yes</td><td>NULL</td></tr>
+      <tr><td><code>AVG(CASE WHEN c THEN x END)</code></td><td>yes</td><td>yes</td><td>NULL</td></tr>
+    </tbody>
+  </table></div>
+  <p>A percentage is the classic use: divide a conditional count by the total count. Write
+  <code>100.0</code>, not <code>100</code>, so the division is not an integer division.</p>
+  <pre data-title="Share of delivered orders"><code class="language-sql">SELECT ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'DELIVERED') / COUNT(*), 1)
+           AS delivered_pct
+FROM orders;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> delivered_pct
+---------------
+          50.0
+(1 row)</code></pre>
+
+  <h4>Per group</h4>
+  <p>Combined with <code>GROUP BY</code> it answers "for each department, how many high earners?" without
+  hiding departments that have none:</p>
+  <pre data-title="High earners per department"><code class="language-sql">SELECT dept_id,
+       COUNT(*)                                          AS headcount,
+       SUM(CASE WHEN salary &gt;= 150000 THEN 1 ELSE 0 END)   AS earn_150k_plus,
+       ROUND(AVG(salary) FILTER (WHERE salary &gt;= 100000), 0) AS avg_of_high
+FROM employees
+GROUP BY dept_id
+ORDER BY dept_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id | headcount | earn_150k_plus | avg_of_high
+---------+-----------+----------------+-------------
+       1 |         5 |              3 |      157500
+       2 |         3 |              2 |      155000
+       3 |         3 |              0 |      120000
+  (null) |         1 |              1 |      300000
+(4 rows)</code></pre>
+  <p>Department 1 high earners (at least 100,000): 220000, 150000, 150000, 110000, average 157,500. Department
+  3 has one (Sunita, 120,000), so the average is 120,000.</p>
+
+  <h4>Pivoting rows into columns</h4>
+  <p>A <strong>pivot</strong> turns values of a column into column headings. SQL has no simple pivot command in
+  PostgreSQL or MySQL, so you write one conditional aggregate per output column. Revenue per product category
+  by order status, a small report:</p>
+  <pre data-title="Pivot with conditional sums"><code class="language-sql">SELECT p.category,
+       SUM(oi.quantity * oi.unit_price) FILTER (WHERE o.status = 'DELIVERED') AS delivered,
+       SUM(oi.quantity * oi.unit_price) FILTER (WHERE o.status = 'SHIPPED')   AS shipped,
+       SUM(oi.quantity * oi.unit_price) FILTER (WHERE o.status = 'PLACED')    AS placed
+FROM order_items oi
+JOIN orders   o ON o.order_id   = oi.order_id
+JOIN products p ON p.product_id = oi.product_id
+GROUP BY p.category
+ORDER BY p.category;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">  category   | delivered | shipped | placed
+-------------+-----------+---------+---------
+ Electronics |   6793.00 | 5494.00 | 1098.00
+ Home        |    450.00 |  (null) |  900.00
+ Stationery  |   2910.00 |  (null) |  780.00
+(3 rows)</code></pre>
+  <p>(Joins are explained in the next articles; read this one again afterwards.) The cancelled order 4 is left
+  out of all three columns on purpose. Wrap a column in <code>COALESCE(…, 0)</code> to show 0 instead of NULL.
+  The same pivot idea shows up again in
+  <a href="#m3-classic-pivot-median">Pivot and median</a>.</p>
+
+  <h4>Subtotals with ROLLUP</h4>
+  <p><code>GROUP BY ROLLUP (category)</code> adds an extra row with the grand total. With two columns it also
+  adds a subtotal per first column. The added rows show NULL in the rolled-up columns.</p>
+  <pre data-title="Products and stock per category, plus a total"><code class="language-sql">SELECT category,
+       COUNT(*)   AS products,
+       SUM(stock) AS units_in_stock
+FROM products
+GROUP BY ROLLUP (category)
+ORDER BY category;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">  category   | products | units_in_stock
+-------------+----------+----------------
+ Electronics |        3 |            465
+ Home        |        2 |             60
+ Stationery  |        2 |           1300
+ (null)      |        7 |           1825
+(4 rows)</code></pre>
+  <p>MySQL spells it <code>GROUP BY category WITH ROLLUP</code>. The last row is the grand total. If a real
+  group can also be NULL, you cannot tell it from the total row; the function <code>GROUPING(category)</code>
+  returns 1 on the added rows (PostgreSQL and MySQL 8). Related: <code>CUBE</code> (all combinations) and
+  <code>GROUPING SETS</code> (the exact set of groupings you list), both PostgreSQL.</p>
+
+  <h4>Filtering groups by a conditional measure</h4>
+  <p>A conditional aggregate can sit in <code>HAVING</code> too. "Customers who have at least one delivered
+  order and at least one order still open" needs two conditions on the same group, which a plain
+  <code>WHERE</code> cannot express:</p>
+  <pre data-title="HAVING with conditional counts"><code class="language-sql">SELECT customer_id,
+       COUNT(*) FILTER (WHERE status = 'DELIVERED')            AS delivered,
+       COUNT(*) FILTER (WHERE status IN ('PLACED', 'SHIPPED')) AS open_orders
+FROM orders
+GROUP BY customer_id
+HAVING COUNT(*) FILTER (WHERE status = 'DELIVERED') &gt;= 1
+   AND COUNT(*) FILTER (WHERE status IN ('PLACED', 'SHIPPED')) &gt;= 1
+ORDER BY customer_id;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> customer_id | delivered | open_orders
+-------------+-----------+-------------
+           1 |         2 |           1
+           2 |         1 |           1
+(2 rows)</code></pre>
+  <p>Customer 3 has a delivered order but only a cancelled one besides it, and customer 5 has open orders but
+  nothing delivered, so both are left out.</p>
+
+  <h4>ROLLUP with two columns</h4>
+  <p>With <code>ROLLUP (a, b)</code> you get the detail rows <code>(a, b)</code>, a subtotal for each
+  <code>a</code>, and one grand total. The order of the columns matters: the grouping is rolled up from right
+  to left. Units sold per product, with a subtotal per category:</p>
+  <pre data-title="Detail, subtotal and grand total"><code class="language-sql">SELECT p.category, p.name,
+       COALESCE(SUM(oi.quantity), 0) AS units
+FROM products p
+LEFT JOIN order_items oi ON oi.product_id = p.product_id
+GROUP BY ROLLUP (p.category, p.name)
+ORDER BY p.category NULLS LAST, p.name NULLS LAST;</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">  category   |         name         | units
+-------------+----------------------+-------
+ Electronics | Mechanical Keyboard  |     3
+ Electronics | USB-C Cable          |     8
+ Electronics | Wireless Mouse       |     5
+ Electronics | (null)               |    16
+ Home        | Desk Lamp            |     0
+ Home        | Water Bottle         |     3
+ Home        | (null)               |     3
+ Stationery  | Gel Pen Pack         |    17
+ Stationery  | Notebook A5          |    18
+ Stationery  | (null)               |    35
+ (null)      | (null)               |    54
+(11 rows)</code></pre>
+  <p>The <code>LEFT JOIN</code> keeps Desk Lamp, which was never sold. A <code>(null)</code> in
+  <code>name</code> marks a subtotal row, and NULL in both columns marks the grand total. To print readable
+  labels, test with <code>GROUPING</code>, not with <code>IS NULL</code>:</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: a real NULL looks like a total</p><pre><code class="language-sql">SELECT COALESCE(category, 'TOTAL') AS category,
+       COUNT(*) AS products
+FROM products
+GROUP BY ROLLUP (category);</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: GROUPING() is 1 only on added rows</p><pre><code class="language-sql">SELECT CASE WHEN GROUPING(category) = 1 THEN 'TOTAL'
+            ELSE category END AS category,
+       COUNT(*) AS products
+FROM products
+GROUP BY ROLLUP (category);</code></pre></div>
+  </div>
+  <p>The wrong version works on the sample data, because no category is NULL. It breaks the day a product with
+  a NULL category is added: that group would also be labelled TOTAL.</p>
+
+  <h4>ROLLUP, CUBE and GROUPING SETS compared</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Clause</th><th>Groupings it produces for (a, b)</th><th>PostgreSQL</th><th>MySQL</th></tr></thead>
+    <tbody>
+      <tr><td><code>ROLLUP (a, b)</code></td><td>(a, b), (a), ()</td><td>yes</td><td><code>WITH ROLLUP</code></td></tr>
+      <tr><td><code>CUBE (a, b)</code></td><td>(a, b), (a), (b), ()</td><td>yes</td><td>no</td></tr>
+      <tr><td><code>GROUPING SETS ((a), (b))</code></td><td>exactly the sets you list</td><td>yes</td><td>no</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>ROLLUP</code> is shorthand for a particular list of <code>GROUPING SETS</code>, and the database
+  still reads the table only once. The alternative, a <code>UNION ALL</code> of one <code>GROUP BY</code> per
+  level, reads it once per level and is much longer. In MySQL, write
+  <code>GROUP BY p.category, p.name WITH ROLLUP</code>.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: prefer FILTER, fall back to CASE</p>
+    <p>In PostgreSQL code <code>FILTER (WHERE …)</code> reads best. In code that must also run on MySQL (or
+    that a JPA native query shares between databases) use <code>SUM(CASE WHEN …)</code>.</p>
+  </div>
+  <div class="co co-rule">
+    <p class="co-t">Rule: the condition belongs inside the aggregate, not in WHERE</p>
+    <p>Use <code>WHERE</code> for conditions that apply to every measure in the query. Use
+    <code>FILTER</code> or <code>CASE</code> for conditions that apply to one measure. Mix them freely: first
+    <code>WHERE</code> shrinks the rows, then each aggregate filters further.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li><strong>Empty group, empty result.</strong> <code>SUM(…) FILTER</code> and
+      <code>SUM(CASE … END)</code> give NULL when nothing matches. Wrap them in <code>COALESCE(…, 0)</code>
+      for reports, or use <code>ELSE 0</code> if zero is the right answer.</li>
+      <li><strong>NULLs in the tested column.</strong> A condition like <code>status = 'DELIVERED'</code> is
+      unknown (not true) for a NULL status, so the row is simply not counted. It is not counted as
+      "not delivered" either; that is why the sums of all buckets may be lower than <code>COUNT(*)</code>.</li>
+      <li><strong>Ties and overlaps.</strong> Buckets such as <code>salary &gt;= 100000</code> and
+      <code>salary &gt;= 150000</code> overlap, so a row counts in both. Make ranges exclusive when the columns
+      must add up to the total.</li>
+      <li><strong>MySQL shortcut.</strong> MySQL treats a comparison as 0 or 1, so
+      <code>SUM(status = 'CANCELLED')</code> works there. PostgreSQL rejects it (a boolean cannot be summed);
+      write the <code>CASE</code> or <code>FILTER</code> form instead.</li>
+    </ul>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: ELSE 0 inside AVG (and COUNT)</p>
+    <p>A zero is a value, so it takes part in the average. Average salary of people earning at least 100,000:</p>
+    <div class="vs">
+      <div class="vs-bad"><p class="vs-t">Wrong: the 4 low earners drag it down</p><pre><code class="language-sql">SELECT AVG(CASE WHEN salary &gt;= 100000 THEN salary ELSE 0 END)
+FROM employees;          -- 113333.33  (1,360,000 / 12)</code></pre></div>
+      <div class="vs-good"><p class="vs-t">Right: skipped rows give NULL</p><pre><code class="language-sql">SELECT AVG(CASE WHEN salary &gt;= 100000 THEN salary END)
+FROM employees;          -- 170000.00  (1,360,000 / 8)
+-- PostgreSQL: AVG(salary) FILTER (WHERE salary &gt;= 100000)</code></pre></div>
+    </div>
+    <p>The same trap makes <code>COUNT(CASE … ELSE 0 END)</code> count every row. Use <code>ELSE 0</code> only
+    with <code>SUM</code>.</p>
+  </div>
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Dashboards and admin screens ("orders today: placed, shipped, delivered, cancelled") usually run one
+    conditional-aggregate query instead of four counts, which saves round trips and gives a consistent snapshot.
+    In a Spring Data repository this is typically a native query returning a projection interface.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: using WHERE when you need several measures</p>
+    <p>If you put <code>WHERE status = 'DELIVERED'</code> on the query, the other columns (cancelled, open)
+    become zero. A <code>WHERE</code> limits all measures; a <code>FILTER</code> limits one.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"Show orders per status as columns" or "count male and female employees in one row per department" are
+    pivot questions: answer with <code>SUM(CASE WHEN … THEN 1 ELSE 0 END)</code> per output column plus
+    <code>GROUP BY</code>. Mention <code>FILTER</code> as the PostgreSQL form.</p>
+    <p>Likely follow-ups: "what does <code>SUM</code> return when no row matches?" (NULL, so use <code>COALESCE</code>), "why does <code>COUNT(CASE … ELSE 0 END)</code> count everything?" (0 is not NULL), and "how do you add a total row?" (<code>ROLLUP</code>, with <code>GROUPING()</code> to label it).</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-logical-order">
+  <h3>Logical order of a query</h3>
+  <p class="tldr">You write <code>SELECT</code> first, but the database evaluates a query in a different order:
+  FROM, WHERE, GROUP BY, HAVING, SELECT, ORDER BY, then LIMIT. That order explains almost every "why can't I use
+  this here?" error.</p>
+
+  <h4>The order</h4>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  A["1 FROM and JOIN"] --> B["2 WHERE"]
+  B --> C["3 GROUP BY"]
+  C --> D["4 HAVING"]
+  D --> E["5 SELECT"]
+  E --> F["6 DISTINCT"]
+  F --> G["7 ORDER BY"]
+  G --> H["8 LIMIT / OFFSET"]
+</pre>
+  <figcaption>The logical processing order. The written order starts with SELECT, but it is evaluated fifth</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><strong>FROM / JOIN</strong>: find the tables and combine them into one big set of rows.</li>
+    <li><strong>WHERE</strong>: throw away rows that do not match. No groups and no select aliases exist yet.</li>
+    <li><strong>GROUP BY</strong>: collapse the remaining rows into groups.</li>
+    <li><strong>HAVING</strong>: throw away groups. Aggregates are available now.</li>
+    <li><strong>SELECT</strong>: compute the output columns, expressions and aliases. Window functions
+    (<a href="#m3-window-intro">Module 3</a>) are computed here too.</li>
+    <li><strong>DISTINCT</strong>: remove duplicate output rows.</li>
+    <li><strong>ORDER BY</strong>: sort the result. The select aliases exist now.</li>
+    <li><strong>LIMIT / OFFSET</strong> (<code>FETCH FIRST</code>): cut the sorted result.</li>
+  </ol>
+  <p>This is the <em>logical</em> order, the meaning of the query. The optimizer is free to reorder the real
+  work (it uses an index, filters early, joins in a smarter order) as long as the answer is the same.</p>
+
+  <h4>What the order explains</h4>
+  <pre data-title="One query, annotated"><code class="language-sql">SELECT   dept_id,                              -- 5. compute columns
+         ROUND(AVG(salary), 0) AS avg_sal      --    alias avg_sal is born here
+FROM     employees                             -- 1. read table
+WHERE    hire_date &gt;= '2018-01-01'             -- 2. keep rows hired from 2018
+GROUP BY dept_id                               -- 3. one group per department
+HAVING   COUNT(*) &gt;= 2                         -- 4. keep groups with 2+ rows
+ORDER BY avg_sal DESC                          -- 7. alias is allowed here
+LIMIT    2;                                    -- 8. top two groups</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext"> dept_id | avg_sal
+---------+---------
+       1 |  125000
+       2 |  117500
+(2 rows)</code></pre>
+  <p>Check by hand. <code>WHERE</code> keeps nine people hired from 2018 (Meera, Vikram and Ananya drop out).
+  <code>GROUP BY</code> makes three groups: department 1 (Priya, Rahul, Arjun, Divya, average 125,000),
+  department 2 (Karan, Neha, average 117,500) and department 3 (Sunita, Farhan, Isha, average 80,000).
+  <code>HAVING</code> keeps all three (each has two or more rows), <code>ORDER BY</code> sorts them by the alias
+  and <code>LIMIT 2</code> cuts off department 3.</p>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Question</th><th>Answer from the order</th></tr></thead>
+    <tbody>
+      <tr><td>Why can't I use a <code>SELECT</code> alias in <code>WHERE</code>?</td>
+      <td><code>WHERE</code> (step 2) runs before <code>SELECT</code> (step 5) creates the alias. Repeat the
+      expression, or use a subquery/CTE.</td></tr>
+      <tr><td>Why can I use it in <code>ORDER BY</code>?</td><td><code>ORDER BY</code> (step 7) runs after
+      <code>SELECT</code>.</td></tr>
+      <tr><td>Why can <code>HAVING</code> use <code>COUNT(*)</code> but <code>WHERE</code> cannot?</td>
+      <td>Groups exist only after step 3.</td></tr>
+      <tr><td>Why does <code>LIMIT</code> need <code>ORDER BY</code> to be meaningful?</td>
+      <td>It cuts the result at step 8, after sorting. Without a sort, "the first rows" is arbitrary.</td></tr>
+      <tr><td>Why can't I filter on a window function in <code>WHERE</code>?</td>
+      <td>Windows are computed in step 5, after <code>WHERE</code>. Wrap the query in a subquery or CTE and
+      filter outside.</td></tr>
+      <tr><td>Why can a <code>LEFT JOIN</code>'s <code>ON</code> and <code>WHERE</code> give different
+      results?</td><td><code>ON</code> is part of step 1 (builds the rows, keeps unmatched left rows);
+      <code>WHERE</code> (step 2) then deletes rows, including those NULL-extended ones.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Where PostgreSQL and MySQL are more relaxed</h4>
+  <p>Both databases accept a select alias in <code>GROUP BY</code>, and MySQL also in <code>HAVING</code>. This
+  is a convenience, not standard SQL, and it does not extend to <code>WHERE</code>. Do not rely on it if the
+  query must be portable.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: a clause can only use what earlier steps produced</p>
+    <p>If an error says a column, alias or aggregate "does not exist" or "is not allowed", find the step where
+    the thing is created and the step where you used it. Fix the order: repeat the expression, move it into a
+    subquery, or move the condition to the right clause.</p>
+  </div>
+  <div class="co co-tip">
+    <p class="co-t">Tip: build queries in this order too</p>
+    <p>Write <code>FROM</code> and <code>JOIN</code> first, then <code>WHERE</code>, then
+    <code>GROUP BY</code>, then the select list. Check the rows after each step. Many people start from the
+    select list and end up confused.</p>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"In which order does SQL execute a query?" Name all eight steps and explain the alias rule. It is also
+    the clean way to answer "<code>WHERE</code> vs <code>HAVING</code>". The optional follow-up is that the
+    optimizer may physically reorder work but must keep the logical result.</p>
+  </div>
+</article>

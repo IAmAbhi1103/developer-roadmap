@@ -1,0 +1,611 @@
+<article class="topic" id="m2-pagination">
+  <h3>Pagination, sorting and filtering</h3>
+  <p class="tldr">Never return a whole table: accept page, size and sort parameters through Spring's Pageable, cap the page size, filter with optional query parameters, and return your own page DTO instead of the raw Page.</p>
+
+  <p>A <code>findAll()</code> that works with 20 rows in development will freeze the server and the browser with 2 million rows in production. <strong>Pagination</strong> returns one slice of the data at a time. <strong>Sorting</strong> decides the order of rows, which a page needs to be stable. <strong>Filtering</strong> narrows the rows. Together they make every list endpoint safe and fast. Spring Data and Spring MVC support all three with very little code.</p>
+
+  <h4>The Pageable parameter</h4>
+  <p>Declare a <code>Pageable</code> parameter on a controller method. Spring MVC fills it from the query string.</p>
+  <pre data-title="ProductController.java"><code class="language-java">@GetMapping
+public PageResponse&lt;ProductResponse&gt; list(
+        @PageableDefault(size = 20, sort = "name") Pageable pageable) {
+    return service.findAll(pageable);
+}</code></pre>
+  <pre data-title="Requests"><code class="language-bash">curl "http://localhost:8080/api/v1/products?page=0&amp;size=10"
+curl "http://localhost:8080/api/v1/products?page=2&amp;size=10&amp;sort=price,desc"
+curl "http://localhost:8080/api/v1/products?sort=category,asc&amp;sort=name,desc"</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Parameter</th><th>Meaning</th><th>Default</th></tr></thead>
+    <tbody>
+      <tr><td><code>page</code></td><td>Page number, <strong>zero-based</strong> (first page is 0)</td><td>0</td></tr>
+      <tr><td><code>size</code></td><td>Rows per page</td><td>20</td></tr>
+      <tr><td><code>sort</code></td><td><code>property,direction</code>; repeat for several fields</td><td>unsorted</td></tr>
+    </tbody>
+  </table></div>
+  <p>Defaults and limits are set in properties. The default maximum page size is large (2000), so lower it yourself:</p>
+  <pre data-title="application.properties"><code class="language-properties">spring.data.web.pageable.default-page-size=20
+spring.data.web.pageable.max-page-size=100
+# set to true if the client counts pages from 1 (not recommended: confusing)
+spring.data.web.pageable.one-indexed-parameters=false</code></pre>
+  <p>A request with <code>size=100000</code> is then reduced to the maximum instead of loading everything. This protects the database and memory: always set a maximum.</p>
+
+  <h4>Repository side: Page and Slice</h4>
+  <p>A Spring Data repository method that takes a <code>Pageable</code> can return a <code>Page</code> or a <code>Slice</code>. <code>JpaRepository</code> already has <code>findAll(Pageable)</code>.</p>
+  <pre data-title="ProductRepository.java"><code class="language-java">public interface ProductRepository extends JpaRepository&lt;Product, Long&gt; {
+
+    Page&lt;Product&gt; findByCategory(String category, Pageable pageable);
+
+    Slice&lt;Product&gt; findByNameContainingIgnoreCase(String text, Pageable pageable);
+}</code></pre>
+  <pre data-title="Building a Pageable by hand (service, tests, batch jobs)"><code class="language-java">Pageable p = PageRequest.of(0, 20);                                  // page 0, 20 rows
+Pageable sorted = PageRequest.of(0, 20, Sort.by("price").descending());
+Pageable multi = PageRequest.of(1, 10,
+        Sort.by(Sort.Order.asc("category"), Sort.Order.desc("name")));</code></pre>
+
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th><code>Page&lt;T&gt;</code></th><th><code>Slice&lt;T&gt;</code></th></tr></thead>
+    <tbody>
+      <tr><td>Extra count query</td><td>Yes: <code>select count(*)</code></td><td>No</td></tr>
+      <tr><td>Knows total elements and pages</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Knows if there is a next page</td><td>Yes</td><td>Yes (fetches one extra row)</td></tr>
+      <tr><td>Cost on a big table</td><td>Higher (count can be slow)</td><td>Lower</td></tr>
+      <tr><td>Good for</td><td>Admin tables with "page 3 of 40"</td><td>Infinite scroll, "Load more"</td></tr>
+    </tbody>
+  </table></div>
+  <p>Useful methods: <code>getContent()</code>, <code>getTotalElements()</code>, <code>getTotalPages()</code>, <code>getNumber()</code> (current page), <code>getSize()</code>, <code>hasNext()</code>, <code>isFirst()</code>, <code>isLast()</code>, and <code>map(function)</code>, which converts each element (entity → DTO) and keeps the paging data.</p>
+
+  <h4>Return a page DTO, not the raw Page</h4>
+  <p>If you return Spring Data's <code>Page</code> from a controller, Jackson serializes the implementation class <code>PageImpl</code> with many internal fields (<code>pageable</code>, <code>sort</code>, <code>numberOfElements</code>, …). Spring Data logs a warning that serializing <code>PageImpl</code> as-is gives <strong>no guarantee about the stability of the JSON structure</strong>: a library upgrade can change what your clients receive. It also exposes entities if you forgot to map. Define your own small record:</p>
+  <pre data-title="PageResponse.java"><code class="language-java">public record PageResponse&lt;T&gt;(
+        List&lt;T&gt; content,
+        int page,
+        int size,
+        long totalElements,
+        int totalPages,
+        boolean last) {
+
+    public static &lt;E, T&gt; PageResponse&lt;T&gt; from(Page&lt;E&gt; page, Function&lt;E, T&gt; mapper) {
+        return new PageResponse&lt;&gt;(
+                page.getContent().stream().map(mapper).toList(),
+                page.getNumber(), page.getSize(),
+                page.getTotalElements(), page.getTotalPages(), page.isLast());
+    }
+}
+
+// service
+@Transactional(readOnly = true)
+public PageResponse&lt;ProductResponse&gt; findAll(Pageable pageable) {
+    return PageResponse.from(repository.findAll(pageable), mapper::toResponse);
+}</code></pre>
+  <pre class="out" data-title="GET /api/v1/products?page=0&amp;size=2&amp;sort=price,desc"><code class="language-json">{
+  "content": [
+    { "id": 7, "name": "Mechanical Keyboard", "price": 3499.00 },
+    { "id": 3, "name": "Wireless Mouse", "price": 799.00 }
+  ],
+  "page": 0,
+  "size": 2,
+  "totalElements": 23,
+  "totalPages": 12,
+  "last": false
+}</code></pre>
+  <div class="co co-version">
+    <p class="co-t">Spring Data's own DTO mode</p>
+    <p>Since Spring Data 3.3 you can opt in to a stable, documented JSON shape (<code>PagedModel</code>) with <code>@EnableSpringDataWebSupport(pageSerializationMode = EnableSpringDataWebSupport.PageSerializationMode.VIA_DTO)</code>. It outputs <code>content</code> and a <code>page</code> object with <code>size</code>, <code>number</code>, <code>totalElements</code> and <code>totalPages</code>. It is a fine choice if you want less code; a hand-written record gives you full control over the names, so many teams keep their own. Both exist in Boot 3.3+ and 4.x.</p>
+  </div>
+
+  <h4>Sorting safely</h4>
+  <p>Sort names from the URL go straight to the query. An unknown property (<code>sort=salary</code> on <code>Product</code>) throws <code>PropertyReferenceException</code>, which becomes a 500 unless you handle it. A property that is not indexed makes the query slow. Two protections:</p>
+  <ul>
+    <li><strong>Whitelist</strong> the allowed fields and map public names to entity fields:</li>
+  </ul>
+  <pre data-title="Sort whitelist"><code class="language-java">private static final Set&lt;String&gt; SORTABLE = Set.of("name", "price", "createdAt");
+
+private Pageable safe(Pageable in) {
+    for (Sort.Order o : in.getSort()) {
+        if (!SORTABLE.contains(o.getProperty())) {
+            throw new BadRequestException("Cannot sort by " + o.getProperty());
+        }
+    }
+    return in;
+}</code></pre>
+  <ul>
+    <li>Always add a <strong>stable tiebreaker</strong> such as <code>id</code>. If you sort by <code>price</code> and many rows have the same price, rows can jump between pages. <code>@PageableDefault(sort = {"createdAt", "id"})</code> or <code>Sort.by("price").and(Sort.by("id"))</code> fixes it.</li>
+  </ul>
+
+  <h4>Filtering with optional query parameters</h4>
+  <pre data-title="Request"><code class="language-bash">curl "http://localhost:8080/api/v1/products?category=mouse&amp;maxPrice=1000&amp;q=wire&amp;page=0&amp;size=10"</code></pre>
+  <p>For one or two fixed filters, derived query methods are enough (<code>findByCategory</code>, <code>findByPriceBetween</code>). When filters are optional and combine freely, use the <strong>Specification</strong> API: each filter is a small reusable object, and you add only those that were sent. The repository must extend <code>JpaSpecificationExecutor</code>.</p>
+  <pre data-title="Specifications (fragment)"><code class="language-java">public interface ProductRepository
+        extends JpaRepository&lt;Product, Long&gt;, JpaSpecificationExecutor&lt;Product&gt; { }
+
+public final class ProductSpecs {
+    public static Specification&lt;Product&gt; categoryIs(String category) {
+        return (root, query, cb) -&gt; cb.equal(root.get("category"), category);
+    }
+    public static Specification&lt;Product&gt; priceAtMost(BigDecimal max) {
+        return (root, query, cb) -&gt; cb.lessThanOrEqualTo(root.get("price"), max);
+    }
+    public static Specification&lt;Product&gt; nameContains(String text) {
+        return (root, query, cb) -&gt;
+                cb.like(cb.lower(root.get("name")), "%" + text.toLowerCase() + "%");
+    }
+}
+
+// service: combine only the filters that were provided
+Specification&lt;Product&gt; spec = Specification.where(null);
+if (filter.category() != null) spec = spec.and(ProductSpecs.categoryIs(filter.category()));
+if (filter.maxPrice() != null) spec = spec.and(ProductSpecs.priceAtMost(filter.maxPrice()));
+if (filter.q() != null)        spec = spec.and(ProductSpecs.nameContains(filter.q()));
+Page&lt;Product&gt; page = repository.findAll(spec, pageable);</code></pre>
+  <p>Specifications, JPQL and the Criteria API are explained in <a href="#m3">module 3</a>. In the controller, bind filters with a plain record (<a href="#m2-mapping-annotations">mapping annotations</a>) plus the <code>Pageable</code>:</p>
+  <pre data-title="ProductController.java"><code class="language-java">@GetMapping
+public PageResponse&lt;ProductResponse&gt; search(
+        ProductFilter filter,
+        @PageableDefault(size = 20, sort = {"name", "id"}) Pageable pageable) {
+    return service.search(filter, pageable);
+}</code></pre>
+
+  <h4>Offset paging and its limits; keyset (cursor) paging</h4>
+  <p>The <code>page</code>/<code>size</code> style is <strong>offset pagination</strong>: SQL <code>LIMIT 20 OFFSET 40000</code>. The database must walk past the first 40,000 rows before returning 20, so deep pages get slower. Also, if rows are inserted while the user browses, items shift and the user sees duplicates or misses some.</p>
+  <p><strong>Keyset (cursor) pagination</strong> asks for "the 20 rows after the last one I saw", using an indexed column:</p>
+  <pre data-title="Keyset idea in SQL"><code class="language-sql">SELECT * FROM product
+WHERE (created_at, id) &lt; (:lastCreatedAt, :lastId)     -- the cursor from the previous page
+ORDER BY created_at DESC, id DESC
+LIMIT 20;</code></pre>
+  <p>The API returns a <code>nextCursor</code> token (often a Base64 string with the last <code>created_at</code> and <code>id</code>) and the client sends it back as <code>?cursor=…</code>. It stays fast on any depth and is stable under inserts, but you cannot jump to "page 37". It suits feeds, logs and infinite scroll. Spring Data has a Scroll API for this (<code>Window</code> and <code>ScrollPosition</code>, Spring Data 3.1+). Offset paging is correct for most business apps; mention keyset when the interviewer asks about millions of rows.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Every list endpoint that can grow is paged, with a maximum page size.</li>
+      <li>Pages are zero-based in Spring: <code>page=0</code> is the first.</li>
+      <li>Sorting must be deterministic: add a unique tiebreaker.</li>
+      <li>Return your own page DTO, map entities to response DTOs inside the transaction (<code>Page.map</code>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Mistakes</p>
+    <ul>
+      <li>Returning <code>List&lt;Product&gt;</code> from <code>findAll()</code> with no limit.</li>
+      <li>Returning <code>Page&lt;Product&gt;</code> (entities) directly: JSON instability and entity exposure.</li>
+      <li>Letting the client sort by any column, or using <code>LIKE '%text%'</code> on a huge table and wondering about speed (a leading wildcard cannot use a normal index).</li>
+      <li>A <code>Page</code> query with a heavy join fetch: the count query repeats it, or Hibernate pages in memory (warning <code>HHH90003004</code>). Page the parent ids first; see <a href="#m3">module 3</a>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you implement pagination in Spring Boot?" <code>Pageable</code> in the controller, <code>Page</code> from the repository, map to a page DTO, cap the size. Then: "<code>Page</code> vs <code>Slice</code>" (count query), "problem with large offsets" (use keyset), and "how do you filter?" (derived queries for simple cases, Specifications for optional combinations).</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-openapi">
+  <h3>API documentation with springdoc-openapi and Swagger UI</h3>
+  <p class="tldr">Add the springdoc starter and your controllers produce an OpenAPI document at /v3/api-docs and an interactive Swagger UI page where anyone can read and try every endpoint.</p>
+
+  <p>An API without documentation is a guessing game for the React developer, the mobile team and your future self. <strong>OpenAPI</strong> (formerly "Swagger spec") is the standard, machine-readable description of a REST API: paths, parameters, request and response schemas, status codes and security. <strong>Swagger UI</strong> turns that description into a web page with a "Try it out" button. <strong>springdoc-openapi</strong> is the library that builds the OpenAPI document from your Spring annotations at runtime, so the docs match the code.</p>
+
+  <h4>Setup</h4>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springdoc&lt;/groupId&gt;
+    &lt;artifactId&gt;springdoc-openapi-starter-webmvc-ui&lt;/artifactId&gt;
+    &lt;version&gt;${springdoc.version}&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+  <div class="co co-version">
+    <p class="co-t">Match springdoc to your Spring Boot version</p>
+    <p>springdoc releases follow Spring Boot: the 2.x line is for Spring Boot 3.x, and Spring Boot 4 needs the newer springdoc line built for it. Check the version table in the springdoc documentation (springdoc.org) before choosing <code>springdoc.version</code>; a mismatched version fails at startup with confusing <code>NoSuchMethodError</code> or <code>ClassNotFoundException</code> errors. Use <code>springdoc-openapi-starter-webmvc-ui</code> for Spring MVC (the <code>webflux</code> variant is for WebFlux).</p>
+  </div>
+  <p>Start the app and open:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>URL</th><th>What you get</th></tr></thead>
+    <tbody>
+      <tr><td><code>http://localhost:8080/swagger-ui.html</code></td><td>Interactive UI (redirects to <code>/swagger-ui/index.html</code>)</td></tr>
+      <tr><td><code>http://localhost:8080/v3/api-docs</code></td><td>The OpenAPI document as JSON</td></tr>
+      <tr><td><code>http://localhost:8080/v3/api-docs.yaml</code></td><td>The same as YAML</td></tr>
+    </tbody>
+  </table></div>
+  <p>With no annotations at all, springdoc already lists every endpoint, the parameters and the DTO schemas, including <code>@Valid</code> constraints such as <code>@NotBlank</code> and <code>@Size</code>. Annotations add the human explanation.</p>
+
+  <h4>Describe the API once</h4>
+  <pre data-title="OpenApiConfig.java"><code class="language-java">import io.swagger.v3.oas.models.OpenAPI;
+import io.swagger.v3.oas.models.info.Info;
+
+@Configuration
+public class OpenApiConfig {
+
+    @Bean
+    public OpenAPI shopOpenApi() {
+        return new OpenAPI().info(new Info()
+                .title("Shop API")
+                .version("v1")
+                .description("Products, orders and customers"));
+    }
+}</code></pre>
+
+  <h4>The annotations you use</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation</th><th>On</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>@Tag(name, description)</code></td><td>controller</td><td>Group endpoints in the UI</td></tr>
+      <tr><td><code>@Operation(summary, description)</code></td><td>method</td><td>Title and explanation of an endpoint</td></tr>
+      <tr><td><code>@ApiResponse(responseCode, description, content)</code></td><td>method</td><td>Document a status code and its body</td></tr>
+      <tr><td><code>@Parameter(description, example)</code></td><td>parameter</td><td>Describe a path or query parameter</td></tr>
+      <tr><td><code>@Schema(description, example, requiredMode)</code></td><td>DTO field or class</td><td>Describe a model and its fields</td></tr>
+      <tr><td><code>@Hidden</code></td><td>method, class</td><td>Leave out of the docs</td></tr>
+      <tr><td><code>@SecurityRequirement(name)</code></td><td>method, class</td><td>Mark an endpoint as needing the named scheme</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="ProductController.java (documented)"><code class="language-java">import io.swagger.v3.oas.annotations.*;
+import io.swagger.v3.oas.annotations.media.*;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.tags.Tag;
+
+@RestController
+@RequestMapping("/api/v1/products")
+@Tag(name = "Products", description = "Create, read, update and delete products")
+public class ProductController {
+
+    @Operation(summary = "Get a product by id",
+               description = "Returns one product or 404 when the id does not exist")
+    @ApiResponse(responseCode = "200", description = "Product found")
+    @ApiResponse(responseCode = "404", description = "No product with this id",
+            content = @Content(mediaType = "application/problem+json",
+                    schema = @Schema(implementation = ProblemDetail.class)))
+    @GetMapping("/{id}")
+    public ProductResponse get(
+            @Parameter(description = "Product id", example = "42")
+            @PathVariable Long id) {
+        return service.findById(id);
+    }
+}</code></pre>
+  <pre data-title="CreateProductRequest.java (documented record)"><code class="language-java">public record CreateProductRequest(
+        @Schema(description = "Display name", example = "Wireless Mouse")
+        @NotBlank String name,
+
+        @Schema(description = "Unique stock keeping unit", example = "MS-100")
+        @NotBlank String sku,
+
+        @Schema(description = "Price in rupees", example = "799.00")
+        @NotNull @Positive BigDecimal price,
+
+        @Schema(example = "25") @PositiveOrZero int stock) {}</code></pre>
+  <p>Do not repeat the status codes of every endpoint by hand if your global error handler produces them. A common trick is to document the shared 400/404/500 once in a custom <code>OperationCustomizer</code> or on a base annotation. For a small API, annotating the main responses is enough.</p>
+
+  <h4>Documenting JWT authentication</h4>
+  <p>Once the API is secured with a JWT (<a href="#m4">module 4</a>), Swagger needs an "Authorize" button that sends the <code>Authorization: Bearer …</code> header. Declare a security scheme and require it:</p>
+  <pre data-title="OpenApiConfig.java (security scheme)"><code class="language-java">import io.swagger.v3.oas.annotations.security.SecurityScheme;
+import io.swagger.v3.oas.annotations.enums.SecuritySchemeType;
+
+@Configuration
+@SecurityScheme(
+        name = "bearerAuth",
+        type = SecuritySchemeType.HTTP,
+        scheme = "bearer",
+        bearerFormat = "JWT")
+public class OpenApiConfig { /* the OpenAPI bean from above */ }
+
+// on a controller or method that needs a token
+@SecurityRequirement(name = "bearerAuth")
+@RestController
+public class OrderController { ... }</code></pre>
+  <p>In the UI, click <strong>Authorize</strong>, paste the token (without the word "Bearer"), and "Try it out" sends it. Remember to allow the docs URLs in your Spring Security configuration (<code>/swagger-ui.html</code>, <code>/swagger-ui/**</code>, <code>/v3/api-docs/**</code>) or Swagger itself gets a 401.</p>
+
+  <h4>Grouping and versions</h4>
+  <p>For larger APIs, split the documentation by path or package: one group per API version or per audience (public vs admin).</p>
+  <pre data-title="GroupedOpenApi beans"><code class="language-java">@Bean
+GroupedOpenApi publicApi() {
+    return GroupedOpenApi.builder().group("public").pathsToMatch("/api/v1/**").build();
+}
+
+@Bean
+GroupedOpenApi adminApi() {
+    return GroupedOpenApi.builder().group("admin").pathsToMatch("/api/admin/**").build();
+}</code></pre>
+  <p>Swagger UI then shows a dropdown with the groups; each has its own <code>/v3/api-docs/{group}</code>.</p>
+
+  <h4>Useful properties and turning it off in production</h4>
+  <pre data-title="application.properties"><code class="language-properties">springdoc.swagger-ui.path=/swagger-ui.html
+springdoc.swagger-ui.operations-sorter=method
+springdoc.swagger-ui.tags-sorter=alpha
+springdoc.packages-to-scan=com.example.shop
+springdoc.paths-to-match=/api/**</code></pre>
+  <pre data-title="application-prod.properties"><code class="language-properties">springdoc.api-docs.enabled=false
+springdoc.swagger-ui.enabled=false</code></pre>
+  <p>Public Swagger on an internet-facing production service shows attackers a complete map of your API. Disable it in the <code>prod</code> profile (<a href="#m1">profiles in module 1</a>), or put it behind authentication. Internal tools and staging are fine.</p>
+
+  <h4>Code-first vs contract-first</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Code-first (springdoc)</th><th>Contract-first</th></tr></thead>
+    <tbody>
+      <tr><td>You write</td><td>Controllers, then generate the spec</td><td>The OpenAPI YAML first, then code</td></tr>
+      <tr><td>Good for</td><td>One team owns client and server; fast start</td><td>Several teams agree on the API before coding; public APIs</td></tr>
+      <tr><td>Risk</td><td>The API shape changes by accident with a code change</td><td>Spec and code drift unless generated or tested</td></tr>
+      <tr><td>Tools</td><td>springdoc, annotations</td><td>OpenAPI Generator (server stubs and client SDKs), contract tests</td></tr>
+    </tbody>
+  </table></div>
+  <p>Most Spring Boot job projects are code-first. Even so, you can export <code>/v3/api-docs</code> as a file, import it into Postman or Bruno, or generate a typed TypeScript client for the React app from it (<a href="06-frontend.html#m6">Frontend · Module 6</a>).</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>The starter version must match your Spring Boot line.</li>
+      <li>Documentation must describe DTOs, not entities (another reason for <a href="#m2-dtos">DTOs</a>).</li>
+      <li>Do not leave Swagger UI open on a public production server.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common problems</p>
+    <ul>
+      <li>Swagger page shows "Failed to load API definition" or a 401: security rules block <code>/v3/api-docs</code>.</li>
+      <li>Every endpoint returns <code>200</code> in the docs even though you return 201: add <code>@ApiResponse(responseCode = "201")</code>, or return <code>ResponseEntity</code> with a status the library can see.</li>
+      <li>Returning <code>ResponseEntity&lt;?&gt;</code> or <code>Object</code>: the schema is empty. Use concrete types.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"How do you document a REST API?" OpenAPI with springdoc: one dependency, <code>/swagger-ui.html</code> and <code>/v3/api-docs</code>, annotate with <code>@Operation</code>, <code>@ApiResponse</code>, <code>@Schema</code>, add the bearer security scheme for JWT, disable it in production. Mention contract-first as the alternative.</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-api-testing-tools">
+  <h3>Testing endpoints: curl, Postman, Bruno and .http files</h3>
+  <p class="tldr">Use curl for quick checks and copy-pasteable bug reports, and Postman or Bruno for saved collections with environments, auth and test scripts that your whole team can share.</p>
+
+  <p>You test an endpoint by hand while you build it, long before you write automated tests (<a href="#m5">module 5</a>). A good tool lets you save requests, switch between local and staging, reuse an auth token and check the response automatically. Learn curl first, because it works on every server and in every CI log; then use a GUI client for daily work.</p>
+
+  <h4>curl</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>-X POST</code></td><td>HTTP method (GET is the default)</td></tr>
+      <tr><td><code>-H "Name: value"</code></td><td>Add a header</td></tr>
+      <tr><td><code>-d '{...}'</code> / <code>--data-binary @file.json</code></td><td>Request body, inline or from a file</td></tr>
+      <tr><td><code>-i</code></td><td>Show response status and headers</td></tr>
+      <tr><td><code>-v</code></td><td>Verbose: request and response details</td></tr>
+      <tr><td><code>-s</code></td><td>Silent (no progress meter)</td></tr>
+      <tr><td><code>-o file</code></td><td>Write the body to a file</td></tr>
+      <tr><td><code>-w "%{http_code}"</code></td><td>Print the status code only</td></tr>
+      <tr><td><code>-u user:pass</code></td><td>Basic authentication</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Typical session"><code class="language-bash"># login, keep the token in a variable (jq extracts JSON fields)
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"asha@example.com","password":"secret123"}' | jq -r .accessToken)
+
+# call a protected endpoint
+curl -i http://localhost:8080/api/v1/orders \
+  -H "Authorization: Bearer $TOKEN"
+
+# create with a body from a file
+curl -i -X POST http://localhost:8080/api/v1/products \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-binary @product.json
+
+# only the status code
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/api/v1/products/999</code></pre>
+  <pre class="out" data-title="Output of the last command"><code class="language-plaintext">404</code></pre>
+  <div class="co co-exc">
+    <p class="co-t">Windows quoting</p>
+    <p>In Windows <code>cmd.exe</code> single quotes do not group text, and JSON quotes need escaping (<code>-d "{\"name\":\"Mouse\"}"</code>). In PowerShell, call <code>curl.exe</code> (plain <code>curl</code> is an alias for <code>Invoke-WebRequest</code>) or use Git Bash, where the Linux examples work unchanged. Putting the JSON in a file and using <code>--data-binary @file.json</code> avoids most quoting trouble.</p>
+  </div>
+
+  <h4>Postman</h4>
+  <p>Postman is a GUI client with collections, environments and scripts. The concepts you need:</p>
+  <dl class="terms">
+    <dt>Request</dt><dd>Method + URL + headers + body, saved with a name.</dd>
+    <dt>Collection</dt><dd>A folder of requests, for example "Shop API", grouped into folders (Auth, Products, Orders). One collection per project.</dd>
+    <dt>Environment</dt><dd>A named set of variables: <code>local</code>, <code>staging</code>, <code>prod</code>. Each has its own values for the same names.</dd>
+    <dt>Variable</dt><dd>Written <code>{{name}}</code> in URLs, headers and bodies. Example: <code>{{baseUrl}}/api/v1/products</code>. Keep secrets in "current value" fields, which are not shared when you export.</dd>
+    <dt>Scripts</dt><dd>JavaScript that runs before a request (pre-request) or after the response (tests).</dd>
+  </dl>
+  <p>The usual setup: environment <code>local</code> with <code>baseUrl = http://localhost:8080</code> and an empty <code>token</code>. The login request has a test script that saves the token. Every other request uses <code>Authorization: Bearer {{token}}</code> (or the collection's Authorization tab, type Bearer Token, value <code>{{token}}</code>, inherited by all requests).</p>
+  <pre data-title="Tests tab of the login request (Postman script)"><code class="language-javascript">pm.test("login returns 200", function () {
+  pm.response.to.have.status(200);
+});
+
+const body = pm.response.json();
+pm.test("token is present", function () {
+  pm.expect(body.accessToken).to.be.a("string");
+});
+
+pm.environment.set("token", body.accessToken);   // reused as {{token}}</code></pre>
+  <pre data-title="Tests tab of the create-product request"><code class="language-javascript">pm.test("created with Location", function () {
+  pm.response.to.have.status(201);
+  pm.expect(pm.response.headers.get("Location")).to.include("/api/v1/products/");
+});
+pm.environment.set("productId", pm.response.json().id);   // next request: /{{productId}}</code></pre>
+  <p>Run the whole collection with the Collection Runner to smoke-test the API in order. Postman also has a command-line tool (the Postman CLI) that runs a collection in a script or CI job, so the same requests can guard a deployment. You can import an OpenAPI file (<code>/v3/api-docs</code>) to create a collection automatically (<a href="#m2-openapi">springdoc</a>). For your project's README, export the collection (and the environment without secrets) as JSON files and commit them in a <code>docs/</code> folder.</p>
+
+  <h4>Bruno</h4>
+  <p><strong>Bruno</strong> is an open-source API client that saves each request as a plain-text file (a <code>.bru</code> file) in a folder on your disk. Because collections are ordinary files, they live in your Git repository next to the code, reviews show readable diffs, and there is no cloud account needed. It has the same concepts: collections, environments (files in an <code>environments</code> folder), <code>{{variables}}</code>, pre-request scripts and tests (JavaScript with a Postman-like <code>expect</code> style), and a command-line runner for CI.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Postman</th><th>Bruno</th><th>curl</th></tr></thead>
+    <tbody>
+      <tr><td>Storage</td><td>Cloud workspace or export files</td><td>Plain files in your repo</td><td>Shell history, scripts</td></tr>
+      <tr><td>Team sharing</td><td>Workspaces (account)</td><td>Git</td><td>Copy and paste</td></tr>
+      <tr><td>Scripts and tests</td><td>Yes (JavaScript)</td><td>Yes (JavaScript)</td><td>Shell</td></tr>
+      <tr><td>Learning curve</td><td>Medium</td><td>Low</td><td>Medium</td></tr>
+      <tr><td>Best for</td><td>Large teams, mock servers, monitors</td><td>Git-centred teams, small projects</td><td>Servers, CI, bug reports</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>IntelliJ HTTP client (.http files)</h4>
+  <p>IntelliJ IDEA (and VS Code with an extension) can run requests written in a plain <code>.http</code> file inside the editor. They are easy to commit and review.</p>
+  <pre data-title="products.http"><code class="language-http">### variables for the file
+@baseUrl = http://localhost:8080
+
+### list
+GET {{baseUrl}}/api/v1/products?page=0&amp;size=5
+Accept: application/json
+
+### create
+POST {{baseUrl}}/api/v1/products
+Content-Type: application/json
+
+{
+  "name": "Wireless Mouse",
+  "sku": "MS-100",
+  "price": 799.00,
+  "stock": 25
+}</code></pre>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Keep one environment per target (local, staging); never put production tokens or passwords in an exported file or in Git.</li>
+      <li>Name requests like the operation: "Create product", "Get product by id".</li>
+      <li>Test the failure cases too: invalid body (400), unknown id (404), duplicate (409), no token (401), wrong role (403).</li>
+      <li>When you report a bug, attach the curl command and the response with status and headers.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m2-lombok">
+  <h3>Lombok basics</h3>
+  <p class="tldr">Lombok is a compile-time tool whose annotations generate getters, setters, constructors, equals, hashCode, toString, builders and loggers, so you write less boilerplate; use it carefully, and not with @Data on JPA entities.</p>
+
+  <p>Java classes carry a lot of repeated code: fields, getters, setters, constructors, <code>toString</code>. <strong>Lombok</strong> is an annotation processor: while <code>javac</code> compiles your class, Lombok adds the methods to the compiled <code>.class</code> file. The source stays short. Many Spring Boot projects use it, so you must be able to read it, even if you prefer records.</p>
+
+  <h4>Setup</h4>
+  <pre data-title="pom.xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.projectlombok&lt;/groupId&gt;
+    &lt;artifactId&gt;lombok&lt;/artifactId&gt;
+    &lt;optional&gt;true&lt;/optional&gt;
+&lt;/dependency&gt;</code></pre>
+  <p>Spring Boot manages the Lombok version, and its Maven plugin keeps Lombok out of the final jar. In the IDE, enable <strong>annotation processing</strong> (IntelliJ: Settings → Build, Execution, Deployment → Compiler → Annotation Processors → Enable). Current IntelliJ versions include Lombok support; in Eclipse or VS Code install the Lombok plugin or agent. If the code compiles with Maven but the IDE shows "cannot find symbol getName()", annotation processing or the plugin is the cause.</p>
+
+  <h4>The annotations</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Annotation</th><th>Generates</th></tr></thead>
+    <tbody>
+      <tr><td><code>@Getter</code> / <code>@Setter</code></td><td>Getters / setters for all fields (or one field)</td></tr>
+      <tr><td><code>@ToString</code></td><td><code>toString()</code>; <code>@ToString.Exclude</code> removes a field</td></tr>
+      <tr><td><code>@EqualsAndHashCode</code></td><td><code>equals</code> and <code>hashCode</code> from fields (choose with <code>onlyExplicitlyIncluded</code>)</td></tr>
+      <tr><td><code>@NoArgsConstructor</code></td><td>Constructor with no parameters</td></tr>
+      <tr><td><code>@AllArgsConstructor</code></td><td>Constructor with every field</td></tr>
+      <tr><td><code>@RequiredArgsConstructor</code></td><td>Constructor for <code>final</code> and <code>@NonNull</code> fields</td></tr>
+      <tr><td><code>@Data</code></td><td>Getter + setter + toString + equals/hashCode + required-args constructor</td></tr>
+      <tr><td><code>@Value</code></td><td>Immutable class: all fields private final, getters only</td></tr>
+      <tr><td><code>@Builder</code></td><td>Builder pattern: <code>Product.builder().name("x").build()</code></td></tr>
+      <tr><td><code>@Slf4j</code></td><td>A <code>private static final Logger log</code> field</td></tr>
+      <tr><td><code>@NonNull</code></td><td>Null check on the parameter or field</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="Before: plain Java"><code class="language-java">public class CustomerDto {
+    private Long id;
+    private String name;
+    public CustomerDto() { }
+    public CustomerDto(Long id, String name) { this.id = id; this.name = name; }
+    public Long getId() { return id; }
+    public void setId(Long id) { this.id = id; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    // plus equals, hashCode, toString ...
+}</code></pre>
+  <pre data-title="After: Lombok"><code class="language-java">@Getter @Setter
+@NoArgsConstructor @AllArgsConstructor
+@ToString
+public class CustomerDto {
+    private Long id;
+    private String name;
+}</code></pre>
+
+  <h4>The Spring Boot favourites</h4>
+  <pre data-title="@RequiredArgsConstructor + @Slf4j in a service"><code class="language-java">@Slf4j
+@Service
+@RequiredArgsConstructor                  // constructor for all final fields
+public class ProductService {
+
+    private final ProductRepository repository;   // injected through that constructor
+    private final ProductMapper mapper;
+
+    public ProductResponse findById(Long id) {
+        log.info("Loading product {}", id);        // log comes from @Slf4j
+        return mapper.toResponse(repository.findById(id)
+                .orElseThrow(() -&gt; new ResourceNotFoundException("Product", id)));
+    }
+}</code></pre>
+  <p>This pair removes the constructor and logger boilerplate from every service and controller. Spring uses the single generated constructor for injection.</p>
+  <pre data-title="@Builder for objects with many fields"><code class="language-java">@Builder
+public record SearchCriteria(String text, BigDecimal minPrice, BigDecimal maxPrice) {}
+
+SearchCriteria c = SearchCriteria.builder().text("mouse").maxPrice(new BigDecimal("1000")).build();</code></pre>
+
+  <h4>@Data and JPA entities: avoid</h4>
+  <div class="co co-mistake">
+    <p class="co-t">Do not put @Data (or @EqualsAndHashCode / @ToString) on JPA entities</p>
+    <ul>
+      <li><strong><code>equals</code>/<code>hashCode</code> on all fields:</strong> the generated version includes the id (null until saved) and mutable fields. An entity put in a <code>HashSet</code> and then saved is "lost", because its hash code changed. Hibernate proxies and lazy collections break comparison too.</li>
+      <li><strong><code>toString</code> touching relationships:</strong> it calls <code>getOrders()</code> on a lazy collection (extra queries or <code>LazyInitializationException</code>), and two entities that point to each other cause infinite recursion and <code>StackOverflowError</code>.</li>
+      <li><strong>Setters everywhere</strong> let any code put an entity in an invalid state.</li>
+    </ul>
+    <p>Instead use <code>@Getter</code> with a protected no-args constructor (<code>@NoArgsConstructor(access = AccessLevel.PROTECTED)</code>), write <code>equals</code>/<code>hashCode</code> on the id (or a business key) by hand as described in <a href="#m3">module 3</a>, and exclude relationships from <code>toString</code>.</p>
+  </div>
+
+  <h4>Lombok vs records</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Java record</th><th>Lombok</th></tr></thead>
+    <tbody>
+      <tr><td>Part of</td><td>The language (Java 16+)</td><td>A library plus compiler plugin</td></tr>
+      <tr><td>Immutable</td><td>Always</td><td>With <code>@Value</code> or final fields</td></tr>
+      <tr><td>Best for</td><td>DTOs, value objects, request/response types</td><td>Classes that need to be mutable or extended: entities, config classes, services (<code>@RequiredArgsConstructor</code>, <code>@Slf4j</code>)</td></tr>
+      <tr><td>Tool support</td><td>Everything works</td><td>Needs plugin; can conflict with other processors</td></tr>
+    </tbody>
+  </table></div>
+  <p>A practical split: records for DTOs, Lombok for the repetitive bits of services and entities (and some teams skip Lombok entirely, which is also fine). Since the modern IDE can generate constructors and getters in a click, Lombok's value is mostly in keeping files short and diffs small.</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Check the team's rules: some codebases ban Lombok or limit it to a few annotations.</li>
+      <li>Prefer specific annotations (<code>@Getter</code>, <code>@RequiredArgsConstructor</code>) over <code>@Data</code>.</li>
+      <li>With MapStruct, add the <code>lombok-mapstruct-binding</code> processor and list Lombok first (<a href="#m2-dtos">DTOs</a>).</li>
+      <li>Use <code>delombok</code> if you ever need to see the generated source.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <p>"What is Lombok and how does it work?" An annotation processor that modifies the compiled classes to add methods; no runtime cost. "Why is <code>@Data</code> dangerous on entities?" Equals/hashCode on mutable or lazy state, <code>toString</code> loops on relationships. Show you know <code>@RequiredArgsConstructor</code> for constructor injection.</p>
+  </div>
+</article>
+
+<article class="topic" id="m2-negotiation-cors">
+  <h3>Content negotiation, CORS and file uploads (pointers)</h3>
+  <p class="tldr">Content negotiation lets the client ask for a format through the Accept header; CORS is a browser rule that you configure on the server so a React app on another origin may call your API; file uploads arrive as multipart requests.</p>
+
+  <h4>Content negotiation</h4>
+  <p>The same resource can have several <strong>representations</strong>: JSON, XML, CSV. The client states what it can read in the <code>Accept</code> header, and says what it sends in <code>Content-Type</code>. Spring MVC picks an <code>HttpMessageConverter</code> that fits both (<a href="#m2-request-flow">request flow</a>). Spring Boot REST apps normally have only the JSON converter, so the result is always JSON.</p>
+  <ul>
+    <li><code>Accept: application/json</code> → JSON. <code>Accept: */*</code> → the default (JSON).</li>
+    <li><code>Accept: application/xml</code> with no XML converter on the classpath → <strong>406 Not Acceptable</strong> (<code>HttpMediaTypeNotAcceptableException</code>).</li>
+    <li>Body sent as <code>text/plain</code> to a JSON-only <code>@RequestBody</code> → <strong>415 Unsupported Media Type</strong>.</li>
+    <li>To offer XML too, add <code>jackson-dataformat-xml</code> to the classpath; the converter is registered and clients can ask for either.</li>
+    <li>You can pin a method to one format with <code>produces</code> and <code>consumes</code> (<a href="#m2-mapping-annotations">mapping annotations</a>), or give one URL two methods that differ only in <code>produces</code>.</li>
+    <li>Do not use file extensions (<code>/products.json</code>) or a <code>?format=</code> parameter for negotiation in new APIs; use the headers. Recent Spring versions have removed suffix matching.</li>
+  </ul>
+  <pre data-title="Try it"><code class="language-bash">curl -i http://localhost:8080/api/v1/products/1 -H "Accept: application/xml"</code></pre>
+  <pre class="out" data-title="Response (JSON-only app)"><code class="language-http">HTTP/1.1 406</code></pre>
+  <p>See the header tables in <a href="#m2-http-headers">HTTP headers</a> and the versioning-by-media-type idea in <a href="#m2-api-versioning">API versioning</a>.</p>
+
+  <h4>CORS in one paragraph</h4>
+  <p>A browser lets a page call another <strong>origin</strong> (scheme + host + port) only if that server says so. Your React dev server runs on <code>http://localhost:5173</code> and your API on <code>http://localhost:8080</code>: different ports, so different origins, and the browser blocks the response unless your API sends <strong>CORS</strong> headers (<code>Access-Control-Allow-Origin</code> and friends), after a preflight <code>OPTIONS</code> request for non-simple calls. CORS is enforced by browsers only; curl and Postman never see it. Configure it on the server, and list exact origins, never <code>*</code> together with credentials. The quick way is <code>@CrossOrigin(origins = "http://localhost:5173")</code> on a controller; the right way for a whole API is one global configuration, and with Spring Security it must be wired into the security filter chain so the preflight is not rejected with 401. The full explanation, the Java configuration and the React side are in <a href="06-frontend.html#m6">Frontend · Module 6</a>; the security wiring is in <a href="#m4">module 4</a>.</p>
+
+  <h4>File upload pointer</h4>
+  <p>A file arrives as a <code>multipart/form-data</code> request, and a controller reads it with <code>@RequestPart</code> or a <code>MultipartFile</code> parameter:</p>
+  <pre data-title="Upload endpoint (sketch)"><code class="language-java">@PostMapping(value = "/{id}/image", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+public ResponseEntity&lt;Void&gt; uploadImage(@PathVariable Long id,
+                                        @RequestPart("file") MultipartFile file) {
+    // check size and content type, store the file, save its URL or key
+    return ResponseEntity.noContent().build();
+}</code></pre>
+  <pre data-title="application.properties"><code class="language-properties">spring.servlet.multipart.max-file-size=5MB
+spring.servlet.multipart.max-request-size=10MB</code></pre>
+  <pre data-title="curl"><code class="language-bash">curl -i -X POST http://localhost:8080/api/v1/products/1/image -F "file=@mouse.png"</code></pre>
+  <p>Rules for real uploads: limit the size, check the content type and extension against an allow-list, never trust the original file name (path traversal), and store files in object storage such as S3 instead of the app server's disk. Storage choices are covered in <a href="#m6">module 6</a>. Too-large files give <code>MaxUploadSizeExceededException</code> (a 413 response with a handler).</p>
+</article>

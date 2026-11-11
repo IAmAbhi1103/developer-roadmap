@@ -1,0 +1,830 @@
+<article class="topic" id="m1-strings">
+  <h3>Strings: immutability, the String pool and common methods</h3>
+  <p class="tldr">A <code>String</code> is an immutable sequence of characters; literals are shared through the String pool, so compare contents with <code>equals()</code>, never <code>==</code>, and remember that every "change" creates a new object.</p>
+
+  <p>A <code>String</code> is an object (not a primitive) that holds text. You create it with a literal: <code>String city = "Pune";</code>. Strings are used everywhere — names, JSON, SQL, URLs, log lines — so it is worth understanding exactly how they behave.</p>
+
+  <h4>Immutability</h4>
+  <p><strong>Immutable</strong> means the object cannot change after creation. Methods such as <code>toUpperCase()</code>, <code>replace()</code> and <code>trim()</code> do not modify the string; they return a <em>new</em> one.</p>
+  <pre data-title="Immutable.java"><code class="language-java">String name = "ravi";
+name.toUpperCase();                 // result thrown away: name is unchanged
+System.out.println(name);           // ravi
+name = name.toUpperCase();          // now name points to a NEW string "RAVI"
+System.out.println(name);           // RAVI</code></pre>
+  <p><strong>Why Java made <code>String</code> immutable:</strong></p>
+  <ul>
+    <li><strong>String pool sharing.</strong> Many variables can safely point to one shared <code>"java"</code> object, because nobody can change it. If strings were mutable, changing one would change all.</li>
+    <li><strong>Security.</strong> Strings carry file paths, class names, database URLs and user names. If a path could change after a security check passed, the check would be meaningless.</li>
+    <li><strong>Thread safety.</strong> Immutable objects can be shared between threads with no locks.</li>
+    <li><strong>Hash code caching.</strong> A string's <code>hashCode()</code> is computed once and stored, which makes <code>String</code> an excellent <code>HashMap</code> key. This only works because the content cannot change.</li>
+    <li><strong>Class loading.</strong> Class names are strings; they must not change between lookup and load.</li>
+  </ul>
+  <p>The price: many temporary objects when you build text in a loop. That is the job of <a href="#m1-stringbuilder">StringBuilder</a>.</p>
+
+  <h4>The String pool</h4>
+  <p>The <strong>String pool</strong> (string constant pool or intern pool) is a special area inside the heap (since Java 7; before that it was in PermGen) where the JVM keeps one copy of each distinct string <em>literal</em>. When you write a literal, the JVM first looks in the pool; if the text already exists it reuses that object, otherwise it adds it.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Stack (references)         Heap
+┌────────────────┐      ┌──────────────────────────────┐
+│ a ─────────────┼──┐   │  String pool                 │
+│ b ─────────────┼──┴──▶│    "java"   (one shared obj) │
+│ d (intern) ────┼─────▶│                              │
+│ c ─────────────┼──┐   ├──────────────────────────────┤
+└────────────────┘  └──▶│  normal heap: new String     │
+                        │    "java"   (separate obj)   │
+                        └──────────────────────────────┘
+ a, b: literals "java"; c = new String("java"); d = c.intern()
+</pre>
+    <figcaption>Literals share one pooled object; <code>new String(...)</code> always makes another</figcaption>
+  </figure>
+  <pre data-title="StringPool.java"><code class="language-java">String a = "java";
+String b = "java";
+String c = new String("java");      // always creates a new object on the heap
+String d = c.intern();              // returns the pooled "java"
+
+System.out.println(a == b);         // true   same pooled object
+System.out.println(a == c);         // false  different objects
+System.out.println(a.equals(c));    // true   same characters
+System.out.println(a == d);         // true   intern() gives the pooled copy
+
+String e = "ja" + "va";             // joined by the compiler: constant expression
+System.out.println(a == e);         // true
+
+String part = "ja";
+String f = part + "va";             // computed at runtime: new object
+System.out.println(a == f);         // false
+
+final String fixed = "ja";
+String g = fixed + "va";            // final variable with a constant: compile-time constant
+System.out.println(a == g);         // true
+System.out.println(a == f.intern());// true</code></pre>
+  <ul>
+    <li><code>new String("java")</code> creates <em>one</em> new heap object, and the literal <code>"java"</code> inside the parentheses is in the pool (created the first time that line is loaded, if not already there). A common interview question: "How many objects does <code>new String("abc")</code> create?" — answer: one on the heap, plus the pooled literal if it did not exist yet (so one or two).</li>
+    <li>The compiler joins constant expressions at compile time, so <code>"ja" + "va"</code> is stored as <code>"java"</code>. Concatenation that involves a non-final variable or a method call happens at runtime and creates a new object.</li>
+    <li><code>intern()</code> returns the pooled instance of equal content. It is rarely needed in application code; do not use it to avoid writing <code>equals</code>.</li>
+    <li>Strings produced at runtime (from <code>Scanner</code>, files, JSON, the network, <code>substring</code>) are not in the pool, which is another reason <code>==</code> fails on real data.</li>
+  </ul>
+
+  <h4><code>==</code> vs <code>equals</code> vs <code>equalsIgnoreCase</code> vs <code>compareTo</code></h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Expression</th><th>Compares</th><th>Result type</th></tr></thead>
+    <tbody>
+      <tr><td><code>a == b</code></td><td>References: are they the same object?</td><td><code>boolean</code></td></tr>
+      <tr><td><code>a.equals(b)</code></td><td>Characters, case-sensitive</td><td><code>boolean</code></td></tr>
+      <tr><td><code>a.equalsIgnoreCase(b)</code></td><td>Characters, ignoring case</td><td><code>boolean</code></td></tr>
+      <tr><td><code>a.compareTo(b)</code></td><td>Dictionary order by Unicode value; 0 if equal, negative if <code>a</code> is first</td><td><code>int</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Write <code>"admin".equals(role)</code>, with the literal first. It never throws <code>NullPointerException</code> if <code>role</code> is null, while <code>role.equals("admin")</code> does. <code>"apple".compareTo("banana")</code> is <code>-1</code> (the difference between <code>'a'</code> and <code>'b'</code>), and <code>"apple".compareTo("apricot")</code> is <code>-2</code>.</p>
+
+  <h4>Common methods</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Purpose and example</th></tr></thead>
+    <tbody>
+      <tr><td><code>length()</code></td><td>Number of <code>char</code>s: <code>"Java".length()</code> is 4</td></tr>
+      <tr><td><code>charAt(i)</code></td><td>The char at index <code>i</code>; invalid index throws <code>StringIndexOutOfBoundsException</code></td></tr>
+      <tr><td><code>substring(from)</code>, <code>substring(from, to)</code></td><td>Part of the string; <code>to</code> is exclusive: <code>"Hello".substring(1, 3)</code> is <code>"el"</code></td></tr>
+      <tr><td><code>indexOf(x)</code>, <code>lastIndexOf(x)</code></td><td>Position of the first/last match, or <code>-1</code></td></tr>
+      <tr><td><code>contains(s)</code>, <code>startsWith(s)</code>, <code>endsWith(s)</code></td><td>Boolean checks</td></tr>
+      <tr><td><code>replace(a, b)</code></td><td>Replaces every literal occurrence (char or text)</td></tr>
+      <tr><td><code>replaceAll(regex, s)</code></td><td>Replaces by regular expression</td></tr>
+      <tr><td><code>split(regex)</code></td><td>Splits into a <code>String[]</code> (the argument is a <strong>regex</strong>)</td></tr>
+      <tr><td><code>String.join(sep, parts...)</code></td><td>Joins strings or an <code>Iterable</code> with a separator</td></tr>
+      <tr><td><code>trim()</code> / <code>strip()</code></td><td>Remove surrounding whitespace (see below)</td></tr>
+      <tr><td><code>isEmpty()</code> / <code>isBlank()</code></td><td>Length zero / empty or only whitespace (<code>isBlank</code> is Java 11)</td></tr>
+      <tr><td><code>repeat(n)</code></td><td><code>"ab".repeat(3)</code> is <code>"ababab"</code> (Java 11)</td></tr>
+      <tr><td><code>toUpperCase()</code>, <code>toLowerCase()</code></td><td>Change case</td></tr>
+      <tr><td><code>toCharArray()</code></td><td>Copy into a <code>char[]</code></td></tr>
+      <tr><td><code>chars()</code></td><td>An <code>IntStream</code> of the characters</td></tr>
+      <tr><td><code>String.valueOf(x)</code></td><td>Converts a number, char, boolean or object to a String</td></tr>
+      <tr><td><code>formatted(args...)</code></td><td><code>"%s has %d".formatted(a, b)</code>, same as <code>String.format</code> (Java 15)</td></tr>
+      <tr><td><code>lines()</code></td><td>Stream of lines (Java 11)</td></tr>
+      <tr><td><code>concat(s)</code></td><td>Same as <code>+</code> for two strings</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="StringMethods.java"><code class="language-java">String raw = "  Hello, Java World  ";
+String s = raw.strip();                          // "Hello, Java World"
+
+System.out.println(raw.length() + " " + s.length());          // 21 17
+System.out.println(s.charAt(0) + " " + s.indexOf("Java"));    // H 7
+System.out.println(s.lastIndexOf('o') + " " + s.indexOf("xyz"));   // 13 -1
+System.out.println(s.substring(7, 11) + "|" + s.substring(7)); // Java|Java World
+System.out.println(s.contains("Java") + " " + s.startsWith("Hello") + " " + s.endsWith("d"));
+System.out.println(s.replace('l', 'L'));                      // HeLLo, Java WorLd
+System.out.println(s.replaceAll("\\s+", "_"));                // Hello,_Java_World
+System.out.println(Arrays.toString(s.split(" ")));            // [Hello,, Java, World]
+System.out.println(String.join("-", "UPI", "NEFT", "IMPS"));  // UPI-NEFT-IMPS
+System.out.println("ab".repeat(3) + " " + "  ".isBlank() + " " + "".isEmpty());
+System.out.println("banana".chars().filter(ch -&gt; ch == 'a').count());   // 3
+System.out.println("Hi %s, you are %d".formatted("Asha", 25));
+System.out.println(String.valueOf(42) + String.valueOf(true));  // 42true
+
+char[] letters = "hello".toCharArray();
+Arrays.sort(letters);
+System.out.println(new String(letters));                      // ehllo</code></pre>
+
+  <h4><code>split</code> takes a regex</h4>
+  <pre data-title="SplitTraps.java"><code class="language-java">System.out.println("a.b.c".split(".").length);          // 0   "." matches ANY char
+System.out.println(Arrays.toString("a.b.c".split("\\.")));        // [a, b, c]
+System.out.println(Arrays.toString("a|b|c".split("\\|")));        // [a, b, c]
+System.out.println(Arrays.toString("a,b,,".split(",")));          // [a, b]   trailing empties dropped
+System.out.println(Arrays.toString("a,b,,".split(",", -1)));      // [a, b, , ]  keep them
+System.out.println(Arrays.toString("  a  b ".trim().split("\\s+")));  // [a, b]
+System.out.println(Arrays.toString("a1b22c".split("\\d+")));      // [a, b, c]</code></pre>
+  <p>Characters like <code>. | * + ? ( ) [ ] \ $ ^</code> have special meaning in a regex. Escape them with <code>\\</code> (a backslash in a Java string literal is written <code>\\</code>) or use <code>Pattern.quote(".")</code>.</p>
+
+  <h4><code>trim</code> vs <code>strip</code>, <code>isEmpty</code> vs <code>isBlank</code></h4>
+  <ul>
+    <li><code>trim()</code> (old) removes characters up to code point <code>' '</code> (space, tab, newline and control characters). It does not remove Unicode spaces such as the non-breaking space.</li>
+    <li><code>strip()</code> (Java 11) uses <code>Character.isWhitespace</code> and understands Unicode. Prefer it in new code. <code>stripLeading()</code> and <code>stripTrailing()</code> exist too.</li>
+    <li><code>isEmpty()</code> is true only for length 0. <code>isBlank()</code> is true for length 0 <em>or</em> whitespace only. For form input, <code>isBlank()</code> is usually what you want.</li>
+  </ul>
+
+  <h4>Immutability trap in a loop</h4>
+  <pre data-title="Concat in a loop"><code class="language-java">String result = "";
+for (int i = 0; i &lt; 5; i++) {
+    result += i;                // creates a new String each time
+}
+System.out.println(result);     // 01234</code></pre>
+  <p>Each pass copies the whole text so far. For five items this is nothing; for 100,000 it is slow and creates a lot of garbage. See the next article.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>Compare string contents with <code>equals</code>/<code>equalsIgnoreCase</code>; <code>==</code> compares references.</li>
+      <li>String methods return new strings; assign the result.</li>
+      <li>String indexes start at 0; <code>substring(from, to)</code> includes <code>from</code> and excludes <code>to</code>.</li>
+      <li><code>switch</code> on a String uses <code>equals</code> and throws <code>NullPointerException</code> for <code>null</code>.</li>
+    </ul>
+  </div>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>StringIndexOutOfBoundsException</code> from <code>charAt</code> or <code>substring</code> when an index is negative or too large (the message wording differs between Java versions).</li>
+      <li><code>NullPointerException</code> on <code>s.length()</code> when <code>s</code> is <code>null</code>. The text <code>"null"</code> appears if you concatenate a null: <code>"x" + null</code> is <code>"xnull"</code>.</li>
+      <li><code>NumberFormatException</code> from <code>Integer.parseInt("12a")</code> or <code>parseInt("")</code>.</li>
+      <li><code>length()</code> counts UTF-16 units, so an emoji can count as 2. For true characters use <code>codePointCount</code>.</li>
+      <li>Case conversion depends on locale for some languages (Turkish dotted i). Use <code>toLowerCase(Locale.ROOT)</code> for identifiers and keys.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li><code>if (name == "Ravi")</code> — works in a quick demo because of the pool, then fails with real input.</li>
+      <li>Calling <code>str.toUpperCase()</code> and ignoring the result.</li>
+      <li>Using <code>split(".")</code> or <code>split("|")</code> without escaping.</li>
+      <li>Using <code>new String("text")</code> for no reason; it wastes memory and breaks <code>==</code> expectations.</li>
+      <li>Putting a password in a <code>String</code>: it stays in memory until garbage collected, so Java APIs for passwords use <code>char[]</code>, which can be wiped.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Why is String immutable? What is the String pool? == vs equals?"</p>
+    <ul>
+      <li>Immutable for pool sharing, security, thread safety, cached hash code and class loading.</li>
+      <li>The pool is a region of the heap that stores one copy of each literal; <code>intern()</code> adds or fetches a string from it; <code>new String("a")</code> bypasses it.</li>
+      <li><code>==</code> compares references, <code>equals</code> compares characters; give the example <code>a == c</code> false, <code>a.equals(c)</code> true.</li>
+      <li>Compile-time constant folding: <code>"ja" + "va" == "java"</code> is true; with a non-final variable it is false.</li>
+      <li>Related: <code>String</code> is <code>final</code> (cannot be subclassed), implements <code>Comparable</code>, <code>CharSequence</code> and <code>Serializable</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-stringbuilder">
+  <h3>StringBuilder, StringBuffer and building text efficiently</h3>
+  <p class="tldr">Use <code>StringBuilder</code> to build text in a loop because it changes one internal buffer instead of creating a new String each time; <code>StringBuffer</code> is its old synchronized twin.</p>
+
+  <p><code>StringBuilder</code> (Java 5) is a <strong>mutable</strong> sequence of characters. It keeps an internal array that grows when needed (the default capacity is 16, and it grows automatically), so <code>append</code> is cheap on average.</p>
+  <pre data-title="BuilderBasics.java"><code class="language-java">StringBuilder sb = new StringBuilder();
+sb.append("Order #").append(1042).append(" total: ").append(499.5);   // chaining
+sb.insert(0, "[NEW] ");
+System.out.println(sb);                    // [NEW] Order #1042 total: 499.5
+System.out.println(sb.length());           // 31
+
+sb.setLength(0);                           // clear and reuse the builder
+sb.append("racecar");
+System.out.println(sb.reverse());          // racecar  (reverse changes sb in place)
+
+StringBuilder b2 = new StringBuilder("Hello");
+b2.append(' ').append("World");
+b2.replace(0, 5, "HELLO");                 // [0, 5) replaced
+b2.deleteCharAt(b2.length() - 1);          // remove last char
+b2.setCharAt(0, 'J');
+System.out.println(b2);                    // JELLO Worl
+System.out.println(b2.indexOf("W") + " " + b2.charAt(2));   // 6 L
+String finished = b2.toString();           // turn into an immutable String when done</code></pre>
+
+  <h4>Common StringBuilder methods</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>append(x)</code></td><td>Adds any type at the end; returns the builder (chainable)</td></tr>
+      <tr><td><code>insert(i, x)</code></td><td>Inserts at index <code>i</code></td></tr>
+      <tr><td><code>delete(from, to)</code>, <code>deleteCharAt(i)</code></td><td>Removes characters</td></tr>
+      <tr><td><code>replace(from, to, s)</code></td><td>Replaces a range</td></tr>
+      <tr><td><code>reverse()</code></td><td>Reverses in place</td></tr>
+      <tr><td><code>setCharAt(i, c)</code>, <code>charAt(i)</code></td><td>Write/read one char</td></tr>
+      <tr><td><code>setLength(n)</code></td><td>Truncates or pads with <code>'\0'</code></td></tr>
+      <tr><td><code>length()</code>, <code>capacity()</code></td><td>Characters stored / buffer size</td></tr>
+      <tr><td><code>indexOf</code>, <code>lastIndexOf</code>, <code>substring</code></td><td>Like <code>String</code></td></tr>
+      <tr><td><code>toString()</code></td><td>Creates the final <code>String</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>String vs StringBuilder vs StringBuffer</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>String</code></th><th><code>StringBuilder</code></th><th><code>StringBuffer</code></th></tr></thead>
+    <tbody>
+      <tr><td>Mutable?</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Thread-safe?</td><td>Yes (immutable)</td><td>No</td><td>Yes (methods are synchronized)</td></tr>
+      <tr><td>Speed in loops</td><td>Slow (new object each time)</td><td>Fastest</td><td>Slower than StringBuilder (locking)</td></tr>
+      <tr><td>Since</td><td>1.0</td><td>1.5</td><td>1.0</td></tr>
+      <tr><td>Use for</td><td>Constants, keys, values</td><td>Building text in one thread</td><td>Legacy code; rarely needed</td></tr>
+    </tbody>
+  </table></div>
+  <p>A <code>StringBuilder</code> is normally a local variable used by one thread, so locking in <code>StringBuffer</code> is wasted effort. Sharing one builder between threads is almost always a design smell anyway.</p>
+
+  <h4>Why <code>+</code> in a loop is slow</h4>
+  <pre data-title="LoopConcat.java"><code class="language-java">// Slow: O(n^2) work. Pass k copies all the k characters built so far.
+String s = "";
+for (int i = 0; i &lt; 100_000; i++) {
+    s += "x";
+}
+
+// Fast: O(n). One buffer, appended in place.
+StringBuilder sb = new StringBuilder(100_000);   // optional: pre-size the capacity
+for (int i = 0; i &lt; 100_000; i++) {
+    sb.append("x");
+}
+String t = sb.toString();</code></pre>
+  <p>A single expression such as <code>"a" + b + "c" + d</code> is fine: the compiler turns it into one efficient concatenation (since Java 9 through <code>invokedynamic</code>; before it used a hidden <code>StringBuilder</code>). The problem is only <em>repeated</em> concatenation across loop passes, where each pass creates a new intermediate string. For one-off joins prefer <code>String.join</code>, <code>StringJoiner</code>, <code>String.format</code> or <code>stream.collect(Collectors.joining(", "))</code>.</p>
+
+  <h4>Typical uses</h4>
+  <pre data-title="BuilderUses.java"><code class="language-java">// 1. Palindrome check
+static boolean isPalindrome(String s) {
+    String clean = s.toLowerCase().replaceAll("[^a-z0-9]", "");
+    return clean.contentEquals(new StringBuilder(clean).reverse());
+}
+
+// 2. Build a comma-separated list without a trailing comma
+static String csv(int[] values) {
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i &lt; values.length; i++) {
+        if (i &gt; 0) sb.append(", ");
+        sb.append(values[i]);
+    }
+    return sb.toString();
+}
+
+// 3. Count characters, then rebuild
+static String compress(String s) {          // "aaabbc" -&gt; "a3b2c1"
+    StringBuilder out = new StringBuilder();
+    int i = 0;
+    while (i &lt; s.length()) {
+        char c = s.charAt(i);
+        int j = i;
+        while (j &lt; s.length() &amp;&amp; s.charAt(j) == c) j++;
+        out.append(c).append(j - i);
+        i = j;
+    }
+    return out.toString();
+}
+
+public static void main(String[] args) {
+    System.out.println(isPalindrome("A man, a plan, a canal: Panama"));   // true
+    System.out.println(csv(new int[]{3, 5, 8}));                         // 3, 5, 8
+    System.out.println(compress("aaabbc"));                              // a3b2c1
+}</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: StringBuilder does not override equals() or hashCode()</p>
+    <p><code>sb1.equals(sb2)</code> compares references, and a builder is a bad <code>HashMap</code> key because its content can change. Compare with <code>sb1.compareTo(sb2) == 0</code> (Java 11), or convert with <code>toString()</code> first. <code>String.contentEquals(CharSequence)</code> compares a string to a builder.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Passing a <code>char</code> where an int is expected: <code>new StringBuilder('A')</code> sets the <em>capacity</em> to 65, it does not add "A". Use <code>new StringBuilder("A")</code>.</li>
+      <li>Appending <code>'a' + 'b'</code> (which is the <code>int</code> 195) instead of <code>"a" + "b"</code>.</li>
+      <li>Calling <code>sb.reverse()</code> and forgetting that it changed <code>sb</code> itself.</li>
+      <li>Concatenating strings in a loop and wondering why a report takes minutes.</li>
+    </ul>
+  </div>
+
+  <h4 id="m1-stringbuilder-inside">How a StringBuilder works inside</h4>
+  <p>A <code>StringBuilder</code> owns one array of characters (a compact byte array since Java 9) and a counter called <code>count</code>. <code>length()</code> is that counter; <code>capacity()</code> is the size of the array. <code>append</code> copies the new characters into the free space. Only when the array is full does the builder allocate a bigger array (about double the old size plus 2) and copy the old content once. Because the size doubles, the copying cost over many appends adds up to O(n) in total, so each append is <strong>amortised O(1)</strong>.</p>
+  <pre data-title="CapacityDemo.java"><code class="language-java">StringBuilder a = new StringBuilder();
+System.out.println(a.capacity());            // 16 (the default)
+a.append("12345678901234567");               // 17 characters do not fit in 16
+System.out.println(a.length() + " " + a.capacity());   // 17 34
+
+StringBuilder b = new StringBuilder("Hello");
+System.out.println(b.capacity());            // 21 = 16 + length of the initial text
+
+StringBuilder c = new StringBuilder(1000);   // you choose the capacity
+c.ensureCapacity(5000);                      // grow once, up front
+c.append("short");
+c.trimToSize();                              // give back the unused space
+System.out.println(c.length() + " " + c.capacity());   // 5 5</code></pre>
+  <p>Pre-sizing with <code>new StringBuilder(expectedLength)</code> avoids the repeated growth. It is a small gain; correct use of a builder matters far more than the exact capacity.</p>
+
+  <h4>Ways to build text: which one when?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Way</th><th>Best for</th><th>Watch out</th></tr></thead>
+    <tbody>
+      <tr><td><code>a + b</code></td><td>A short, one-line join</td><td>Slow when repeated in a loop (see above)</td></tr>
+      <tr><td><code>StringBuilder</code></td><td>Loops, conditional pieces, editing in place</td><td>Not thread-safe; remember <code>toString()</code></td></tr>
+      <tr><td><code>String.join(sep, items)</code></td><td>Joining an existing collection or array</td><td>No prefix or suffix</td></tr>
+      <tr><td><code>StringJoiner</code></td><td>Delimiter plus prefix and suffix: <code>[a, b, c]</code></td><td>Slightly more code than <code>join</code></td></tr>
+      <tr><td><code>Collectors.joining</code></td><td>Joining the result of a stream</td><td>Elements must already be <code>CharSequence</code>; map them first</td></tr>
+      <tr><td><code>String.format</code>, <code>formatted</code></td><td>Templates with numbers and padding</td><td>Slowest of the group; fine outside hot loops</td></tr>
+      <tr><td>Text block</td><td>Fixed multi-line text (SQL, JSON)</td><td>Still a constant, not a builder</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>StringBuffer: what "synchronized" really gives you</h4>
+  <p>Each <code>StringBuffer</code> method locks the object while it runs, so two threads calling <code>append</code> at the same time never corrupt the buffer. That protects only <em>single</em> calls. A sequence such as "check <code>length()</code>, then <code>append</code>" is still a race, because another thread can run between the two calls. If threads must build one text together, hold your own lock around the whole sequence, or let each thread build its own <code>StringBuilder</code> and merge the results. In new code <code>StringBuffer</code> is almost never the answer.</p>
+
+  <div class="co co-exc">
+    <p class="co-t">Exceptions and edge cases</p>
+    <ul>
+      <li><code>StringIndexOutOfBoundsException</code> — <code>charAt</code>, <code>setCharAt</code>, <code>deleteCharAt</code>, <code>insert</code> or <code>substring</code> with an index outside <code>0..length</code>. Also thrown by <code>delete(start, end)</code> when <code>start</code> is negative or greater than <code>end</code>; an <code>end</code> past the length is silently clamped.</li>
+      <li><code>NegativeArraySizeException</code> — <code>new StringBuilder(-1)</code>.</li>
+      <li><code>NullPointerException</code> — <code>new StringBuilder((String) null)</code>. But <code>append((String) null)</code> does <em>not</em> throw: it appends the four letters <code>null</code>.</li>
+      <li><code>OutOfMemoryError</code> — the buffer cannot grow beyond about 2 billion characters, and a huge builder can exhaust the heap sooner.</li>
+      <li><code>reverse()</code> treats a surrogate pair (an emoji or a rare script character) as one unit, so it does not break such characters.</li>
+    </ul>
+  </div>
+
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: a builder defeated by + inside append</p><pre><code class="language-java">StringBuilder sb = new StringBuilder();
+for (String name : names) {
+    sb.append(name + ", ");        // creates a temporary String every pass
+}</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: append each piece</p><pre><code class="language-java">StringBuilder sb = new StringBuilder();
+for (String name : names) {
+    sb.append(name).append(", ");
+}
+// or simply: String.join(", ", names)</code></pre></div>
+  </div>
+
+  <div class="co co-conv">
+    <p class="co-t">Conventions</p>
+    <ul>
+      <li>Keep the builder a local variable, build, call <code>toString()</code> once, and return the <code>String</code>. Do not store builders in fields or pass them between threads.</li>
+      <li>Declare the variable as <code>StringBuilder</code> (it has no useful interface); take <code>CharSequence</code> in method parameters that only read text.</li>
+      <li>Do not rewrite a simple <code>a + b + c</code> into a builder; it is no faster and harder to read.</li>
+      <li>For a trailing separator, either test <code>i &gt; 0</code> before appending (as above) or call <code>setLength(sb.length() - 2)</code> at the end.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>Builders appear in report and CSV export code, custom <code>toString()</code> methods, log messages built in loops, and code generators. For SQL do not glue user input into a builder: that opens the door to SQL injection. Build the statement text with a builder if you must, but pass the values as <code>?</code> parameters to a <code>PreparedStatement</code>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "String vs StringBuilder vs StringBuffer"</p>
+    <ul>
+      <li>String is immutable; StringBuilder is mutable and not thread-safe; StringBuffer is mutable and synchronized.</li>
+      <li>Loop concatenation with <code>+</code> is O(n²) because of repeated copying; builder appends are amortised O(1).</li>
+      <li>Default capacity 16; the buffer grows (roughly doubling) when it is full — pre-size when you know the size.</li>
+      <li>Mention that a single-line <code>+</code> expression is already optimised by the compiler.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-input-output">
+  <h3>Input and output: Scanner, BufferedReader, printf and text blocks</h3>
+  <p class="tldr">Read console input with <code>Scanner</code> (easy) or <code>BufferedReader</code> (fast), watch the <code>nextInt()</code> + <code>nextLine()</code> pitfall, and format output with <code>printf</code> or <code>String.format</code>.</p>
+
+  <h4>Output basics</h4>
+  <ul>
+    <li><code>System.out.println(x)</code> prints and adds a line break; <code>print(x)</code> does not.</li>
+    <li><code>System.out.printf(format, args...)</code> formats like C's printf; <code>System.out.format</code> is the same.</li>
+    <li><code>System.err</code> is the error stream: it can be redirected separately (<code>2&gt;errors.txt</code>). In real applications you use a logger instead (<a href="#m8-logging">Logging</a>).</li>
+  </ul>
+
+  <h4>Scanner</h4>
+  <p><code>java.util.Scanner</code> splits input into tokens (separated by whitespace) and converts them for you.</p>
+  <pre data-title="ScannerDemo.java"><code class="language-java">import java.util.Scanner;
+
+public class ScannerDemo {
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        System.out.print("Enter age: ");
+        int age = sc.nextInt();
+        System.out.print("Enter price: ");
+        double price = sc.nextDouble();
+        System.out.print("Enter first word: ");
+        String word = sc.next();                 // one token
+        sc.nextLine();                           // consume the rest of that line
+        System.out.print("Enter full name: ");
+        String fullName = sc.nextLine();         // whole line, spaces allowed
+        System.out.println(age + " " + price + " " + word + " [" + fullName + "]");
+        sc.close();
+    }
+}</code></pre>
+  <pre class="out" data-title="Terminal"><code class="language-shell">Enter age: 25
+Enter price: 99.5
+Enter first word: hello
+Enter full name: Asha Rao
+25 99.5 hello [Asha Rao]</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Reads</th></tr></thead>
+    <tbody>
+      <tr><td><code>nextInt()</code>, <code>nextLong()</code>, <code>nextDouble()</code>, <code>nextBoolean()</code></td><td>The next token, converted; leaves the line break in the buffer</td></tr>
+      <tr><td><code>next()</code></td><td>The next token as a String (stops at whitespace)</td></tr>
+      <tr><td><code>nextLine()</code></td><td>The rest of the current line (can be empty), and consumes the line break</td></tr>
+      <tr><td><code>hasNext()</code>, <code>hasNextInt()</code>, <code>hasNextLine()</code></td><td>Whether another token/line is available; use these for loops and validation</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The <code>nextInt()</code> + <code>nextLine()</code> pitfall</h4>
+  <p>If the user types <code>5</code> and presses Enter, the input buffer contains <code>5\n</code>. <code>nextInt()</code> reads <code>5</code> and stops, leaving <code>\n</code>. The next <code>nextLine()</code> immediately reads the rest of that line — which is empty — and returns <code>""</code>, so your program seems to skip the question.</p>
+  <div class="vs">
+    <div class="vs-bad"><p class="vs-t">Wrong: the name is always empty</p><pre><code class="language-java">int n = sc.nextInt();
+String name = sc.nextLine();   // reads the leftover "\n" -&gt; ""</code></pre></div>
+    <div class="vs-good"><p class="vs-t">Right: consume the line break first</p><pre><code class="language-java">int n = Integer.parseInt(sc.nextLine().trim());
+String name = sc.nextLine();   // reads the real line</code></pre></div>
+  </div>
+  <p>Two safe approaches: read everything with <code>nextLine()</code> and parse yourself (shown above), or call an extra <code>sc.nextLine()</code> after <code>nextInt()</code>. Invalid input such as <code>abc</code> for <code>nextInt()</code> throws <code>InputMismatchException</code> and leaves the bad token in the buffer, so loops must call <code>sc.next()</code> to discard it. Reading when nothing is left throws <code>NoSuchElementException</code>.</p>
+  <pre data-title="SafeInput.java"><code class="language-java">static int readInt(Scanner sc, String prompt) {
+    while (true) {
+        System.out.print(prompt);
+        if (sc.hasNextInt()) {
+            int value = sc.nextInt();
+            sc.nextLine();                 // clear the line break
+            return value;
+        }
+        System.out.println("Please enter a whole number.");
+        sc.next();                         // discard the bad token
+    }
+}</code></pre>
+  <p>A <code>Scanner</code> can also parse a string or file: <code>new Scanner("10 20 30")</code>. Closing a <code>Scanner</code> on <code>System.in</code> closes the standard input for the whole program, so create one Scanner for <code>System.in</code> and close it once, at the end.</p>
+
+  <h4>BufferedReader — fast input</h4>
+  <p><code>Scanner</code> is convenient but slow for large input (it uses regular expressions). <code>BufferedReader</code> reads whole lines through a buffer and is the usual choice when input has many lines — competitive programming, big files. It reads text only; you convert it yourself.</p>
+  <pre data-title="FastInput.java"><code class="language-java">import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.util.StringTokenizer;
+
+public class FastInput {
+    public static void main(String[] args) throws IOException {
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(System.in))) {
+            int n = Integer.parseInt(br.readLine().trim());        // first line: count
+            StringTokenizer st = new StringTokenizer(br.readLine()); // second line: numbers
+            long sum = 0;
+            for (int i = 0; i &lt; n; i++) {
+                sum += Long.parseLong(st.nextToken());
+            }
+            System.out.println("Sum = " + sum);
+        }
+    }
+}</code></pre>
+  <pre class="out" data-title="Terminal"><code class="language-shell">3
+10 20 30
+Sum = 60</code></pre>
+  <ul>
+    <li><code>readLine()</code> returns <code>null</code> at the end of input, so loops read until <code>null</code>.</li>
+    <li><code>readLine()</code> throws the checked <code>IOException</code>: declare <code>throws IOException</code> or catch it.</li>
+    <li>Instead of <code>StringTokenizer</code> you can use <code>line.split(" ")</code> — simpler, slightly slower.</li>
+  </ul>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Point</th><th><code>Scanner</code></th><th><code>BufferedReader</code></th></tr></thead>
+    <tbody>
+      <tr><td>Parsing</td><td>Built in (<code>nextInt</code>, …)</td><td>Manual (<code>Integer.parseInt</code>)</td></tr>
+      <tr><td>Speed on large input</td><td>Slow</td><td>Fast</td></tr>
+      <tr><td>Checked exceptions</td><td>None for <code>System.in</code></td><td><code>IOException</code></td></tr>
+      <tr><td>Best for</td><td>Small console programs, menus</td><td>Large input, files, performance</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Formatted output with printf and String.format</h4>
+  <pre data-title="Printf.java"><code class="language-java">System.out.printf("%-10s|%8d|%8.2f%n", "Pen", 12, 5.5);
+System.out.printf("%-10s|%8d|%8.2f%n", "Notebook", 3, 45.0);
+System.out.println(String.format("%05d", 42));            // 00042
+System.out.println(String.format("%,d", 1234567));        // 1,234,567
+System.out.println(String.format("%x %X %o", 255, 255, 8));   // ff FF 10
+System.out.println(String.format("%b %c %e", true, 'A', 12345.678));
+System.out.println(String.format("%+d and 100%%", 5));    // +5 and 100%
+String line = String.format("%s paid Rs %.2f", "Asha", 1499.5);
+System.out.println(line);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">Pen       |      12|    5.50
+Notebook  |       3|   45.00
+00042
+1,234,567
+ff FF 10
+true A 1.234568e+04
++5 and 100%
+Asha paid Rs 1499.50</code></pre>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Specifier</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>%d</code></td><td>Integer (<code>byte</code>, <code>short</code>, <code>int</code>, <code>long</code>, <code>BigInteger</code>)</td></tr>
+      <tr><td><code>%f</code>, <code>%.2f</code></td><td>Decimal number; <code>.2</code> is digits after the point (rounds half up)</td></tr>
+      <tr><td><code>%s</code></td><td>Any value as text (calls <code>toString()</code>)</td></tr>
+      <tr><td><code>%c</code>, <code>%b</code></td><td>Character, boolean</td></tr>
+      <tr><td><code>%x</code>, <code>%X</code>, <code>%o</code>, <code>%e</code></td><td>Hex, uppercase hex, octal, scientific</td></tr>
+      <tr><td><code>%n</code></td><td>Platform line separator (prefer to <code>\n</code> in format strings)</td></tr>
+      <tr><td><code>%%</code></td><td>A literal percent sign</td></tr>
+      <tr><td><code>%10d</code>, <code>%-10s</code></td><td>Width 10, right-aligned / left-aligned with <code>-</code></td></tr>
+      <tr><td><code>%05d</code>, <code>%+d</code>, <code>%,d</code></td><td>Zero-padded, with sign, with thousands separator</td></tr>
+    </tbody>
+  </table></div>
+  <p>A mismatch throws an exception at runtime: <code>String.format("%d", 3.5)</code> gives <code>IllegalFormatConversionException: d != java.lang.Double</code>, and a missing argument gives <code>MissingFormatArgumentException</code>. The thousands separator and decimal mark follow the default <code>Locale</code>; for lakh/crore grouping (12,34,567) use <code>NumberFormat</code> with the <code>en-IN</code> locale (<code>Locale.forLanguageTag("en-IN")</code>).</p>
+
+  <h4>Text blocks (Java 15)</h4>
+  <p>A <strong>text block</strong> is a multi-line string between triple quotes. It keeps line breaks, needs no <code>\n</code> or escaped quotes, and removes the common indentation. It is ideal for JSON, SQL and HTML. More about it in <a href="#m5">Module 5</a>.</p>
+  <pre data-title="TextBlock.java"><code class="language-java">String sql = """
+        SELECT id, name
+        FROM customers
+        WHERE city = 'Pune'
+        ORDER BY name
+        """;
+System.out.print(sql);</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">SELECT id, name
+FROM customers
+WHERE city = 'Pune'
+ORDER BY name</code></pre>
+
+  <div class="co co-rule">
+    <p class="co-t">Rules</p>
+    <ul>
+      <li>The opening <code>"""</code> must be followed by a line break; the closing <code>"""</code> position decides the indentation that is removed.</li>
+      <li>Every <code>printf</code> specifier must match its argument type; the count of arguments must match the count of specifiers.</li>
+      <li>Create one <code>Scanner</code> per input source; do not close <code>System.in</code> early.</li>
+    </ul>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>The <code>nextInt()</code> / <code>nextLine()</code> skip (above).</li>
+      <li>Using <code>%d</code> for a <code>double</code> or <code>%f</code> for an <code>int</code>.</li>
+      <li>Using <code>\n</code> in printf for a platform-correct newline; use <code>%n</code>.</li>
+      <li>Forgetting to <code>trim()</code> before <code>Integer.parseInt(line)</code>: a trailing space causes <code>NumberFormatException</code>.</li>
+      <li>Creating a new <code>Scanner(System.in)</code> in every method: buffered input is lost between scanners.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: "Scanner vs BufferedReader? Why does nextLine() seem to be skipped?"</p>
+    <ul>
+      <li>Scanner tokenises and parses (convenient, slower); BufferedReader reads lines (fast, manual parsing, throws <code>IOException</code>).</li>
+      <li><code>nextInt()</code> leaves the line break in the buffer; the following <code>nextLine()</code> consumes that empty remainder.</li>
+      <li>Fix: read lines and parse, or add one extra <code>nextLine()</code>.</li>
+      <li>Mention <code>hasNextInt()</code> for validation and <code>InputMismatchException</code>.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m1-math-random">
+  <h3>The Math class, Random and ThreadLocalRandom</h3>
+  <p class="tldr"><code>Math</code> offers static methods for everyday arithmetic (<code>pow</code>, <code>sqrt</code>, <code>floorMod</code>, <code>addExact</code>); use <code>ThreadLocalRandom</code> for quick random numbers and <code>SecureRandom</code> when the value protects something.</p>
+
+  <h4>Math essentials</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Method</th><th>Result and notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>abs(x)</code>, <code>max(a, b)</code>, <code>min(a, b)</code></td><td>Same type as the arguments; <code>abs(Integer.MIN_VALUE)</code> stays negative</td></tr>
+      <tr><td><code>pow(a, b)</code>, <code>sqrt(x)</code>, <code>cbrt(x)</code></td><td>Always return <code>double</code>; <code>sqrt(-1)</code> is <code>NaN</code></td></tr>
+      <tr><td><code>floor(x)</code>, <code>ceil(x)</code></td><td>Round down / up, as a <code>double</code></td></tr>
+      <tr><td><code>round(x)</code></td><td>Nearest whole number (half rounds up); <code>long</code> for <code>double</code>, <code>int</code> for <code>float</code></td></tr>
+      <tr><td><code>floorDiv(a, b)</code>, <code>floorMod(a, b)</code></td><td>Division and remainder that round toward negative infinity</td></tr>
+      <tr><td><code>addExact</code>, <code>subtractExact</code>, <code>multiplyExact</code>, <code>toIntExact</code></td><td>Throw <code>ArithmeticException</code> on overflow</td></tr>
+      <tr><td><code>hypot(a, b)</code>, <code>signum(x)</code></td><td>sqrt(a²+b²) without overflow; −1, 0 or 1</td></tr>
+      <tr><td><code>log(x)</code>, <code>log10(x)</code>, <code>exp(x)</code></td><td>Natural log, base-10 log, e<sup>x</sup></td></tr>
+      <tr><td><code>sin</code>, <code>cos</code>, <code>toRadians</code>, <code>PI</code>, <code>E</code></td><td>Trigonometry works in radians</td></tr>
+      <tr><td><code>clamp(value, min, max)</code></td><td>Keeps a value inside a range (Java 21)</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="MathDemo.java"><code class="language-java">System.out.println(Math.pow(2, 10));            // 1024.0
+System.out.println((int) Math.pow(2, 10));      // 1024
+System.out.println(Math.sqrt(144));             // 12.0
+System.out.println(Math.ceil(7 / 2));           // 3.0   7/2 is already 3 (int division)
+System.out.println(Math.ceil(7 / 2.0));         // 4.0
+System.out.println(Math.floor(-1.5) + " " + Math.ceil(-1.5));   // -2.0 -1.0
+System.out.println(Math.round(2.5) + " " + Math.round(-2.5) + " " + Math.round(2.4));  // 3 -2 2
+System.out.println(Math.floorDiv(-7, 2) + " " + (-7 / 2));       // -4 -3
+System.out.println(Math.floorMod(-7, 5) + " " + (-7 % 5));        // 3 -2
+System.out.println(Math.hypot(3, 4));           // 5.0
+System.out.println(Math.addExact(Integer.MAX_VALUE, 1));         // throws</code></pre>
+  <pre class="out" data-title="Last line"><code class="language-plaintext">Exception in thread "main" java.lang.ArithmeticException: integer overflow</code></pre>
+  <p>To round a price to two decimals with <code>double</code> people write <code>Math.round(x * 100) / 100.0</code>. It is acceptable for display, but use <code>BigDecimal.setScale</code> for real money. Use <code>pow</code> only when you need powers of non-integers or large powers; for squares write <code>x * x</code>, which is faster and exact for integers.</p>
+
+  <h4>Random numbers</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Tool</th><th>Use it for</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>Math.random()</code></td><td>Quick demos</td><td>A <code>double</code> in [0.0, 1.0)</td></tr>
+      <tr><td><code>java.util.Random</code></td><td>Reproducible sequences (tests, simulations)</td><td><code>new Random(42)</code> gives the same numbers each run; thread-safe but contended</td></tr>
+      <tr><td><code>ThreadLocalRandom</code></td><td>Everyday random numbers, especially from many threads</td><td><code>ThreadLocalRandom.current().nextInt(1, 7)</code> — upper bound exclusive; do not share the object between threads, and it cannot be seeded</td></tr>
+      <tr><td><code>java.security.SecureRandom</code></td><td>OTPs, tokens, passwords, keys</td><td>Cryptographically strong; slower. <strong>Never</strong> use <code>Random</code> for security</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="RandomDemo.java"><code class="language-java">import java.security.SecureRandom;
+import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
+
+public class RandomDemo {
+    public static void main(String[] args) {
+        Random seeded = new Random(42);              // same seed -&gt; same sequence every run
+        int fromRandom = seeded.nextInt(100);        // 0..99
+        double d = seeded.nextDouble();              // [0.0, 1.0)
+
+        int dice = ThreadLocalRandom.current().nextInt(1, 7);   // 1..6
+
+        int otp = new SecureRandom().nextInt(900_000) + 100_000; // 6-digit OTP: 100000..999999
+        System.out.println("dice=" + dice + " otp-length=" + String.valueOf(otp).length());
+
+        int min = 10, max = 20;                      // random int in [min, max]
+        int inRange = min + (int) (Math.random() * (max - min + 1));
+        System.out.println(inRange &gt;= min &amp;&amp; inRange &lt;= max);   // true
+    }
+}</code></pre>
+  <pre class="out" data-title="Output"><code class="language-plaintext">dice=4 otp-length=6
+true</code></pre>
+  <p>The dice and OTP values change on each run. <code>nextInt(bound)</code> returns <code>0</code> to <code>bound - 1</code> and throws <code>IllegalArgumentException</code> if <code>bound</code> is zero or negative.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li><code>Math.random() * 10</code> cast to int gives 0–9, not 1–10: add 1 for 1–10.</li>
+      <li>Creating a new <code>Random()</code> inside a loop — create it once.</li>
+      <li>Using <code>Random</code> for OTPs or session tokens: it is predictable. Use <code>SecureRandom</code>.</li>
+      <li>Assuming <code>Math.round</code> returns an <code>int</code>: it returns <code>long</code> for a double, so <code>int r = Math.round(x);</code> does not compile.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview: Random vs ThreadLocalRandom vs SecureRandom</p>
+    <ul>
+      <li><code>Random</code>: seedable, reproducible, shared state; <code>ThreadLocalRandom</code>: one instance per thread, no contention, not seedable; <code>SecureRandom</code>: unpredictable, for security.</li>
+      <li><code>Math.floorMod</code> vs <code>%</code> with negatives; <code>Math.round(-2.5)</code> is −2.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic recap" id="m1-interview">
+  <h3>Interview questions — Basics and syntax</h3>
+
+  <details class="qa">
+    <summary>What are the JDK, JRE and JVM? How is Java platform independent?</summary>
+    <div class="qa-a">
+      <p>The JVM runs bytecode. The JRE is the JVM plus the standard libraries. The JDK is the JRE plus development tools such as <code>javac</code>. <code>javac</code> compiles source to platform-neutral bytecode in <code>.class</code> files; each operating system has its own JVM that executes the same bytecode. So the bytecode is portable and the JVM is platform specific. At runtime the class loader loads classes, the verifier checks them, and the interpreter and JIT compiler run them.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why is <code>main</code> declared <code>public static void</code>?</summary>
+    <div class="qa-a">
+      <p><code>public</code> so the JVM can call it from outside; <code>static</code> so no object is needed to start the program; <code>void</code> because it returns nothing to the JVM (use <code>System.exit(code)</code> for a status). The parameter <code>String[] args</code> carries the command-line arguments. A different signature compiles but will not be started as the entry point.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why does <code>Integer a = 127, b = 127; a == b</code> give true, but 128 gives false?</summary>
+    <div class="qa-a">
+      <p>Autoboxing calls <code>Integer.valueOf</code>, which returns cached objects for values from −128 to 127. Inside that range both variables share one object; outside it, two different objects are created, and <code>==</code> compares references. Always use <code>equals()</code> for wrapper objects.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Is Java pass-by-value or pass-by-reference?</summary>
+    <div class="qa-a">
+      <p>Always pass-by-value. For primitives the value is copied. For objects the <em>reference</em> is copied, so the method and the caller share one object: calling <code>list.add(x)</code> in the method changes what the caller sees. But assigning a new object to the parameter only changes the local copy. That is why a <code>swap(a, b)</code> method cannot swap the caller's variables.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why is <code>String</code> immutable, and what is the String pool?</summary>
+    <div class="qa-a">
+      <p>Immutability allows safe sharing of literals in the pool, protects security-sensitive values like paths and class names, makes strings thread-safe, and lets <code>hashCode()</code> be cached, which is ideal for <code>HashMap</code> keys. The String pool is a heap area that keeps one instance for each distinct literal. <code>new String("a")</code> creates a separate heap object; <code>intern()</code> returns the pooled one.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does this print? <code>String a = "java"; String b = new String("java"); System.out.println(a == b); System.out.println(a.equals(b));</code></summary>
+    <div class="qa-a">
+      <p><code>false</code> then <code>true</code>. <code>a</code> points to the pooled literal and <code>b</code> to a new heap object, so the references differ, but the characters are equal. <code>"ja" + "va" == "java"</code> would be <code>true</code> because the compiler folds constants, while <code>part + "va" == "java"</code> with a non-final variable <code>part</code> is <code>false</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>String vs StringBuilder vs StringBuffer?</summary>
+    <div class="qa-a">
+      <p>String is immutable. StringBuilder is mutable and not thread-safe, so it is the fastest for building text. StringBuffer is mutable and synchronized, so it is thread-safe but slower, and rarely needed. Concatenating with <code>+</code> in a loop is O(n²) because every pass copies the text; use a <code>StringBuilder</code> there.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why can't you use <code>double</code> for money? What do you use instead?</summary>
+    <div class="qa-a">
+      <p>Binary floating point cannot represent most decimal fractions exactly: <code>0.1 + 0.2</code> is <code>0.30000000000000004</code>, and errors accumulate. Use <code>BigDecimal</code> created from Strings (<code>new BigDecimal("0.10")</code>), set the scale and a <code>RoundingMode</code> explicitly, and compare with <code>compareTo</code>. Or keep the amount as a <code>long</code> in paise. In the database use <code>NUMERIC(p, s)</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why does <code>byte b = 10; b += 5;</code> compile but <code>b = b + 5;</code> does not?</summary>
+    <div class="qa-a">
+      <p><code>b + 5</code> is promoted to <code>int</code>, and assigning an <code>int</code> to a <code>byte</code> needs a cast. A compound assignment <code>b += 5</code> is defined as <code>b = (byte)(b + 5)</code>, so the compiler adds the cast for you. The same hidden cast silently truncates in <code>int i = 10; i += 3.7;</code> (result 13).</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What is the output of <code>int x = 5; x = x++ + ++x;</code>?</summary>
+    <div class="qa-a">
+      <p><code>12</code>. <code>x++</code> yields 5 and sets x to 6; <code>++x</code> sets x to 7 and yields 7; the sum 12 is then assigned to x. Java evaluates operands left to right. Also remember that <code>x = x++;</code> leaves x unchanged.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How does Java choose between overloaded methods?</summary>
+    <div class="qa-a">
+      <p>At compile time, in three phases: first exact match or widening without boxing, then boxing/unboxing, then varargs. The most specific method wins; if none is more specific, the call is ambiguous. So with <code>show(int)</code>, <code>show(long)</code> and <code>show(Integer)</code>, the call <code>show(5)</code> picks <code>int</code>, and without <code>show(int)</code> it picks <code>long</code> (widening beats boxing). Return type is not part of the signature.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why does <code>Scanner.nextLine()</code> sometimes return an empty string after <code>nextInt()</code>?</summary>
+    <div class="qa-a">
+      <p><code>nextInt()</code> reads only the number and leaves the line break in the buffer. The next <code>nextLine()</code> reads the rest of that line, which is empty. Fix it by reading all input with <code>nextLine()</code> and parsing with <code>Integer.parseInt</code>, or by calling one extra <code>nextLine()</code> after <code>nextInt()</code>.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What can a <code>switch</code> be used on, and what is a switch expression?</summary>
+    <div class="qa-a">
+      <p>The selector may be <code>byte</code>, <code>short</code>, <code>char</code>, <code>int</code> (and wrappers), <code>String</code> or an <code>enum</code> — not <code>long</code>, <code>double</code> or <code>boolean</code>. In the old colon form, missing <code>break</code> causes fall-through. Since Java 14 the arrow form has no fall-through, and a switch expression produces a value (<code>int days = switch (m) { case "Feb" -&gt; 28; default -&gt; 31; };</code>), must be exhaustive, and uses <code>yield</code> inside a block.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What does <code>Arrays.asList</code> return, and what are its traps?</summary>
+    <div class="qa-a">
+      <p>A fixed-size list backed by the array: <code>set</code> works and writes through to the array, but <code>add</code> and <code>remove</code> throw <code>UnsupportedOperationException</code>. With a primitive array like <code>int[]</code> you get a <code>List&lt;int[]&gt;</code> of size 1. Wrap it in <code>new ArrayList&lt;&gt;(...)</code> for a normal list, or use <code>List.of</code> for an immutable one.</p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>What exceptions can arrays and strings throw at runtime?</summary>
+    <div class="qa-a">
+      <p><code>ArrayIndexOutOfBoundsException</code> for a bad array index, <code>NegativeArraySizeException</code> for a negative size, <code>ArrayStoreException</code> when storing the wrong type into a covariant array, <code>StringIndexOutOfBoundsException</code> for <code>charAt</code>/<code>substring</code>, <code>NullPointerException</code> for a null array or string, <code>NumberFormatException</code> for bad numeric text, and <code>ArithmeticException: / by zero</code> for integer division by zero.</p>
+    </div>
+  </details>
+</article>
+
+<article class="topic recap" id="m1-cheatsheet">
+  <h3>Cheat sheet — Basics and syntax</h3>
+  <ul class="cheat">
+    <li><b>JDK ⊃ JRE ⊃ JVM</b> JDK has the tools, JRE the libraries, JVM runs bytecode.</li>
+    <li><b>Run</b> <code>javac A.java</code> then <code>java A</code>; or <code>java A.java</code> (Java 11+); <code>jshell</code> for experiments.</li>
+    <li><b>main</b> <code>public static void main(String[] args)</code>; one public class per file, file name = class name.</li>
+    <li><b>Primitives</b> byte 8, short 16, int 32, long 64, float 32, double 64, char 16 (unsigned), boolean.</li>
+    <li><b>Literals</b> <code>10L</code>, <code>3.14f</code>, <code>1_000_000</code>, <code>0xFF</code>, <code>0b101</code>; decimals default to double, integers to int.</li>
+    <li><b>Defaults</b> fields and array elements: 0 / false / null; locals have none.</li>
+    <li><b>Integer cache</b> −128…127; compare wrappers with <code>equals</code>.</li>
+    <li><b>Unboxing null</b> throws <code>NullPointerException</code>.</li>
+    <li><b>var</b> local variables only; needs an initializer; still statically typed.</li>
+    <li><b>Division</b> int / int drops the fraction; <code>-7 % 3 == -1</code>; use <code>Math.floorMod</code> for wrap-around.</li>
+    <li><b>Overflow</b> wraps silently; <code>Math.addExact</code> throws; use <code>1000000L * 1000000</code> for long maths.</li>
+    <li><b>0.1 + 0.2</b> is <code>0.30000000000000004</code>; money → <code>BigDecimal("0.10")</code> + <code>setScale</code> + <code>RoundingMode</code>.</li>
+    <li><b>Promotion</b> byte/short/char arithmetic gives int; <code>b += 1</code> has a hidden cast, <code>b = b + 1</code> does not compile.</li>
+    <li><b>Casting</b> narrowing truncates: <code>(int) 3.99 == 3</code>, <code>(byte) 130 == -126</code>.</li>
+    <li><b>i++ / ++i</b> old value then add / add then new value.</li>
+    <li><b>&amp;&amp; and ||</b> short-circuit; <code>&amp;</code> and <code>|</code> evaluate both sides.</li>
+    <li><b>switch</b> arrow form has no fall-through; switch expressions return a value and use <code>yield</code>.</li>
+    <li><b>Loops</b> for, enhanced for, while, do-while; <code>break outer;</code> leaves a labeled loop.</li>
+    <li><b>Pass-by-value</b> always; object references are copied; reassigning a parameter never changes the caller.</li>
+    <li><b>Overload order</b> exact/widening → boxing → varargs; most specific wins.</li>
+    <li><b>Arrays</b> fixed size, <code>length</code> field; <code>Arrays.toString</code>, <code>deepToString</code>, <code>sort</code>, <code>copyOf</code>, <code>fill</code>, <code>equals</code>.</li>
+    <li><b>Arrays.asList</b> fixed-size view; <code>List.of</code> immutable; <code>new ArrayList&lt;&gt;(…)</code> growable.</li>
+    <li><b>Strings</b> immutable; literals pooled; <code>equals</code> for content, <code>"x".equals(s)</code> avoids null.</li>
+    <li><b>split</b> takes a regex: <code>split("\\.")</code>, <code>split("\\s+")</code>; trailing empty strings dropped.</li>
+    <li><b>Builders</b> <code>StringBuilder</code> for loops (not thread-safe), <code>StringBuffer</code> synchronized.</li>
+    <li><b>Input</b> <code>Scanner</code> for small programs, <code>BufferedReader</code> for speed; beware <code>nextInt()</code> then <code>nextLine()</code>.</li>
+    <li><b>printf</b> <code>%d %s %.2f %n %5d %-10s %05d %,d</code>.</li>
+    <li><b>Random</b> <code>ThreadLocalRandom.current().nextInt(1, 7)</code> for everyday use; <code>SecureRandom</code> for secrets.</li>
+  </ul>
+</article>
+
+<article class="topic recap" id="m1-practice">
+  <h3>Practice — Basics and syntax</h3>
+  <ol class="steps">
+    <li><strong>Warm-up: types and operators (easy).</strong> In JShell or a single file, predict and then check: <code>7 / 2</code>, <code>-7 % 3</code>, <code>(byte) 200</code>, <code>0.1 + 0.2</code>, <code>'a' + 1</code>, <code>1 + 2 + "x"</code>, <code>Integer.MAX_VALUE + 1</code>. Done when all seven guesses match the output and you can explain each.</li>
+    <li><strong>Star and number patterns (easy).</strong> Print a right triangle, an inverted triangle, a pyramid, a diamond, a hollow square, Floyd's triangle and Pascal's triangle of height n. Done when each prints correctly for n = 1, 5 and 9.</li>
+    <li><strong>Number programs (easy).</strong> Write: even/odd, prime check (up to √n), primes up to N, factorial (iterative and recursive), Fibonacci (first N), GCD and LCM, Armstrong number, perfect number, sum of digits, reverse a number, palindrome number, binary to decimal and back. Done when each handles 0, 1 and a large int without errors.</li>
+    <li><strong>String programs (easy to medium).</strong> Write: reverse a string, palindrome (ignoring case and punctuation), count vowels and consonants, anagram check (sort the chars, then a count array), first non-repeating character, remove duplicates, count words, capitalise each word, run-length compression. Done when each works on empty strings and on strings with spaces.</li>
+    <li><strong>Array programs (medium).</strong> Write: reverse an array, largest and second largest, sum and average, remove duplicates from a sorted array, merge two sorted arrays, rotate by k, linear and binary search, bubble sort, count frequency of each element. Done when you use no library sort for the sorting task and handle length 0 and 1.</li>
+    <li><strong>Matrix programs (medium).</strong> Write: matrix addition, multiplication (use the example in the Arrays article), transpose, row and column sums, diagonal sum, spiral print of a 4×4 matrix. Done when it works for non-square matrices where mathematically valid.</li>
+    <li><strong>Menu-driven calculator (medium).</strong> Use a <code>do-while</code> menu with a <code>switch</code> expression, a <code>Scanner</code> and a method per operation; reject division by zero and non-numeric input without crashing. Done when the program survives entering letters at every prompt.</li>
+    <li><strong>Pass-by-value lab (medium).</strong> Write methods that try to swap two ints, two Strings, two array elements, and mutate or reassign a <code>StringBuilder</code> and an <code>int[]</code>. Predict each result on paper, run it, and write one sentence per case explaining what was copied.</li>
+    <li><strong>Billing with BigDecimal (medium).</strong> Read item names, prices and quantities with <code>BufferedReader</code>, compute a subtotal, 18% GST and a total with <code>BigDecimal</code>, round with <code>HALF_UP</code> to two decimals, and print an aligned receipt with <code>printf</code>. Done when 3 × ₹33.33 plus GST matches a hand calculation to the paisa.</li>
+    <li><strong>Mini project: word and number statistics (harder).</strong> Read a text file given as a command-line argument line by line, then print the 5 most frequent words (use a loop and arrays or a <code>Map</code> if you know it), the longest word, and the average word length. Build the final report with a <code>StringBuilder</code>. Done when it handles an empty file and a missing file with a clear message.</li>
+  </ol>
+</article>

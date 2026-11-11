@@ -1,0 +1,534 @@
+<article class="topic" id="m5-isolation-levels">
+  <h3>Isolation levels and concurrency problems</h3>
+  <p class="tldr">The isolation level decides how much one transaction sees of others running at the same time:
+  higher levels prevent more anomalies (dirty, non-repeatable and phantom reads, lost update, write skew) at the
+  price of more blocking or more retries; PostgreSQL defaults to Read Committed and MySQL InnoDB to Repeatable
+  Read.</p>
+
+  <h4>The problem: transactions run at the same time</h4>
+  <p>Real databases serve hundreds of transactions at once. If each one saw every change of every other one
+  instantly, results would be unpredictable. If each one waited for the others to finish (strict serial order),
+  the database would be safe but slow. <strong>Isolation levels</strong> are the dial between the two. The
+  anomalies below are what can go wrong at lower settings.</p>
+
+  <h4>MVCC in simple words</h4>
+  <p><strong>MVCC</strong> (multi-version concurrency control) is how PostgreSQL and InnoDB achieve isolation
+  without making readers wait for writers. An <code>UPDATE</code> does not overwrite a row; it writes a <em>new
+  version</em> and keeps the old one. Each transaction (or each statement) works with a <strong>snapshot</strong>:
+  the set of versions that were committed when the snapshot was taken. Readers read old versions while a writer
+  prepares new ones, so "readers never block writers and writers never block readers". Writers still block each
+  other on the same row. Old versions are cleaned later (<code>VACUUM</code> in PostgreSQL, purge in InnoDB).</p>
+
+  <h4>The anomalies</h4>
+  <dl class="terms">
+    <dt>Dirty read</dt><dd>Reading data another transaction has changed but not yet committed. If it rolls
+    back, you read data that never existed.</dd>
+    <dt>Non-repeatable read</dt><dd>Reading the same row twice in one transaction and getting different values,
+    because another transaction committed a change in between.</dd>
+    <dt>Phantom read</dt><dd>Running the same query twice and getting different <em>rows</em> (new or missing),
+    because another transaction committed an insert or delete that matches your condition.</dd>
+    <dt>Lost update</dt><dd>Two transactions read a value, both compute a new one, and the second write
+    overwrites the first, so one update is lost.</dd>
+    <dt>Write skew</dt><dd>Two transactions read overlapping data, each makes a decision, and each writes
+    <em>different</em> rows; together they break a rule that each alone respected.</dd>
+  </dl>
+
+  <h4>Levels versus anomalies</h4>
+  <p>The SQL standard defines four levels. The table shows what can happen at each, in PostgreSQL's actual
+  behaviour (the standard is weaker in places, and MySQL differs slightly).</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom read</th><th>Lost update / write skew</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Read Uncommitted</strong></td><td>Possible in the standard; PostgreSQL treats it as Read
+      Committed (never)</td><td>Possible</td><td>Possible</td><td>Possible</td></tr>
+      <tr><td><strong>Read Committed</strong> (PostgreSQL default)</td><td>No</td><td>Possible</td><td>Possible</td>
+      <td>Both possible</td></tr>
+      <tr><td><strong>Repeatable Read</strong> (MySQL InnoDB default)</td><td>No</td><td>No</td>
+      <td>Standard: possible. PostgreSQL: no (snapshot). InnoDB: no for plain reads</td>
+      <td>Lost update: PostgreSQL aborts with an error; write skew still possible</td></tr>
+      <tr><td><strong>Serializable</strong></td><td>No</td><td>No</td><td>No</td><td>Prevented. Transactions behave as if
+      run one by one; some are aborted and must retry (PostgreSQL)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Setting the level</h4>
+<pre data-title="Choosing an isolation level"><code class="language-sql">-- PostgreSQL: for one transaction
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+-- or, as the first statement inside it:
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+SHOW transaction_isolation;               -- PostgreSQL: current level
+SELECT @@transaction_isolation;           -- MySQL
+
+-- MySQL, for the next transaction only
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;</code></pre>
+<pre data-title="Spring"><code class="language-java">@Transactional(isolation = Isolation.REPEATABLE_READ)
+public void closeDayReport() { /* ... */ }</code></pre>
+
+  <h4>Demo 1: dirty read (and why you never see it in PostgreSQL)</h4>
+  <p>Starting state: Asha's balance is 50000.</p>
+  <pre class="out" data-title="Read Uncommitted (possible in MySQL, not in PostgreSQL)"><code class="language-plaintext">Session A                                 Session B
+------------------------------------      ------------------------------------
+BEGIN;
+UPDATE accounts SET balance_paise = 0
+  WHERE id = 1;                           -- not committed
+                                          BEGIN ISOLATION LEVEL READ UNCOMMITTED;
+                                          SELECT balance_paise FROM accounts
+                                            WHERE id = 1;     --&gt; 0  (dirty!)
+ROLLBACK;                                 -- the 0 never existed
+                                          -- PostgreSQL would show 50000 here</code></pre>
+
+  <h4>Demo 2: non-repeatable read at Read Committed</h4>
+  <p>In Read Committed each <em>statement</em> gets a fresh snapshot, so it sees everything committed before it
+  started.</p>
+  <pre class="out" data-title="Read Committed"><code class="language-plaintext">Session A                                 Session B
+------------------------------------      ------------------------------------
+BEGIN;  -- READ COMMITTED
+SELECT balance_paise FROM accounts
+  WHERE id = 1;                --&gt; 50000
+                                          BEGIN;
+                                          UPDATE accounts SET balance_paise = 30000
+                                            WHERE id = 1;
+                                          COMMIT;
+SELECT balance_paise FROM accounts
+  WHERE id = 1;                --&gt; 30000   (same query, different answer)
+COMMIT;</code></pre>
+  <p>At <strong>Repeatable Read</strong> the second select in session A would still return 50000, because the
+  snapshot is taken once, at the first statement of the transaction.</p>
+
+  <h4>Demo 3: phantom read</h4>
+  <pre class="out" data-title="Read Committed: a new row appears"><code class="language-plaintext">Session A                                 Session B
+------------------------------------      ------------------------------------
+BEGIN;  -- READ COMMITTED
+SELECT count(*) FROM orders
+  WHERE restaurant_id = 1
+    AND status = 'PLACED';     --&gt; 3
+                                          INSERT INTO orders (...)  -- restaurant 1, PLACED
+                                          COMMIT;
+SELECT count(*) FROM orders
+  WHERE restaurant_id = 1
+    AND status = 'PLACED';     --&gt; 4   (a phantom row)
+COMMIT;</code></pre>
+  <p>Non-repeatable reads are about changes to a row you already saw; phantoms are about new or removed rows that
+  match your condition.</p>
+
+  <h4>Demo 4: lost update</h4>
+  <p>Two customers buy the last two units of an item. The application reads the stock, subtracts in Java and
+  writes the result back:</p>
+  <pre class="out" data-title="Lost update at Read Committed (stock starts at 10)"><code class="language-plaintext">Session A                                 Session B
+------------------------------------      ------------------------------------
+BEGIN;                                    BEGIN;
+SELECT stock FROM items WHERE id = 7;     SELECT stock FROM items WHERE id = 7;
+  --&gt; 10                                     --&gt; 10
+-- app computes 10 - 2 = 8                -- app computes 10 - 3 = 7
+UPDATE items SET stock = 8
+  WHERE id = 7;
+COMMIT;
+                                          UPDATE items SET stock = 7
+                                            WHERE id = 7;     -- overwrites A!
+                                          COMMIT;
+-- final stock = 7, but 5 units were sold: should be 5</code></pre>
+  <p>Fixes, from simplest: (1) let the database do the arithmetic, which takes a row lock for the update:
+  <code>UPDATE items SET stock = stock - 2 WHERE id = 7 AND stock &gt;= 2;</code> and check the row count;
+  (2) lock the row when you read it: <code>SELECT ... FOR UPDATE</code> (see
+  <a href="#m5-locking">Locking</a>); (3) add a version column and detect the conflict
+  (<a href="#m5-optimistic-pessimistic">optimistic locking</a>); (4) use Repeatable Read, where PostgreSQL makes
+  the second writer fail with "could not serialize access due to concurrent update" and you retry.</p>
+
+  <h4>Demo 5: write skew</h4>
+  <p>Rule: at least one rider must stay on shift. Two riders go off shift at the same moment:</p>
+  <pre class="out" data-title="Write skew at Repeatable Read (riders 1 and 2 are both on shift)"><code class="language-plaintext">Session A (rider 1 leaves)                Session B (rider 2 leaves)
+------------------------------------      ------------------------------------
+BEGIN ISOLATION LEVEL REPEATABLE READ;    BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM riders
+  WHERE on_shift;              --&gt; 2       SELECT count(*) FROM riders
+                                            WHERE on_shift;       --&gt; 2
+-- 2 &gt;= 2, safe to leave                   -- 2 &gt;= 2, safe to leave
+UPDATE riders SET on_shift = false
+  WHERE id = 1;
+                                          UPDATE riders SET on_shift = false
+                                            WHERE id = 2;   -- different row: no conflict
+COMMIT;                                   COMMIT;
+-- nobody is on shift: the rule is broken</code></pre>
+  <p>Each transaction was correct alone. They wrote different rows, so row-level conflict detection never
+  fired. Only <strong>Serializable</strong> (in PostgreSQL, serializable snapshot isolation) notices the
+  dependency and aborts one transaction with an error. You can also lock the rows you read
+  (<code>SELECT ... FOR UPDATE</code> on all on-shift riders) or enforce the rule with a constraint or a
+  single row that all transactions must update.</p>
+
+  <h4>Serialization failures and retry</h4>
+  <p>At Repeatable Read and Serializable, PostgreSQL may abort a transaction rather than allow an anomaly. The
+  error has SQLSTATE <code>40001</code> (<code>serialization_failure</code>); a detected deadlock gives
+  <code>40P01</code>. These are not bugs: the transaction did nothing wrong and should simply be run again.</p>
+<pre data-title="Retry loop for serialization failures"><code class="language-java">for (int attempt = 1; attempt &lt;= 3; attempt++) {
+    try {
+        transferService.transfer(fromId, toId, amountPaise);   // @Transactional inside
+        break;
+    } catch (CannotSerializeTransactionException | DeadlockLoserDataAccessException e) {
+        if (attempt == 3) throw e;
+        Thread.sleep(20L * attempt);                           // small back-off
+    }
+}</code></pre>
+  <p>Spring translates these SQL states into <code>CannotSerializeTransactionException</code> and
+  <code>DeadlockLoserDataAccessException</code>. Retry the whole transaction (outside the
+  <code>@Transactional</code> method), never a single statement. Spring Retry's <code>@Retryable</code> does
+  this declaratively.</p>
+
+  <h4>MySQL InnoDB differences</h4>
+  <ul>
+    <li>Default is <strong>Repeatable Read</strong>: plain <code>SELECT</code>s read a snapshot fixed at the
+    first read.</li>
+    <li>Locking reads and writes (<code>SELECT ... FOR UPDATE</code>, <code>UPDATE</code>) read the <em>latest</em>
+    committed data, not the snapshot, and use <em>next-key locks</em> (row plus gap locks) to block phantoms. A
+    transaction can therefore see rows its own snapshot select did not show.</li>
+    <li>InnoDB Repeatable Read does not abort lost updates; the second writer waits for the lock and then writes.
+    Atomic updates (<code>SET stock = stock - 2</code>) or <code>FOR UPDATE</code> remain the right tools.</li>
+    <li>Serializable turns plain selects into shared locking reads, so transactions block rather than abort.</li>
+  </ul>
+
+  <h4>Which level should you use?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Level</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td>Read Committed</td><td>The default for most OLTP code: each statement sees fresh data and
+      transactions rarely abort. Combine with atomic updates or row locks for read-then-write logic.</td></tr>
+      <tr><td>Repeatable Read</td><td>Reports and multi-statement reads that must see a consistent picture
+      (monthly statement totals); be ready for serialization errors on writes.</td></tr>
+      <tr><td>Serializable</td><td>Rules spanning several rows that you cannot lock or constrain easily; accept
+      retries.</td></tr>
+      <tr><td>Read Uncommitted</td><td>Almost never.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: a higher level is not a substitute for correct write logic</p>
+    <p>Read-modify-write in application code is a lost-update bug at Read Committed. Use an atomic
+    <code>UPDATE ... SET x = x - n</code>, a lock, or a version check, and know what your level really
+    guarantees.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>The standard allows phantoms at Repeatable Read; PostgreSQL and InnoDB (plain reads) do not show them.
+      Interview answers should name the standard first and mention the difference.</li>
+      <li>In PostgreSQL the snapshot of a Repeatable Read transaction starts at its first query, not at
+      <code>BEGIN</code>.</li>
+      <li>Sequences and <code>now()</code> are not affected by isolation: <code>now()</code> is the transaction
+      start time, so it stays fixed inside the transaction.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Name the isolation levels and the anomalies each prevents.</b> Use the table: RU allows all, RC stops
+      dirty reads, RR stops non-repeatable reads, Serializable stops phantoms and write skew.</li>
+      <li><b>Default levels?</b> PostgreSQL Read Committed; MySQL InnoDB Repeatable Read.</li>
+      <li><b>Dirty vs non-repeatable vs phantom?</b> Uncommitted data; a changed row; changed set of rows.</li>
+      <li><b>What is MVCC?</b> Keeping several versions of a row, so readers use a snapshot and do not block
+      writers.</li>
+      <li><b>You get "could not serialize access". What do you do?</b> Retry the whole transaction.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-locking">
+  <h3>Locking: row locks, FOR UPDATE, SKIP LOCKED and deadlocks</h3>
+  <p class="tldr">Databases lock rows (and sometimes tables) so concurrent writers do not collide;
+  <code>SELECT ... FOR UPDATE</code> locks the rows you read, <code>NOWAIT</code> and <code>SKIP LOCKED</code>
+  control what happens when they are busy, and two transactions waiting for each other cause a deadlock that the
+  database breaks by aborting one.</p>
+
+  <h4>Row locks and table locks</h4>
+  <p>MVCC lets readers proceed, but two transactions that change the same row must take turns. The first
+  <code>UPDATE</code> or <code>DELETE</code> takes an <strong>exclusive row lock</strong>; a second one on the same
+  row waits until the first commits or rolls back. Plain <code>SELECT</code> takes no row lock.</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Lock</th><th>Taken by</th><th>Blocks</th></tr></thead>
+    <tbody>
+      <tr><td>Exclusive row lock</td><td><code>UPDATE</code>, <code>DELETE</code>, <code>SELECT ... FOR UPDATE</code></td>
+      <td>Other writers and lockers of that row; not plain reads</td></tr>
+      <tr><td>Shared row lock</td><td><code>SELECT ... FOR SHARE</code></td><td>Writers of that row; other shared
+      lockers are fine</td></tr>
+      <tr><td>Table lock (various modes)</td><td><code>LOCK TABLE</code>, most <code>ALTER TABLE</code>, <code>CREATE INDEX</code>
+      (not concurrently), <code>TRUNCATE</code></td><td>Depends on the mode; the strongest blocks all reads and writes</td></tr>
+    </tbody>
+  </table></div>
+  <p>Row locks are held until the end of the transaction. That is why long transactions are dangerous: the
+  longer you hold locks, the longer others wait. Table-level locks from schema changes are the most disruptive
+  (an <code>ALTER TABLE</code> waiting behind a long query makes every new query queue behind it). Set a
+  <code>lock_timeout</code> for migrations.</p>
+
+  <h4>SELECT ... FOR UPDATE: lock what you read</h4>
+  <p>This is the pessimistic fix for read-then-write logic. Read the row and lock it in one statement; nobody
+  else can change it until you commit.</p>
+<pre data-title="Safe stock decrement with FOR UPDATE"><code class="language-sql">BEGIN;
+SELECT stock FROM items WHERE id = 7 FOR UPDATE;     -- locks the row; others wait here
+-- application checks stock &gt;= 2 and computes the new value
+UPDATE items SET stock = stock - 2 WHERE id = 7;
+COMMIT;                                              -- lock released</code></pre>
+  <pre class="out" data-title="Two sessions"><code class="language-plaintext">Session A                                 Session B
+------------------------------------      ------------------------------------
+BEGIN;                                    BEGIN;
+SELECT stock FROM items WHERE id = 7
+  FOR UPDATE;            --&gt; 10
+                                          SELECT stock FROM items WHERE id = 7
+                                            FOR UPDATE;      -- waits...
+UPDATE items SET stock = 8 WHERE id = 7;
+COMMIT;                                   --&gt; 8   (B continues with the new value)
+                                          UPDATE items SET stock = 5 WHERE id = 7;
+                                          COMMIT;</code></pre>
+  <p>If the check and update can be one statement, prefer it: <code>UPDATE items SET stock = stock - 2 WHERE
+  id = 7 AND stock &gt;= 2</code> is atomic, needs no explicit lock, and returns 0 rows when stock is short.</p>
+
+  <h4>FOR SHARE, NOWAIT, SKIP LOCKED</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Clause</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>FOR UPDATE</code></td><td>Exclusive lock on the selected rows; waits if busy</td></tr>
+      <tr><td><code>FOR SHARE</code></td><td>Shared lock: the row cannot change while you hold it (for example the
+      parent row while you insert children)</td></tr>
+      <tr><td><code>... NOWAIT</code></td><td>Fail immediately with an error if any row is locked, instead of waiting</td></tr>
+      <tr><td><code>... SKIP LOCKED</code></td><td>Silently skip rows that are locked and return the rest</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>SKIP LOCKED</code> is the building block of a <strong>database job queue</strong>: many workers each
+  claim a different job without waiting for each other.</p>
+<pre data-title="Job queue: each worker claims one different job"><code class="language-sql">BEGIN;
+
+SELECT id, payload
+FROM jobs
+WHERE status = 'PENDING'
+ORDER BY id
+LIMIT 1
+FOR UPDATE SKIP LOCKED;          -- a row another worker holds is skipped, not waited for
+
+-- ... process the job, then:
+UPDATE jobs SET status = 'DONE' WHERE id = 101;
+COMMIT;</code></pre>
+  <p>If a worker crashes, its transaction rolls back and the job returns to <code>PENDING</code> by itself.
+  <code>FOR UPDATE NOWAIT</code> suits "if this seat is being booked right now, tell the user to try another".
+  Both clauses exist in PostgreSQL (<code>SKIP LOCKED</code> since 9.5) and MySQL 8.0+.</p>
+
+  <h4>Deadlocks</h4>
+  <p>A <strong>deadlock</strong> happens when two transactions each hold a lock the other needs. Neither can
+  continue, ever.</p>
+  <pre class="out" data-title="Deadlock: opposite transfers"><code class="language-plaintext">Session A (1 -&gt; 2)                         Session B (2 -&gt; 1)
+------------------------------------      ------------------------------------
+BEGIN;                                    BEGIN;
+UPDATE accounts SET balance_paise =
+  balance_paise - 100 WHERE id = 1;       -- A holds row 1
+                                          UPDATE accounts SET balance_paise =
+                                            balance_paise - 50 WHERE id = 2;  -- B holds row 2
+UPDATE accounts SET balance_paise =
+  balance_paise + 100 WHERE id = 2;       -- A waits for B
+                                          UPDATE accounts SET balance_paise =
+                                            balance_paise + 50 WHERE id = 1;  -- B waits for A
+-- ERROR:  deadlock detected               (one session is chosen as the victim and rolled back)
+-- DETAIL:  Process 1201 waits for ShareLock on transaction 5532; blocked by process 1244.
+--          Process 1244 waits for ShareLock on transaction 5531; blocked by process 1201.
+-- HINT:  See server log for query details.</code></pre>
+  <p>The database finds the cycle (PostgreSQL checks after <code>deadlock_timeout</code>, 1 second by default;
+  InnoDB detects it at once), aborts one transaction with an error (SQLSTATE <code>40P01</code> in PostgreSQL,
+  error 1213 in MySQL), and the other proceeds. Your code must retry the aborted transaction.</p>
+  <p><strong>How to prevent deadlocks:</strong></p>
+  <ul>
+    <li><strong>Lock in a consistent order.</strong> Always update the lower account id first, whatever the
+    transfer direction. This removes the cycle.</li>
+    <li>Keep transactions short and touch as few rows as possible.</li>
+    <li>Lock all needed rows up front: <code>SELECT ... WHERE id IN (1, 2) ORDER BY id FOR UPDATE</code>.</li>
+    <li>Index foreign keys: a missing index can make a delete lock many rows.</li>
+    <li>Retry on deadlock errors.</li>
+  </ul>
+<pre data-title="Consistent lock order in a transfer"><code class="language-sql">BEGIN;
+SELECT id FROM accounts WHERE id IN (1, 2) ORDER BY id FOR UPDATE;   -- always ascending
+UPDATE accounts SET balance_paise = balance_paise - 100 WHERE id = 1;
+UPDATE accounts SET balance_paise = balance_paise + 100 WHERE id = 2;
+COMMIT;</code></pre>
+
+  <h4>Lock waits and timeouts</h4>
+  <p>A transaction that waits for a lock waits forever by default in PostgreSQL. Set limits so a stuck session
+  does not freeze the application:</p>
+<pre data-title="Timeouts and finding blockers"><code class="language-sql">SET lock_timeout = '3s';                       -- PostgreSQL: error if a lock wait exceeds 3 s
+SET statement_timeout = '30s';
+SET idle_in_transaction_session_timeout = '60s';
+
+-- Who is blocking whom? (PostgreSQL)
+SELECT pid, pg_blocking_pids(pid) AS blocked_by, state, query
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) &gt; 0;</code></pre>
+  <p>MySQL has <code>innodb_lock_wait_timeout</code> (50 seconds by default), after which the waiting statement
+  fails with error 1205 "Lock wait timeout exceeded".</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: take locks in a fixed order and release them fast</p>
+    <p>Commit or roll back quickly. Never keep a transaction open while waiting for a user, an HTTP call or a
+    message queue.</p>
+  </div>
+  <div class="co co-mistake">
+    <p class="co-t">Mistake: FOR UPDATE on a wide range</p>
+    <p><code>SELECT * FROM orders WHERE status = 'PLACED' FOR UPDATE</code> locks every placed order for as
+    long as the transaction lives. Lock the few rows you need, with <code>LIMIT</code> or by id.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>In PostgreSQL, inserting a row with a foreign key takes a shared lock on the referenced parent row, so
+      many child inserts and a parent update can conflict.</li>
+      <li>In MySQL InnoDB, a locking read on a range also locks the <em>gaps</em> between index records, which can
+      block inserts you did not expect. Use an exact unique key lookup when possible.</li>
+      <li>A locking read without a useful index may lock (or scan and lock) more rows than you expect;
+      check the plan with <code>EXPLAIN</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>What does <code>SELECT ... FOR UPDATE</code> do?</b> Locks the selected rows until commit so no one else
+      can update them; the pessimistic fix for read-then-write.</li>
+      <li><b>What is <code>SKIP LOCKED</code> for?</b> Work queues: workers take unlocked jobs without waiting.</li>
+      <li><b>What is a deadlock and how do you avoid it?</b> A cycle of waits; the database aborts one victim.
+      Consistent lock order, short transactions, retry.</li>
+      <li><b>How do you find what is blocking?</b> <code>pg_stat_activity</code> and
+      <code>pg_blocking_pids</code> (PostgreSQL), <code>SHOW ENGINE INNODB STATUS</code> (MySQL).</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m5-optimistic-pessimistic">
+  <h3>Optimistic vs pessimistic locking</h3>
+  <p class="tldr">Pessimistic locking locks the row before you change it and makes others wait; optimistic
+  locking lets everyone proceed, stores a version number in the row, and rejects an update whose version has
+  changed, so you retry or tell the user.</p>
+
+  <h4>Two philosophies</h4>
+  <ul>
+    <li><strong>Pessimistic:</strong> "Conflicts are likely, so prevent them." Lock the row first
+    (<code>SELECT ... FOR UPDATE</code>). Others wait. Safe, simple to reason about, but holds locks and can
+    deadlock.</li>
+    <li><strong>Optimistic:</strong> "Conflicts are rare, so detect them." Read without locking, and at update
+    time check that nobody changed the row since you read it. No locks are held while the user thinks.</li>
+  </ul>
+
+  <h4>Optimistic locking with a version column</h4>
+  <p>Add an integer <code>version</code> column. Every update includes the version it read in the
+  <code>WHERE</code> clause and increments it. If another transaction changed the row meanwhile, the version no
+  longer matches, zero rows are updated, and you know there was a conflict.</p>
+<pre data-title="Optimistic update in SQL"><code class="language-sql">ALTER TABLE items ADD COLUMN version INT NOT NULL DEFAULT 0;
+
+-- Read (no lock)
+SELECT id, stock, version FROM items WHERE id = 7;      --&gt; stock 10, version 3
+
+-- Update only if still version 3
+UPDATE items
+SET stock = 8, version = version + 1
+WHERE id = 7 AND version = 3;
+-- UPDATE 1  -> success.   UPDATE 0 -> someone else changed it: reload and retry or report</code></pre>
+  <pre class="out" data-title="Two users edit at the same time"><code class="language-plaintext">User A                                    User B
+------------------------------------      ------------------------------------
+reads stock 10, version 3                 reads stock 10, version 3
+UPDATE ... SET stock = 8, version = 4
+  WHERE id = 7 AND version = 3;  --&gt; 1 row
+                                          UPDATE ... SET stock = 7, version = 4
+                                            WHERE id = 7 AND version = 3;  --&gt; 0 rows
+                                          -- conflict detected: reload (stock 8) and retry</code></pre>
+  <p>This catches the lost update without any lock held across the user's think time (a form open for two
+  minutes), which is why it is the standard for web apps and REST APIs. A timestamp column works too, but an
+  integer version has no clock-precision problems.</p>
+
+  <h4>JPA: @Version</h4>
+  <p>JPA does this for you. Add <code>@Version</code> to an entity; Hibernate adds the version check to every
+  <code>UPDATE</code> and increments it.</p>
+<pre data-title="Item.java"><code class="language-java">@Entity
+public class Item {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private int stock;
+
+    @Version
+    private int version;          // managed by JPA: never set it yourself
+}
+// SQL issued: update item set stock=?, version=? where id=? and version=?
+// If 0 rows are updated: OptimisticLockException
+// (Spring translates it to ObjectOptimisticLockingFailureException)</code></pre>
+  <p>In a REST API this maps well to HTTP: return the version (or an <code>ETag</code>) with the resource, and
+  reject an update with <code>412 Precondition Failed</code> or <code>409 Conflict</code> when it is stale. See
+  <a href="04-spring-boot.html#m3">Spring Boot · Module 3</a> for entities and the repository layer.</p>
+
+  <h4>Pessimistic locking in JPA</h4>
+<pre data-title="ItemRepository.java"><code class="language-java">public interface ItemRepository extends JpaRepository&lt;Item, Long&gt; {
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)                 // SELECT ... FOR UPDATE
+    @Query("select i from Item i where i.id = :id")
+    Optional&lt;Item&gt; findByIdForUpdate(@Param("id") Long id);
+}
+
+@Transactional
+public void reserve(Long itemId, int qty) {
+    Item item = repo.findByIdForUpdate(itemId).orElseThrow();   // row locked until commit
+    if (item.getStock() &lt; qty) throw new IllegalStateException("Out of stock");
+    item.setStock(item.getStock() - qty);
+}</code></pre>
+
+  <h4>Comparison</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th></th><th>Optimistic</th><th>Pessimistic</th></tr></thead>
+    <tbody>
+      <tr><td>Mechanism</td><td>Version check at update</td><td>Row lock at read (<code>FOR UPDATE</code>)</td></tr>
+      <tr><td>Locks held</td><td>None</td><td>Until commit</td></tr>
+      <tr><td>On conflict</td><td>Update fails; retry or report</td><td>Second transaction waits</td></tr>
+      <tr><td>Best when</td><td>Conflicts are rare; long think time; read-heavy</td><td>Conflicts are common; short
+      transaction; failure is costly</td></tr>
+      <tr><td>Throughput</td><td>High with few conflicts; wasted work and retries when hot</td><td>Predictable,
+      but waiting lowers throughput; deadlock risk</td></tr>
+      <tr><td>Schema change</td><td>Needs a version column</td><td>None</td></tr>
+      <tr><td>Works across HTTP requests</td><td>Yes</td><td>No: locks live in one transaction only</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Which one when?</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Scenario</th><th>Choice</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Edit profile, edit a product in an admin form</td><td>Optimistic</td><td>Rare conflicts; the form is
+      open a long time</td></tr>
+      <tr><td>Flash sale: thousands buy the same item</td><td>Atomic <code>UPDATE ... stock = stock - n WHERE stock &gt;= n</code>,
+      or pessimistic</td><td>Hot row: optimistic would fail and retry constantly</td></tr>
+      <tr><td>Seat booking (last seat on a train)</td><td>Pessimistic with <code>NOWAIT</code>, or a
+      unique constraint on (show, seat)</td><td>Two people must never get the same seat</td></tr>
+      <tr><td>Wallet balance debit</td><td>Atomic update with a <code>CHECK</code>, or pessimistic</td><td>Money
+      must not be lost; contention on one account is real</td></tr>
+      <tr><td>Job queue</td><td><code>FOR UPDATE SKIP LOCKED</code></td><td>Workers take distinct rows</td></tr>
+    </tbody>
+  </table></div>
+  <p>Often the best "lock" is a <strong>constraint</strong>: a <code>UNIQUE (show_id, seat_no)</code> makes the
+  database reject the second booking with no application locking at all. Catch the unique violation and say
+  "seat taken".</p>
+
+  <div class="co co-conv">
+    <p class="co-t">Convention: add @Version to entities that users edit</p>
+    <p>It costs one column and protects against silent lost updates. Handle
+    <code>ObjectOptimisticLockingFailureException</code> by returning HTTP 409 or retrying a small, safe
+    operation.</p>
+  </div>
+  <div class="co co-exc">
+    <p class="co-t">Edge cases</p>
+    <ul>
+      <li>Bulk JPQL/SQL updates bypass <code>@Version</code> unless you increment the version yourself.</li>
+      <li>Retrying an optimistic failure must reload the entity first; re-sending the same stale object fails
+      again.</li>
+      <li>A pessimistic lock without a timeout can hang a request; set a lock timeout hint
+      (<code>jakarta.persistence.lock.timeout</code>) or use <code>NOWAIT</code>.</li>
+    </ul>
+  </div>
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li><b>Optimistic vs pessimistic?</b> Detect conflicts with a version vs prevent them with a lock; choose by
+      how often conflicts happen and how long the user holds data.</li>
+      <li><b>How does <code>@Version</code> work?</b> Hibernate adds <code>AND version = ?</code> to the update,
+      increments it, and throws <code>OptimisticLockException</code> if no row matched.</li>
+      <li><b>How do you prevent overselling the last item?</b> Atomic conditional <code>UPDATE</code>,
+      <code>FOR UPDATE</code>, or a version check with retry.</li>
+    </ul>
+  </div>
+</article>

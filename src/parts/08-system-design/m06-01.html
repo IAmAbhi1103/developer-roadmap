@@ -1,0 +1,586 @@
+<div class="mintro">
+  <p>Once an application runs on more than one machine, new problems appear that a single Spring Boot
+  process never had: a call can time out and you do not know if it worked, a message can arrive twice, two
+  databases cannot commit together, and one slow service can drag down ten others. This module teaches the
+  standard patterns that handle those problems. It builds on the building blocks in
+  <a href="#m5">Module 5</a> (queues, caches, replication) and the trade-offs in <a href="#m4">Module 4</a>
+  (CAP, consistency), and it is the toolbox you reach for in every design in <a href="#m7">Module 7</a>.</p>
+  <p>The Spring-side code for these ideas (Resilience4j, Kafka, RabbitMQ, the outbox with Spring Data)
+  lives in <a href="04-spring-boot.html#m7">Spring Boot · Module 7</a>. Here you learn the concepts, the
+  failure stories and the interview answers.</p>
+  <p>After this module you will be able to:</p>
+  <ul>
+    <li>Argue for a monolith, a modular monolith or microservices, and draw service boundaries.</li>
+    <li>Choose between synchronous and asynchronous calls, and between choreography and orchestration.</li>
+    <li>Make an API safe to retry with idempotency keys, and retry with backoff, jitter and a budget.</li>
+    <li>Explain at-most-once, at-least-once and "effectively once" delivery.</li>
+    <li>Explain why two-phase commit is avoided, and run an order saga with compensation.</li>
+    <li>Use the transactional outbox and change data capture to publish events safely.</li>
+    <li>Protect a service with timeouts, circuit breakers, bulkheads and load shedding.</li>
+    <li>Generate unique IDs at scale and do the Snowflake bit arithmetic.</li>
+    <li>Instrument a system with logs, metrics and traces, and explain leader election and locks.</li>
+  </ul>
+</div>
+
+<article class="topic" id="m6-monolith-microservices">
+  <h3>Monolith, modular monolith and microservices</h3>
+  <p class="tldr">A monolith is one deployable unit, microservices are many small independently deployed
+  services that each own their data, and a modular monolith sits between them; choose microservices for
+  team and scaling reasons, not because they sound modern.</p>
+
+  <h4>The three shapes</h4>
+  <p>A <strong>monolith</strong> is one codebase built and deployed as one unit. All features (users,
+  orders, payments) run in the same process and usually share one database. Calls between features are
+  plain method calls. A <strong>microservices</strong> architecture splits the system into many small
+  services. Each runs in its own process, is deployed on its own, and owns its own data. Calls between them
+  go over the network (HTTP, gRPC or messages). A <strong>modular monolith</strong> is one deployable unit
+  whose insides are split into strict modules with clear public interfaces and no reaching into another
+  module's tables.</p>
+  <figure class="fig">
+<pre class="diagram">
+ Monolith              Modular monolith           Microservices
+┌───────────────┐     ┌───────────────┐     ┌────────┐ ┌────────┐ ┌────────┐
+│ users orders  │     │ [users]       │     │ users  │ │ orders │ │payment │
+│ payments cart │     │ [orders]      │     │  svc   │ │  svc   │ │  svc   │
+│ (tangled)     │     │ [payments]    │     └───┬────┘ └───┬────┘ └───┬────┘
+└───────┬───────┘     └───────┬───────┘      ┌──┴──┐    ┌──┴──┐    ┌──┴──┐
+    ┌───┴───┐             ┌───┴───┐          │ DB  │    │ DB  │    │ DB  │
+    │  DB   │             │  DB   │          └─────┘    └─────┘    └─────┘
+    └───────┘             └───────┘
+</pre>
+    <figcaption>One deployable unit with a tangled inside, one with clean modules, and many services with
+    their own databases</figcaption>
+  </figure>
+
+  <h4>Comparison</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Monolith</th><th>Modular monolith</th><th>Microservices</th></tr></thead>
+    <tbody>
+      <tr><td>Deployment</td><td>One unit</td><td>One unit</td><td>Many units, independent</td></tr>
+      <tr><td>Call between parts</td><td>Method call (nanoseconds)</td><td>Method call via interface</td><td>Network call (milliseconds, can fail)</td></tr>
+      <tr><td>Transactions</td><td>One ACID transaction</td><td>One ACID transaction</td><td>Sagas, eventual consistency</td></tr>
+      <tr><td>Scaling</td><td>Whole app together</td><td>Whole app together</td><td>Each service on its own</td></tr>
+      <tr><td>Team independence</td><td>Low, shared code</td><td>Medium</td><td>High, if boundaries are right</td></tr>
+      <tr><td>Operational cost</td><td>Low</td><td>Low</td><td>High: CI/CD, tracing, many deployments</td></tr>
+      <tr><td>Debugging</td><td>One stack trace</td><td>One stack trace</td><td>Needs distributed tracing</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Why start with a monolith</h4>
+  <p>A network call is slower than a method call by a factor of roughly 10,000 or more (approximate: a
+  method call takes nanoseconds, a call inside one data centre takes about half a millisecond to a few
+  milliseconds). A network call can also fail, time out or return late, while a method call cannot. Each
+  microservice adds a pipeline, monitoring, a deployment, versioned contracts and a data copy problem. Small
+  teams pay all of this cost and get little in return. The common advice is: <strong>start with a
+  well-structured (modular) monolith, and split out a service when a clear pain appears</strong>.</p>
+  <p>Good reasons to split a service:</p>
+  <ul>
+    <li><strong>Independent scaling:</strong> video encoding needs many CPUs, the user profile does not.</li>
+    <li><strong>Team autonomy:</strong> 50+ engineers stepping on each other in one codebase and one release
+    train.</li>
+    <li><strong>Different technology or reliability needs:</strong> a payment service with stricter
+    security, or a machine-learning service in Python.</li>
+    <li><strong>Fault isolation:</strong> a bug in the recommendation code must not take down checkout.</li>
+  </ul>
+  <p>Bad reasons: "Netflix does it", "it is modern", "we want to put it on the CV".</p>
+
+  <h4>Service boundaries: bounded contexts</h4>
+  <p>The hardest part is deciding <em>where to cut</em>. The best guide is the idea of a <strong>bounded
+  context</strong> from domain-driven design. In simple words: a part of the business where words have one
+  clear meaning and one team owns the rules. "Product" means different things to different teams. To the
+  catalogue team it is a title, images and a description. To the inventory team it is a SKU and a stock
+  count. To billing it is a price and a tax code. Each context keeps its own model of "product" instead of
+  one giant shared class.</p>
+  <ul>
+    <li>Cut along <strong>business capabilities</strong> (Orders, Payments, Inventory, Shipping), not
+    technical layers (a "database service", a "validation service").</li>
+    <li>A good service has <strong>high cohesion</strong> (things that change together live together) and
+    <strong>low coupling</strong> (it rarely needs another service to finish its work).</li>
+    <li>If two services must always be deployed together, or one cannot do anything without calling the
+    other on every request, the boundary is probably wrong. You built a <em>distributed monolith</em>:
+    all the pain of microservices with none of the benefits.</li>
+  </ul>
+
+  <h4>Database per service and its consequences</h4>
+  <p>Each microservice should own its data and expose it only through its API or events. If two services
+  share tables, a schema change in one breaks the other, and you are back to a monolith. The consequences
+  are real:</p>
+  <ul>
+    <li><strong>No cross-service joins.</strong> To show "my orders with product names" you call the
+    product service, or keep a small copy of the product name inside the order (a deliberate duplicate), or
+    build a read model fed by events.</li>
+    <li><strong>No cross-service ACID transaction.</strong> Placing an order that touches orders, payment and
+    inventory needs a <a href="#m6-saga">saga</a>, not <code>@Transactional</code>.</li>
+    <li><strong>Eventual consistency.</strong> Copies of data lag behind; the user may see old data for a
+    moment.</li>
+    <li><strong>Polyglot persistence</strong> becomes possible: Postgres for orders, Redis for sessions,
+    Elasticsearch for search.</li>
+  </ul>
+
+  <div class="co co-exc">
+    <p class="co-t">Exception: sometimes share a database early</p>
+    <p>Many real migrations first split the code into services while they still read the same database,
+    then separate the schemas step by step. It is a temporary compromise, fine if you know it is temporary
+    and each table has exactly one writing service.</p>
+  </div>
+
+  <h4>Moving from monolith to services: the strangler fig</h4>
+  <p>Do not rewrite everything. Put a gateway in front, build one new service for one capability, route
+  that capability's traffic to it, and delete the old code. Repeat. Over months the monolith shrinks. This
+  is called the <strong>strangler fig</strong> pattern. See <a href="#m5">Module 5</a> for the gateway.</p>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Splitting too early: ten services for a team of four.</li>
+      <li>Splitting by technical layer, so every feature touches every service.</li>
+      <li>Shared database tables between services.</li>
+      <li>Long synchronous call chains (A calls B calls C calls D): availability multiplies down. Four
+      services at 99.9% each give about 99.6% together (0.999<sup>4</sup> ≈ 0.996).</li>
+      <li>No tracing or central logging, so nobody can follow a request.</li>
+    </ul>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>In Spring Boot, a modular monolith is separate packages or Maven modules with a small public API
+    each; tools such as Spring Modulith check that modules do not reach into each other. When a module is
+    split out, the in-process interface becomes a REST client or a message. The Spring side of services,
+    discovery and messaging is in <a href="04-spring-boot.html#m7">Spring Boot · Module 7</a>.</p>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"Monolith vs microservices?" Never answer "microservices are better". Say: monolith first, split
+      for independent scaling, team size or fault isolation, and name the cost (network failures,
+      distributed data, operations).</li>
+      <li>Define a bounded context in one sentence and give the "product means different things" example.</li>
+      <li>Name the distributed monolith as the anti-pattern.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-sync-async">
+  <h3>Sync vs async communication, and event-driven architecture</h3>
+  <p class="tldr">Synchronous calls (REST, gRPC) are simple and give an immediate answer but couple
+  availability and latency; asynchronous messaging decouples services in time and absorbs spikes at the
+  cost of eventual consistency and harder debugging.</p>
+
+  <h4>Synchronous communication</h4>
+  <p>The caller sends a request and <strong>waits</strong> for the response. Examples: REST over HTTP, gRPC.
+  It fits when the caller needs the answer to continue: "is this coupon valid?", "what is the price?". It
+  is easy to understand and debug, and errors come back directly.</p>
+  <p>The problem is <strong>temporal coupling</strong>: both services must be up at the same moment. If the
+  payment service is down, checkout is down. If it is slow, checkout is slow, and your threads pile up
+  waiting. Latency adds up along the chain, and availability multiplies down (see the previous article).</p>
+
+  <h4>Asynchronous communication</h4>
+  <p>The sender puts a message on a broker (Kafka, RabbitMQ, SQS, see the queues article in
+  <a href="#m5">Module 5</a>) and moves on. A consumer processes it later. Two shapes exist:</p>
+  <ul>
+    <li><strong>Command / task message:</strong> "send this email", "charge this card". One consumer group
+    does the work.</li>
+    <li><strong>Event:</strong> "OrderPlaced happened". The producer does not know or care who listens; many
+    consumers may react.</li>
+  </ul>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant U as User
+  participant O as Order service
+  participant B as Broker
+  participant N as Notification service
+  U->>O: place order
+  O->>O: save order as PENDING
+  O-->>U: 202 Accepted with order id
+  O->>B: publish OrderPlaced
+  B->>N: deliver OrderPlaced
+  N->>N: send email later
+</pre>
+    <figcaption>The user gets a fast answer; the slow work happens afterwards through the broker</figcaption>
+  </figure>
+
+  <h4>Comparison table</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Synchronous (REST, gRPC)</th><th>Asynchronous (queue, events)</th></tr></thead>
+    <tbody>
+      <tr><td>Caller waits?</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Coupling in time</td><td>Both must be up</td><td>Receiver can be down; messages wait</td></tr>
+      <tr><td>Spikes</td><td>Pass straight to the callee</td><td>Queue absorbs and smooths them</td></tr>
+      <tr><td>Result</td><td>Immediate</td><td>Later, via callback, polling or another event</td></tr>
+      <tr><td>Failure handling</td><td>Error returned, caller retries</td><td>Broker retries, dead-letter queue</td></tr>
+      <tr><td>Consistency</td><td>Easier to reason about</td><td>Eventual</td></tr>
+      <tr><td>Debugging</td><td>Straightforward</td><td>Needs tracing and message ids</td></tr>
+      <tr><td>Best for</td><td>Queries, "need the answer now"</td><td>Side effects, fan-out, long work</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Rule of thumb:</strong> use sync for reads and for steps where the user must see the result
+  now; use async for everything that can happen "soon" (emails, analytics, search indexing, inventory
+  updates, shipping). A mixed design is normal: the user-facing call is sync and fast, and it triggers
+  async work behind it.</p>
+
+  <h4>Event-driven architecture</h4>
+  <p>In an <strong>event-driven architecture</strong>, services announce facts that already happened
+  (<code>OrderPlaced</code>, <code>PaymentCaptured</code>) and other services react. Benefits: loose
+  coupling (add a new consumer without touching the producer), natural audit trail, easy fan-out, and
+  buffering. Costs: you cannot read the flow from one place, ordering and duplicates need care, and the
+  system is eventually consistent.</p>
+  <ul>
+    <li><strong>Event notification:</strong> a small event ("order 42 changed"); consumers call back for
+    details.</li>
+    <li><strong>Event-carried state transfer:</strong> the event holds the data consumers need, so they can
+    keep their own copy and never call back. Good for read models.</li>
+    <li><strong>Event sourcing</strong> (advanced, brief): the stored truth <em>is</em> the sequence of
+    events; current state is computed from them. Powerful but a big commitment; do not offer it casually.</li>
+  </ul>
+
+  <h4>Choreography vs orchestration</h4>
+  <p>When one business process crosses several services, who decides what happens next?</p>
+  <p><strong>Choreography:</strong> there is no boss. Each service listens for events and reacts, and may
+  emit its own event. Like dancers who know their steps.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart LR
+  O[Order service] -->|OrderPlaced| P[Payment service]
+  P -->|PaymentCaptured| I[Inventory service]
+  I -->|StockReserved| S[Shipping service]
+  S -->|ShipmentCreated| O
+</pre>
+    <figcaption>Choreography: each service reacts to the previous service's event</figcaption>
+  </figure>
+  <p><strong>Orchestration:</strong> one component (the orchestrator, often inside the order service or a
+  workflow engine) tells each service what to do and tracks the state of the whole process.</p>
+  <figure class="fig">
+<pre class="mermaid">
+flowchart TD
+  OR[Order orchestrator] -->|1 charge| P[Payment service]
+  OR -->|2 reserve| I[Inventory service]
+  OR -->|3 ship| S[Shipping service]
+  P -->|result| OR
+  I -->|result| OR
+  S -->|result| OR
+</pre>
+    <figcaption>Orchestration: a central coordinator sends commands and receives results</figcaption>
+  </figure>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Aspect</th><th>Choreography</th><th>Orchestration</th></tr></thead>
+    <tbody>
+      <tr><td>Control</td><td>Spread across services</td><td>One place</td></tr>
+      <tr><td>Coupling</td><td>Loose; services know events only</td><td>Orchestrator knows every participant</td></tr>
+      <tr><td>Visibility</td><td>Hard: the flow is implicit</td><td>Easy: one place shows the state</td></tr>
+      <tr><td>Adding a step</td><td>Add a listener</td><td>Change the orchestrator</td></tr>
+      <tr><td>Risk</td><td>Hidden cycles, "who handles failure?"</td><td>Orchestrator becomes a bottleneck or god service</td></tr>
+      <tr><td>Fits</td><td>Simple flows, 2–4 steps</td><td>Complex flows with branching and compensation</td></tr>
+    </tbody>
+  </table></div>
+  <p>Many teams start with choreography and move to orchestration when the process grows to five or more
+  steps with failure paths. Workflow engines (Temporal, Camunda, AWS Step Functions) provide orchestration
+  as a product; they store the state and retry for you.</p>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: async consumers must assume duplicates and reordering</p>
+    <p>Brokers usually deliver at least once. Every consumer must be idempotent (see
+    <a href="#m6-idempotency">Idempotency</a> and <a href="#m6-delivery-semantics">Delivery
+    semantics</a>), and must not assume events from different keys arrive in global order.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Making everything async: simple reads become a maze of events and polling.</li>
+      <li>Fake async: sending a message and then blocking until a reply, which keeps all the coupling.</li>
+      <li>Publishing events with no schema versioning, so a field rename breaks every consumer.</li>
+      <li>Dual write: saving to the database and publishing to the broker as two separate steps (fixed by
+      the <a href="#m6-outbox-cdc">outbox pattern</a>).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Give the rule: sync when the caller needs the answer now, async for side effects and spikes.</li>
+      <li>Define choreography and orchestration with the order example; say you would pick orchestration
+      once failure paths grow.</li>
+      <li>Mention the cost: eventual consistency, duplicates, tracing.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-idempotency">
+  <h3>Idempotency and idempotency keys</h3>
+  <p class="tldr">An operation is idempotent if doing it many times has the same effect as doing it once;
+  because networks force clients to retry, you make non-idempotent operations (like "charge ₹500")
+  idempotent with a client-generated idempotency key and a dedupe table.</p>
+
+  <h4>Why this matters: the timeout problem</h4>
+  <p>A client calls <code>POST /payments</code>. The server charges the card, but the response is lost, or
+  the client times out before it arrives. The client now knows nothing: did the charge happen? If it
+  retries and the server charges again, the customer pays twice. If it does not retry and the charge never
+  happened, the order is lost. The network gives you no way to tell the two cases apart. The fix is to make
+  the retry <strong>safe</strong>.</p>
+  <p><strong>Idempotent</strong> means: applying the operation once or ten times leaves the system in the
+  same state (and returns the same result).</p>
+
+  <h4>Naturally idempotent operations</h4>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Operation</th><th>Idempotent?</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>GET /orders/42</code></td><td>Yes</td><td>Reads change nothing</td></tr>
+      <tr><td><code>PUT /users/7</code> with a full body</td><td>Yes</td><td>Sets the same final state</td></tr>
+      <tr><td><code>DELETE /orders/42</code></td><td>Yes (state)</td><td>Gone after the first call; the second returns 404 or 204</td></tr>
+      <tr><td><code>SET balance = 500</code></td><td>Yes</td><td>Absolute value</td></tr>
+      <tr><td><code>balance = balance + 500</code></td><td>No</td><td>Each call adds again</td></tr>
+      <tr><td><code>POST /payments</code></td><td>No</td><td>Each call creates a new payment</td></tr>
+      <tr><td>"Send email"</td><td>No</td><td>Each call sends another email</td></tr>
+    </tbody>
+  </table></div>
+  <p>HTTP defines GET, PUT, DELETE, HEAD and OPTIONS as idempotent and POST as not. That is the contract;
+  your code must honour it. The tricks: prefer "set to X" over "add X"; use natural unique constraints
+  (one row per <code>(order_id, step)</code>); and for POST, use an idempotency key.</p>
+
+  <h4>The idempotency key pattern</h4>
+  <p>The client generates a unique key (a UUID) once per <em>logical</em> action and sends it in a header on
+  every attempt of that action. The server stores the key with the result. If the same key arrives again, the
+  server returns the stored result instead of doing the work again.</p>
+  <pre data-title="Request" class="out"><code class="language-http">POST /v1/payments HTTP/1.1
+Host: api.example.com
+Idempotency-Key: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+Content-Type: application/json
+
+{"orderId": 42, "amountPaise": 50000, "currency": "INR"}</code></pre>
+  <figure class="fig">
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant S as Payment API
+  participant D as Dedupe table
+  participant G as Card network
+  C->>S: POST payment with key K
+  S->>D: insert K as IN_PROGRESS
+  D-->>S: inserted
+  S->>G: charge 500 rupees
+  G-->>S: success
+  S->>D: save response for K
+  S--xC: response lost
+  C->>S: retry POST with the same key K
+  S->>D: look up K
+  D-->>S: stored response
+  S-->>C: same response, no second charge
+</pre>
+    <figcaption>The retry finds the saved result and the card is charged only once</figcaption>
+  </figure>
+
+  <h4>The dedupe table</h4>
+  <pre data-title="schema.sql"><code class="language-sql">CREATE TABLE idempotency_key (
+    key            VARCHAR(64) PRIMARY KEY,   -- unique per client and action
+    client_id      BIGINT       NOT NULL,
+    request_hash   CHAR(64)     NOT NULL,     -- SHA-256 of the request body
+    status         VARCHAR(16)  NOT NULL,     -- IN_PROGRESS, DONE
+    response_code  INT,
+    response_body  TEXT,
+    created_at     TIMESTAMP    NOT NULL DEFAULT now()
+);
+-- delete rows older than 24 hours with a scheduled job</code></pre>
+  <p>The primary key does the heavy lifting: two concurrent requests with the same key cannot both insert.
+  The handler in Java, simplified:</p>
+  <pre data-title="PaymentController.java"><code class="language-java">@PostMapping("/v1/payments")
+public ResponseEntity&lt;PaymentResponse&gt; pay(
+        @RequestHeader("Idempotency-Key") String key,
+        @RequestBody PaymentRequest req) {
+
+    String hash = Sha256.of(req.toString());
+    try {
+        keys.insertInProgress(key, req.clientId(), hash);       // PK insert
+    } catch (DuplicateKeyException dup) {
+        IdempotencyRecord rec = keys.find(key);
+        if (!rec.requestHash().equals(hash)) {
+            return ResponseEntity.status(422).build();          // same key, different body
+        }
+        if (rec.status().equals("IN_PROGRESS")) {
+            return ResponseEntity.status(409).build();          // first attempt still running
+        }
+        return ResponseEntity.status(rec.responseCode()).body(rec.responseAs(PaymentResponse.class));
+    }
+    PaymentResponse result = paymentService.charge(req);         // do the real work
+    keys.complete(key, 201, result);                             // store the response
+    return ResponseEntity.status(201).body(result);
+}</code></pre>
+  <p>In a real service, the business write and the "complete" update should be in <em>one database
+  transaction</em> whenever the work is in the same database. If the work is an external call (a card
+  network), pass the same key on to that provider too, so the whole chain is protected.</p>
+
+  <h4>Rules for keys</h4>
+  <ul>
+    <li>The <strong>client</strong> creates the key, once per intention, and reuses it on every retry. A new
+    key per retry defeats the purpose.</li>
+    <li>Scope the key to the client (or user) so two clients cannot collide.</li>
+    <li>Store a hash of the request. Same key with a different body is a client bug: return an error (HTTP
+    422 is commonly used), do not silently replay.</li>
+    <li>Handle the <code>IN_PROGRESS</code> state: return 409 or make the second request wait.</li>
+    <li>Keep keys long enough to cover the client's retry window (24 hours is a common choice), then delete
+    them.</li>
+    <li>Return the <em>same</em> response (status and body) for a replay.</li>
+  </ul>
+
+  <h4>Idempotent consumers</h4>
+  <p>The same idea protects message consumers. Each message has a unique id. Before processing, the consumer
+  inserts the id into a <code>processed_message</code> table in the same transaction as its business change.
+  A duplicate hits the unique constraint and is skipped. Alternatives: make the business operation naturally
+  idempotent (upsert by key), or use a version check ("apply only if version is 6, set to 7").</p>
+  <pre data-title="ProcessedMessage.sql"><code class="language-sql">BEGIN;
+INSERT INTO processed_message (message_id) VALUES ('evt-9f31');   -- fails on duplicate
+UPDATE account SET balance_paise = balance_paise + 50000 WHERE id = 7;
+COMMIT;</code></pre>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Generating a new key on each retry.</li>
+      <li>Checking for the key with <code>SELECT</code> and then inserting: two parallel requests both see
+      "not found". Use the unique constraint as the lock.</li>
+      <li>Saving the key after the work. A crash between the two loses the protection.</li>
+      <li>Keeping keys forever (table grows) or for too short a time (late retry double-charges).</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>Open with the "response lost" story, then define idempotency.</li>
+      <li>Describe the header, the dedupe table with a primary key, the stored response and the request
+      hash. Mention the in-progress state.</li>
+      <li>Say that payment providers expose exactly this idea (an <code>Idempotency-Key</code> style header)
+      and that consumers use a processed-message table.</li>
+    </ul>
+  </div>
+</article>
+
+<article class="topic" id="m6-retries">
+  <h3>Retries: backoff, jitter, retry storms and budgets</h3>
+  <p class="tldr">Retry only safe, transient failures, wait longer after each attempt (exponential
+  backoff), add randomness (jitter) so clients do not retry in sync, cap the attempts, and limit total
+  retries with a budget, or your retries will become the outage.</p>
+
+  <h4>Why retry, and when</h4>
+  <p>Many failures are <strong>transient</strong>: a dropped packet, a brief overload, a leader election, a
+  deployment restarting a pod. A retry a moment later usually works. But a retry is also extra load, and it
+  can repeat a side effect. So ask two questions first:</p>
+  <ol>
+    <li><strong>Is the failure retryable?</strong> Timeouts, connection resets, HTTP 502/503/504 and 429 (after
+    the wait the server asks for) are. A 400, 401, 403 or 404 will fail the same way again; do not retry.</li>
+    <li><strong>Is the operation safe to repeat?</strong> Reads and idempotent writes: yes. A plain POST
+    without an idempotency key: no (see <a href="#m6-idempotency">Idempotency</a>).</li>
+  </ol>
+
+  <h4>Exponential backoff</h4>
+  <p>Retrying immediately in a tight loop hammers a service that is already struggling. <strong>Exponential
+  backoff</strong> doubles the wait after each failure: wait = base × 2<sup>attempt</sup>, up to a maximum
+  cap. With a base of 100 ms and a cap of 10 s:</p>
+  <div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Attempt</th><th>Pure exponential wait</th><th>With cap 10 s</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>100 ms</td><td>100 ms</td></tr>
+      <tr><td>2</td><td>200 ms</td><td>200 ms</td></tr>
+      <tr><td>3</td><td>400 ms</td><td>400 ms</td></tr>
+      <tr><td>4</td><td>800 ms</td><td>800 ms</td></tr>
+      <tr><td>5</td><td>1.6 s</td><td>1.6 s</td></tr>
+      <tr><td>8</td><td>12.8 s</td><td>10 s</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Jitter: why randomness is essential</h4>
+  <p>Suppose 10,000 clients lose their connection at the same instant (a server restarted). With plain
+  backoff they all retry at 100 ms, then all at 200 ms, then all at 400 ms. The server sees waves of 10,000
+  requests, each wave knocking it down again. This is a <strong>thundering herd</strong>. <strong>Jitter</strong>
+  adds randomness so retries spread out over time.</p>
+  <ul>
+    <li><strong>Full jitter:</strong> sleep a random time between 0 and the backoff value. Spreads load best
+    and is a widely recommended default.</li>
+    <li><strong>Equal jitter:</strong> half the backoff fixed plus a random half.</li>
+    <li><strong>Decorrelated jitter:</strong> next sleep is random between the base and 3 × the previous
+    sleep.</li>
+  </ul>
+  <pre data-title="Retry.java"><code class="language-java">import java.util.concurrent.Callable;
+import java.util.concurrent.ThreadLocalRandom;
+
+public final class Retry {
+    public static &lt;T&gt; T withBackoff(Callable&lt;T&gt; call, int maxAttempts) throws Exception {
+        long baseMs = 100, capMs = 10_000;
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return call.call();
+            } catch (Exception e) {
+                if (attempt == maxAttempts || !isRetryable(e)) {
+                    throw e;                                  // give up: bubble up
+                }
+                long backoff = Math.min(capMs, baseMs * (1L &lt;&lt; attempt));
+                long sleep = ThreadLocalRandom.current().nextLong(backoff + 1);   // full jitter
+                Thread.sleep(sleep);
+            }
+        }
+    }
+
+    private static boolean isRetryable(Exception e) {
+        return e instanceof java.net.SocketTimeoutException
+            || e instanceof java.net.ConnectException;
+    }
+}</code></pre>
+
+  <h4>Retry storms and multiplication</h4>
+  <p>Retries multiply across layers. Imagine three layers, A calls B calls C, each allowing 3 attempts. If C
+  is down, each request to A causes up to 3 calls to B, and each of those causes 3 calls to C: 3 × 3 = 9
+  calls to the already-failing C. With four layers it is 27. A small slowdown turns into a
+  <strong>retry storm</strong> that makes recovery impossible, because the failing service keeps getting
+  more load than normal.</p>
+  <p>Defences:</p>
+  <ul>
+    <li><strong>Retry at one layer only</strong> (usually the edge or the layer closest to the failure) and
+    pass errors up without retrying in the middle layers.</li>
+    <li><strong>Retry budget:</strong> allow retries only as a small fraction of normal traffic, for example
+    "retries may be at most 10% of requests in the last minute". When the budget is spent, fail fast. At
+    1,000 requests per second, that is at most about 100 retries per second, never 3,000.</li>
+    <li><strong>Circuit breaker:</strong> stop calling a dependency that is clearly down (see
+    <a href="#m6-resilience">Resilience</a>).</li>
+    <li><strong>Deadlines:</strong> pass a total time limit down the chain; do not start a retry if the
+    caller has already given up.</li>
+    <li><strong>Respect <code>Retry-After</code></strong> headers and 429 responses from the server.</li>
+  </ul>
+
+  <div class="co co-rule">
+    <p class="co-t">Rule: a retry needs a limit, a delay, randomness and a safe operation</p>
+    <p>Max attempts, backoff with a cap, jitter, and idempotency. Remove any one of the four and you have a
+    risk.</p>
+  </div>
+
+  <div class="co co-real">
+    <p class="co-t">In real projects</p>
+    <p>You rarely hand-write the loop. Spring offers retry support and Resilience4j has
+    <code>Retry</code> with exponential backoff configuration; see
+    <a href="04-spring-boot.html#m7">Spring Boot · Module 7</a>. For messaging, the broker or a retry topic
+    does it, with a <strong>dead-letter queue</strong> for messages that still fail after N attempts so
+    that a poison message does not block the queue forever.</p>
+  </div>
+
+  <div class="co co-mistake">
+    <p class="co-t">Common mistakes</p>
+    <ul>
+      <li>Retrying non-idempotent POSTs, causing duplicate orders or charges.</li>
+      <li>Retrying 4xx errors that can never succeed.</li>
+      <li>Fixed delay with no jitter, which synchronises the clients.</li>
+      <li>Retries at every layer of a call chain.</li>
+      <li>No timeout on the call, so the first attempt hangs and the retry logic never runs.</li>
+    </ul>
+  </div>
+
+  <div class="co co-interview">
+    <p class="co-t">Interview angle</p>
+    <ul>
+      <li>"How do you retry safely?" Idempotency, exponential backoff with a cap, jitter, a max attempt
+      count, a retry budget, a circuit breaker.</li>
+      <li>Explain the multiplication: 3 layers × 3 attempts = 27 calls from one user request in the worst
+      case.</li>
+      <li>Mention dead-letter queues for async work.</li>
+    </ul>
+  </div>
+</article>
